@@ -3857,27 +3857,48 @@ async function handleProxyRequest(clientReq, clientRes) {
       return;
     }
 
-    // ── 400: Bad request (no body) → likely corrupted token/headers, try recovery ──
+    // ── 400: Bad request → check if it's a recoverable token/auth issue ──
     if (status === 400) {
       const bodyBuf = await drainResponse(proxyRes);
       const bodyStr = bodyBuf.toString('utf8').trim();
 
+      // Parse the error to distinguish request errors from token/auth errors.
+      // Only `invalid_request_error` is a legitimate client mistake (bad model,
+      // missing fields, etc.) where switching accounts cannot help.
+      // ALL other 400s (auth errors, empty body, unparseable body, HTML from
+      // load-balancers) should trigger recovery — the previous code skipped
+      // recovery whenever ANY body was present, which was the root cause of
+      // cascading 400 failures across all sessions.
+      let isRequestError = false;
+      let parsedError = null;
       if (bodyStr) {
-        // 400 with a body = legitimate API validation error, pass through as-is
-        log('info', `${acctName} → 400 with body (passing through): ${bodyStr.slice(0, 200)}`);
+        try {
+          parsedError = JSON.parse(bodyStr);
+          const errType = parsedError?.error?.type || parsedError?.type;
+          if (errType === 'invalid_request_error') {
+            isRequestError = true;
+          }
+        } catch {
+          // Not JSON (HTML error page, garbled compressed data, etc.) — treat as recoverable
+        }
+      }
+
+      if (isRequestError) {
+        // Genuine request validation error — pass through, switching won't help
+        log('info', `${acctName} → 400 invalid_request_error (passing through): ${bodyStr.slice(0, 200)}`);
         clientRes.writeHead(400, proxyRes.headers);
         clientRes.end(bodyBuf);
         return;
       }
 
-      // 400 with NO body = likely bad token or malformed request from proxy
-      log('error', `${acctName} → 400 with no body (possible bad token or header issue)`);
-      logEvent('bad-request-400', { account: acctName });
+      // All other 400s: likely bad token, auth issue, or corrupted headers
+      log('error', `${acctName} → 400 (attempting recovery, body: ${bodyStr.slice(0, 300) || '(empty)'})`);
+      logEvent('bad-request-400', { account: acctName, hasBody: !!bodyStr });
 
       // Try refreshing the token first (like 401 handling)
       if (acct && !refreshAttempted.has(acctName)) {
         refreshAttempted.add(acctName);
-        log('refresh', `${acctName}: attempting token refresh after 400 (no body)...`);
+        log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
           const refreshResult = await refreshAccountToken(acct.name);
           if (refreshResult.ok && !refreshResult.skipped) {
@@ -3901,7 +3922,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (settings.autoSwitch) {
         const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
         if (next) {
-          log('switch', `  → 400 (no body) on ${acctName}, switching to ${next.label || next.name}`);
+          log('switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
           try {
             await withSwitchLock(() => {
               writeKeychain(next.creds);
@@ -3911,21 +3932,27 @@ async function handleProxyRequest(clientReq, clientRes) {
             log('warn', `Keychain write failed during 400 switch: ${e.message}`);
           }
           token = next.token;
-          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-no-body' });
+          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-error' });
           notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`);
           continue;
         }
       }
 
-      // No recovery possible — return error to client
-      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'proxy_error',
-          message: `Upstream returned 400 with no body on all accounts. Check proxy logs.`,
-        },
-      }));
+      // No recovery possible — return the original error if we have one
+      if (bodyStr) {
+        log('error', `All accounts returned 400, forwarding last error to client`);
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+      } else {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'proxy_error',
+            message: `Upstream returned 400 on all accounts. Check proxy logs.`,
+          },
+        }));
+      }
       return;
     }
 
