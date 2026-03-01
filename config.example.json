@@ -3,5 +3,7 @@
   "proxyEnabled": true,
   "rotationStrategy": "conserve",
   "rotationIntervalMin": 60,
-  "notifications": true
+  "notifications": true,
+  "serializeRequests": false,
+  "serializeDelayMs": 200
 }

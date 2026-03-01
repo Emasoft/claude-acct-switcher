@@ -1607,7 +1607,7 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('config')">Config</button>
-    <button class="tab" onclick="switchTab('tokens')">Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.25rem;vertical-align:middle">BETA</span></button>
+    <button class="tab" onclick="switchTab('tokens')" style="display:inline-flex;align-items:center;justify-content:center;gap:0.25rem">Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;line-height:1">BETA</span></button>
   </div>
 
   <div id="tab-accounts" class="tab-content active">
@@ -1736,7 +1736,7 @@ function renderHTML() {
         <option value="90">90 days</option>
       </select>
     </div>
-    <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.<br>Install the hooks with <code>vdm upgrade</code> to start tracking.</div>
+    <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
       <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
       <div class="usage-card" style="margin-bottom:1rem">

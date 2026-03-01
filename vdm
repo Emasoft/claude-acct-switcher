@@ -579,6 +579,14 @@ cmd_config() {
     fi
     echo -e "  rotationStrategy:   ${CYAN}${strategy:-sticky}${NC}"
     echo -e "  rotationIntervalMin: ${interval:-60}"
+    local serialize=$(get_config_value "serializeRequests")
+    if [[ "$serialize" == "True" ]]; then
+      echo -e "  serializeRequests:  ${GREEN}on${NC}  ${DIM}[BETA]${NC}"
+    else
+      echo -e "  serializeRequests:  ${DIM}off${NC}  ${DIM}[BETA]${NC}"
+    fi
+    local delay=$(get_config_string "serializeDelayMs")
+    echo -e "  serializeDelayMs:   ${delay:-200}  ${DIM}[BETA]${NC}"
     echo ""
     echo -e "  ${DIM}Usage: vdm config <key> <value>${NC}"
     echo -e "  ${DIM}  vdm config proxy on${NC}"
@@ -586,6 +594,8 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config notifications off${NC}"
     echo -e "  ${DIM}  vdm config rotation sticky|conserve|round-robin|spread|drain-first${NC}"
     echo -e "  ${DIM}  vdm config interval 15|30|60|120${NC}"
+    echo -e "  ${DIM}  vdm config serialize on|off${NC}  ${DIM}[BETA]${NC}"
+    echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
     return 0
   fi
 
@@ -597,9 +607,11 @@ cmd_config() {
     notifications|notifs)                 key="notifications" ;;
     rotation|rotationStrategy|strategy)   key="rotationStrategy"; is_bool=false ;;
     interval|rotationIntervalMin)         key="rotationIntervalMin"; is_bool=false ;;
+    serialize|serializeRequests|serialize-requests) key="serializeRequests" ;;
+    serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay"
       return 1
       ;;
   esac
@@ -652,6 +664,16 @@ cmd_config() {
     esac
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} min${NC}"
+  elif [[ "$key" == "serializeDelayMs" ]]; then
+    case "$value" in
+      0|100|200|500|1000|2000) ;;
+      *)
+        echo -e "${RED}Invalid delay: $value${NC}  (use 0, 100, 200, 500, 1000, or 2000)"
+        return 1
+        ;;
+    esac
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} ms${NC}"
   fi
 
   log_activity "settings-changed" "$key=$value"
@@ -761,7 +783,7 @@ cmd_upgrade() {
   fi
 
   # Verify the fetched repo has the files we need
-  for f in vdm dashboard.mjs lib.mjs; do
+  for f in vdm dashboard.mjs lib.mjs install-hooks.sh; do
     if [[ ! -f "$tmpdir/$f" ]]; then
       echo -e "  ${RED}Fetched repo is missing $f — aborting.${NC}"
       return 1
@@ -791,13 +813,20 @@ cmd_upgrade() {
   # Overwrite only code files — never touch accounts/, config.json,
   # activity-log.json, .label files, or any other user data.
   echo -e "  ${DIM}Updating files…${NC}"
-  cp "$tmpdir/vdm"          "$SCRIPT_DIR/vdm"
-  cp "$tmpdir/dashboard.mjs" "$SCRIPT_DIR/dashboard.mjs"
-  cp "$tmpdir/lib.mjs"      "$SCRIPT_DIR/lib.mjs"
+  cp "$tmpdir/vdm"               "$SCRIPT_DIR/vdm"
+  cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs"
+  cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs"
+  cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh"
   chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker
   echo "$latest_hash" > "$SCRIPT_DIR/.version"
+
+  # [BETA] Install hooks if not yet present
+  if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+    source "$SCRIPT_DIR/install-hooks.sh"
+    install_beta_hooks && echo -e "  ${GREEN}✓${NC} [BETA] Token tracking hooks installed" || true
+  fi
 
   # Restart dashboard if it was running
   if [[ "$dashboard_was_running" == "true" ]]; then
@@ -816,6 +845,169 @@ cmd_upgrade() {
   log_activity "upgrade" "from=${current_hash:-unknown}" "to=$latest_hash"
 }
 
+cmd_tokens() {
+  # [BETA] Token usage tracking
+  local repo=""
+  local branch=""
+  local days=1
+  local per_commit=false
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)     repo="$2"; shift 2 ;;
+      --branch)   branch="$2"; shift 2 ;;
+      --days)     days="$2"; shift 2 ;;
+      --per-commit) per_commit=true; shift ;;
+      *)          shift ;;
+    esac
+  done
+
+  # Auto-detect repo from cwd if not specified
+  if [[ -z "$repo" ]]; then
+    repo=$(git rev-parse --show-toplevel 2>/dev/null) || true
+  fi
+
+  local since=$(( ($(date +%s) - days * 86400) * 1000 ))
+
+  # Build URL
+  local url="http://localhost:$DASHBOARD_PORT/api/token-usage?since=$since"
+  if [[ -n "$repo" ]]; then
+    url="${url}&repo=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$repo'))" 2>/dev/null)"
+  fi
+  if [[ -n "$branch" ]]; then
+    url="${url}&branch=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$branch'))" 2>/dev/null)"
+  fi
+
+  local usage
+  usage=$(curl -s --max-time 5 "$url" 2>/dev/null) || {
+    echo -e "${RED}Could not connect to dashboard. Is it running?${NC}"
+    return 1
+  }
+
+  if [[ "$per_commit" == "true" && -n "$repo" ]]; then
+    # Per-commit breakdown
+    echo ""
+    echo -e "${BOLD}  Token Usage per Commit  ${DIM}[BETA]${NC}"
+    echo -e "  ────────────────────────────────────────────"
+    if [[ -n "$repo" ]]; then
+      echo -e "  ${DIM}Repo: $repo${NC}"
+    fi
+    echo ""
+
+    python3 -c "
+import json, sys, subprocess, os
+
+usage = json.loads('''$usage''')
+repo = '$repo'
+
+if not repo:
+    print('  No repo specified or detected.')
+    sys.exit(0)
+
+# Get git log
+try:
+    log = subprocess.check_output(
+        ['git', '-C', repo, 'log', '--format=%H %ct %s', '--reverse'],
+        stderr=subprocess.DEVNULL
+    ).decode().strip().split('\n')
+except:
+    print('  Could not read git log.')
+    sys.exit(0)
+
+commits = []
+for line in log:
+    if not line.strip(): continue
+    parts = line.split(' ', 2)
+    if len(parts) >= 3:
+        commits.append({'hash': parts[0][:7], 'ts': int(parts[1]) * 1000, 'msg': parts[2]})
+
+if not commits:
+    print('  No commits found.')
+    sys.exit(0)
+
+# Build buckets: between consecutive commits
+buckets = []
+for i, c in enumerate(commits):
+    start_ts = c['ts']
+    end_ts = commits[i+1]['ts'] if i+1 < len(commits) else float('inf')
+    tokens = sum(e['inputTokens'] + e['outputTokens'] for e in usage if start_ts <= e['ts'] < end_ts)
+    if tokens > 0:
+        buckets.append({'hash': c['hash'], 'tokens': tokens, 'msg': c['msg'][:60]})
+
+# Uncommitted bucket (after last commit)
+if commits:
+    uncommitted = sum(e['inputTokens'] + e['outputTokens'] for e in usage if e['ts'] >= commits[-1]['ts'])
+
+if not buckets and uncommitted <= 0:
+    print('  No token usage found in this period.')
+    sys.exit(0)
+
+for b in buckets:
+    tok = f'{b[\"tokens\"]:>10,}'
+    print(f'  {b[\"hash\"]}  {tok} tok  {b[\"msg\"]}')
+
+if uncommitted > 0:
+    tok = f'{uncommitted:>10,}'
+    print(f'  (uncommitted)  {tok} tok')
+
+total = sum(b['tokens'] for b in buckets) + (uncommitted if uncommitted > 0 else 0)
+print(f'')
+print(f'  Total: {total:,} tokens')
+" 2>/dev/null
+    echo ""
+    return 0
+  fi
+
+  # Standard summary view
+  echo ""
+  echo -e "${BOLD}  Token Usage Summary  ${DIM}[BETA]${NC}"
+  echo -e "  ────────────────────────────────────────────"
+  if [[ -n "$repo" ]]; then
+    echo -e "  ${DIM}Repo: $repo${NC}"
+  fi
+  if [[ -n "$branch" ]]; then
+    echo -e "  ${DIM}Branch: $branch${NC}"
+  fi
+  echo -e "  ${DIM}Period: last $days day(s)${NC}"
+  echo ""
+
+  python3 -c "
+import json, sys
+
+usage = json.loads('''$usage''')
+if not usage:
+    print('  No token usage recorded in this period.')
+    sys.exit(0)
+
+# Group by model
+models = {}
+total_in = 0
+total_out = 0
+for e in usage:
+    m = e.get('model', 'unknown')
+    if m not in models:
+        models[m] = {'input': 0, 'output': 0}
+    models[m]['input'] += e.get('inputTokens', 0)
+    models[m]['output'] += e.get('outputTokens', 0)
+    total_in += e.get('inputTokens', 0)
+    total_out += e.get('outputTokens', 0)
+
+for model, counts in sorted(models.items()):
+    total = counts['input'] + counts['output']
+    print(f'  {model}')
+    print(f'    Input:  {counts[\"input\"]:>10,} tokens')
+    print(f'    Output: {counts[\"output\"]:>10,} tokens')
+    print(f'    Total:  {total:>10,} tokens')
+    print()
+
+grand = total_in + total_out
+print(f'  Grand Total: {grand:,} tokens ({total_in:,} in / {total_out:,} out)')
+print(f'  Entries: {len(usage)}')
+" 2>/dev/null
+  echo ""
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -830,6 +1022,7 @@ cmd_help() {
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
+  echo -e "    ${CYAN}tokens${NC} [options]        Show token usage [BETA]"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
@@ -867,6 +1060,7 @@ case "$command" in
   status|st) cmd_status ;;
   config|cfg) cmd_config "$@" ;;
   dashboard) cmd_dashboard "$@" ;;
+  tokens|tok) cmd_tokens "$@" ;;
   upgrade|update) cmd_upgrade ;;
   help|--help|-h) cmd_help ;;
   *)

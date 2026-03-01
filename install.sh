@@ -54,6 +54,7 @@ mkdir -p "$INSTALL_DIR/accounts"
 cp "$SCRIPT_DIR/dashboard.mjs" "$INSTALL_DIR/dashboard.mjs"
 cp "$SCRIPT_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
 cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
+cp "$SCRIPT_DIR/install-hooks.sh" "$INSTALL_DIR/install-hooks.sh"
 chmod +x "$INSTALL_DIR/vdm"
 
 # Create default config if it doesn't exist
@@ -127,6 +128,13 @@ else
   echo '    fi'
   echo '    export ANTHROPIC_BASE_URL=http://localhost:3334'
   echo '    # END claude-account-switcher'
+fi
+
+# ── [BETA] Install token tracking hooks ──
+
+if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
+  source "$INSTALL_DIR/install-hooks.sh"
+  install_beta_hooks && echo -e "  ${GREEN}✓${NC} [BETA] Token tracking hooks installed" || true
 fi
 
 echo ""
