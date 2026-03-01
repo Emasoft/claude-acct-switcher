@@ -2167,7 +2167,7 @@ function evtMsg(e) {
     case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
     case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
     case 'settings-changed': return 'Settings updated';
-    case 'upgrade': return 'Upgraded to <b>v' + (e.to||'?') + '</b>';
+    case 'upgrade': return 'Upgraded to <b>' + (e.to||'?') + '</b>';
     case 'refresh-failed': return '<b>' + (e.account||'?') + '</b> refresh failed: ' + (e.error||'unknown');
     case 'token-refreshed': return '<b>' + (e.account||'?') + '</b> token refreshed';
     default: return e.type;
