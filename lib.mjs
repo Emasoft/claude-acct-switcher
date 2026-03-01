@@ -28,6 +28,10 @@ export const HOP_BY_HOP = new Set([
   'te', 'trailer', 'transfer-encoding', 'upgrade',
   // Not strictly hop-by-hop, but must be recalculated by the proxy:
   'host', 'content-length',
+  // Strip accept-encoding: proxy must read/inspect error bodies (400, 401, etc.)
+  // and compressed responses break the text-based error parsing. Localhost
+  // traffic doesn't benefit from compression anyway.
+  'accept-encoding',
 ]);
 
 /**

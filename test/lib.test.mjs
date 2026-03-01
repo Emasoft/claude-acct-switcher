@@ -60,6 +60,7 @@ describe('stripHopByHopHeaders', () => {
       'upgrade': 'websocket',
       'host': 'localhost:3334',
       'content-length': '42',
+      'accept-encoding': 'gzip, br',
       // These should survive:
       'content-type': 'application/json',
       'authorization': 'Bearer tok',

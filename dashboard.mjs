@@ -95,6 +95,7 @@ function saveSettings(settings) {
 
 let settings = loadSettings();
 let lastRotationTime = 0; // tracks when proactive rotation last happened
+let _consecutive400s = 0;  // global: consecutive 400 errors across requests (reset on success)
 
 // ─────────────────────────────────────────────────
 // Keychain helpers
@@ -709,6 +710,19 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/activity' && req.method === 'GET') {
     json(res, { log: activityLog.slice(0, 100) });
+    return true;
+  }
+
+  // SSE endpoint: stream proxy logs in real-time (used by `vdm logs`)
+  if (url.pathname === '/api/logs/stream' && req.method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write(`data: ${JSON.stringify({ tag: 'system', msg: 'Connected to log stream', line: '--- Connected to Van Damme-o-Matic log stream ---' })}\n\n`);
+    _logSubscribers.add(res);
+    req.on('close', () => _logSubscribers.delete(res));
     return true;
   }
 
@@ -2706,9 +2720,18 @@ const MAX_EVENT_LOG = 50;
 
 // ── Structured logger ──
 
+// ── Live log streaming (SSE subscribers for `vdm logs`) ──
+const _logSubscribers = new Set();
+
 function log(tag, msg, extra = '') {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
-  console.log(`[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`);
+  const line = `[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
+  console.log(line);
+  // Push to all SSE subscribers
+  for (const res of _logSubscribers) {
+    try { res.write(`data: ${JSON.stringify({ ts, tag, msg: msg + (extra ? ' ' + extra : ''), line })}\n\n`); }
+    catch { _logSubscribers.delete(res); }
+  }
 }
 
 // ── Event log (exposed to dashboard via /api/proxy-log) ──
@@ -3577,9 +3600,11 @@ async function handleProxyRequest(clientReq, clientRes) {
     return;
   }
 
-  const maxAttempts = allAccounts.length + 1; // +1 to allow for a refresh retry
+  const maxAttempts = allAccounts.length + 2; // +1 for refresh retry, +1 for minimal-header retry
   const triedTokens = new Set();
   const refreshAttempted = new Set(); // track refresh attempts to prevent infinite loops
+  let _bulkRefreshAttempted = false;   // per-request: tried force-refreshing all tokens?
+  let _minimalHeaderRetried = false;   // per-request: tried minimal-header last resort?
 
   // Start with active keychain token, apply rotation strategy
   let token = getActiveToken();
@@ -3857,27 +3882,83 @@ async function handleProxyRequest(clientReq, clientRes) {
       return;
     }
 
-    // ── 400: Bad request (no body) → likely corrupted token/headers, try recovery ──
+    // ── 400: Bad request → multi-layer recovery ──
+    //
+    // The Anthropic API returns 400 for many reasons: bad tokens, expired
+    // OAuth, malformed headers, AND legitimate request errors.  We must
+    // distinguish between "request is wrong" (switching won't help) and
+    // "something about the proxy/token is wrong" (switching/refreshing can
+    // help).  Multiple recovery strategies are tried in order.
     if (status === 400) {
       const bodyBuf = await drainResponse(proxyRes);
       const bodyStr = bodyBuf.toString('utf8').trim();
 
+      // Track this 400 for the global consecutive-failure counter
+      _consecutive400s++;
+
+      // Parse error type from response body
+      let errorType = null;
+      let parsedError = null;
       if (bodyStr) {
-        // 400 with a body = legitimate API validation error, pass through as-is
-        log('info', `${acctName} → 400 with body (passing through): ${bodyStr.slice(0, 200)}`);
+        try {
+          parsedError = JSON.parse(bodyStr);
+          errorType = parsedError?.error?.type || parsedError?.type || null;
+        } catch {
+          // Not JSON — HTML error page, garbled data, etc.
+        }
+      }
+
+      // Detect the specific "no body" / empty-body / non-JSON patterns that
+      // indicate this is NOT a legitimate request validation error
+      const looksLikeAuthIssue =
+        !bodyStr ||                                  // truly empty
+        !parsedError ||                              // not valid JSON
+        errorType === 'authentication_error' ||      // explicit auth error
+        errorType === 'permission_error' ||           // permission issue
+        /status code|no body|invalid.*token|unauthorized/i.test(bodyStr);  // heuristic
+
+      // Only pass through immediately if it's clearly a request validation
+      // error AND we haven't seen a suspicious pattern of repeated 400s
+      if (errorType === 'invalid_request_error' && _consecutive400s < 3) {
+        log('info', `${acctName} → 400 invalid_request_error (passing through): ${bodyStr.slice(0, 200)}`);
         clientRes.writeHead(400, proxyRes.headers);
         clientRes.end(bodyBuf);
         return;
       }
 
-      // 400 with NO body = likely bad token or malformed request from proxy
-      log('error', `${acctName} → 400 with no body (possible bad token or header issue)`);
-      logEvent('bad-request-400', { account: acctName });
+      const reason = looksLikeAuthIssue ? 'auth/token issue' :
+        _consecutive400s >= 3 ? `repeated 400s (${_consecutive400s} consecutive)` :
+        `unknown (type: ${errorType || 'none'})`;
+      log('error', `${acctName} → 400 (${reason}, body: ${bodyStr.slice(0, 300) || '(empty)'})`);
+      logEvent('bad-request-400', { account: acctName, errorType, consecutive: _consecutive400s });
 
-      // Try refreshing the token first (like 401 handling)
+      // ── Strategy 1: Force-refresh ALL tokens if we're in a repeated-failure loop ──
+      if (_consecutive400s >= 3 && !_bulkRefreshAttempted) {
+        _bulkRefreshAttempted = true;
+        log('error', `${_consecutive400s} consecutive 400s — force-refreshing ALL account tokens`);
+        for (const a of allAccounts) {
+          if (refreshAttempted.has(a.label || a.name)) continue;
+          refreshAttempted.add(a.label || a.name);
+          try {
+            await refreshAccountToken(a.name);
+          } catch (e) {
+            log('refresh', `${a.name}: bulk refresh failed: ${e.message}`);
+          }
+        }
+        invalidateAccountsCache();
+        const refreshedAccounts = loadAllAccountTokens();
+        const refreshedAcct = refreshedAccounts.find(a => a.name === (acct?.name));
+        if (refreshedAcct && refreshedAcct.token !== token) {
+          token = refreshedAcct.token;
+          triedTokens.clear(); // all tokens changed — retry everything
+          continue;
+        }
+      }
+
+      // ── Strategy 2: Refresh this specific account's token ──
       if (acct && !refreshAttempted.has(acctName)) {
         refreshAttempted.add(acctName);
-        log('refresh', `${acctName}: attempting token refresh after 400 (no body)...`);
+        log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
           const refreshResult = await refreshAccountToken(acct.name);
           if (refreshResult.ok && !refreshResult.skipped) {
@@ -3897,11 +3978,11 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
       }
 
-      // Try switching accounts
+      // ── Strategy 3: Switch to another account ──
       if (settings.autoSwitch) {
         const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
         if (next) {
-          log('switch', `  → 400 (no body) on ${acctName}, switching to ${next.label || next.name}`);
+          log('switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
           try {
             await withSwitchLock(() => {
               writeKeychain(next.creds);
@@ -3911,21 +3992,61 @@ async function handleProxyRequest(clientReq, clientRes) {
             log('warn', `Keychain write failed during 400 switch: ${e.message}`);
           }
           token = next.token;
-          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-no-body' });
+          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-error' });
           notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`);
           continue;
         }
       }
 
-      // No recovery possible — return error to client
-      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'proxy_error',
-          message: `Upstream returned 400 with no body on all accounts. Check proxy logs.`,
-        },
-      }));
+      // ── Strategy 4 (last resort): Retry with minimal headers ──
+      // If ALL accounts failed, the problem might be a forwarded header that
+      // the API rejects.  Retry once with only the essential headers.
+      if (!_minimalHeaderRetried) {
+        _minimalHeaderRetried = true;
+        log('error', 'All accounts returned 400 — retrying with minimal headers (last resort)');
+        const minimalHeaders = {
+          'host': 'api.anthropic.com',
+          'authorization': `Bearer ${token}`,
+          'content-type': clientReq.headers['content-type'] || 'application/json',
+          'content-length': String(body.length),
+          'anthropic-version': clientReq.headers['anthropic-version'] || '2023-06-01',
+          'anthropic-beta': 'oauth-2025-04-20',
+        };
+        try {
+          const retryRes = await forwardToAnthropic(clientReq.method, clientReq.url, minimalHeaders, body);
+          if (retryRes.statusCode < 400 || retryRes.statusCode >= 500) {
+            // It worked (or it's a server error, not our fault) — pipe through
+            log('info', `Minimal-header retry succeeded (status ${retryRes.statusCode})`);
+            _consecutive400s = 0;
+            clientRes.writeHead(retryRes.statusCode, retryRes.headers);
+            retryRes.on('error', () => { try { clientRes.end(); } catch {} });
+            clientRes.on('close', () => { retryRes.destroy(); });
+            await pipeAndWait(retryRes, clientRes);
+            return;
+          }
+          // Still 4xx — it's genuinely a bad request or truly dead tokens
+          const retryBuf = await drainResponse(retryRes);
+          log('error', `Minimal-header retry also returned ${retryRes.statusCode}: ${retryBuf.toString('utf8').slice(0, 200)}`);
+        } catch (e) {
+          log('error', `Minimal-header retry failed: ${e.message}`);
+        }
+      }
+
+      // All strategies exhausted — return the best error we have
+      log('error', `All 400 recovery strategies exhausted for this request`);
+      if (bodyStr) {
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+      } else {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'proxy_error',
+            message: `Upstream returned 400 on all accounts after all recovery strategies. Check proxy logs.`,
+          },
+        }));
+      }
       return;
     }
 
@@ -3940,6 +4061,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     }
 
     // ── Any other response: success or client error → pipe through ──
+    _consecutive400s = 0; // reset on any non-400 response
     updateAccountState(token, acctName, proxyRes.headers, getFingerprintFromToken(token));
 
     // Check if utilization is critically high and log a warning

@@ -1027,6 +1027,60 @@ print(f'  Entries: {len(usage)}')
   echo ""
 }
 
+cmd_logs() {
+  local filter="${1:-}"
+
+  # Check if dashboard is running
+  if ! curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
+    echo -e "${RED}Dashboard is not running. Start it with: vdm dashboard${NC}"
+    return 1
+  fi
+
+  echo -e "${BOLD}  Van Damme-o-Matic — Live Proxy Logs${NC}"
+  echo -e "  ─────────────────────────────────────────────"
+  if [[ -n "$filter" ]]; then
+    echo -e "  ${DIM}Filter: $filter${NC}"
+  fi
+  echo -e "  ${DIM}Press Ctrl-C to stop${NC}"
+  echo ""
+
+  # Stream SSE logs, parse the JSON data lines, colorize by tag
+  curl -s -N "http://localhost:$DASHBOARD_PORT/api/logs/stream" 2>/dev/null | while IFS= read -r line; do
+    # SSE format: "data: {...}"
+    if [[ "$line" == data:* ]]; then
+      local json="${line#data: }"
+      local log_line
+      log_line=$(echo "$json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    tag = d.get('tag', '')
+    line = d.get('line', d.get('msg', ''))
+    # Color coding
+    colors = {
+        'error': '\033[0;31m',     # red
+        'warn': '\033[1;33m',      # yellow
+        'switch': '\033[0;36m',    # cyan
+        'refresh': '\033[0;34m',   # blue
+        'proactive': '\033[0;35m', # magenta
+        'info': '\033[0m',         # default
+        'system': '\033[0;32m',    # green
+    }
+    color = colors.get(tag, '\033[2m')  # dim for unknown
+    reset = '\033[0m'
+    print(f'{color}{line}{reset}')
+except:
+    pass
+" 2>/dev/null)
+      if [[ -n "$log_line" ]]; then
+        if [[ -z "$filter" ]] || echo "$log_line" | grep -qi "$filter" 2>/dev/null; then
+          echo -e "  $log_line"
+        fi
+      fi
+    fi
+  done
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -1041,6 +1095,7 @@ cmd_help() {
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
+  echo -e "    ${CYAN}logs${NC} [filter]            Stream live proxy logs"
   echo -e "    ${CYAN}tokens${NC} [options]        Show token usage [BETA]"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
@@ -1079,6 +1134,7 @@ case "$command" in
   status|st) cmd_status ;;
   config|cfg) cmd_config "$@" ;;
   dashboard) cmd_dashboard "$@" ;;
+  logs|log) cmd_logs "$@" ;;
   tokens|tok) cmd_tokens "$@" ;;
   upgrade|update) cmd_upgrade ;;
   help|--help|-h) cmd_help ;;
