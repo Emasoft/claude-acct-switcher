@@ -877,7 +877,7 @@ async function handleAPI(req, res) {
           } catch {
             repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
           }
-          branch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          branch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
           commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
         } catch { /* not a git repo */ }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
@@ -888,7 +888,7 @@ async function handleAPI(req, res) {
         // Keep cwd up to date so periodic persist and auto-claim use the latest directory
         if (cwd && cwd !== session.cwd) session.cwd = cwd;
         try {
-          const newBranch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          const newBranch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
           if (newBranch && newBranch !== session.branch) {
             log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
             session.branch = newBranch;
@@ -1759,7 +1759,6 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('config')">Config</button>
-    <button class="tab" onclick="switchTab('tokens')" style="display:inline-flex;align-items:center;justify-content:center;gap:0.25rem">Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;line-height:1">BETA</span></button>
   </div>
 
   <div id="tab-accounts" class="tab-content active">
@@ -1784,6 +1783,33 @@ function renderHTML() {
           <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--purple)"></span> Tokens</div>
         </div>
         <div id="chart" class="chart-container"></div>
+      </div>
+    </div>
+    <div class="tok-filters">
+      <select class="config-select" id="tok-repo" onchange="tokFilterChange('repo')"><option value="">All repos</option></select>
+      <select class="config-select" id="tok-branch" onchange="tokFilterChange('branch')"><option value="">All branches</option></select>
+      <select class="config-select" id="tok-model" onchange="tokFilterChange('model')"><option value="">All models</option></select>
+      <select class="config-select" id="tok-time" onchange="tokFilterChange('time')">
+        <option value="1">1 day</option>
+        <option value="7" selected>7 days</option>
+        <option value="30">30 days</option>
+        <option value="90">90 days</option>
+      </select>
+    </div>
+    <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
+    <div id="tok-content" style="display:none">
+      <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Daily Usage</div>
+        <div id="tok-chart"></div>
+      </div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Model Breakdown</div>
+        <div id="tok-models"></div>
+      </div>
+      <div class="usage-card">
+        <div class="usage-title">Repository &amp; Branch</div>
+        <div id="tok-repos"></div>
       </div>
     </div>
   </div>
@@ -1887,35 +1913,6 @@ function renderHTML() {
     </div>
   </div>
 
-  <div id="tab-tokens" class="tab-content">
-    <div class="tok-filters">
-      <select class="config-select" id="tok-repo" onchange="tokFilterChange('repo')"><option value="">All repos</option></select>
-      <select class="config-select" id="tok-branch" onchange="tokFilterChange('branch')"><option value="">All branches</option></select>
-      <select class="config-select" id="tok-model" onchange="tokFilterChange('model')"><option value="">All models</option></select>
-      <select class="config-select" id="tok-time" onchange="tokFilterChange('time')">
-        <option value="1">1 day</option>
-        <option value="7" selected>7 days</option>
-        <option value="30">30 days</option>
-        <option value="90">90 days</option>
-      </select>
-    </div>
-    <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
-    <div id="tok-content" style="display:none">
-      <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
-      <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Daily Usage</div>
-        <div id="tok-chart"></div>
-      </div>
-      <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Model Breakdown</div>
-        <div id="tok-models"></div>
-      </div>
-      <div class="usage-card">
-        <div class="usage-title">Repository &amp; Branch</div>
-        <div id="tok-repos"></div>
-      </div>
-    </div>
-  </div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -1926,7 +1923,7 @@ function switchTab(id) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
-  if (id === 'tokens') refreshTokens();
+  if (id === 'usage') refreshTokens();
 }
 
 function formatNum(n) {
@@ -2557,7 +2554,7 @@ function tokTimeRange() {
 }
 
 async function refreshTokens() {
-  var tab = document.getElementById('tab-tokens');
+  var tab = document.getElementById('tab-usage');
   if (!tab || !tab.classList.contains('active')) return;
   if (_tokFetching) { _tokNeedsRefresh = true; return; }
   _tokFetching = true;
@@ -3660,6 +3657,44 @@ function claimUsageInRange(startTs, endTs) {
   return claimed;
 }
 
+/**
+ * When inside a Claude Code git worktree, the checked-out branch is an
+ * auto-generated name like `worktree-jolly-dazzling-dolphin`.  Resolve it
+ * back to the real feature branch so token usage is attributed correctly.
+ */
+function _resolveWorktreeBranch(cwd, detectedBranch) {
+  if (!detectedBranch.startsWith('worktree-')) return detectedBranch;
+  try {
+    // Confirm we're actually in a worktree (git-dir != git-common-dir)
+    const gitDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+    const commonDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+    if (gitDir === commonDir) return detectedBranch;
+  } catch { return detectedBranch; }
+
+  // Strategy 1: find a non-worktree branch at the exact same commit
+  try {
+    const candidates = execSync(`git -C "${cwd}" branch --points-at HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 })
+      .trim().split('\n')
+      .map(b => b.replace(/^\*?\s+/, '').trim())
+      .filter(b => b && !b.startsWith('worktree-'));
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1) return candidates.find(b => b.includes('/')) || candidates[0];
+  } catch { /* ignore */ }
+
+  // Strategy 2: walk recent commits for the closest decorated non-worktree branch
+  try {
+    const lines = execSync(`git -C "${cwd}" log --format=%D --max-count=30 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const refs = line.split(',').map(r => r.trim())
+        .filter(r => r && !r.startsWith('HEAD') && !r.startsWith('worktree-') && !r.startsWith('origin/') && !r.startsWith('tag:'));
+      if (refs.length > 0) return refs.find(r => r.includes('/')) || refs[0];
+    }
+  } catch { /* ignore */ }
+
+  return detectedBranch;
+}
+
 // ─────────────────────────────────────────────────
 // [BETA] Session Tracking
 // ─────────────────────────────────────────────────
@@ -3671,7 +3706,7 @@ function _autoClaimSession(sessionId, session) {
   // Re-read branch before persisting (handles worktree branch switches)
   if (session.cwd) {
     try {
-      const cur = execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+      const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
       if (cur && cur !== session.branch) {
         session.branch = cur;
         session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
@@ -3707,7 +3742,7 @@ setInterval(() => {
     // Re-read branch before persisting (handles worktree branch switches)
     if (session.cwd) {
       try {
-        const cur = execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
         if (cur && cur !== session.branch) {
           log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${session.branch} → ${cur}`);
           session.branch = cur;
