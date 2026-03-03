@@ -172,10 +172,9 @@ _install_git_hook() {
 
   local hook_file="$hooks_dir/prepare-commit-msg"
 
-  # Check if our hook is already installed
+  # If our hook is already installed, remove it so we can write the latest version
   if [[ -f "$hook_file" ]] && grep -q "$_VDM_HOOKS_MARKER" "$hook_file" 2>/dev/null; then
-    # Already installed — update in place
-    return 0
+    rm -f "$hook_file" 2>/dev/null || true
   fi
 
   # If existing hook without our marker, move aside
@@ -210,6 +209,8 @@ else
 fi
 
 # Query proxy for token usage since last commit (2s timeout, silent fail)
+# Use --git-common-dir to resolve to main repo root (matches dashboard storage)
+REPO=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git/*$||') ||
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 LAST_TS=$(( $(git log -1 --format=%ct 2>/dev/null || echo 0) * 1000 ))
 USAGE=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/token-usage?repo=${REPO}&since=${LAST_TS}" 2>/dev/null) || exit 0
