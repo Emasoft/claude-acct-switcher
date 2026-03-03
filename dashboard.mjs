@@ -44,10 +44,15 @@ function detectClaudeCodeVersion() {
 }
 const CLAUDE_CODE_VERSION = detectClaudeCodeVersion();
 
-// Project version — derived from the latest git tag at startup
+// Project version — read from .version file (written by vdm upgrade), fall back to git tag
 function detectProjectVersion() {
+  const versionFile = join(__dirname, '.version');
   try {
-    return execSync('git describe --tags --abbrev=0 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
+    const v = readFileSync(versionFile, 'utf8').trim();
+    if (v) return v;
+  } catch {}
+  try {
+    return execSync('git describe --tags --abbrev=0 2>/dev/null', { encoding: 'utf8', cwd: __dirname, timeout: 3000 }).trim();
   } catch {}
   return 'dev';
 }
