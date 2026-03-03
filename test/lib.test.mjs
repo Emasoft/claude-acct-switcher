@@ -299,8 +299,15 @@ describe('parseRefreshResponse', () => {
     assert.equal(result.retriable, false);
   });
 
-  it('stringifies object error fields instead of [object Object]', () => {
+  it('extracts message from object error fields', () => {
     const body = JSON.stringify({ error: { type: 'invalid_grant', message: 'token revoked' } });
+    const result = parseRefreshResponse(400, body);
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'token revoked');
+  });
+
+  it('stringifies object error fields without message instead of [object Object]', () => {
+    const body = JSON.stringify({ error: { type: 'invalid_grant' } });
     const result = parseRefreshResponse(400, body);
     assert.equal(result.ok, false);
     assert.ok(!result.error.includes('[object Object]'), `error should not contain [object Object]: ${result.error}`);

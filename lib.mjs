@@ -502,7 +502,7 @@ export function parseRefreshResponse(statusCode, bodyStr) {
   try {
     const data = JSON.parse(bodyStr);
     const raw = data.error_description || data.error || data.message || error;
-    error = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    error = typeof raw === 'string' ? raw : (raw && raw.message) || JSON.stringify(raw);
   } catch {}
   return { ok: false, error, retriable };
 }
