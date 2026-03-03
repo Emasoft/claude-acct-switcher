@@ -37,6 +37,14 @@ Restart your terminal. Done. The proxy auto-starts on new shells.
 
 **Requirements:** macOS, Node.js 18+, python3, Claude Code CLI.
 
+### Upgrade
+
+```bash
+vdm upgrade
+```
+
+Fetches the latest release, auto-installs hooks, and restarts the dashboard.
+
 ## Usage
 
 Accounts are auto-discovered — just log in:
@@ -50,16 +58,31 @@ claude login    # account B — that's it
 
 ```
 vdm list                    List accounts
-vdm switch [name]           Switch account
+vdm switch [name]           Switch account (interactive if no name)
 vdm remove <name>           Remove account
 vdm status                  Current account + settings
 vdm config [key] [on|off]   View/toggle settings
 vdm dashboard [start|stop]  Dashboard control
+vdm logs [filter]           Stream live proxy logs
+vdm tokens [options]        Show token usage (BETA)
+vdm upgrade                 Update to latest version
 ```
 
 ### Dashboard
 
-`http://localhost:3333` — accounts, rate limits, usage, activity log.
+`http://localhost:3333` — accounts, rate limits, token usage, activity log.
+
+#### Tokens Tab (BETA)
+
+Per-session token usage tracking with breakdowns by model, repo, branch, and time range.
+
+- **Filter row** — repo, branch, model, and time range (1d/7d/30d/90d)
+- **Summary stats** — total tokens, input, output, requests at a glance
+- **Daily stacked bar chart** — per-model colored segments with hover tooltips
+- **Model breakdown** — input/output split with proportional bars
+- **Repo/branch breakdown** — sorted by total tokens, with per-model detail
+
+Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees.
 
 ### Settings
 
@@ -68,6 +91,8 @@ vdm config proxy on|off           # Token-swapping proxy
 vdm config autoswitch on|off      # Auto-switch on 429/401
 vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-first
 vdm config interval <minutes>     # Round-robin timer
+vdm config serialize on|off       # Serialize proxy requests
+vdm config serialize-delay <ms>   # Serialization delay
 ```
 
 ### Rotation Strategies
@@ -89,10 +114,34 @@ Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.
                                           |-- Swaps Authorization header
                                           |-- On 429 → retries with next account
                                           |-- On 401 → refreshes token, then switches
-                                          '-- Background token refresh (every 5 min)
+                                          |-- On 400 → multi-layer recovery (4 strategies)
+                                          |-- Background token refresh (every 5 min)
+                                          |-- Passthrough fallback if all recovery fails
+                                          '-- Circuit breaker auto-disables on repeated failures
 ```
 
 Credentials live in the macOS Keychain. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. On 429, it writes the next account's credentials to the Keychain and retries — Claude Code picks up the change seamlessly.
+
+### Proxy Resilience
+
+The proxy is designed to never kill your Claude Code sessions, even when things go wrong:
+
+**Passthrough fallback** — When all proxy recovery strategies fail (expired tokens, network errors, auth failures), the request is forwarded with the original client auth header. This lets Claude Code reach the real API and trigger its own re-auth flow, instead of receiving an opaque error that permanently kills the session.
+
+**Circuit breaker** — After 3 consecutive total failures, the proxy auto-disables into passthrough mode for 2 minutes. All requests go straight to Anthropic with the client's own auth. After the cooldown, proxy mode is re-engaged automatically.
+
+**400 error recovery** — When the API returns 400 (which can mean bad tokens, expired OAuth, or malformed headers), four escalating strategies are tried:
+
+1. Bulk token refresh — force-refresh all account tokens in parallel
+2. Single token refresh — refresh the failing account
+3. Account switch — try a different account
+4. Minimal headers retry — strip all forwarded headers, retry with essentials only
+
+**Sleep recovery** — After laptop sleep, all tokens may expire simultaneously. The proxy detects this and refreshes tokens in parallel (~37s) instead of sequentially (37s × N accounts). A 45-second request deadline prevents indefinite hangs.
+
+### Worktree Support
+
+Sessions running in git worktrees are correctly grouped with the parent repo in the dashboard and token tracking. The proxy resolves the main repo root via `--git-common-dir` and re-reads the checked-out branch on every prompt.
 
 ## Ports
 
