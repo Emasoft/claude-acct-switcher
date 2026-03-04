@@ -2955,22 +2955,26 @@ function renderTokenStats(data, prevData) {
     if (s.extra) h += s.extra;
     return h + '</div>';
   }).join('');
-  // Savings banner
+  // Savings banner — daily rate comparison
   var savingsEl = document.getElementById('tok-savings');
   if (savingsEl) {
     var days = tokTimeRange();
     var planSel = document.getElementById('tok-plan');
     var planKey = planSel ? planSel.value : 'max5x';
     var plan = TOK_PLANS[planKey] || TOK_PLANS['max5x'];
-    var proratedCost = (plan.monthly / 30) * days;
-    var saved = totalCost - proratedCost;
+    var planDaily = plan.monthly / 30;
+    var apiDaily = days > 0 ? totalCost / days : 0;
+    var savedDaily = apiDaily - planDaily;
     var opts = Object.keys(TOK_PLANS).map(function(k) {
       return '<option value="' + k + '"' + (k === planKey ? ' selected' : '') + '>' + TOK_PLANS[k].label + '</option>';
     }).join('');
-    savingsEl.innerHTML = 'Your <select id="tok-plan" onchange="applyTokenModelFilter()">' + opts + '</select> ' +
-      (saved > 0
-        ? 'saves you <span class="tok-savings-val">' + formatCost(saved) + '</span> vs API pricing this period'
-        : 'equivalent API cost: ' + formatCost(totalCost) + ' (' + days + 'd window)');
+    var msg;
+    if (savedDaily > 0) {
+      msg = 'saves you ~<span class="tok-savings-val">' + formatCost(savedDaily) + '/day</span> vs API rates (' + formatCost(planDaily) + '/day plan vs ' + formatCost(apiDaily) + '/day API)';
+    } else {
+      msg = 'costs ' + formatCost(planDaily) + '/day \u00b7 API equiv ' + formatCost(apiDaily) + '/day';
+    }
+    savingsEl.innerHTML = 'Your <select id="tok-plan" onchange="applyTokenModelFilter()">' + opts + '</select> ' + msg;
   }
 }
 
