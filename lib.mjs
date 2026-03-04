@@ -32,6 +32,10 @@ export const HOP_BY_HOP = new Set([
   // and compressed responses break the text-based error parsing. Localhost
   // traffic doesn't benefit from compression anyway.
   'accept-encoding',
+  // Strip x-api-key: if Claude Code or another client forwards this header,
+  // it can cause the API to bill a different account than the OAuth Bearer
+  // token, leading to false "credit balance too low" 400 errors.
+  'x-api-key',
 ]);
 
 /**
@@ -106,6 +110,13 @@ export function createAccountStateManager() {
     state.set(token, { ...prev, name, expired: true, updatedAt: Date.now() });
   }
 
+  function clearBillingCooldown(token) {
+    const prev = state.get(token);
+    if (prev && prev.retryAfter > 0) {
+      state.set(token, { ...prev, retryAfter: 0, updatedAt: Date.now() });
+    }
+  }
+
   function get(token) {
     return state.get(token);
   }
@@ -122,7 +133,7 @@ export function createAccountStateManager() {
     state.delete(token);
   }
 
-  return { update, markLimited, markExpired, get, entries, clear, remove };
+  return { update, markLimited, markExpired, clearBillingCooldown, get, entries, clear, remove };
 }
 
 // ─────────────────────────────────────────────────
