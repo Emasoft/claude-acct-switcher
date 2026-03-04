@@ -4721,6 +4721,7 @@ async function handleProxyRequest(clientReq, clientRes) {
 
   const maxAttempts = allAccounts.length + 2; // +1 for refresh retry, +1 for minimal-header retry
   const triedTokens = new Set();
+  const billingMarkedTokens = new Set(); // tokens marked billing-unavailable this request
   const refreshAttempted = new Set(); // track refresh attempts to prevent infinite loops
   let _bulkRefreshAttempted = false;   // per-request: tried force-refreshing all tokens?
   let _minimalHeaderRetried = false;   // per-request: tried minimal-header last resort?
@@ -5099,6 +5100,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (isBillingError && token) {
         const BILLING_COOLDOWN_SEC = 300; // 5 min cooldown
         accountState.markLimited(token, acctName, BILLING_COOLDOWN_SEC);
+        billingMarkedTokens.add(token);
         log('billing', `${acctName}: marked unavailable for ${BILLING_COOLDOWN_SEC}s (billing error)`);
       }
 
@@ -5207,6 +5209,27 @@ async function handleProxyRequest(clientReq, clientRes) {
             // It worked (or it's a server error, not our fault) — pipe through
             log('info', `Minimal-header retry succeeded (status ${retryRes.statusCode})`);
             _consecutive400s = 0;
+
+            // The minimal-header retry succeeded — billing errors were header-caused,
+            // not genuine. Clear the false billing marks from this request.
+            if (billingMarkedTokens.size > 0) {
+              for (const t of billingMarkedTokens) {
+                accountState.clearBillingCooldown(t);
+              }
+              log('billing', `Cleared ${billingMarkedTokens.size} false-positive billing marks (header-caused)`);
+            }
+
+            // Log header diff for debugging: which headers were in the full request
+            // but NOT in the minimal retry? One of these caused the 400.
+            const fullHeaders = buildForwardHeaders(clientReq.headers, token);
+            const strippedKeys = Object.keys(fullHeaders)
+              .filter(k => !(k.toLowerCase() in {
+                'host': 1, 'authorization': 1, 'content-type': 1,
+                'content-length': 1, 'anthropic-version': 1, 'anthropic-beta': 1,
+              }));
+            if (strippedKeys.length > 0) {
+              log('info', `Headers in full request but not minimal retry: ${strippedKeys.join(', ')}`);
+            }
             clientRes.writeHead(retryRes.statusCode, retryRes.headers);
             retryRes.on('error', () => { try { clientRes.end(); } catch {} });
             clientRes.on('close', () => { retryRes.destroy(); });

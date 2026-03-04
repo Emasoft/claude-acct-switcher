@@ -61,6 +61,7 @@ describe('stripHopByHopHeaders', () => {
       'host': 'localhost:3334',
       'content-length': '42',
       'accept-encoding': 'gzip, br',
+      'x-api-key': 'sk-ant-abc123',
       // These should survive:
       'content-type': 'application/json',
       'authorization': 'Bearer tok',
@@ -73,6 +74,17 @@ describe('stripHopByHopHeaders', () => {
     assert.equal(result['content-type'], 'application/json');
     assert.equal(result['authorization'], 'Bearer tok');
     assert.equal(result['x-custom'], 'value');
+  });
+
+  it('strips x-api-key header to prevent billing conflicts', () => {
+    const result = stripHopByHopHeaders({
+      'x-api-key': 'sk-ant-abc123',
+      'content-type': 'application/json',
+      'authorization': 'Bearer oauth-token',
+    });
+    assert.ok(!('x-api-key' in result), 'x-api-key should be stripped');
+    assert.equal(result['content-type'], 'application/json');
+    assert.equal(result['authorization'], 'Bearer oauth-token');
   });
 
   it('strips custom hop-by-hop headers declared in Connection', () => {
@@ -156,6 +168,15 @@ describe('buildForwardHeaders', () => {
     assert.equal(oauthCount, 1);
   });
 
+  it('strips x-api-key from forwarded headers', () => {
+    const headers = buildForwardHeaders({
+      'x-api-key': 'sk-ant-abc123',
+      'content-type': 'application/json',
+    }, 'test-token');
+    assert.ok(!('x-api-key' in headers), 'x-api-key should not be forwarded');
+    assert.equal(headers['authorization'], 'Bearer test-token');
+  });
+
   it('throws on null token', () => {
     assert.throws(() => buildForwardHeaders({}, null), /Cannot forward request: token is null/);
   });
@@ -192,6 +213,47 @@ describe('createAccountStateManager', () => {
   it('remove() on non-existent key is a no-op', () => {
     const sm = createAccountStateManager();
     sm.remove('nonexistent'); // should not throw
+    assert.equal(sm.get('nonexistent'), undefined);
+  });
+
+  it('clearBillingCooldown() clears retryAfter but preserves rate-limit state', () => {
+    const sm = createAccountStateManager();
+    // Set up an account with both rate-limit and billing cooldown
+    sm.update('tok1', 'acct1', {
+      'anthropic-ratelimit-unified-status': 'limited',
+      'anthropic-ratelimit-unified-5h-utilization': '0.8',
+      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 3600),
+    });
+    // Mark with billing cooldown
+    sm.markLimited('tok1', 'acct1', 300);
+    const before = sm.get('tok1');
+    assert.ok(before.retryAfter > 0, 'retryAfter should be set');
+    assert.equal(before.limited, true);
+
+    // Clear billing cooldown
+    sm.clearBillingCooldown('tok1');
+    const after = sm.get('tok1');
+    assert.equal(after.retryAfter, 0, 'retryAfter should be cleared');
+    assert.equal(after.limited, true, 'limited flag should be preserved');
+    assert.equal(after.utilization5h, 0.8, 'utilization5h should be preserved');
+    assert.equal(after.utilization7d, 0.4, 'utilization7d should be preserved');
+    assert.ok(after.resetAt > 0, 'resetAt should be preserved');
+  });
+
+  it('clearBillingCooldown() is a no-op when retryAfter is already 0', () => {
+    const sm = createAccountStateManager();
+    sm.update('tok1', 'acct1', { 'anthropic-ratelimit-unified-status': 'ok' });
+    const before = sm.get('tok1');
+    const beforeUpdatedAt = before.updatedAt;
+    sm.clearBillingCooldown('tok1');
+    const after = sm.get('tok1');
+    assert.equal(after.updatedAt, beforeUpdatedAt, 'should not update when retryAfter is already 0');
+  });
+
+  it('clearBillingCooldown() is a no-op for unknown tokens', () => {
+    const sm = createAccountStateManager();
+    sm.clearBillingCooldown('nonexistent'); // should not throw
     assert.equal(sm.get('nonexistent'), undefined);
   });
 });
