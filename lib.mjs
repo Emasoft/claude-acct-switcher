@@ -137,11 +137,11 @@ export function isAccountAvailable(token, expiresAt, stateManager, now = Date.no
   if (expiresAt && expiresAt < now) return false;
   // Marked expired by a 401
   if (acctState?.expired) return false;
-  // Limited and reset hasn't passed
+  // Limited: unavailable if ANY active cooldown hasn't passed yet
   if (acctState?.limited) {
-    if (acctState.resetAt && acctState.resetAt < nowSec) return true; // reset passed
-    if (acctState.retryAfter && acctState.retryAfter < now) return true; // retry-after passed
-    return false;
+    if (acctState.retryAfter && acctState.retryAfter >= now) return false;   // billing cooldown active
+    if (acctState.resetAt && acctState.resetAt >= nowSec) return false;      // 5h rate-limit active
+    return true; // all cooldowns expired
   }
   return true;
 }
