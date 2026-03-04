@@ -1793,6 +1793,25 @@ function renderHTML() {
     line-height: 1.6;
   }
   #tok-stats.stat-grid { grid-template-columns: repeat(5, 1fr); }
+  .tok-stat-sub { font-size: 0.5625rem; color: var(--muted); margin-top: 0.0625rem; }
+  .tok-savings-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8125rem;
+    color: var(--muted);
+    margin-bottom: 1.25rem;
+    flex-wrap: wrap;
+  }
+  .tok-savings-banner select {
+    font-size: 0.75rem;
+    padding: 0.125rem 0.375rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--foreground);
+  }
+  .tok-savings-val { color: var(--green); font-weight: 600; }
   .tok-trend { font-size: 0.6875rem; font-weight: 500; margin-top: 0.125rem; }
   .tok-trend.up { color: var(--red); }
   .tok-trend.down { color: var(--green); }
@@ -1970,7 +1989,8 @@ function renderHTML() {
     <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
       <div id="tok-chart" class="usage-card" style="margin-bottom:1rem"></div>
-      <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
+      <div id="tok-stats" class="stat-grid" style="margin-bottom:0.5rem"></div>
+      <div id="tok-savings" class="tok-savings-banner"></div>
       <div class="usage-card" style="margin-bottom:1rem">
         <div class="usage-title">Model Breakdown</div>
         <div id="tok-models"></div>
@@ -2724,6 +2744,11 @@ var TOK_PRICING = {
   'claude-haiku-4-5': { input: 0.80, output: 4 },
 };
 var TOK_PRICING_DEFAULT = { input: 3, output: 15 };
+var TOK_PLANS = {
+  'pro':    { label: 'Pro ($20/mo)', monthly: 20 },
+  'max5x':  { label: 'MAX 5x ($100/mo)', monthly: 100 },
+  'max20x': { label: 'MAX 20x ($200/mo)', monthly: 200 },
+};
 var _tokPrevPeriodData = [];
 var _tokRepoCollapsed = {};
 
@@ -2923,8 +2948,30 @@ function renderTokenStats(data, prevData) {
     { v: formatNum(totalIn), l: 'Input' },
     { v: formatNum(totalOut), l: 'Output' },
     { v: formatNum(requests), l: 'Requests' },
-    { v: formatCost(totalCost), l: 'Est. Cost' },
-  ].map(function(s) { return '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>' + (s.extra || '') + '</div>'; }).join('');
+    { v: formatCost(totalCost), l: 'API Equiv.', sub: 'at API rates' },
+  ].map(function(s) {
+    var h = '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>';
+    if (s.sub) h += '<div class="tok-stat-sub">' + s.sub + '</div>';
+    if (s.extra) h += s.extra;
+    return h + '</div>';
+  }).join('');
+  // Savings banner
+  var savingsEl = document.getElementById('tok-savings');
+  if (savingsEl) {
+    var days = tokTimeRange();
+    var planSel = document.getElementById('tok-plan');
+    var planKey = planSel ? planSel.value : 'max5x';
+    var plan = TOK_PLANS[planKey] || TOK_PLANS['max5x'];
+    var proratedCost = (plan.monthly / 30) * days;
+    var saved = totalCost - proratedCost;
+    var opts = Object.keys(TOK_PLANS).map(function(k) {
+      return '<option value="' + k + '"' + (k === planKey ? ' selected' : '') + '>' + TOK_PLANS[k].label + '</option>';
+    }).join('');
+    savingsEl.innerHTML = 'Your <select id="tok-plan" onchange="applyTokenModelFilter()">' + opts + '</select> ' +
+      (saved > 0
+        ? 'saves you <span class="tok-savings-val">' + formatCost(saved) + '</span> vs API pricing this period'
+        : 'equivalent API cost: ' + formatCost(totalCost) + ' (' + days + 'd window)');
+  }
 }
 
 function renderModelBreakdown(data) {
