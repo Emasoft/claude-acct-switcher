@@ -1606,7 +1606,7 @@ function renderHTML() {
     position: relative;
     cursor: default;
   }
-  .chart-bar:hover { opacity: 0.75; }
+  .chart-bar:hover { opacity: 0.75; z-index: 20; }
   .chart-bar:hover::after {
     content: attr(data-tooltip);
     position: absolute;
@@ -1938,7 +1938,7 @@ function renderHTML() {
   }
   .tok-chart-seg:first-child { border-radius: 0 0 2px 2px; }
   .tok-chart-seg:last-child { border-radius: 2px 2px 0 0; }
-  .tok-chart-seg:hover { opacity: 0.75; }
+  .tok-chart-seg:hover { opacity: 0.75; z-index: 20; }
   .tok-chart-seg:hover::after {
     content: attr(data-tooltip);
     position: absolute;
@@ -1965,6 +1965,106 @@ function renderHTML() {
     max-width: 100%;
     text-align: center;
   }
+
+  /* ── Chart carousel ── */
+  .chart-carousel {
+    position: relative;
+  }
+  .chart-carousel-inner {
+    overflow: hidden;
+  }
+  .chart-carousel-slides {
+    display: flex;
+    transition: transform 0.3s ease;
+  }
+  .chart-carousel-slide {
+    min-width: 100%;
+    flex-shrink: 0;
+  }
+  .chart-carousel-dots {
+    display: flex;
+    justify-content: center;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+  }
+  .chart-carousel-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border);
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    transition: background 0.2s;
+  }
+  .chart-carousel-dot.active { background: var(--primary); }
+  .chart-carousel-dot:hover { background: var(--muted); }
+
+  /* ── Cost savings chart ── */
+  .savings-chart-container {
+    position: relative;
+    height: 160px;
+    margin-top: 0.5rem;
+  }
+  .savings-chart-svg {
+    width: 100%;
+    height: 100%;
+  }
+  .savings-chart-svg .grid-line {
+    stroke: var(--border);
+    stroke-width: 0.5;
+  }
+  .savings-chart-svg .axis-label {
+    fill: var(--muted);
+    font-size: 9px;
+    font-family: inherit;
+  }
+  .savings-chart-svg .line-plan {
+    stroke: var(--muted);
+    stroke-width: 1.5;
+    stroke-dasharray: 6 3;
+    fill: none;
+  }
+  .savings-chart-svg .line-api {
+    stroke: var(--primary);
+    stroke-width: 2;
+    fill: none;
+  }
+  .savings-chart-svg .area-savings {
+    opacity: 0.10;
+  }
+  .savings-chart-legend {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+  }
+  .savings-chart-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: 0.6875rem;
+    color: var(--muted);
+  }
+  .savings-chart-legend-line {
+    width: 16px;
+    height: 2px;
+    border-radius: 1px;
+  }
+  .savings-chart-legend-line.dashed {
+    background: repeating-linear-gradient(90deg, var(--muted) 0 6px, transparent 6px 9px);
+    height: 2px;
+  }
+  .savings-chart-legend-line.solid {
+    background: var(--primary);
+  }
+  .savings-chart-total {
+    font-size: 0.8125rem;
+    color: var(--foreground);
+    margin-top: 0.5rem;
+    text-align: center;
+  }
+  .savings-chart-total .saved { color: var(--green); font-weight: 600; }
+  .savings-chart-total .over { color: var(--red); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -2028,7 +2128,18 @@ function renderHTML() {
     </div>
     <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
-      <div id="tok-chart" class="usage-card" style="margin-bottom:1rem"></div>
+      <div class="usage-card chart-carousel" style="margin-bottom:1rem">
+        <div class="chart-carousel-inner">
+          <div class="chart-carousel-slides" id="chart-carousel-slides">
+            <div class="chart-carousel-slide" id="tok-savings-chart"></div>
+            <div class="chart-carousel-slide" id="tok-chart"></div>
+          </div>
+        </div>
+        <div class="chart-carousel-dots" id="chart-carousel-dots">
+          <button class="chart-carousel-dot active" onclick="chartCarouselGo(0)"></button>
+          <button class="chart-carousel-dot" onclick="chartCarouselGo(1)"></button>
+        </div>
+      </div>
       <div id="tok-stats" class="stat-grid" style="margin-bottom:0.5rem"></div>
       <div id="tok-savings" class="tok-savings-banner"></div>
       <div class="usage-card" style="margin-bottom:1rem">
@@ -2423,6 +2534,7 @@ function renderVelocityInline(p) {
 }
 
 let _lastProfilesHash = '';
+var _cachedProfiles = [];
 let _lastActivityHash = '';
 let _lastStatsHash = '';
 let _firstRender = true;
@@ -2436,6 +2548,7 @@ async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
     const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, queueStats } = await resp.json();
+    _cachedProfiles = profiles;
     const ph = quickHash(profiles);
     if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
@@ -2831,6 +2944,7 @@ function getModelColor(model, sortedModels) {
 
 var _lastTokensHash = '';
 var _tokensRawData = [];
+var _tok30dData = [];
 var _tokFilteredData = [];
 var _tokFetching = false;
 var _tokNeedsRefresh = false;
@@ -2850,7 +2964,7 @@ async function refreshTokens() {
     var days = tokTimeRange();
     var now = Date.now();
     var currentCutoff = now - days * 24 * 60 * 60 * 1000;
-    var since = now - 2 * days * 24 * 60 * 60 * 1000;
+    var since = now - Math.max(2 * days, 30) * 24 * 60 * 60 * 1000;
     var url = '/api/token-usage?since=' + since;
     var repoSel = document.getElementById('tok-repo');
     var branchSel = document.getElementById('tok-branch');
@@ -2863,6 +2977,8 @@ async function refreshTokens() {
     var hash = quickHash(data);
     if (hash === _lastTokensHash) return;
     _lastTokensHash = hash;
+    var cutoff30d = now - 30 * 24 * 60 * 60 * 1000;
+    _tok30dData = data.filter(function(e) { return (e.timestamp || e.ts || 0) >= cutoff30d; });
     _tokensRawData = data.filter(function(e) { return (e.timestamp || e.ts || 0) >= currentCutoff; });
     _tokPrevPeriodData = data.filter(function(e) { var t = e.timestamp || e.ts || 0; return t < currentCutoff; });
     applyTokenModelFilter();
@@ -2898,6 +3014,7 @@ function applyTokenModelFilter() {
   populateTokenFilters(_tokensRawData);
   renderTokenStats(data, prevData);
   renderDailyChart(data);
+  renderCostSavingsChart();
   renderModelBreakdown(data);
   renderAccountBreakdown(data);
   renderRepoBranchBreakdown(data);
@@ -3147,6 +3264,155 @@ function renderDailyChart(data) {
   bars += '</div>';
   var chartTitle = days === 1 ? 'Hourly Usage' : days <= 30 ? 'Daily Usage' : 'Weekly Usage';
   el.innerHTML = '<div class="usage-title">' + chartTitle + '</div>' + legend + bars;
+}
+
+var _chartCarouselIdx = 0;
+function chartCarouselGo(idx) {
+  _chartCarouselIdx = idx;
+  var slides = document.getElementById('chart-carousel-slides');
+  var dots = document.getElementById('chart-carousel-dots');
+  if (slides) slides.style.transform = 'translateX(-' + (idx * 100) + '%)';
+  if (dots) {
+    var btns = dots.querySelectorAll('.chart-carousel-dot');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('active', i === idx);
+    }
+  }
+}
+
+function getPlanMonthlyCost(subscriptionType, rateLimitTier) {
+  var sub = (subscriptionType || '').toLowerCase();
+  var tier = (rateLimitTier || '').toLowerCase();
+  if (sub === 'max') {
+    var m = tier.match(/(\d+)x/);
+    if (m) {
+      var mult = parseInt(m[1], 10);
+      if (mult >= 20) return 200;
+      return 100;
+    }
+    return 100;
+  }
+  if (sub === 'pro') return 20;
+  return 0;
+}
+
+function renderCostSavingsChart() {
+  var el = document.getElementById('tok-savings-chart');
+  if (!el) return;
+  var data = _tok30dData;
+  if (!data.length) { el.innerHTML = '<div class="usage-title">Cost Savings</div><div style="color:var(--muted);font-size:0.8125rem;padding:2rem 0;text-align:center">No usage data for savings chart</div>'; return; }
+
+  // Compute total monthly plan cost from profiles
+  var totalMonthlyPlan = 0;
+  for (var pi = 0; pi < _cachedProfiles.length; pi++) {
+    totalMonthlyPlan += getPlanMonthlyCost(_cachedProfiles[pi].subscriptionType, _cachedProfiles[pi].rateLimitTier);
+  }
+  if (totalMonthlyPlan === 0) totalMonthlyPlan = 100; // fallback
+
+  var dailyPlanCost = totalMonthlyPlan / 30;
+
+  // Build 30-day buckets of API cost
+  var now = Date.now();
+  var dayMs = 86400000;
+  var bucketCount = 30;
+  var periodStart = now - bucketCount * dayMs;
+  var dailyCosts = [];
+  for (var b = 0; b < bucketCount; b++) dailyCosts.push(0);
+
+  for (var i = 0; i < data.length; i++) {
+    var ts = data[i].timestamp || data[i].ts || 0;
+    var elapsed = ts - periodStart;
+    if (elapsed < 0) continue;
+    var idx = Math.floor(elapsed / dayMs);
+    if (idx >= bucketCount) idx = bucketCount - 1;
+    if (idx < 0) idx = 0;
+    dailyCosts[idx] += estimateCost(data[i].model, data[i].inputTokens || 0, data[i].outputTokens || 0);
+  }
+
+  // Accumulate
+  var cumPlan = [];
+  var cumApi = [];
+  var runPlan = 0, runApi = 0;
+  for (var d = 0; d < bucketCount; d++) {
+    runPlan += dailyPlanCost;
+    runApi += dailyCosts[d];
+    cumPlan.push(runPlan);
+    cumApi.push(runApi);
+  }
+
+  var maxVal = Math.max(cumPlan[bucketCount - 1], cumApi[bucketCount - 1], 1);
+  var totalSaved = cumApi[bucketCount - 1] - cumPlan[bucketCount - 1];
+
+  // SVG dimensions
+  var svgW = 500, svgH = 140;
+  var padL = 45, padR = 10, padT = 10, padB = 25;
+  var chartW = svgW - padL - padR;
+  var chartH = svgH - padT - padB;
+
+  function xPos(idx) { return padL + (idx / (bucketCount - 1)) * chartW; }
+  function yPos(val) { return padT + chartH - (val / maxVal) * chartH; }
+
+  // Grid lines
+  var gridLines = '';
+  var gridCount = 4;
+  for (var g = 0; g <= gridCount; g++) {
+    var gVal = (maxVal / gridCount) * g;
+    var gy = yPos(gVal);
+    gridLines += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (svgW - padR) + '" y2="' + gy + '" class="grid-line"/>';
+    gridLines += '<text x="' + (padL - 4) + '" y="' + (gy + 3) + '" class="axis-label" text-anchor="end">$' + Math.round(gVal) + '</text>';
+  }
+
+  // X-axis labels (every 5 days)
+  var xLabels = '';
+  for (var xl = 0; xl < bucketCount; xl += 5) {
+    var labelDate = new Date(periodStart + (xl + 0.5) * dayMs);
+    xLabels += '<text x="' + xPos(xl) + '" y="' + (svgH - 2) + '" class="axis-label" text-anchor="middle">' + (labelDate.getMonth() + 1) + '/' + labelDate.getDate() + '</text>';
+  }
+  // Last day label
+  var lastDate = new Date(now - 0.5 * dayMs);
+  xLabels += '<text x="' + xPos(bucketCount - 1) + '" y="' + (svgH - 2) + '" class="axis-label" text-anchor="middle">' + (lastDate.getMonth() + 1) + '/' + lastDate.getDate() + '</text>';
+
+  // Build path strings
+  var planPath = '', apiPath = '';
+  for (var p = 0; p < bucketCount; p++) {
+    var cmd = p === 0 ? 'M' : 'L';
+    planPath += cmd + xPos(p).toFixed(1) + ',' + yPos(cumPlan[p]).toFixed(1);
+    apiPath += cmd + xPos(p).toFixed(1) + ',' + yPos(cumApi[p]).toFixed(1);
+  }
+
+  // Area between the two lines (for savings visualization)
+  var areaPath = '';
+  for (var a = 0; a < bucketCount; a++) {
+    areaPath += (a === 0 ? 'M' : 'L') + xPos(a).toFixed(1) + ',' + yPos(cumApi[a]).toFixed(1);
+  }
+  for (var a2 = bucketCount - 1; a2 >= 0; a2--) {
+    areaPath += 'L' + xPos(a2).toFixed(1) + ',' + yPos(cumPlan[a2]).toFixed(1);
+  }
+  areaPath += 'Z';
+
+  var areaColor = totalSaved > 0 ? 'var(--green)' : 'var(--red)';
+
+  var svg = '<svg class="savings-chart-svg" viewBox="0 0 ' + svgW + ' ' + svgH + '" preserveAspectRatio="none">' +
+    gridLines + xLabels +
+    '<path d="' + areaPath + '" class="area-savings" fill="' + areaColor + '"/>' +
+    '<path d="' + planPath + '" class="line-plan"/>' +
+    '<path d="' + apiPath + '" class="line-api"/>' +
+    '</svg>';
+
+  var legend = '<div class="savings-chart-legend">' +
+    '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line dashed"></span>Plan cost</div>' +
+    '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line solid"></span>API equiv.</div>' +
+    '</div>';
+
+  var totalLine = '';
+  if (totalSaved > 0) {
+    totalLine = '<div class="savings-chart-total">30-day savings: <span class="saved">' + formatCost(totalSaved) + '</span> (' + formatCost(totalMonthlyPlan) + '/mo plan vs ' + formatCost(cumApi[bucketCount - 1]) + ' API)</div>';
+  } else {
+    totalLine = '<div class="savings-chart-total">30-day delta: <span class="over">' + formatCost(Math.abs(totalSaved)) + ' over</span> (' + formatCost(totalMonthlyPlan) + '/mo plan vs ' + formatCost(cumApi[bucketCount - 1]) + ' API)</div>';
+  }
+
+  el.innerHTML = '<div class="usage-title">Cost Savings (30 days)</div>' + legend +
+    '<div class="savings-chart-container">' + svg + '</div>' + totalLine;
 }
 
 function renderAccountBreakdown(data) {
