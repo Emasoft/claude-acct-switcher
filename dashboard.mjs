@@ -5198,8 +5198,8 @@ ${assistantContext ? `CLAUDE FOUND: ${assistantContext.slice(0, 300)}` : ''}
 TOOLS USED: ${toolList || 'none'}
 
 Reply format (plain text, no markdown):
-TASK: what user asked, imperative, max 60 chars
-1-3 lines: key decisions, findings, or outcomes, max 80 chars each`;
+TASK: what user asked, imperative, one line
+1-3 lines: key decisions, findings, or outcomes`;
 
   let token;
   try { token = getActiveToken(); } catch { return null; }
@@ -5207,7 +5207,7 @@ TASK: what user asked, imperative, max 60 chars
 
   const reqBody = JSON.stringify({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 200,
+    max_tokens: 300,
     messages: [{ role: 'user', content: prompt }],
   });
 
@@ -5247,9 +5247,9 @@ TASK: what user asked, imperative, max 60 chars
     for (const line of cleaned) {
       const taskMatch = line.match(/^TASK:\s*(.+)/i);
       if (taskMatch) {
-        input = taskMatch[1].slice(0, 100);
+        input = taskMatch[1].slice(0, 200);
       } else {
-        actions.push(line.slice(0, 100));
+        actions.push(line.slice(0, 200));
       }
     }
     if (actions.length > 3) actions.length = 3;
