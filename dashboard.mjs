@@ -25,6 +25,7 @@ const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
 const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
+const SESSION_HISTORY_FILE = join(__dirname, 'session-history.json');
 const KEYCHAIN_ACCOUNT = process.env.USER || execSync('whoami').toString().trim();
 
 // Detect installed Claude Code version for User-Agent mimicry
@@ -98,6 +99,7 @@ const DEFAULT_SETTINGS = {
   serializeRequests: false,
   serializeDelayMs: 200,
   commitTokenUsage: false,
+  sessionMonitor: false,
 };
 
 function loadSettings() {
@@ -276,6 +278,35 @@ function logActivity(type, detail = {}) {
   // Persist async  - fire and forget
   writeFile(ACTIVITY_LOG_FILE, JSON.stringify(activityLog)).catch(() => {});
 }
+
+// ─────────────────────────────────────────────────
+// [BETA] Session Monitor — constants & data
+// ─────────────────────────────────────────────────
+
+const SESSION_INACTIVITY_MS = 10 * 60 * 1000; // 10 min → session considered completed
+const SESSION_HISTORY_MAX = 200;               // max entries on disk
+const SESSION_MAX_ACTIVE = 30;                 // max concurrent tracked sessions
+const SESSION_TIMELINE_MAX = 50;               // max timeline entries per session
+const SESSION_FILES_MAX = 100;                 // max filesModified per session
+const SESSION_BODY_MAX = 2 * 1024 * 1024;      // 2 MB — skip parsing larger bodies
+const HAIKU_TIMEOUT = 5000;                    // 5s timeout on Haiku calls
+const HAIKU_BACKOFF_MS = 2 * 60 * 1000;        // 2 min backoff after 3 consecutive failures
+const SESSION_AWAITING_THRESHOLD = 15000;      // 15s idle → "awaiting input"
+
+const monitoredSessions = new Map();           // sessionId → session object
+let _summarizerOverhead = { inputTokens: 0, outputTokens: 0 };
+let _haikuFailCount = 0;
+let _haikuBackoffUntil = 0;
+
+// Load persisted session history on startup
+let sessionHistory = [];
+try {
+  if (existsSync(SESSION_HISTORY_FILE)) {
+    sessionHistory = JSON.parse(readFileSync(SESSION_HISTORY_FILE, 'utf8'));
+    if (!Array.isArray(sessionHistory)) sessionHistory = [];
+    sessionHistory = sessionHistory.slice(0, SESSION_HISTORY_MAX);
+  }
+} catch { sessionHistory = []; }
 
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
@@ -898,6 +929,7 @@ async function handleAPI(req, res) {
       settings.serializeDelayMs = patch.serializeDelayMs;
     }
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
+    if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
@@ -1059,6 +1091,46 @@ async function handleAPI(req, res) {
     } catch (e) {
       json(res, [], 500);
     }
+    return true;
+  }
+
+  // ── [BETA] Session Monitor API ──
+
+  if (url.pathname === '/api/sessions' && req.method === 'GET') {
+    const now = Date.now();
+    const active = [];
+    for (const [, s] of monitoredSessions) {
+      active.push({
+        id: s.id,
+        account: s.account,
+        model: s.model,
+        cwd: s.cwd,
+        repo: s.repo,
+        branch: s.branch,
+        timeline: s.timeline,
+        currentActivity: s.currentActivity,
+        requestCount: s.requestCount,
+        totalInputTokens: s.totalInputTokens,
+        totalOutputTokens: s.totalOutputTokens,
+        startedAt: s.startedAt,
+        lastActiveAt: s.lastActiveAt,
+      });
+    }
+    // Sort: processing first, then by lastActiveAt desc
+    active.sort((a, b) => {
+      const aProc = (now - a.lastActiveAt) < SESSION_AWAITING_THRESHOLD;
+      const bProc = (now - b.lastActiveAt) < SESSION_AWAITING_THRESHOLD;
+      if (aProc !== bProc) return aProc ? -1 : 1;
+      return b.lastActiveAt - a.lastActiveAt;
+    });
+    const recent = sessionHistory.slice(0, 20);
+    json(res, {
+      enabled: !!settings.sessionMonitor,
+      active,
+      recent,
+      overhead: _summarizerOverhead,
+      conflicts: getFileConflicts(),
+    });
     return true;
   }
 
@@ -1498,6 +1570,149 @@ function renderHTML() {
   }
 
   .card.switching { opacity: 0.5; pointer-events: none; }
+
+  /* ── Session Monitor ── */
+  .session-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 0.875rem 1rem;
+    margin-bottom: 0.75rem;
+    border-left: 3px solid var(--muted);
+    position: relative;
+  }
+  .session-card.processing { border-left-color: #3fb950; }
+  .session-card.awaiting { border-left-color: var(--yellow); }
+  .session-card.completed { border-left-color: var(--muted); opacity: 0.85; }
+  .session-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8125rem;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .session-header b { color: var(--foreground); font-weight: 600; }
+  .session-awaiting {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: var(--yellow-soft);
+    color: var(--yellow);
+    border: 1px solid var(--yellow-border);
+    border-radius: 4px;
+    padding: 0.0625rem 0.375rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .session-timeline {
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    margin: 0.375rem 0;
+  }
+  .tl-input {
+    color: var(--foreground);
+    font-weight: 600;
+  }
+  .tl-input::before { content: '\\2192 '; color: var(--primary); }
+  .tl-action {
+    color: var(--muted);
+    padding-left: 1.25rem;
+  }
+  .tl-action::before { content: '\\21B3 '; }
+  .tl-current {
+    color: var(--muted);
+    padding-left: 1.25rem;
+    font-style: italic;
+    font-size: 0.75rem;
+  }
+  .session-meta {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.375rem;
+    display: flex;
+    gap: 0.75rem;
+  }
+  .session-conflicts {
+    background: rgba(248,81,73,0.08);
+    border: 1px solid rgba(248,81,73,0.3);
+    border-radius: var(--radius);
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.8125rem;
+    color: #f85149;
+  }
+  .session-copy-btn {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 0.125rem 0.375rem;
+    color: var(--muted);
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .session-card:hover .session-copy-btn { opacity: 1; }
+  .session-copy-btn:hover { background: var(--surface); }
+  .tab-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--yellow);
+    color: #000;
+    font-size: 0.625rem;
+    font-weight: 700;
+    min-width: 1rem;
+    height: 1rem;
+    border-radius: 0.5rem;
+    padding: 0 0.25rem;
+    margin-left: 0.375rem;
+    vertical-align: middle;
+  }
+  .session-section-title {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0.75rem 0 0.375rem;
+  }
+  .session-overhead {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.75rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border);
+  }
+  @keyframes braille-spin {
+    0%   { content: '\\280B'; }
+    10%  { content: '\\2819'; }
+    20%  { content: '\\2839'; }
+    30%  { content: '\\2838'; }
+    40%  { content: '\\283C'; }
+    50%  { content: '\\2834'; }
+    60%  { content: '\\2826'; }
+    70%  { content: '\\2827'; }
+    80%  { content: '\\2807'; }
+    90%  { content: '\\280F'; }
+  }
+  .braille-spin::before {
+    content: '\\280B';
+    animation: braille-spin 1.2s steps(1) infinite;
+    margin-right: 0.25rem;
+  }
+  .braille-static::before {
+    content: '\\28FF';
+    margin-right: 0.25rem;
+    opacity: 0.6;
+  }
 
   /* ── Activity log ── */
   .activity-card {
@@ -2085,6 +2300,7 @@ function renderHTML() {
     <button class="tab active" onclick="switchTab('accounts')">Accounts</button>
     <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('usage')">Usage</button>
+    <button class="tab" onclick="switchTab('sessions')">Sessions<span id="sessions-badge" class="tab-badge" style="display:none"></span></button>
     <button class="tab" onclick="switchTab('config')">Config</button>
     <button class="tab" onclick="switchTab('logs')">Logs</button>
   </div>
@@ -2154,6 +2370,12 @@ function renderHTML() {
         <div class="usage-title">Repository &amp; Branch</div>
         <div id="tok-repos"></div>
       </div>
+    </div>
+  </div>
+
+  <div id="tab-sessions" class="tab-content">
+    <div id="sessions-content">
+      <div class="empty-state" id="sessions-disabled">Session Monitor is OFF. Enable it in Config (BETA).</div>
     </div>
   </div>
 
@@ -2253,6 +2475,17 @@ function renderHTML() {
           <input type="checkbox" class="sw" id="toggle-commit-tokens" onchange="toggleSetting('commitTokenUsage', this.checked)">
         </div>
       </div>
+
+      <div class="config-section">
+        <div class="config-section-title">Session Monitor <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Enable session monitor</div>
+            <div class="config-desc">Track active Claude Code sessions with AI-summarized timelines. Uses Haiku for summaries (separate token overhead).</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-session-monitor" onchange="toggleSetting('sessionMonitor', this.checked)">
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2275,6 +2508,7 @@ function switchTab(id) {
   document.getElementById('tab-' + id).classList.add('active');
   document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
   if (id === 'usage') refreshTokens();
+  if (id === 'sessions') refreshSessions();
   if (id === 'logs') connectLogStream();
   const url = new URL(location);
   url.searchParams.set('tab', id);
@@ -2597,6 +2831,13 @@ async function refresh() {
   } catch {}
   _firstRender = false;
   refreshTokens();
+  // Only fetch sessions when the tab is active or periodically for badge updates
+  var sessTab = document.getElementById('tab-sessions');
+  if (sessTab && sessTab.classList.contains('active')) {
+    refreshSessions();
+  } else {
+    refreshSessionsBadgeOnly();
+  }
 }
 
 function renderAccounts(profiles, animate) {
@@ -2808,6 +3049,8 @@ async function loadSettingsUI() {
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
     // Commit token usage
     document.getElementById('toggle-commit-tokens').checked = !!s.commitTokenUsage;
+    // Session monitor
+    document.getElementById('toggle-session-monitor').checked = !!s.sessionMonitor;
   } catch {}
 }
 
@@ -3675,6 +3918,188 @@ function clearLogs() {
 
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Session Monitor ──
+
+function sessionDuration(ms) {
+  if (ms < 60000) return Math.floor(ms / 1000) + 's';
+  if (ms < 3600000) return Math.floor(ms / 60000) + 'm ' + Math.floor((ms % 60000) / 1000) + 's';
+  return Math.floor(ms / 3600000) + 'h ' + Math.floor((ms % 3600000) / 60000) + 'm';
+}
+
+function sessionTimeAgo(ts) {
+  var d = Date.now() - ts;
+  if (d < 60000) return Math.floor(d / 1000) + 's ago';
+  if (d < 3600000) return Math.floor(d / 60000) + 'm ago';
+  return Math.floor(d / 3600000) + 'h ago';
+}
+
+function sessionEstCost(inTok, outTok, model) {
+  // Rough estimates per 1M tokens
+  var inCost = 15, outCost = 75; // opus defaults
+  if (model && model.includes('sonnet')) { inCost = 3; outCost = 15; }
+  if (model && model.includes('haiku')) { inCost = 0.25; outCost = 1.25; }
+  return ((inTok * inCost + outTok * outCost) / 1e6).toFixed(2);
+}
+
+var _lastBadgeRefresh = 0;
+function refreshSessionsBadgeOnly() {
+  // Throttle badge-only fetches to once per 10s
+  var now = Date.now();
+  if (now - _lastBadgeRefresh < 10000) return;
+  _lastBadgeRefresh = now;
+  fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
+    var threshold = ${SESSION_AWAITING_THRESHOLD};
+    updateSessionsBadge((data.active || []).filter(function(s) { return (Date.now() - s.lastActiveAt) >= threshold; }).length);
+  }).catch(function() {});
+}
+
+async function refreshSessions() {
+  try {
+    var resp = await fetch('/api/sessions');
+    var data = await resp.json();
+    // No quickHash guard — time-derived displays (duration, idle, state) must
+    // update even when API data is unchanged (wall-clock drives state transitions)
+    renderSessions(data);
+    var threshold = ${SESSION_AWAITING_THRESHOLD};
+    updateSessionsBadge((data.active || []).filter(function(s) { return (Date.now() - s.lastActiveAt) >= threshold; }).length);
+  } catch {}
+}
+
+function renderSessions(data) {
+  var el = document.getElementById('sessions-content');
+  if (!el) return;
+  var active = data.active || [];
+  var recent = data.recent || [];
+  if (!active.length && !recent.length) {
+    if (!data.enabled) {
+      el.innerHTML = '<div class="empty-state">Session Monitor is OFF. Enable it in Config (BETA).</div>';
+    } else {
+      el.innerHTML = '<div class="empty-state">No sessions yet. Start a Claude Code session with the proxy running.</div>';
+    }
+    return;
+  }
+  var html = '';
+
+  // Conflicts banner
+  if (data.conflicts && data.conflicts.length) {
+    html += '<div class="session-conflicts">';
+    data.conflicts.forEach(function(c) {
+      html += '<div>\\u26A0 ' + c.count + ' sessions editing ' + escapeHtml(c.file) + '</div>';
+    });
+    html += '</div>';
+  }
+
+  // Active sessions
+  if (active.length) {
+    html += '<div class="session-section-title">ACTIVE</div>';
+    active.forEach(function(s) {
+      var idleMs = Date.now() - s.lastActiveAt;
+      var state = idleMs < ${SESSION_AWAITING_THRESHOLD} ? 'processing' : 'awaiting';
+      var dur = sessionDuration(Date.now() - s.startedAt);
+      var idle = state === 'awaiting' ? sessionDuration(idleMs) : '';
+      var proj = s.repo ? (s.repo + (s.branch ? '/' + s.branch : '')) : (s.cwd || 'unknown');
+      html += '<div class="session-card ' + state + '">';
+      html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
+      html += '<div class="session-header">';
+      html += '<b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(s.model || '?') + ' \\u00b7 ' + escapeHtml(proj);
+      html += ' <span style="margin-left:auto">' + dur + '</span>';
+      if (state === 'awaiting') {
+        html += ' <span class="session-awaiting">\\u23F8 input ' + idle + '</span>';
+      }
+      html += '</div>';
+      // Timeline
+      html += '<div class="session-timeline">';
+      s.timeline.forEach(function(e) {
+        if (e.type === 'input') html += '<div class="tl-input">' + escapeHtml(e.text) + '</div>';
+        else html += '<div class="tl-action">' + escapeHtml(e.text) + '</div>';
+      });
+      // Current activity
+      if (s.currentActivity) {
+        var brailleClass = state === 'processing' ? 'braille-spin' : 'braille-static';
+        html += '<div class="tl-current"><span class="' + brailleClass + '"></span>' + escapeHtml(s.currentActivity) + '</div>';
+      }
+      html += '</div>';
+      // Meta
+      html += '<div class="session-meta">';
+      html += '<span>' + s.requestCount + ' req</span>';
+      html += '<span>' + formatNum(s.totalInputTokens + s.totalOutputTokens) + ' tok</span>';
+      html += '</div>';
+      html += '</div>';
+    });
+  }
+
+  // Recent sessions
+  if (recent.length) {
+    html += '<div class="session-section-title">RECENT</div>';
+    recent.forEach(function(s) {
+      var ago = sessionTimeAgo(s.completedAt || s.startedAt);
+      var dur = sessionDuration(s.duration || 0);
+      var cost = sessionEstCost(s.totalInputTokens || 0, s.totalOutputTokens || 0, s.model);
+      var proj = s.repo ? (s.repo + (s.branch ? '/' + s.branch : '')) : (s.cwd || 'unknown');
+      html += '<div class="session-card completed">';
+      html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
+      html += '<div class="session-header">';
+      html += '<span>' + ago + '</span> \\u00b7 <b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(s.model || '?');
+      html += ' <span style="margin-left:auto">' + dur + ' \\u00b7 ~$' + cost + '</span>';
+      html += '</div>';
+      html += '<div class="session-timeline">';
+      (s.timeline || []).forEach(function(e) {
+        if (e.type === 'input') html += '<div class="tl-input">' + escapeHtml(e.text) + '</div>';
+        else html += '<div class="tl-action">' + escapeHtml(e.text) + '</div>';
+      });
+      html += '</div>';
+      html += '<div class="session-meta">';
+      html += '<span>' + (s.requestCount || 0) + ' req</span>';
+      html += '<span>' + formatNum((s.totalInputTokens || 0) + (s.totalOutputTokens || 0)) + ' tok</span>';
+      html += '</div>';
+      html += '</div>';
+    });
+  }
+
+  // Overhead footer
+  if (data.overhead) {
+    var oh = data.overhead.inputTokens + data.overhead.outputTokens;
+    if (oh > 0) {
+      html += '<div class="session-overhead">Summarizer overhead: ' + formatNum(oh) + ' tokens (Haiku)</div>';
+    }
+  }
+
+  el.innerHTML = html;
+}
+
+function updateSessionsBadge(count) {
+  var badge = document.getElementById('sessions-badge');
+  if (!badge) return;
+  if (count > 0) {
+    badge.textContent = count;
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+function copyTimeline(sessionId) {
+  // Find session data from last render
+  fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
+    var s = (data.active || []).find(function(a) { return a.id === sessionId; })
+         || (data.recent || []).find(function(a) { return a.id === sessionId; });
+    if (!s) { showToast('Session not found'); return; }
+    var proj = s.repo ? (s.repo + (s.branch ? '/' + s.branch : '')) : (s.cwd || 'session');
+    var dur = sessionDuration(s.duration || (Date.now() - s.startedAt));
+    var tok = formatNum((s.totalInputTokens || 0) + (s.totalOutputTokens || 0));
+    var md = '## Session: ' + proj + ' (' + dur + ', ' + tok + ' tokens)\\n';
+    (s.timeline || []).forEach(function(e) {
+      if (e.type === 'input') md += '- \\u2192 ' + e.text + '\\n';
+      else md += '  - ' + e.text + '\\n';
+    });
+    navigator.clipboard.writeText(md).then(function() {
+      showToast('Timeline copied');
+    }).catch(function() {
+      showToast('Copy failed');
+    });
+  }).catch(function() { showToast('Failed to fetch session'); });
 }
 </script>
 <footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:#9ca3af;line-height:1.8">
@@ -4583,6 +5008,402 @@ function createUsageExtractor() {
 
   return extractor;
 }
+
+// ─────────────────────────────────────────────────
+// [BETA] Session Monitor — server-side functions
+// ─────────────────────────────────────────────────
+
+// FNV-1a hash (32-bit) — fast, deterministic, good distribution
+function _fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
+// Simple string hash for turn detection
+function _simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  }
+  return h.toString(36);
+}
+
+function extractCwd(bodyObj) {
+  // Search system prompt for working directory
+  const sysContent = bodyObj.system;
+  let searchText = '';
+  if (typeof sysContent === 'string') {
+    searchText = sysContent;
+  } else if (Array.isArray(sysContent)) {
+    searchText = sysContent.map(b => typeof b === 'string' ? b : b.text || '').join(' ');
+  }
+  const match = searchText.match(/working directory:\s*(.+)/i);
+  if (match) return match[1].trim().split('\n')[0].trim();
+  // Fallback: hash first 200 chars of system prompt
+  return '_sys_' + _fnv1a(searchText.slice(0, 200));
+}
+
+function deriveSessionId(cwd, account) {
+  return _fnv1a(cwd + '::' + account);
+}
+
+function detectNewTurn(bodyObj, session) {
+  const msgs = bodyObj.messages || [];
+  // Find last user message
+  let lastUserText = '';
+  let assistantContext = '';
+  const toolUses = [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role === 'user' && !lastUserText) {
+      if (typeof m.content === 'string') lastUserText = m.content;
+      else if (Array.isArray(m.content)) {
+        lastUserText = m.content.filter(b => b.type === 'text').map(b => b.text).join(' ');
+      }
+    }
+    if (m.role === 'assistant' && !assistantContext) {
+      if (typeof m.content === 'string') assistantContext = m.content;
+      else if (Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (b.type === 'text') assistantContext = (assistantContext || '') + b.text;
+          if (b.type === 'tool_use') toolUses.push(b);
+        }
+      }
+    }
+    if (lastUserText && assistantContext) break;
+  }
+  if (!lastUserText) return null;
+  const hash = _simpleHash(lastUserText);
+  if (hash === session.lastUserHash) return null;
+  session.lastUserHash = hash;
+  return { userText: lastUserText, assistantContext, toolUses };
+}
+
+function formatCurrentActivity(bodyObj) {
+  const msgs = bodyObj.messages || [];
+  // Scan from end for last assistant tool_use (skip user messages — tool_result
+  // content is raw tool output and not useful as an activity label)
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role === 'assistant' && Array.isArray(m.content)) {
+      for (let j = m.content.length - 1; j >= 0; j--) {
+        const b = m.content[j];
+        if (b.type === 'tool_use') {
+          const name = b.name || 'unknown';
+          let arg = '';
+          if (b.input) {
+            if (b.input.command) arg = b.input.command.replace(/\n/g, ' ');
+            else if (b.input.file_path) arg = b.input.file_path;
+            else if (b.input.pattern) arg = b.input.pattern;
+            else if (b.input.query) arg = b.input.query.replace(/\n/g, ' ');
+          }
+          const text = arg ? `${name} ${arg}` : name;
+          return text.length > 60 ? text.slice(0, 57) + '...' : text;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function extractFilesModified(toolUses) {
+  const files = new Set();
+  for (const tu of toolUses) {
+    if (!tu.input) continue;
+    if (tu.name === 'Edit' || tu.name === 'Write') {
+      const fp = tu.input.file_path;
+      if (fp) files.add(basename(fp));
+    }
+    if (tu.name === 'Bash' && typeof tu.input.command === 'string') {
+      // Heuristic: detect common file-modifying patterns
+      const cmd = tu.input.command;
+      const editMatch = cmd.match(/(?:sed|awk|tee|>)\s+["']?([^\s"'|;]+)/);
+      if (editMatch) files.add(basename(editMatch[1]));
+    }
+  }
+  return [...files];
+}
+
+async function callHaikuSummary(userText, assistantContext, toolUses) {
+  // Check backoff
+  if (_haikuBackoffUntil > Date.now()) return null;
+
+  const toolList = toolUses.map(t => {
+    const name = t.name || 'unknown';
+    let arg = '';
+    if (t.input) {
+      if (t.input.command) arg = t.input.command.replace(/\n/g, ' ').slice(0, 60);
+      else if (t.input.file_path) arg = `${basename(t.input.file_path)}`;
+      else if (t.input.pattern) arg = t.input.pattern.slice(0, 40);
+    }
+    return arg ? `${name} ${arg}` : name;
+  }).slice(0, 10).join(', ');
+
+  const prompt = `Tersely summarize this Claude Code turn for a dev dashboard.
+1-3 lines max. Fold decisions into action lines.
+
+USER: ${userText.slice(0, 500)}
+${assistantContext ? `CONTEXT: ${assistantContext.slice(0, 300)}` : ''}
+TOOLS: ${toolList || 'none'}
+
+Format:
+input: <imperative, max 60 chars, if plan referenced include gist>
+did: <1-3 lines, max 80 chars each>`;
+
+  let token;
+  try { token = getActiveToken(); } catch { return null; }
+  if (!token) return null;
+
+  const reqBody = JSON.stringify({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 200,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  try {
+    const res = await forwardToAnthropic('POST', '/v1/messages', {
+      'host': 'api.anthropic.com',
+      'authorization': `Bearer ${token}`,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(reqBody)),
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20',
+    }, Buffer.from(reqBody), HAIKU_TIMEOUT);
+
+    const buf = await drainResponse(res);
+    if (res.statusCode !== 200) {
+      _haikuFailCount++;
+      if (_haikuFailCount >= 3) _haikuBackoffUntil = Date.now() + HAIKU_BACKOFF_MS;
+      return null;
+    }
+
+    _haikuFailCount = 0;
+    const data = JSON.parse(buf.toString('utf8'));
+
+    // Track overhead tokens
+    if (data.usage) {
+      _summarizerOverhead.inputTokens += data.usage.input_tokens || 0;
+      _summarizerOverhead.outputTokens += data.usage.output_tokens || 0;
+    }
+
+    // Parse response
+    const text = data.content?.[0]?.text || '';
+    const inputMatch = text.match(/input:\s*(.+)/i);
+    const didMatch = text.match(/did:\s*([\s\S]+)/i);
+    const input = inputMatch ? inputMatch[1].trim().slice(0, 60) : null;
+    const actions = didMatch
+      ? didMatch[1].trim().split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 3)
+      : [];
+
+    if (input || actions.length) {
+      return { input, actions };
+    }
+    return null;
+  } catch {
+    _haikuFailCount++;
+    if (_haikuFailCount >= 3) _haikuBackoffUntil = Date.now() + HAIKU_BACKOFF_MS;
+    return null;
+  }
+}
+
+function formatTurnFallback(userText, toolUses) {
+  // Rule-based: truncate user text as input, format tool names as actions
+  const input = userText.slice(0, 60).replace(/\n/g, ' ').trim();
+  const actions = toolUses.slice(0, 3).map(t => {
+    const name = t.name || 'unknown';
+    let arg = '';
+    if (t.input) {
+      if (t.input.file_path) arg = basename(t.input.file_path);
+      else if (t.input.command) arg = t.input.command.replace(/\n/g, ' ').slice(0, 40);
+    }
+    return arg ? `${name}: ${arg}` : name;
+  });
+  return { input: input || 'working...', actions };
+}
+
+function updateSessionTimeline(bodyObj, acctName, usage, token) {
+  const cwd = extractCwd(bodyObj);
+  const sessionId = deriveSessionId(cwd, acctName);
+  const model = bodyObj.model || '';
+
+  // Detect repo/branch from cwd
+  let repo = '', branch = '';
+  const cwdStr = typeof cwd === 'string' && !cwd.startsWith('_sys_') ? cwd : '';
+  if (cwdStr) {
+    repo = basename(cwdStr);
+    // Sanitize for shell: reject paths with characters that could escape double quotes
+    if (!/["$`\\]/.test(cwdStr)) {
+      try {
+        branch = execSync(`git -C "${cwdStr}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 2000 }).trim();
+      } catch {}
+    }
+  }
+
+  // Create or retrieve session
+  let session = monitoredSessions.get(sessionId);
+  if (!session) {
+    // Enforce max active sessions
+    if (monitoredSessions.size >= SESSION_MAX_ACTIVE) {
+      // Expire oldest
+      let oldestId = null, oldestTs = Infinity;
+      for (const [id, s] of monitoredSessions) {
+        if (s.lastActiveAt < oldestTs) { oldestTs = s.lastActiveAt; oldestId = id; }
+      }
+      if (oldestId) {
+        persistCompletedSession(monitoredSessions.get(oldestId));
+        monitoredSessions.delete(oldestId);
+      }
+    }
+    session = {
+      id: sessionId,
+      account: acctName,
+      model,
+      cwd: cwdStr || cwd,
+      repo,
+      branch,
+      timeline: [],
+      currentActivity: null,
+      filesModified: [],
+      requestCount: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      lastUserHash: null,
+      pendingHaiku: false,
+      queuedTurns: [],
+      startedAt: Date.now(),
+      lastActiveAt: Date.now(),
+      status: 'active',
+      completedAt: null,
+    };
+    monitoredSessions.set(sessionId, session);
+  }
+
+  // Update session metadata
+  session.lastActiveAt = Date.now();
+  session.requestCount++;
+  if (model) session.model = model;
+  if (usage) {
+    session.totalInputTokens += usage.inputTokens || 0;
+    session.totalOutputTokens += usage.outputTokens || 0;
+  }
+
+  // Update current activity (no AI)
+  const activity = formatCurrentActivity(bodyObj);
+  if (activity) session.currentActivity = activity;
+
+  // Detect new turn
+  const turn = detectNewTurn(bodyObj, session);
+  if (!turn) return;
+
+  // Extract files modified from tool uses
+  const newFiles = extractFilesModified(turn.toolUses);
+  for (const f of newFiles) {
+    if (!session.filesModified.includes(f)) {
+      session.filesModified.push(f);
+      if (session.filesModified.length > SESSION_FILES_MAX) session.filesModified.shift();
+    }
+  }
+
+  // Queue or call Haiku
+  if (session.pendingHaiku) {
+    session.queuedTurns.push(turn);
+    // Cap queued turns to prevent unbounded growth if Haiku is consistently slow
+    if (session.queuedTurns.length > 10) session.queuedTurns.splice(0, session.queuedTurns.length - 5);
+    return;
+  }
+
+  session.pendingHaiku = true;
+  callHaikuSummary(turn.userText, turn.assistantContext, turn.toolUses).then(result => {
+    const summary = result || formatTurnFallback(turn.userText, turn.toolUses);
+    if (summary.input) {
+      session.timeline.push({ type: 'input', text: summary.input });
+    }
+    for (const action of (summary.actions || [])) {
+      session.timeline.push({ type: 'action', text: action });
+    }
+    // Trim timeline
+    while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
+
+    // Process queued turns (batch: just use the latest)
+    const queued = session.queuedTurns.splice(0);
+    session.pendingHaiku = false;
+    if (queued.length > 0) {
+      const latest = queued[queued.length - 1];
+      const fb = formatTurnFallback(latest.userText, latest.toolUses);
+      if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
+      for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
+      while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
+    }
+  }).catch(() => {
+    // Fallback on any error
+    const fb = formatTurnFallback(turn.userText, turn.toolUses);
+    if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
+    for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
+    while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
+    session.pendingHaiku = false;
+    session.queuedTurns.splice(0);
+  });
+}
+
+function persistCompletedSession(session) {
+  if (!session) return;
+  session.status = 'completed';
+  session.completedAt = session.completedAt || Date.now();
+  sessionHistory.unshift({
+    id: session.id,
+    account: session.account,
+    model: session.model,
+    cwd: session.cwd,
+    repo: session.repo,
+    branch: session.branch,
+    timeline: session.timeline.slice(0, SESSION_TIMELINE_MAX),
+    requestCount: session.requestCount,
+    totalInputTokens: session.totalInputTokens,
+    totalOutputTokens: session.totalOutputTokens,
+    startedAt: session.startedAt,
+    completedAt: session.completedAt,
+    duration: session.completedAt - session.startedAt,
+  });
+  if (sessionHistory.length > SESSION_HISTORY_MAX) sessionHistory.length = SESSION_HISTORY_MAX;
+  try { writeFileSync(SESSION_HISTORY_FILE, JSON.stringify(sessionHistory, null, 2)); } catch {}
+}
+
+function getFileConflicts() {
+  const fileToSessions = new Map(); // file → [{ id, account }]
+  for (const [, session] of monitoredSessions) {
+    if (session.status !== 'active') continue;
+    for (const f of session.filesModified) {
+      if (!fileToSessions.has(f)) fileToSessions.set(f, []);
+      fileToSessions.get(f).push({ id: session.id, account: session.account });
+    }
+  }
+  const conflicts = [];
+  for (const [file, sessions] of fileToSessions) {
+    // Deduplicate by session ID (same session can only count once)
+    const uniqueById = new Map();
+    for (const s of sessions) uniqueById.set(s.id, s.account);
+    if (uniqueById.size >= 2) {
+      const accounts = [...new Set(uniqueById.values())];
+      conflicts.push({ file, accounts, count: uniqueById.size });
+    }
+  }
+  return conflicts;
+}
+
+// Session expiry timer — check every 30s
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of monitoredSessions) {
+    if (session.status === 'active' && now - session.lastActiveAt > SESSION_INACTIVITY_MS) {
+      persistCompletedSession(session);
+      monitoredSessions.delete(id);
+    }
+  }
+}, 30000);
 
 // ─────────────────────────────────────────────────
 // [BETA] Ensure prepare-commit-msg hook in repos with local core.hooksPath
@@ -5588,6 +6409,26 @@ async function handleProxyRequest(clientReq, clientRes) {
         clientRes.on('close', finish);
       });
       recordUsage(extractor.getUsage(), acctName);
+      // [BETA] Session Monitor — extract timeline from completed request
+      setImmediate(() => {
+        try {
+          if (!settings.sessionMonitor) return;
+          if (body.length > SESSION_BODY_MAX) {
+            // For oversized bodies, extract cwd via regex on raw string to keep session alive
+            const rawPrefix = body.toString('utf8', 0, Math.min(body.length, 4096));
+            const cwdMatch = rawPrefix.match(/working directory:\s*(.+)/i);
+            if (cwdMatch) {
+              const cwd = cwdMatch[1].trim().split('\\n')[0].trim();
+              const sid = deriveSessionId(cwd, acctName);
+              const s = monitoredSessions.get(sid);
+              if (s) s.lastActiveAt = Date.now();
+            }
+            return;
+          }
+          const bodyObj = JSON.parse(body.toString('utf8'));
+          updateSessionTimeline(bodyObj, acctName, extractor.getUsage(), token);
+        } catch {}
+      });
     } else {
       await pipeAndWait(proxyRes, clientRes);
     }
@@ -5640,6 +6481,11 @@ function getProxyStatus() {
 
 function shutdown(signal) {
   log('info', `Received ${signal}, shutting down...`);
+  // Persist all active monitored sessions before exit
+  for (const [id, session] of monitoredSessions) {
+    persistCompletedSession(session);
+    monitoredSessions.delete(id);
+  }
   proxyServer.close();
   server.close();
   process.exit(0);
