@@ -5124,6 +5124,9 @@ function detectNewTurn(bodyObj, session) {
     if (lastUserText && assistantContext) break;
   }
   if (!lastUserText) return null;
+  // Strip system-reminder tags from inputs before summarisation
+  lastUserText = lastUserText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+  assistantContext = assistantContext.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
   const hash = _simpleHash(lastUserText);
   if (hash === session.lastUserHash) return null;
   session.lastUserHash = hash;
@@ -5190,16 +5193,11 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
     return arg ? `${name} ${arg}` : name;
   }).slice(0, 10).join(', ');
 
-  const prompt = `Summarize this Claude Code turn for a developer monitoring dashboard.
-Focus on DECISIONS made and FINDINGS discovered. Be terse — no bullets, no markdown.
+  const prompt = `Write a 2-3 sentence plain-text summary of this Claude Code turn. No labels, no bullets, no markdown. First sentence: what the user asked (imperative). Next 1-2 sentences: what was done or found.
 
-USER REQUEST: ${userText.slice(0, 500)}
-${assistantContext ? `CLAUDE FOUND: ${assistantContext.slice(0, 300)}` : ''}
-TOOLS USED: ${toolList || 'none'}
-
-Reply format (plain text, no markdown):
-TASK: what user asked, imperative, one line
-1-3 lines: key decisions, findings, or outcomes`;
+${userText.slice(0, 500)}
+${assistantContext ? assistantContext.slice(0, 300) : ''}
+Tools: ${toolList || 'none'}`;
 
   let token;
   try { token = getActiveToken(); } catch { return null; }
@@ -5237,22 +5235,13 @@ TASK: what user asked, imperative, one line
       _summarizerOverhead.outputTokens += data.usage.output_tokens || 0;
     }
 
-    // Parse response — strip markdown noise and template placeholders
-    const text = data.content?.[0]?.text || '';
-    const lines = text.split('\n').map(l => l.replace(/^[\s*\-•>]+/, '').trim()).filter(Boolean);
-    // Skip lines that look like template instructions (contain <placeholder>)
-    const cleaned = lines.filter(l => !/^<.*>$/.test(l) && !(/^</.test(l) && />$/.test(l)));
-    let input = null;
-    const actions = [];
-    for (const line of cleaned) {
-      const taskMatch = line.match(/^TASK:\s*(.+)/i);
-      if (taskMatch) {
-        input = taskMatch[1].slice(0, 200);
-      } else {
-        actions.push(line.slice(0, 200));
-      }
-    }
-    if (actions.length > 3) actions.length = 3;
+    // Parse response — split into sentences, first = input, rest = actions
+    const raw = (data.content?.[0]?.text || '').replace(/<[^>]+>/g, '').trim();
+    if (!raw) return null;
+    // Split on sentence boundaries (period/exclamation/question followed by space or end)
+    const sentences = raw.split(/(?<=[.!?])\s+/).map(s => s.replace(/^[\s*\-•>]+/, '').trim()).filter(Boolean);
+    const input = sentences[0] ? sentences[0].slice(0, 200) : null;
+    const actions = sentences.slice(1, 4).map(s => s.slice(0, 200));
 
     if (input || actions.length) {
       return { input, actions };
