@@ -6241,6 +6241,9 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
       }
 
+      // Extract error message early so the auth-heuristic can use it
+      const errorMessage = parsedError?.error?.message || '';
+
       // Detect the specific "no body" / empty-body / non-JSON patterns that
       // indicate this is NOT a legitimate request validation error
       const looksLikeAuthIssue =
@@ -6248,11 +6251,10 @@ async function handleProxyRequest(clientReq, clientRes) {
         !parsedError ||                              // not valid JSON
         errorType === 'authentication_error' ||      // explicit auth error
         errorType === 'permission_error' ||           // permission issue
-        /status code|no body|invalid.*token|unauthorized/i.test(bodyStr);  // heuristic
+        /status code|no body|invalid.*token|unauthorized/i.test(errorMessage);  // heuristic
 
       // Billing errors (credit balance too low) are never fixable by token
       // refresh — skip straight to account switching (Strategy 3).
-      const errorMessage = parsedError?.error?.message || '';
       const isBillingError = /credit balance|billing.*issue|payment.*required/i.test(errorMessage);
 
       // ── Content 400: pass through immediately ──
