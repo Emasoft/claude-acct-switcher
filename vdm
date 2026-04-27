@@ -33,17 +33,30 @@ mkdir -p "$ACCOUNTS_DIR"
 # ─────────────────────────────────────────────────────────
 
 if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
-  _needs_hooks=false
-  if [[ ! -f "$HOME/.claude/settings.json" ]]; then
-    _needs_hooks=true
-  elif ! grep -q "api/session-start" "$HOME/.claude/settings.json" 2>/dev/null; then
-    _needs_hooks=true
+  # Opt-out sentinel: a user who deliberately removed the BETA hooks
+  # (perhaps because they're noisy or they're testing alternative tracking)
+  # can place this file to keep them removed across vdm invocations.
+  # Without this, the migration silently re-installed disabled hooks
+  # every time any vdm subcommand ran (audit finding 05.C10).
+  if [[ -f "$HOME/.claude/account-switcher/.hooks-disabled" ]]; then
+    : # respect user's opt-out
+  else
+    _needs_hooks=false
+    if [[ ! -f "$HOME/.claude/settings.json" ]]; then
+      _needs_hooks=true
+    elif ! grep -q "api/session-start" "$HOME/.claude/settings.json" 2>/dev/null; then
+      _needs_hooks=true
+    elif ! grep -q "StopFailure" "$HOME/.claude/settings.json" 2>/dev/null; then
+      # Existing install predates the StopFailure / SubagentStop / SessionStart
+      # additions; trigger a re-install so an upgrade picks them up.
+      _needs_hooks=true
+    fi
+    if [[ "$_needs_hooks" == "true" ]]; then
+      source "$SCRIPT_DIR/install-hooks.sh"
+      install_beta_hooks 2>/dev/null || true
+    fi
+    unset _needs_hooks
   fi
-  if [[ "$_needs_hooks" == "true" ]]; then
-    source "$SCRIPT_DIR/install-hooks.sh"
-    install_beta_hooks 2>/dev/null || true
-  fi
-  unset _needs_hooks
 fi
 
 # ─────────────────────────────────────────────────────────

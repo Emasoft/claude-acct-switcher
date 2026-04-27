@@ -5290,6 +5290,11 @@ function _dispatchNext() {
 function createUsageExtractor() {
   let inputTokens = 0;
   let outputTokens = 0;
+  // Cache tokens are billed separately by Anthropic; the original extractor
+  // ignored them entirely, so any response whose only "delta" was cache
+  // creation/read showed up as 0/0 and got dropped by recordUsage.
+  let cacheCreationInputTokens = 0;
+  let cacheReadInputTokens = 0;
   let model = '';
   let lineBuffer = '';
   let nextEventType = '';
@@ -5317,12 +5322,21 @@ function createUsageExtractor() {
             if (nextEventType === 'message_start' && data.message) {
               if (data.message.usage) {
                 inputTokens = data.message.usage.input_tokens || 0;
+                cacheCreationInputTokens = data.message.usage.cache_creation_input_tokens || 0;
+                cacheReadInputTokens = data.message.usage.cache_read_input_tokens || 0;
               }
               if (data.message.model) {
                 model = data.message.model;
               }
             } else if (nextEventType === 'message_delta' && data.usage) {
               outputTokens = data.usage.output_tokens || 0;
+              // message_delta usage may also carry final cache totals.
+              if (data.usage.cache_creation_input_tokens != null) {
+                cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
+              }
+              if (data.usage.cache_read_input_tokens != null) {
+                cacheReadInputTokens = data.usage.cache_read_input_tokens;
+              }
             }
           } catch { /* not JSON or malformed — skip */ }
           nextEventType = '';
@@ -5332,6 +5346,24 @@ function createUsageExtractor() {
       callback();
     },
     flush(callback) {
+      // Try the trailing partial line one last time so the final
+      // message_delta isn't lost when upstream closes between newlines.
+      const trimmed = lineBuffer.trim();
+      lineBuffer = '';
+      if (trimmed.startsWith('data:') && nextEventType === 'message_delta') {
+        try {
+          const data = JSON.parse(trimmed.slice(5).trim());
+          if (data.usage) {
+            outputTokens = data.usage.output_tokens || outputTokens;
+            if (data.usage.cache_creation_input_tokens != null) {
+              cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
+            }
+            if (data.usage.cache_read_input_tokens != null) {
+              cacheReadInputTokens = data.usage.cache_read_input_tokens;
+            }
+          }
+        } catch {}
+      }
       callback();
     },
   });
@@ -5339,6 +5371,8 @@ function createUsageExtractor() {
   extractor.getUsage = () => ({
     inputTokens,
     outputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
     model,
     ts: Date.now(),
   });
@@ -5827,20 +5861,48 @@ function ensureLocalCommitHook(cwd) {
 // [BETA] Token Usage Ring Buffer
 // ─────────────────────────────────────────────────
 
-const recentUsage = []; // { ts, inputTokens, outputTokens, model, account, claimed }
-const RECENT_USAGE_MAX = 2000;
+const recentUsage = []; // { ts, inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens, model, account, claimed }
+// Raised from 2000. With per-Stop claim windows that can span minutes and
+// parallel sub-agents producing multiple SSE responses per second, 2000
+// ran out under burst traffic and silently shifted unclaimed entries off
+// the head — the audit's F2 silent-data-loss bug.
+const RECENT_USAGE_MAX = 50_000;
+let _recentUsageOverflowWarned = 0;
 
 function recordUsage(usage, account) {
-  if (!usage || (!usage.inputTokens && !usage.outputTokens)) return;
+  // Accept any response that carries non-zero tokens of ANY kind, including
+  // cache creation/read responses. The previous filter only checked input
+  // and output, so prompt-cache-only responses (billed) were silently
+  // dropped — audit finding F1.
+  if (!usage) return;
+  const total =
+    (usage.inputTokens || 0) +
+    (usage.outputTokens || 0) +
+    (usage.cacheCreationInputTokens || 0) +
+    (usage.cacheReadInputTokens || 0);
+  if (total <= 0) return;
   recentUsage.push({
     ts: usage.ts || Date.now(),
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
+    inputTokens: usage.inputTokens || 0,
+    outputTokens: usage.outputTokens || 0,
+    cacheCreationInputTokens: usage.cacheCreationInputTokens || 0,
+    cacheReadInputTokens: usage.cacheReadInputTokens || 0,
     model: usage.model,
     account,
     claimed: false,
   });
-  while (recentUsage.length > RECENT_USAGE_MAX) recentUsage.shift();
+  // Warn before silently dropping unclaimed entries on overflow. Throttled
+  // to one log line per 60 s to avoid spam under sustained overflow.
+  while (recentUsage.length > RECENT_USAGE_MAX) {
+    const dropped = recentUsage.shift();
+    if (dropped && !dropped.claimed) {
+      const now = Date.now();
+      if (now - _recentUsageOverflowWarned > 60_000) {
+        _recentUsageOverflowWarned = now;
+        log('warn', `recentUsage ring buffer overflow — dropping unclaimed entries (cap ${RECENT_USAGE_MAX}). Increase RECENT_USAGE_MAX or check that sessions are claiming.`);
+      }
+    }
+  }
 }
 
 function claimUsageInRange(startTs, endTs) {

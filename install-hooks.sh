@@ -92,8 +92,22 @@ def ensure_hook(event_name, url):
     keep.append({'hooks': [{'type': 'http', 'url': url, 'timeout': 5}]})
     hooks[event_name] = keep
 
+# Subscribe to the full session lifecycle so we capture usage in every
+# scenario:
+#   * SessionStart       — opens a session window before the first turn.
+#   * UserPromptSubmit   — additional turn boundary; idempotent if the
+#                          session is already open.
+#   * Stop               — normal turn end; persists claimed usage.
+#   * StopFailure        — rate-limit / auth error end; otherwise the
+#                          session would die mid-stream and lose tokens.
+#   * SubagentStop       — sub-agent task end so spawned-agent usage
+#                          gets attributed instead of being swallowed
+#                          by the orchestrator's claim window.
+ensure_hook('SessionStart', start_url)
 ensure_hook('UserPromptSubmit', start_url)
 ensure_hook('Stop', stop_url)
+ensure_hook('StopFailure', stop_url)
+ensure_hook('SubagentStop', stop_url)
 
 # Atomic write: tmp + os.replace
 tmp_file = settings_file + '.tmp'
@@ -155,8 +169,11 @@ def remove_hook(event_name, url):
     if not hooks[event_name]:
         del hooks[event_name]
 
+remove_hook('SessionStart', start_url)
 remove_hook('UserPromptSubmit', start_url)
 remove_hook('Stop', stop_url)
+remove_hook('StopFailure', stop_url)
+remove_hook('SubagentStop', stop_url)
 
 # Clean up empty hooks dict
 if not hooks:
