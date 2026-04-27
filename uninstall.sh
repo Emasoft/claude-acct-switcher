@@ -13,7 +13,6 @@ DIM='\033[2m'
 NC='\033[0m'
 
 INSTALL_DIR="$HOME/.claude/account-switcher"
-SNIPPET_MARKER="# BEGIN claude-account-switcher"
 
 echo ""
 echo -e "${BOLD}  Claude Account Switcher  - Uninstaller${NC}"
@@ -74,35 +73,95 @@ fi
 echo -e "  ${GREEN}✓${NC} Stopped dashboard/proxy"
 
 # ── 2. Remove shell config block ──
+# Issues that bit prior versions:
+#   (a) only `.zshrc/.bashrc/.bash_profile` were searched. On modern
+#       macOS zsh the recommended location for env-var exports is
+#       `.zprofile`, and some users keep snippets in `.zshenv` or
+#       `.profile`. Now we scan all five.
+#   (b) the search loop broke on the first match, so a user who had
+#       reinstalled across shells or hand-copied the snippet ended up
+#       with the block lingering in subsequent files. Now we clean
+#       every file where the marker is found.
+#   (c) the sed pattern was anchored at column 0 (`^# BEGIN ...`) but
+#       the grep wasn't, so any indented snippet was "found but not
+#       removed" — the unsolicited silent-failure bug. Now both grep
+#       and sed allow optional leading whitespace.
+#   (d) a stray CRLF line ending (file edited under Windows) made the
+#       END marker fail to match `^# END$`, deleting from BEGIN to EOF.
+#       We strip CRLF before sed touches the file.
 
-SHELL_RC=""
-for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-  if [[ -f "$rc" ]] && grep -q "$SNIPPET_MARKER" "$rc" 2>/dev/null; then
-    SHELL_RC="$rc"
-    break
+# Helper: track every cleaned file so we can list backups + report.
+CLEANED_RC_FILES=()
+
+# Portable in-place sed wrapper. The BSD `sed -i ''` form silently fails
+# under GNU sed (which most homebrew-using Mac developers have shadowed
+# `/usr/bin/sed` with): GNU sed's `-i` takes an optional GLUED suffix, so
+# `''` is interpreted as a SEPARATE FILENAME arg, the script slides into
+# what sed thinks is a filename, and the in-place edit silently no-ops.
+# This bug has shipped with the project for its entire lifetime — every
+# macOS user with `brew install gnu-sed` on PATH had a broken uninstall.
+# Writing to .tmp and renaming sidesteps `-i` entirely; works under both
+# BSD and GNU sed unchanged.
+_sed_in_place() {
+  local script="$1" file="$2"
+  local tmp="${file}.vdm-sed-tmp"
+  sed "$script" "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+clean_one_rc() {
+  local rc="$1"
+  [[ -f "$rc" ]] || return 0
+  # Permissive grep: any line that contains the marker (possibly indented,
+  # possibly with trailing CR from a CRLF file).
+  grep -Eq '^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$' "$rc" 2>/dev/null || return 0
+
+  cp "$rc" "${rc}.vdm-backup"
+
+  # Strip any CRLF line endings in-place so the END marker is reachable.
+  if grep -q $'\r' "$rc" 2>/dev/null; then
+    LC_ALL=C tr -d '\r' < "$rc" > "${rc}.vdm-tmp" && mv "${rc}.vdm-tmp" "$rc"
   fi
+
+  # Range-delete the entire block, indent-tolerant on both ends.
+  _sed_in_place \
+    '/^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$/,/^[[:space:]]*# END claude-account-switcher[[:space:]]*$/d' \
+    "$rc"
+
+  # Verify the markers are actually gone — if not, fall back to a more
+  # aggressive line-by-line removal so we don't leave the user wondering
+  # why their shell still launches the dashboard.
+  if grep -Eq '# BEGIN claude-account-switcher|# END claude-account-switcher' "$rc" 2>/dev/null; then
+    _sed_in_place '/# BEGIN claude-account-switcher/d; /# END claude-account-switcher/d' "$rc"
+    echo -e "  ${YELLOW}!${NC} Found indented or non-matching markers in ${CYAN}$rc${NC} — used permissive cleanup"
+  fi
+
+  # Trim a single trailing blank line left behind by the heredoc's
+  # leading `echo "" >>`. Avoids an unbounded loop on weird states.
+  if [[ -s "$rc" ]] && [[ -z "$(tail -1 "$rc")" ]]; then
+    _sed_in_place '$ d' "$rc"
+  fi
+
+  CLEANED_RC_FILES+=("$rc")
+  echo -e "  ${GREEN}✓${NC} Removed auto-start block from ${CYAN}$rc${NC}"
+  echo -e "    ${DIM}Backup: ${rc}.vdm-backup${NC}"
+}
+
+CHECKED_RCS=()
+for rc in \
+    "$HOME/.zshrc"         "$HOME/.zprofile"      "$HOME/.zshenv" \
+    "$HOME/.bashrc"        "$HOME/.bash_profile"  "$HOME/.profile"; do
+  CHECKED_RCS+=("$rc")
+  clean_one_rc "$rc"
 done
 
-if [[ -n "$SHELL_RC" ]]; then
-  cp "$SHELL_RC" "${SHELL_RC}.vdm-backup"
-
-  sed -i '' '/^# BEGIN claude-account-switcher/,/^# END claude-account-switcher/d' "$SHELL_RC"
-
-  # Clean up trailing blank lines left behind
-  while [[ -s "$SHELL_RC" ]] && [[ -z "$(tail -1 "$SHELL_RC")" ]]; do
-    last_two=$(tail -2 "$SHELL_RC" | head -1)
-    if [[ -z "$last_two" ]]; then
-      sed -i '' '$ d' "$SHELL_RC"
-    else
-      break
-    fi
-  done
-
-  echo -e "  ${GREEN}✓${NC} Removed auto-start block from ${CYAN}$SHELL_RC${NC}"
-  echo -e "    ${DIM}Backup: ${SHELL_RC}.vdm-backup${NC}"
-else
-  echo -e "  ${DIM}No shell config block found (already clean)${NC}"
+if (( ${#CLEANED_RC_FILES[@]} == 0 )); then
+  echo -e "  ${DIM}No shell config block found in any of:${NC}"
+  for rc in "${CHECKED_RCS[@]}"; do echo -e "    ${DIM}$rc${NC}"; done
+  echo -e "  ${DIM}If you installed the snippet elsewhere, remove the BEGIN/END block manually.${NC}"
 fi
+# For the "Backups left behind" prompt below: pick the first cleaned
+# file (any will do — backups exist for all of them).
+SHELL_RC="${CLEANED_RC_FILES[0]:-}"
 
 # ── 3. Remove vdm symlink (and legacy csw) ──
 
@@ -139,13 +198,14 @@ fi
 
 # ── 6. Offer to clean up backup files ──
 # uninstall historically left these behind; they accumulate over repeated
-# install/uninstall cycles. Offer to remove them at the end.
+# install/uninstall cycles. Offer to remove them at the end. Iterate
+# every rc file we cleaned (not just SHELL_RC) so multi-file installs
+# get every backup listed.
 backup_candidates=()
-for f in \
-    "${SHELL_RC:-/dev/null}.vdm-backup" \
-    "$HOME/.claude/settings.json.vdm-backup"; do
-  [[ -f "$f" ]] && backup_candidates+=("$f")
+for rc in "${CLEANED_RC_FILES[@]:-}"; do
+  [[ -n "$rc" ]] && [[ -f "${rc}.vdm-backup" ]] && backup_candidates+=("${rc}.vdm-backup")
 done
+[[ -f "$HOME/.claude/settings.json.vdm-backup" ]] && backup_candidates+=("$HOME/.claude/settings.json.vdm-backup")
 if (( ${#backup_candidates[@]} > 0 )); then
   echo ""
   echo -e "  ${BOLD}Backup files left behind:${NC}"
