@@ -481,10 +481,19 @@ function notify(title, message) {
   if (now - _lastNotifyAt < NOTIFY_THROTTLE_MS) return; // throttle notification spam
   _lastNotifyAt = now;
   try {
-    const escaped = (s) => s.replace(/"/g, '\\"');
-    execFile('osascript', ['-e',
-      `display notification "${escaped(message)}" with title "${escaped(title)}" sound name "Blow"`
-    ], { timeout: 3000 }, () => {});
+    // Use JXA (JavaScript for Automation) + JSON.stringify to encode the
+    // strings. JSON.stringify handles every character — backslash, newline,
+    // carriage return, quote — so account names containing those bytes
+    // cannot break out of the string and inject `do shell script`. The
+    // previous AppleScript form only escaped `"` and was an RCE path
+    // through user-controlled account labels.
+    const script =
+      'var app = Application.currentApplication(); ' +
+      'app.includeStandardAdditions = true; ' +
+      'app.displayNotification(' + JSON.stringify(String(message)) +
+      ', {withTitle: ' + JSON.stringify(String(title)) +
+      ', soundName: "Blow"});';
+    execFile('osascript', ['-l', 'JavaScript', '-e', script], { timeout: 3000 }, () => {});
   } catch { /* non-critical */ }
 }
 
@@ -824,8 +833,14 @@ async function handleAPI(req, res) {
     try {
       const raw = await readFile(file, 'utf8');
       const creds = JSON.parse(raw);
-      writeKeychain(creds);
-      invalidateTokenCache();
+      // Serialize manual switches against proxy-side rotations. Without
+      // this, a UI click + an in-flight 429-driven swap can interleave
+      // and leave the keychain pointing at the proxy's choice, not the
+      // user's. (Concern 6 in the OAuth/keychain audit.)
+      await withSwitchLock(() => {
+        writeKeychain(creds);
+        invalidateTokenCache();
+      });
       // Log the manual switch
       let label = '';
       try { label = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
@@ -4340,18 +4355,109 @@ function savePersistedState() {
 }
 
 function updatePersistedState(fingerprint, data) {
+  // Preserve any prior name/ban-flag fields when called from the probe
+  // path (which only carries utilization + reset). `accountState` is the
+  // canonical source for `limited`/`expired`/`retryAfter`/`name`; we
+  // mirror them into persistedState whenever updateAccountState runs so
+  // a SIGKILL/restart can rehydrate the ban flags. Without this, every
+  // restart wastes one round-trip per banned account rediscovering the
+  // ban — exactly what the audit's Concern 3 flagged.
+  const prior = persistedState[fingerprint] || {};
   persistedState[fingerprint] = {
+    name: data.name != null ? data.name : prior.name,
     utilization5h: data.utilization5h || 0,
     utilization7d: data.utilization7d || 0,
     resetAt: data.resetAt || 0,
     resetAt7d: data.resetAt7d || 0,
+    limited: data.limited != null ? data.limited : (prior.limited || false),
+    expired: data.expired != null ? data.expired : (prior.expired || false),
+    retryAfter: data.retryAfter != null ? data.retryAfter : (prior.retryAfter || 0),
     updatedAt: Date.now(),
   };
   savePersistedState();
 }
 
+// Rehydrate accountState ban flags on startup so a freshly-started proxy
+// doesn't re-probe accounts known to be limited/expired. Skips entries
+// whose 5h reset has already elapsed by wall-clock so we don't carry
+// stale bans across long-offline windows.
+function rehydrateAccountStateFromPersisted() {
+  const accounts = loadAllAccountTokens();
+  const nowSec = Math.floor(Date.now() / 1000);
+  const now = Date.now();
+  for (const a of accounts) {
+    const fp = getFingerprintFromToken(a.token);
+    const ps = persistedState[fp];
+    if (!ps) continue;
+    // Seed utilization regardless (cheap and useful to the UI).
+    accountState.update(a.token, a.name, {
+      'anthropic-ratelimit-unified-status': ps.limited ? 'limited' : 'ok',
+      'anthropic-ratelimit-unified-5h-utilization': String(ps.utilization5h || 0),
+      'anthropic-ratelimit-unified-7d-utilization': String(ps.utilization7d || 0),
+      'anthropic-ratelimit-unified-5h-reset': String(ps.resetAt || 0),
+      'anthropic-ratelimit-unified-7d-reset': String(ps.resetAt7d || 0),
+    });
+    // Re-mark expired/limited only if the cooldown is still in the future.
+    if (ps.expired) {
+      accountState.markExpired(a.token, a.name);
+    }
+    if (ps.limited) {
+      const stillLimited =
+        (ps.resetAt && ps.resetAt > nowSec) ||
+        (ps.retryAfter && ps.retryAfter > now);
+      if (stillLimited) {
+        const retryAfterSec = ps.retryAfter && ps.retryAfter > now
+          ? Math.ceil((ps.retryAfter - now) / 1000)
+          : 0;
+        accountState.markLimited(a.token, a.name, retryAfterSec);
+      }
+    }
+  }
+}
+
+// Periodic clearing pass: when a 5h/7d window elapses, we want the
+// `limited:true` flag dropped immediately so the dashboard reflects
+// reality and the next inbound request picks the account without first
+// burning a probe to "discover" the reset. Runs every 60 s — cheap.
+function clearStaleLimitedFlags() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const now = Date.now();
+  for (const [token, st] of accountState.entries()) {
+    if (!st || !st.limited) continue;
+    const resetPassed = st.resetAt && st.resetAt < nowSec;
+    const retryPassed = st.retryAfter && st.retryAfter < now;
+    // If neither cooldown is set, treat as expired-now to avoid a wedge.
+    const noCooldown = !st.resetAt && !st.retryAfter;
+    if (resetPassed || retryPassed || noCooldown) {
+      // Re-issue a non-limited update preserving utilization + name. Any
+      // subsequent real response from this account will overwrite with
+      // fresh headers.
+      accountState.update(token, st.name, {
+        'anthropic-ratelimit-unified-status': 'ok',
+        'anthropic-ratelimit-unified-5h-utilization': String(st.utilization5h || 0),
+        'anthropic-ratelimit-unified-7d-utilization': String(st.utilization7d || 0),
+        'anthropic-ratelimit-unified-5h-reset': String(st.resetAt || 0),
+        'anthropic-ratelimit-unified-7d-reset': String(st.resetAt7d || 0),
+      });
+      const fp = getFingerprintFromToken(token);
+      // Also clear in persisted state so a restart doesn't re-mark it.
+      const ps = persistedState[fp];
+      if (ps && (ps.limited || ps.retryAfter)) {
+        ps.limited = false;
+        ps.retryAfter = 0;
+        savePersistedState();
+      }
+    }
+  }
+}
+setInterval(clearStaleLimitedFlags, 60_000).unref();
+
 // Load on startup
 loadPersistedState();
+// Re-mark `limited` / `expired` accounts that we knew about before the
+// last shutdown, so the first inbound request doesn't burn one wasted
+// round-trip per banned account rediscovering bans we already had on disk.
+rehydrateAccountStateFromPersisted();
 
 // Prune history entries that predate a known window reset
 (function pruneStaleHistory() {
@@ -4402,17 +4508,53 @@ function updateAccountState(token, name, headers, fingerprint) {
 
     utilizationHistory.record(fingerprint, u5h, u7d);
     weeklyHistory.record(fingerprint, u5h, u7d);
-    updatePersistedState(fingerprint, { utilization5h: u5h, utilization7d: u7d, resetAt: reset5h, resetAt7d: reset7d });
+    // Mirror current ban-flag state so it survives a SIGKILL (Concern 3).
+    const st = accountState.get(token) || {};
+    updatePersistedState(fingerprint, {
+      name,
+      utilization5h: u5h,
+      utilization7d: u7d,
+      resetAt: reset5h,
+      resetAt7d: reset7d,
+      limited: !!st.limited,
+      expired: !!st.expired,
+      retryAfter: st.retryAfter || 0,
+    });
     saveHistoryToDisk();
   }
 }
 
 function markAccountLimited(token, name, retryAfterSec = 0) {
   accountState.markLimited(token, name, retryAfterSec);
+  // Mirror to persistedState so a restart doesn't drop the ban (Concern 3).
+  const fp = getFingerprintFromToken(token);
+  const st = accountState.get(token) || {};
+  updatePersistedState(fp, {
+    name,
+    utilization5h: st.utilization5h || 0,
+    utilization7d: st.utilization7d || 0,
+    resetAt: st.resetAt || 0,
+    resetAt7d: st.resetAt7d || 0,
+    limited: true,
+    expired: !!st.expired,
+    retryAfter: st.retryAfter || 0,
+  });
 }
 
 function markAccountExpired(token, name) {
   accountState.markExpired(token, name);
+  const fp = getFingerprintFromToken(token);
+  const st = accountState.get(token) || {};
+  updatePersistedState(fp, {
+    name,
+    utilization5h: st.utilization5h || 0,
+    utilization7d: st.utilization7d || 0,
+    resetAt: st.resetAt || 0,
+    resetAt7d: st.resetAt7d || 0,
+    limited: !!st.limited,
+    expired: true,
+    retryAfter: st.retryAfter || 0,
+  });
 }
 
 // ── Load saved accounts from disk ──
@@ -6148,7 +6290,26 @@ async function handleProxyRequest(clientReq, clientRes) {
       log('switch', '  → all accounts exhausted, returning 429');
       logEvent('all-exhausted', {});
       notify('All Accounts Exhausted', `All ${allAccounts.length} accounts rate-limited. Reset: ${getEarliestReset()}`);
-      clientRes.writeHead(429, { 'Content-Type': 'application/json' });
+      // Compute a real Retry-After (in seconds) so Claude Code's own retry
+      // loop knows when to come back. Without this header CC retries on
+      // its own (often-overly-aggressive) timer or surfaces the error
+      // immediately. We pick the soonest reset across all known
+      // 5h/7d windows; capped at 1 hour to bound user-visible wait.
+      let retryAfterSec = 0;
+      const nowSec = Math.floor(Date.now() / 1000);
+      for (const [, st] of accountState.entries()) {
+        for (const t of [st && st.resetAt, st && st.resetAt7d]) {
+          if (t && t > nowSec) {
+            const delta = t - nowSec;
+            if (retryAfterSec === 0 || delta < retryAfterSec) retryAfterSec = delta;
+          }
+        }
+      }
+      const retryAfterCapped = Math.min(retryAfterSec || 60, 3600);
+      clientRes.writeHead(429, {
+        'Content-Type': 'application/json',
+        'Retry-After': String(retryAfterCapped),
+      });
       clientRes.end(JSON.stringify({
         type: 'error',
         error: {
