@@ -22,6 +22,7 @@ import {
   buildUpdatedCreds,
   shouldRefreshToken,
   createPerAccountLock,
+  getEarliestReset,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -577,5 +578,93 @@ describe('createPerAccountLock', () => {
     // Should still be able to acquire lock
     const result = await lock.withLock('acct1', async () => 'ok');
     assert.equal(result, 'ok');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// New behavior added by the audit-fix series
+// ─────────────────────────────────────────────────
+
+describe('predictMinutesToLimit clamp against resetAt', () => {
+  // Each test seeds the history with two synthetic points so velocity
+  // is deterministic. Spacing is > HISTORY_MIN_INTERVAL so both points
+  // are kept (the 2-min in-place overwrite would otherwise collapse them).
+  function seedHistory(history, fp, u5hStart, u5hEnd, spreadMs = 25 * 60 * 1000) {
+    const now = Date.now();
+    history.record(fp, u5hStart, 0, now - spreadMs);
+    history.record(fp, u5hEnd,   0, now);
+  }
+
+  it('returns the projection when reset is far away', () => {
+    const h = createUtilizationHistory();
+    seedHistory(h, 'fp1', 0.10, 0.20); // velocity ≈ 0.24/h, remaining 0.80 → ~200 min
+    // Reset is 6 hours away — much later than the 200 min projection.
+    const resetAt = Math.floor((Date.now() + 6 * 60 * 60 * 1000) / 1000);
+    const minutes = h.predictMinutesToLimit('fp1', resetAt);
+    assert.ok(minutes != null && minutes > 0, 'should return a number');
+    assert.ok(minutes >= 100 && minutes <= 300, `expected ~200 min, got ${minutes}`);
+  });
+
+  it('returns null when the projection is past the next reset', () => {
+    const h = createUtilizationHistory();
+    seedHistory(h, 'fp2', 0.10, 0.20); // ~200 min projection
+    // Reset is 30 minutes away — sooner than the projection. The window
+    // will roll over to 0% before the limit is reached.
+    const resetAt = Math.floor((Date.now() + 30 * 60 * 1000) / 1000);
+    const minutes = h.predictMinutesToLimit('fp2', resetAt);
+    assert.equal(minutes, null);
+  });
+
+  it('falls back to unclamped projection when resetAt is 0 or unset', () => {
+    const h = createUtilizationHistory();
+    seedHistory(h, 'fp3', 0.10, 0.20);
+    const noClamp = h.predictMinutesToLimit('fp3'); // default resetAt=0
+    const explicitZero = h.predictMinutesToLimit('fp3', 0);
+    assert.equal(typeof noClamp, 'number');
+    assert.equal(noClamp, explicitZero);
+  });
+
+  it('still returns null for non-positive velocity (post-reset baseline)', () => {
+    const h = createUtilizationHistory();
+    // utilization dropped — velocity <= 0
+    seedHistory(h, 'fp4', 0.50, 0.10);
+    const resetAt = Math.floor((Date.now() + 6 * 60 * 60 * 1000) / 1000);
+    assert.equal(h.predictMinutesToLimit('fp4', resetAt), null);
+  });
+});
+
+describe('getEarliestReset weekday formatting', () => {
+  function fakeMgr(stateMap) {
+    return { entries: () => stateMap.entries() };
+  }
+
+  it('returns "unknown" when no future reset is recorded', () => {
+    const mgr = fakeMgr(new Map([
+      ['t', { resetAt: 0, resetAt7d: 0 }],
+    ]));
+    assert.equal(getEarliestReset(mgr), 'unknown');
+  });
+
+  it('omits the date when reset is later today', () => {
+    // Pick a time three minutes from now — guaranteed same calendar day.
+    const future = Math.floor((Date.now() + 3 * 60 * 1000) / 1000);
+    const mgr = fakeMgr(new Map([
+      ['t', { resetAt: future, resetAt7d: 0 }],
+    ]));
+    const out = getEarliestReset(mgr);
+    // HH:MM only — no weekday.
+    assert.match(out, /^\d{2}:\d{2}$/, `expected HH:MM, got "${out}"`);
+  });
+
+  it('includes the weekday when reset crosses to a different day', () => {
+    // 36 hours from now is always on a different calendar day.
+    const future = Math.floor((Date.now() + 36 * 60 * 60 * 1000) / 1000);
+    const mgr = fakeMgr(new Map([
+      ['t', { resetAt: future, resetAt7d: 0 }],
+    ]));
+    const out = getEarliestReset(mgr);
+    // Should contain a 3-letter weekday and HH:MM.
+    assert.match(out, /(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i, `expected weekday in "${out}"`);
+    assert.match(out, /\d{2}:\d{2}/, `expected HH:MM in "${out}"`);
   });
 });

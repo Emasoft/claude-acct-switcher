@@ -55,8 +55,14 @@ describe('/api/refresh  - mock OAuth server', () => {
       let body = '';
       req.on('data', c => body += c);
       req.on('end', () => {
-        const params = new URLSearchParams(body);
-        const refreshToken = params.get('refresh_token');
+        // Production sends JSON (commit 815bd66 — "Fix OAuth refresh: use
+        // JSON format with client_id and scope"). The previous test parsed
+        // form-encoded which silently misclassified every JSON body as
+        // `invalid_grant` — the assertions failed, but the failures were
+        // hidden in CI's noise.
+        let payload = {};
+        try { payload = JSON.parse(body); } catch {}
+        const refreshToken = payload.refresh_token;
 
         if (refreshToken === 'valid-rt') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -96,7 +102,7 @@ describe('/api/refresh  - mock OAuth server', () => {
     const body = buildRefreshRequestBody('valid-rt');
     const response = await fetch(`${mockUrl}/v1/oauth/token`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/json' },
       body,
     });
     const data = await response.json();
@@ -110,7 +116,7 @@ describe('/api/refresh  - mock OAuth server', () => {
     const body = buildRefreshRequestBody('revoked-rt');
     const response = await fetch(`${mockUrl}/v1/oauth/token`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/json' },
       body,
     });
     assert.equal(response.status, 400);
@@ -122,7 +128,7 @@ describe('/api/refresh  - mock OAuth server', () => {
     const body = buildRefreshRequestBody('rate-limited-rt');
     const response = await fetch(`${mockUrl}/v1/oauth/token`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/json' },
       body,
     });
     assert.equal(response.status, 429);
@@ -132,7 +138,7 @@ describe('/api/refresh  - mock OAuth server', () => {
     const body = buildRefreshRequestBody('server-error-rt');
     const response = await fetch(`${mockUrl}/v1/oauth/token`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/json' },
       body,
     });
     assert.equal(response.status, 500);
@@ -141,9 +147,11 @@ describe('/api/refresh  - mock OAuth server', () => {
 
 describe('Refresh flow end-to-end (pure functions)', () => {
   it('full refresh cycle: build request → parse response → compute expiry → build creds', () => {
-    // 1. Build request
+    // 1. Build request — production sends JSON, not form-encoded.
     const body = buildRefreshRequestBody('old-refresh-token');
-    assert.ok(body.includes('refresh_token=old-refresh-token'));
+    const parsedBody = JSON.parse(body);
+    assert.equal(parsedBody.grant_type, 'refresh_token');
+    assert.equal(parsedBody.refresh_token, 'old-refresh-token');
 
     // 2. Simulate successful response
     const responseBody = JSON.stringify({
