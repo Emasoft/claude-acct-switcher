@@ -322,7 +322,21 @@ export function getEarliestReset(stateManager) {
   }
   if (earliest === Infinity) return 'unknown';
   const d = new Date(earliest * 1000);
-  return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  // Include the weekday when the reset is not today, otherwise just the
+  // time. The previous bare `HH:MM` form was misleading for 7-d resets
+  // (which almost always cross a calendar boundary): a 36-hour wait read
+  // as "8 a.m. today" with no calendar context.
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) {
+    return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  }
+  return d.toLocaleString('en-GB', {
+    weekday: 'short', hour: '2-digit', minute: '2-digit',
+  });
 }
 
 // ─────────────────────────────────────────────────
@@ -430,9 +444,17 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
 
   /**
    * Predict minutes until 5h utilization reaches 1.0 (rate limit).
-   * Returns null if velocity is <= 0 or insufficient data.
+   * Returns null if velocity is <= 0, insufficient data, OR the projected
+   * limit-reach is past the next 5h reset epoch (in which case utilization
+   * will roll back to 0 first and the prediction is meaningless).
+   *
+   * Pass `resetAt5h` (unix epoch seconds) when available so the prediction
+   * is clamped against the actual next reset. Without it the function
+   * happily returns "6h to limit" while the window is about to roll over
+   * in 30 min — exactly the misleading "wrong estimation at end of cycle"
+   * pattern users have reported.
    */
-  function predictMinutesToLimit(fingerprint) {
+  function predictMinutesToLimit(fingerprint, resetAt5h = 0) {
     const arr = history.get(fingerprint);
     if (!arr || arr.length < 2) return null;
     const velocity = getVelocity(fingerprint);
@@ -440,7 +462,13 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
     const current = arr[arr.length - 1].u5h;
     const remaining = 1.0 - current;
     if (remaining <= 0) return 0;
-    return Math.round((remaining / velocity) * 60); // minutes
+    const minutes = Math.round((remaining / velocity) * 60);
+    if (resetAt5h && resetAt5h > 0) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const minutesToReset = Math.floor((resetAt5h - nowSec) / 60);
+      if (minutesToReset > 0 && minutes > minutesToReset) return null;
+    }
+    return minutes;
   }
 
   function getAllFingerprints() {

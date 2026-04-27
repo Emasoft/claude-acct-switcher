@@ -611,13 +611,23 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
   const data = await fetchRateLimits(token);
   if (data) {
     rateLimitCache.set(fp, { data, fetchedAt: Date.now() });
-    // Persist probe results
-    updatePersistedState(fp, {
-      utilization5h: data.fiveH.utilization,
-      utilization7d: data.sevenD.utilization,
-      resetAt: data.fiveH.reset,
-      resetAt7d: data.sevenD.reset,
-    });
+    // Route probe data through the canonical observation pipeline. The
+    // previous code wrote ONLY to persistedState, so the probe path was
+    // invisible to utilizationHistory / weeklyHistory and was the root
+    // cause for several user-visible prediction bugs (audit findings F2,
+    // C2, C6): velocity slope was computed only from real proxy traffic
+    // and the reset detector silently misfired after a probe poisoned
+    // its `prevReset5h` baseline. By calling updateAccountState we fold
+    // probes into the same machinery as proxy responses.
+    const acctMatch = loadAllAccountTokens().find(a => getFingerprintFromToken(a.token) === fp);
+    const acctName = acctMatch ? acctMatch.name : '(probe)';
+    updateAccountState(token, acctName, {
+      'anthropic-ratelimit-unified-status': data.status === 'limited' ? 'limited' : 'ok',
+      'anthropic-ratelimit-unified-5h-utilization': String(data.fiveH.utilization || 0),
+      'anthropic-ratelimit-unified-7d-utilization': String(data.sevenD.utilization || 0),
+      'anthropic-ratelimit-unified-5h-reset': String(data.fiveH.reset || 0),
+      'anthropic-ratelimit-unified-7d-reset': String(data.sevenD.reset || 0),
+    }, fp);
     return data;
   }
 
@@ -808,7 +818,14 @@ async function handleAPI(req, res) {
       p.utilizationHistory = utilizationHistory.getHistory(p.fingerprint);
       p.weeklyHistory = weeklyHistory.getHistory(p.fingerprint);
       p.velocity5h = utilizationHistory.getVelocity(p.fingerprint);
-      p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint);
+      // Pass the 5h reset epoch so the prediction is clamped against it.
+      // Without the clamp, a small positive velocity at 95% utilization can
+      // produce "Est. 6h to limit" even when the rolling window will reset
+      // in 30 minutes — the audit's "wrong estimation at end of cycle"
+      // failure mode. predictMinutesToLimit returns null when the
+      // projected limit is past the next reset, so the UI hides the badge.
+      const resetAt5h = (p.rateLimits && p.rateLimits.fiveH && p.rateLimits.fiveH.reset) || 0;
+      p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint, resetAt5h);
     }
     const stats = await loadStats();
     const probeStats = getProbeStats();
