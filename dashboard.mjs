@@ -120,6 +120,10 @@ function saveSettings(settings) {
 let settings = loadSettings();
 let lastRotationTime = 0; // tracks when proactive rotation last happened
 let _consecutive400s = 0;  // global: consecutive 400 errors across requests (reset on success)
+// Global byte counter for the streaming-phase body buffers. Caps the
+// aggregate memory dedicated to incoming request body accumulation so a
+// burst of large concurrent uploads cannot OOM the dashboard.
+let _bufferedBytes = 0;
 let _consecutive400sAt = 0;  // timestamp of last 400 (for time-based decay)
 const _lastWarnPct = new Map(); // acctName → last logged percentage (dedup 90%+ warnings)
 
@@ -173,6 +177,14 @@ function readKeychain() {
   }
 }
 
+// Tracks the last successful keychain write so autoDiscoverAccount can
+// safely skip the brief race window where the on-disk account file has
+// been refreshed but the keychain has not yet been updated. Without this,
+// an inbound proxy request landing between those two writes would
+// trigger an email-match overwrite of the just-refreshed disk file with
+// the stale (pre-refresh) keychain creds — audit Concern 03.C7.
+let _lastKeychainWriteAt = 0;
+
 function writeKeychain(creds) {
   // Atomic: `add-generic-password -U` updates in place if the entry exists,
   // creates it otherwise. Single syscall — no delete-then-add window where
@@ -183,6 +195,7 @@ function writeKeychain(creds) {
     ['add-generic-password', '-U', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w', json],
     { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }
   );
+  _lastKeychainWriteAt = Date.now();
 }
 
 // Atomic file write: write to .tmp, then rename over the target. POSIX
@@ -224,11 +237,21 @@ import {
   ROTATION_INTERVALS,
 } from './lib.mjs';
 
-// Fetch email from Anthropic roles API using OAuth token
+// Fetch email from Anthropic roles API using OAuth token. This is an
+// authenticated call against api.anthropic.com and consumes the user's
+// unified rate-limit budget on every cache miss — track it as a probe
+// so the cost is visible in `/api/probe-stats` and shape the request to
+// match a real Claude Code session (User-Agent + oauth beta) so it
+// can't be heuristically distinguished by the upstream.
 function fetchAccountEmail(token) {
   return new Promise((resolve) => {
+    try { recordProbe(); } catch {}
     const req = https.get('https://api.anthropic.com/api/oauth/claude_cli/roles', {
-      headers: { 'Authorization': `Bearer ${token}` },
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
       timeout: 3000,
     }, (res) => {
       let data = '';
@@ -327,6 +350,17 @@ try {
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
 async function autoDiscoverAccount() {
+  // Skip a short window after the most recent keychain write. The race we
+  // are dodging: refreshAccountToken() does atomicWriteAccountFile (disk
+  // gets the NEW creds) ... then writeKeychain (keychain gets the new
+  // creds) — but between those two writes the keychain still holds the
+  // OLD creds. If autoDiscoverAccount runs during that window, it reads
+  // the keychain (old token), looks up the saved file by email, finds
+  // the just-refreshed file, and overwrites it with the stale keychain
+  // creds — wiping the new refresh token. The 750 ms window covers the
+  // whole "fingerprint migrated, keychain about to be written" period
+  // for both proxy-side rotations and proactive sweep refreshes.
+  if (Date.now() - _lastKeychainWriteAt < 750) return;
   const creds = readKeychain();
   if (!creds?.claudeAiOauth?.accessToken) return;
   const fp = getFingerprint(creds);
@@ -4867,8 +4901,17 @@ async function _passthroughFallback(clientReq, clientRes, body, reason) {
     const resBuf = await drainResponse(res);
     if (isEmptyBody400(res.statusCode, resBuf)) {
       log('fallback', `Passthrough (${reason}): 400-empty-body — trying fresh keychain token`);
-      invalidateTokenCache();
-      const freshCreds = readKeychain();
+      // Read the keychain INSIDE withSwitchLock so we never observe the
+      // 50–200 ms gap between writeKeychain's delete-and-add (now atomic
+      // via update -U after Phase 1A, but the lock is still the right
+      // serialization point against /api/switch and the proxy's own
+      // proactive rotations). The previous unlocked read was the audit's
+      // newly-discovered N-1 fallback-keychain-race issue.
+      let freshCreds = null;
+      await withSwitchLock(() => {
+        invalidateTokenCache();
+        freshCreds = readKeychain();
+      });
       const freshToken = freshCreds?.claudeAiOauth?.accessToken;
       if (freshToken && freshToken !== fwd['authorization']?.replace(/^Bearer\s+/i, '')) {
         const retryFwd = { ...fwd, authorization: `Bearer ${freshToken}` };
@@ -6211,8 +6254,13 @@ async function handleProxyRequest(clientReq, clientRes) {
     return;
   }
 
-  // Buffer request body for replay on retry (with size guard to prevent OOM)
-  const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50 MB
+  // Buffer request body for replay on retry. Two guards:
+  //   (a) per-request MAX_BODY_SIZE — caps a single oversized payload
+  //   (b) global _bufferedBytes — caps aggregate memory across requests
+  //       so 10 concurrent 49 MB uploads can't push the heap to ~1 GB
+  //       and OOM-kill the dashboard.
+  const MAX_BODY_SIZE = 50 * 1024 * 1024;        // per-request cap (50 MB)
+  const MAX_GLOBAL_BUFFERED = 200 * 1024 * 1024; // global cap (200 MB)
   const bodyChunks = [];
   let bodySize = 0;
   try {
@@ -6220,24 +6268,42 @@ async function handleProxyRequest(clientReq, clientRes) {
       clientReq.on('data', c => {
         bodySize += c.length;
         if (bodySize > MAX_BODY_SIZE) {
-          reject(new Error('body_too_large')); // reject BEFORE destroy to win any sync error-event race
+          reject(new Error('body_too_large'));
           clientReq.destroy();
           return;
         }
+        if (_bufferedBytes + c.length > MAX_GLOBAL_BUFFERED) {
+          reject(new Error('global_buffer_exceeded'));
+          clientReq.destroy();
+          return;
+        }
+        _bufferedBytes += c.length;
         bodyChunks.push(c);
       });
       clientReq.on('end', resolve);
       clientReq.on('error', reject);
     });
   } catch (e) {
+    // Always release the global accounting on early-out paths.
+    _bufferedBytes -= bodyChunks.reduce((n, c) => n + c.length, 0);
     if (e.message === 'body_too_large') {
       clientRes.writeHead(413, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({ error: `Request body too large (max ${MAX_BODY_SIZE / 1024 / 1024}MB)` }));
       return;
     }
+    if (e.message === 'global_buffer_exceeded') {
+      clientRes.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
+      clientRes.end(JSON.stringify({ error: 'Proxy busy: in-flight request bodies exceed memory budget. Retry shortly.' }));
+      return;
+    }
     throw e;
   }
   const body = Buffer.concat(bodyChunks);
+  // Release the streaming-phase accounting now that the chunks are
+  // consolidated into `body`. The held-body memory is still real but
+  // bounded per-request (50 MB) and per-account (4 in flight).
+  _bufferedBytes -= bodySize;
+  bodyChunks.length = 0; // help GC reclaim the chunks promptly
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   const isDeadlineExceeded = () => Date.now() > deadline;
 
@@ -6519,8 +6585,20 @@ async function handleProxyRequest(clientReq, clientRes) {
 
       await drainResponse(proxyRes);
 
-      // Try to refresh the token (once per account per request)
-      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded()) {
+      // Try to refresh the token (once per account per request).
+      // Skip if a recent non-retriable failure is on file — every fresh
+      // 401 was previously hitting the OAuth endpoint with a known-revoked
+      // refresh token, burning rate budget AND any chance of recovery.
+      // The per-request `refreshAttempted` Set covers within-request loops;
+      // `refreshFailures` covers the across-request case the audit flagged
+      // as Concern 03.C5.
+      const REFRESH_FAILURE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+      const priorFailure = refreshFailures.get(acctName);
+      const skipRefresh =
+        priorFailure &&
+        priorFailure.retriable === false &&
+        Date.now() - priorFailure.ts < REFRESH_FAILURE_TTL_MS;
+      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded() && !skipRefresh) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 401...`);
         try {
