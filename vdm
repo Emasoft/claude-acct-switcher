@@ -79,10 +79,9 @@ read_keychain() {
 
 write_keychain() {
   local creds="$1"
-  # Delete existing entry first (security won't overwrite)
-  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
-  # Write new entry
-  security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$creds"
+  # `-U` updates in place if entry exists; creates otherwise. Atomic single
+  # operation — no delete-then-add window where concurrent readers see null.
+  security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$creds"
 }
 
 get_active_fingerprint() {
@@ -861,11 +860,15 @@ cmd_upgrade() {
 
   # Overwrite only code files — never touch accounts/, config.json,
   # activity-log.json, .label files, or any other user data.
+  # Atomic per-file replace: cp into <name>.new on the same FS, then mv -f
+  # (rename(2)). A SIGKILL/^C between cp and mv leaves the original intact
+  # so a half-finished upgrade never bricks the install. dashboard.mjs is
+  # ~225 KB and the cp window is real on slow disks.
   echo -e "  ${DIM}Updating files…${NC}"
-  cp "$tmpdir/vdm"               "$SCRIPT_DIR/vdm"
-  cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs"
-  cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs"
-  cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh"
+  cp "$tmpdir/vdm"               "$SCRIPT_DIR/vdm.new"               && mv -f "$SCRIPT_DIR/vdm.new"               "$SCRIPT_DIR/vdm"
+  cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs.new"     && mv -f "$SCRIPT_DIR/dashboard.mjs.new"     "$SCRIPT_DIR/dashboard.mjs"
+  cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs.new"           && mv -f "$SCRIPT_DIR/lib.mjs.new"           "$SCRIPT_DIR/lib.mjs"
+  cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh.new"  && mv -f "$SCRIPT_DIR/install-hooks.sh.new"  "$SCRIPT_DIR/install-hooks.sh"
   chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker

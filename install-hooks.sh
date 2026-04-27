@@ -29,10 +29,15 @@ uninstall_beta_hooks() {
 _install_claude_code_hooks() {
   local settings_dir="$HOME/.claude"
   local settings_file="$settings_dir/settings.json"
+  local lock_file="$settings_dir/.vdm-settings.lock"
 
   mkdir -p "$settings_dir" 2>/dev/null || true
+  : > "$lock_file" 2>/dev/null || true
 
-  if ! python3 -c "
+  # flock serializes concurrent vdm invocations against settings.json.
+  # The python rewriter writes to a .tmp and os.replace()s atomically so
+  # an OOM/SIGKILL between read and write never leaves a half-written file.
+  if ! ( flock -x 9 2>/dev/null || true; python3 -c "
 import json, os, sys
 
 settings_file = '$settings_file'
@@ -71,32 +76,45 @@ def ensure_hook(event_name, url):
     if not isinstance(event_hooks, list):
         event_hooks = []
         hooks[event_name] = event_hooks
-    # Check if our hook is already present (by URL marker)
+    # Check if our hook is already present (match by event+path so port
+    # changes don't strand orphan entries with the old port number).
+    from urllib.parse import urlparse
+    target_path = urlparse(url).path
+    keep = []
     for entry in event_hooks:
         inner = entry.get('hooks', []) if isinstance(entry, dict) else []
-        for h in inner:
-            if isinstance(h, dict) and h.get('url', '') == url:
-                return  # already installed
-    # Add our hook
-    event_hooks.append({
-        'hooks': [{'type': 'http', 'url': url, 'timeout': 5}]
-    })
+        is_ours = any(
+            isinstance(h, dict) and urlparse(h.get('url', '')).path == target_path
+            for h in inner
+        )
+        if not is_ours:
+            keep.append(entry)
+    keep.append({'hooks': [{'type': 'http', 'url': url, 'timeout': 5}]})
+    hooks[event_name] = keep
 
 ensure_hook('UserPromptSubmit', start_url)
 ensure_hook('Stop', stop_url)
 
-with open(settings_file, 'w') as f:
+# Atomic write: tmp + os.replace
+tmp_file = settings_file + '.tmp'
+with open(tmp_file, 'w') as f:
     json.dump(settings, f, indent=2)
-" 2>&1; then
+os.replace(tmp_file, settings_file)
+" ) 9>"$lock_file" 2>&1; then
     echo -e "  ${YELLOW:-}Warning: Failed to install Claude Code hooks${NC:-}" >&2
   fi
 }
 
 _uninstall_claude_code_hooks() {
   local settings_file="$HOME/.claude/settings.json"
+  local lock_file="$HOME/.claude/.vdm-settings.lock"
   [[ -f "$settings_file" ]] || return 0
+  : > "$lock_file" 2>/dev/null || true
 
-  if ! python3 -c "
+  # Same locking + atomic rewrite as _install. Match by URL path (not full
+  # URL) so a port change between install and uninstall doesn't strand
+  # entries with the old port.
+  if ! ( flock -x 9 2>/dev/null || true; python3 -c "
 import json, os, sys
 
 settings_file = '$settings_file'
@@ -121,10 +139,15 @@ def remove_hook(event_name, url):
     event_hooks = hooks[event_name]
     if not isinstance(event_hooks, list):
         return
+    from urllib.parse import urlparse
+    target_path = urlparse(url).path
     filtered = []
     for entry in event_hooks:
         inner = entry.get('hooks', []) if isinstance(entry, dict) else []
-        has_ours = any(isinstance(h, dict) and h.get('url', '') == url for h in inner)
+        has_ours = any(
+            isinstance(h, dict) and urlparse(h.get('url', '')).path == target_path
+            for h in inner
+        )
         if not has_ours:
             filtered.append(entry)
     hooks[event_name] = filtered
@@ -139,9 +162,12 @@ remove_hook('Stop', stop_url)
 if not hooks:
     del settings['hooks']
 
-with open(settings_file, 'w') as f:
+# Atomic write: tmp + os.replace
+tmp_file = settings_file + '.tmp'
+with open(tmp_file, 'w') as f:
     json.dump(settings, f, indent=2)
-" 2>&1; then
+os.replace(tmp_file, settings_file)
+" ) 9>"$lock_file" 2>&1; then
     echo -e "  ${YELLOW:-}Warning: Failed to uninstall Claude Code hooks${NC:-}" >&2
   fi
 }

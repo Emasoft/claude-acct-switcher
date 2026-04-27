@@ -5,7 +5,7 @@
 import { createServer } from 'node:http';
 import { readdir, readFile, writeFile, mkdir, unlink, chmod, rename } from 'node:fs/promises';
 import { join, basename } from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
@@ -112,7 +112,9 @@ function loadSettings() {
 }
 
 function saveSettings(settings) {
-  writeFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2));
+  // Hoist atomicWriteFileSync usage: defined later in the file but JS hoists
+  // function declarations. This call only runs after module init completes.
+  atomicWriteFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2));
 }
 
 let settings = loadSettings();
@@ -158,9 +160,11 @@ function _openCircuit(reason) {
 
 function readKeychain() {
   try {
-    const raw = execSync(
-      `security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`,
-      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    // execFileSync with argv[] — no shell, no interpolation injection vector.
+    const raw = execFileSync(
+      'security',
+      ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }
     ).trim();
     return JSON.parse(raw);
   } catch (e) {
@@ -170,17 +174,25 @@ function readKeychain() {
 }
 
 function writeKeychain(creds) {
+  // Atomic: `add-generic-password -U` updates in place if the entry exists,
+  // creates it otherwise. Single syscall — no delete-then-add window where
+  // concurrent readers see null. argv[] form — no shell, no interpolation.
   const json = JSON.stringify(creds);
-  try {
-    execSync(
-      `security delete-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}"`,
-      { stdio: 'pipe', timeout: 5000 }
-    );
-  } catch { /* might not exist */ }
-  execSync(
-    `security add-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w "${json.replace(/"/g, '\\"')}"`,
-    { stdio: 'pipe', timeout: 5000 }
+  execFileSync(
+    'security',
+    ['add-generic-password', '-U', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w', json],
+    { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }
   );
+}
+
+// Atomic file write: write to .tmp, then rename over the target. POSIX
+// rename(2) is atomic on the same filesystem, so a SIGKILL/OOM/power-loss
+// between the truncate and the final byte never leaves a half-written
+// state file. Used for every state file whose corruption would lose data.
+function atomicWriteFileSync(filePath, content) {
+  const tmpPath = filePath + '.tmp';
+  writeFileSync(tmpPath, content);
+  renameSync(tmpPath, filePath);
 }
 
 import https from 'node:https';
@@ -275,8 +287,12 @@ function logActivity(type, detail = {}) {
   const cutoff = Date.now() - ACTIVITY_MAX_AGE;
   while (activityLog.length > 0 && activityLog[activityLog.length - 1].ts < cutoff) activityLog.pop();
   if (activityLog.length > ACTIVITY_MAX_ENTRIES) activityLog.length = ACTIVITY_MAX_ENTRIES;
-  // Persist async  - fire and forget
-  writeFile(ACTIVITY_LOG_FILE, JSON.stringify(activityLog)).catch(() => {});
+  // Persist async, atomic via temp+rename. Fire-and-forget; the activity
+  // log is best-effort and we don't want logActivity() to block hot paths.
+  const tmp = ACTIVITY_LOG_FILE + '.tmp';
+  writeFile(tmp, JSON.stringify(activityLog))
+    .then(() => rename(tmp, ACTIVITY_LOG_FILE))
+    .catch(() => {});
 }
 
 // ─────────────────────────────────────────────────
@@ -418,7 +434,7 @@ try {
 } catch { /* corrupt file - start fresh */ }
 
 function saveProbeLogToDisk() {
-  try { writeFileSync(PROBE_LOG_FILE, JSON.stringify(probeTracker.toJSON())); } catch {}
+  try { atomicWriteFileSync(PROBE_LOG_FILE, JSON.stringify(probeTracker.toJSON())); } catch {}
 }
 
 function recordProbe() { probeTracker.record(); saveProbeLogToDisk(); }
@@ -448,7 +464,7 @@ function loadHistoryFromDisk() {
 
 function saveHistoryToDisk() {
   try {
-    writeFileSync(HISTORY_FILE, JSON.stringify({ fiveH: utilizationHistory.toJSON(), weekly: weeklyHistory.toJSON() }));
+    atomicWriteFileSync(HISTORY_FILE, JSON.stringify({ fiveH: utilizationHistory.toJSON(), weekly: weeklyHistory.toJSON() }));
   } catch {}
 }
 
@@ -4319,7 +4335,7 @@ function loadPersistedState() {
 
 function savePersistedState() {
   try {
-    writeFileSync(STATE_FILE, JSON.stringify(persistedState));
+    atomicWriteFileSync(STATE_FILE, JSON.stringify(persistedState));
   } catch {}
 }
 
@@ -5453,7 +5469,7 @@ function persistCompletedSession(session) {
     duration: session.completedAt - session.startedAt,
   });
   if (sessionHistory.length > SESSION_HISTORY_MAX) sessionHistory.length = SESSION_HISTORY_MAX;
-  try { writeFileSync(SESSION_HISTORY_FILE, JSON.stringify(sessionHistory, null, 2)); } catch {}
+  try { atomicWriteFileSync(SESSION_HISTORY_FILE, JSON.stringify(sessionHistory, null, 2)); } catch {}
 }
 
 function getFileConflicts() {
@@ -5728,9 +5744,12 @@ function appendTokenUsage(entry) {
   const final = pruned.length > TOKEN_USAGE_MAX_ENTRIES
     ? pruned.slice(pruned.length - TOKEN_USAGE_MAX_ENTRIES)
     : pruned;
-  _tokenUsageCache = final;
+  // Note: don't update the in-memory cache until disk write succeeds — if
+  // the write throws, the cache stays consistent with disk and the next
+  // load() re-reads the previous-good file instead of an empty one.
   try {
-    writeFileSync(TOKEN_USAGE_FILE, JSON.stringify(final, null, 2));
+    atomicWriteFileSync(TOKEN_USAGE_FILE, JSON.stringify(final, null, 2));
+    _tokenUsageCache = final;
   } catch (e) {
     log('error', `Failed to write token-usage.json: ${e.message}`);
   }
