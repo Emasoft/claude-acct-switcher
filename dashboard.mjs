@@ -184,6 +184,16 @@ function readKeychain() {
 // trigger an email-match overwrite of the just-refreshed disk file with
 // the stale (pre-refresh) keychain creds — audit Concern 03.C7.
 let _lastKeychainWriteAt = 0;
+// Global counter incremented while ANY refresh is in flight. Covers the
+// PRE-keychain-write half of the race that `_lastKeychainWriteAt` cannot:
+// the refresh writes disk first, THEN keychain. Between those two
+// writes the keychain still holds the OLD token while the disk file has
+// the NEW token. autoDiscoverAccount running in that window would
+// match by email and overwrite the just-refreshed file with stale
+// keychain creds. The counter goes up before atomicWriteAccountFile and
+// drops after writeKeychain returns; autoDiscoverAccount short-circuits
+// while > 0.
+let _refreshesInProgress = 0;
 
 function writeKeychain(creds) {
   // Atomic: `add-generic-password -U` updates in place if the entry exists,
@@ -350,16 +360,11 @@ try {
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
 async function autoDiscoverAccount() {
-  // Skip a short window after the most recent keychain write. The race we
-  // are dodging: refreshAccountToken() does atomicWriteAccountFile (disk
-  // gets the NEW creds) ... then writeKeychain (keychain gets the new
-  // creds) — but between those two writes the keychain still holds the
-  // OLD creds. If autoDiscoverAccount runs during that window, it reads
-  // the keychain (old token), looks up the saved file by email, finds
-  // the just-refreshed file, and overwrites it with the stale keychain
-  // creds — wiping the new refresh token. The 750 ms window covers the
-  // whole "fingerprint migrated, keychain about to be written" period
-  // for both proxy-side rotations and proactive sweep refreshes.
+  // Skip while ANY refresh is in flight (pre- AND post-keychain-write
+  // halves of the race) and for a short window after the most recent
+  // keychain write (covers the tiny gap between the refresh hook
+  // dropping the counter and the keychain becoming "stable").
+  if (_refreshesInProgress > 0) return;
   if (Date.now() - _lastKeychainWriteAt < 750) return;
   const creds = readKeychain();
   if (!creds?.claudeAiOauth?.accessToken) return;
@@ -5163,9 +5168,18 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
       : Date.now() + 8 * 60 * 60 * 1000; // fallback: 8 hours
     const newCreds = buildUpdatedCreds(rawCreds, result.accessToken, result.refreshToken, newExpiresAt);
 
+    // Bracket the disk-write + keychain-write window with the in-progress
+    // counter so a concurrent autoDiscoverAccount cannot read the OLD
+    // keychain creds, match the just-refreshed file by email, and
+    // overwrite it with stale tokens. The decrement happens once the
+    // keychain has been updated (or the function returns without
+    // touching it). Increment-before / decrement-after pattern with a
+    // try/finally below.
+    _refreshesInProgress++;
     try {
       await atomicWriteAccountFile(accountName, newCreds);
     } catch (e) {
+      _refreshesInProgress--;
       log('refresh', `CRITICAL: ${accountName}: refresh succeeded but file write failed: ${e.message}`);
       return { ok: false, error: `File write failed: ${e.message}` };
     }
@@ -5194,6 +5208,9 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
     invalidateAccountsCache();
     refreshFailures.delete(accountName);
     logActivity('token-refreshed', { account: accountLabel });
+    // The disk-write + keychain-write window is closed; allow
+    // autoDiscoverAccount to run again.
+    _refreshesInProgress--;
 
     return { ok: true, accessToken: result.accessToken, expiresAt: newExpiresAt };
   });

@@ -232,6 +232,11 @@ _install_git_hook() {
 # [BETA] Appends token usage trailer to commit messages.
 # Part of claude-acct-switcher (https://github.com/loekj/claude-acct-switcher)
 
+# IMPORTANT: even on merge/squash/amend we still run any chained hooks
+# (Husky, git-lfs, project-local) — they are not specific to vdm and the
+# user expects them to fire. We only skip OUR trailer for those events
+# because the commit message there is computed/edited differently.
+
 # Chain to repo-local hook (core.hooksPath disables .git/hooks/)
 LOCAL_HOOK="$(git rev-parse --git-dir 2>/dev/null)/hooks/prepare-commit-msg"
 [[ -x "$LOCAL_HOOK" ]] && [[ "$LOCAL_HOOK" != "$0" ]] && { "$LOCAL_HOOK" "$@" || exit $?; }
@@ -239,7 +244,7 @@ LOCAL_HOOK="$(git rev-parse --git-dir 2>/dev/null)/hooks/prepare-commit-msg"
 # Chain to pre-existing global hook we moved aside
 [[ -x "${0}.vdm-original" ]] && { "${0}.vdm-original" "$@" || exit $?; }
 
-# Skip merge/squash/amend
+# Skip OUR trailer for merge/squash/amend; chained hooks above always run.
 [[ "$2" == "merge" || "$2" == "squash" || "$2" == "commit" ]] && exit 0
 
 # Check if commitTokenUsage is enabled (disabled by default; silent fail = skip)

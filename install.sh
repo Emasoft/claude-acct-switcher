@@ -84,9 +84,24 @@ else
   echo -e "  ${YELLOW}Note:${NC} Add ${DIM}$HOME/.local/bin${NC} to your PATH if not already."
 fi
 
+# Sweep stale `vdm` symlinks at every plausible location BEFORE creating
+# the canonical one. On Apple-Silicon Macs migrated from Intel,
+# /usr/local/bin/vdm could still point at an old install dir while
+# `~/.local/bin/vdm` points at the new one — whichever wins on PATH
+# decides which `vdm` actually runs. Do this on the install side too so
+# the order doesn't depend on the user having previously uninstalled.
+for candidate in \
+    "$HOME/.local/bin/vdm" "$HOME/.local/bin/csw" \
+    "/usr/local/bin/vdm"   "/usr/local/bin/csw"; do
+  if [[ -L "$candidate" ]]; then
+    target="$(readlink "$candidate" 2>/dev/null || true)"
+    if [[ "$target" == *"/.claude/account-switcher/"* ]]; then
+      rm -f "$candidate" 2>/dev/null || true
+    fi
+  fi
+done
+
 ln -sf "$INSTALL_DIR/vdm" "$LINK_DIR/vdm"
-# Clean up legacy csw symlink if present
-rm -f "$LINK_DIR/csw"
 echo -e "  ${GREEN}✓${NC} Linked ${CYAN}vdm${NC} to ${DIM}$LINK_DIR${NC}"
 
 # ── Configure shell ──
@@ -106,11 +121,25 @@ if [[ -n "$SHELL_RC" ]]; then
   if grep -q "$SNIPPET_MARKER" "$SHELL_RC" 2>/dev/null; then
     echo -e "  ${DIM}Shell config already present in $SHELL_RC${NC}"
   else
+    # Resolve the absolute Node binary path at install time and write it
+    # into the snippet. Bare `node` in a non-interactive shell (cron,
+    # launchd, IDE-spawned subshells) often resolves to nothing or to
+    # the wrong arch under Rosetta — silently bypassing the proxy
+    # because $ANTHROPIC_BASE_URL would never get exported either.
+    NODE_BIN="$(command -v node || true)"
+    [[ -z "$NODE_BIN" ]] && NODE_BIN="node" # fallback to PATH lookup at run time
+    # Pre-quote for safety (in case the path contains spaces)
+    NODE_BIN_QUOTED="$(printf '%q' "$NODE_BIN")"
     echo "" >> "$SHELL_RC"
-    cat >> "$SHELL_RC" << 'SHELL_EOF'
+    cat >> "$SHELL_RC" <<SHELL_EOF
 # BEGIN claude-account-switcher
+# Auto-start the dashboard if it isn't already listening. The dashboard's
+# own EADDRINUSE handler exits cleanly if a parallel terminal beat us to
+# it, so a slow lsof check is no longer load-bearing — but we still gate
+# on it to avoid the wasted spawn cost in the common case.
 if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
-  nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
+  nohup ${NODE_BIN_QUOTED} ~/.claude/account-switcher/dashboard.mjs \\
+    >>~/.claude/account-switcher/startup.log 2>&1 &
   disown
 fi
 export ANTHROPIC_BASE_URL=http://localhost:3334
@@ -124,7 +153,8 @@ else
   echo ""
   echo '    # BEGIN claude-account-switcher'
   echo '    if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then'
-  echo '      nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &'
+  echo "      nohup $(command -v node) ~/.claude/account-switcher/dashboard.mjs \\"
+  echo '        >>~/.claude/account-switcher/startup.log 2>&1 &'
   echo '      disown'
   echo '    fi'
   echo '    export ANTHROPIC_BASE_URL=http://localhost:3334'

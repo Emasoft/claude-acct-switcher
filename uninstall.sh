@@ -137,6 +137,38 @@ else
   echo -e "  ${DIM}$INSTALL_DIR does not exist (already clean)${NC}"
 fi
 
+# ── 6. Offer to clean up backup files ──
+# uninstall historically left these behind; they accumulate over repeated
+# install/uninstall cycles. Offer to remove them at the end.
+backup_candidates=()
+for f in \
+    "${SHELL_RC:-/dev/null}.vdm-backup" \
+    "$HOME/.claude/settings.json.vdm-backup"; do
+  [[ -f "$f" ]] && backup_candidates+=("$f")
+done
+if (( ${#backup_candidates[@]} > 0 )); then
+  echo ""
+  echo -e "  ${BOLD}Backup files left behind:${NC}"
+  for f in "${backup_candidates[@]}"; do echo -e "    ${DIM}$f${NC}"; done
+  read -rp "  Remove these backups? [y/N] " rm_backups
+  if [[ "$rm_backups" == "y" || "$rm_backups" == "Y" ]]; then
+    for f in "${backup_candidates[@]}"; do rm -f "$f" 2>/dev/null && echo -e "    ${GREEN}✓${NC} Removed $f" || true; done
+  else
+    echo -e "    ${DIM}Backups kept. Remove manually if you don't need them.${NC}"
+  fi
+fi
+
+# ── 7. Note about LaunchAgent + Keychain ──
+LAUNCHAGENT_PLIST="$HOME/Library/LaunchAgents/com.loekj.vdm.dashboard.plist"
+if [[ -f "$LAUNCHAGENT_PLIST" ]]; then
+  echo ""
+  echo -e "  ${YELLOW}Note:${NC} a LaunchAgent plist exists at"
+  echo -e "    ${DIM}$LAUNCHAGENT_PLIST${NC}"
+  echo -e "  If you previously enabled the supervisor mode, run:"
+  echo -e "    ${DIM}launchctl bootout gui/\$(id -u) \"$LAUNCHAGENT_PLIST\" 2>/dev/null${NC}"
+  echo -e "    ${DIM}rm -f \"$LAUNCHAGENT_PLIST\"${NC}"
+fi
+
 echo ""
 echo -e "  ${BOLD}${GREEN}Uninstall complete.${NC}"
 echo ""
