@@ -1,0 +1,125 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project: Van Damme-o-Matic (vdm)
+
+Multi-account credential switcher for Claude Code on macOS. Auto-rotates OAuth accounts to dodge rate limits and refreshes expiring tokens in the background. The README is the user-facing pitch; this file is the developer-facing one.
+
+## Common commands
+
+```bash
+# Run the test suite (Node's built-in runner — no test framework)
+node --test 'test/*.test.mjs'
+
+# Run a single test file
+node --test test/lib.test.mjs
+
+# Run the dashboard + proxy directly from the repo (skips install)
+node dashboard.mjs                                  # ports 3333 (UI) and 3334 (proxy)
+CSW_PORT=4444 CSW_PROXY_PORT=4445 node dashboard.mjs
+
+# Local dev install — copies dashboard.mjs/lib.mjs/vdm to ~/.claude/account-switcher/
+# and writes a `# BEGIN claude-account-switcher` block into ~/.zshrc.
+./install.sh
+
+# Reverse the install
+./uninstall.sh
+
+# CLI (after install, or run `./vdm <cmd>` from the repo)
+vdm list | switch | remove | status | config | dashboard | logs | tokens | upgrade
+```
+
+There is **no build step, no bundler, no package.json, no lockfile, no linter**. The whole project is plain Node.js using only built-in modules plus bash. Don't add dependencies — that's a deliberate constraint (see Architecture below).
+
+Requires Node 18+, macOS (uses Keychain), and `python3` (used by `vdm` and `install-hooks.sh` for JSON munging).
+
+## Architecture
+
+Three source files do all the work. Understand these and you understand the whole project:
+
+- **`vdm`** (bash, ~1150 lines) — user-facing CLI. Dispatches to `cmd_*` functions; talks to the macOS Keychain via `security(1)` and to the dashboard's HTTP API for anything stateful. The `case` block at the bottom of the file is the command map.
+- **`dashboard.mjs`** (Node, ~4360 lines) — runs **two HTTP servers in one process**: the web dashboard (default port 3333, all the `/api/*` routes plus the embedded HTML in `renderHTML()`) and the API proxy (default port 3334, `handleProxyRequest`). Holds all I/O, timers, and global state. The HTML/CSS/JS for the UI is a single template string returned by `renderHTML()` — there is no separate frontend.
+- **`lib.mjs`** (Node, ~560 lines) — pure functions only, zero side effects. Anything testable lives here: fingerprinting, header rewriting (`buildForwardHeaders`/`stripHopByHopHeaders`), the `createAccountStateManager`/`createUtilizationHistory`/`createProbeTracker`/`createPerAccountLock` factories, rotation-strategy logic (`pickByStrategy` and friends), and OAuth-refresh helpers. **When adding logic that can be expressed as a pure function, put it in `lib.mjs` and unit-test it in `test/lib.test.mjs`** — that's how the existing code is structured.
+
+### How a Claude Code request flows through this
+
+```
+claude CLI ──ANTHROPIC_BASE_URL=http://localhost:3334──▶ dashboard.mjs proxy
+                                                              │
+                                                              │ readKeychain() → active token
+                                                              │ buildForwardHeaders() (lib.mjs)
+                                                              ▼
+                                                        api.anthropic.com
+                                                              │
+                                            ◀──── 200 / 429 / 401 / 5xx ────
+                                                              │
+                                                              ▼
+                                  on 429: pickByStrategy() picks another account,
+                                          writeKeychain() swaps it, retry the request
+                                  on 401: refresh token via OAUTH_TOKEN_URL,
+                                          retry; if refresh fails → mark expired, switch
+                                  on 200: parse `anthropic-ratelimit-*` headers,
+                                          update accountStateManager + utilizationHistory
+```
+
+The shell `install.sh` writes `export ANTHROPIC_BASE_URL=http://localhost:3334` into the user's rc file and auto-starts `dashboard.mjs` on every new shell. That env var is the entire integration point with Claude Code — there is no plugin, no SDK hook on the request path.
+
+### Credential storage — the load-bearing detail
+
+Active credentials live in **a single macOS Keychain entry**: service `Claude Code-credentials`, account `$USER`, value is the JSON blob Claude Code itself writes (`{ claudeAiOauth: { accessToken, refreshToken, expiresAt, ... } }`). Saved-but-inactive accounts are JSON files in `accounts/` (one per account) plus a sibling `<name>.label` text file holding the human-readable label. **Switching accounts means: read the JSON file → `security delete-generic-password` → `security add-generic-password` with the new blob.** Because Claude Code re-reads the keychain on each request, every running session sees the swap immediately. There is no IPC; the keychain *is* the IPC.
+
+`detectKeychainService()` (in both `vdm` and `dashboard.mjs`) exists because the service name has changed across Claude Code releases — don't hardcode `Claude Code-credentials`, always go through that helper.
+
+### Runtime state files (gitignored, live next to dashboard.mjs)
+
+| File | Written by | Holds |
+|---|---|---|
+| `config.json` | `saveSettings()` | user settings (rotation strategy, autoSwitch, proxyEnabled, intervals) |
+| `accounts/*.json` | discovery + add | per-account credential blobs |
+| `accounts/*.label` | rename | per-account human label |
+| `account-state.json` | proxy on rate-limit responses | per-token rate-limit state (5h/7d resets, utilization) |
+| `activity-log.json` | `logActivity()` | rolling 500-event ring buffer (UI feed) |
+| `utilization-history.json` | `saveHistoryToDisk()` | 24h + 7d utilization series for trend graphs |
+| `probe-log.json` | `recordProbe()` | rolling 7-day count of HEAD probes (so the cost of probing is itself observable) |
+| `token-usage.json` | `/api/session-start` + `/api/session-stop` hooks | per-session token counters used by the git commit-message trailer |
+| `.dashboard.pid` | `vdm dashboard start` | PID file for the foreground-launched dashboard |
+
+These all use atomic-rename writes in the helpers; don't write directly with `writeFileSync` from new code — copy the existing pattern.
+
+### OAuth refresh
+
+`OAUTH_TOKEN_URL` defaults to `https://platform.claude.com/v1/oauth/token`, `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.
+
+### Rotation strategies
+
+Defined in `lib.mjs` as `ROTATION_STRATEGIES` and implemented by `pickByStrategy()`: `sticky` (only on 429/401), `conserve` (drain already-active windows first, leave dormant accounts dormant — this is the default in `DEFAULT_SETTINGS`), `round-robin` (every N minutes), `spread` (always lowest utilization), `drain-first` (highest 5h utilization first). When you add or change a strategy, update both `ROTATION_STRATEGIES` (the metadata) and `pickByStrategy` (the dispatch) and the UI's strategy dropdown in `renderHTML()`.
+
+### Hooks installed into the user's machine
+
+`install-hooks.sh` is sourced by `install.sh`/`uninstall.sh` and on every `vdm` startup (the migration block at the top of `vdm` re-installs hooks if they're missing). It installs:
+
+1. **Claude Code hooks** (`UserPromptSubmit`, `Stop`) into `~/.claude/settings.json`, pointing at `/api/session-start` and `/api/session-stop` on the dashboard. Hook entries are matched by URL marker so re-install is idempotent.
+2. **Global git `prepare-commit-msg` hook** in `git config --global core.hooksPath` (created at `~/.config/git/hooks/` if not already set). It chains to any pre-existing repo-local or global hook, then queries `/api/token-usage` and appends a `Token-Usage:` trailer. Look for `_VDM_HOOKS_MARKER` and `_VDM_HOOKS_PATH_MARKER` to see how it tracks ownership for clean uninstall.
+
+If you change the hook payload format, update both ends in lock-step: the writer in `install-hooks.sh` and the reader in the `/api/session-*` handlers and `cmd_tokens` in `vdm`.
+
+## Testing
+
+Tests use Node's built-in `node:test` and `node:assert/strict` — no Jest, no mocha, no test config. Two files:
+
+- `test/lib.test.mjs` — unit tests against the pure functions in `lib.mjs`. Add tests here when you add a function to `lib.mjs`.
+- `test/api.test.mjs` — integration tests for the OAuth refresh flow against an in-process mock OAuth server (`createMockOAuthServer`). The pattern is: spin up the mock on `127.0.0.1:0` (random port), point `OAUTH_TOKEN_URL` at it via env, run the flow, assert. Use this pattern for any new test that exercises an outbound HTTP call — never let tests touch the real Anthropic or `platform.claude.com` endpoints.
+
+There is currently no integration test that exercises the full proxy server end-to-end; the proxy is only covered indirectly through `lib.mjs` units. If you find yourself testing proxy logic, first check whether the logic can be extracted to `lib.mjs` as a pure function.
+
+## Conventions worth knowing
+
+- **Zero dependencies is a hard rule.** No `package.json`, no `node_modules/`. If you need something, write it (the project ships its own activity-log ring buffer, utilization-history with sampling, per-account mutex, etc. for this reason).
+- **Two parallel implementations of the same helpers** exist in `vdm` (bash + python3 one-liners) and `dashboard.mjs` (Node) — `detectKeychainService`, `getFingerprint`, `read/writeKeychain`, etc. They MUST stay in sync; if you change behaviour in one, change the other.
+- **The dashboard HTML is in `renderHTML()` in `dashboard.mjs`** as a template string. There is no build step or framework — vanilla JS, fetch calls to `/api/*`. UI changes go directly in that function.
+- **Accounts are auto-discovered**, not manually added. `autoDiscoverAccount()` runs on every proxy request (and on hooks) — it reads the keychain, hashes the access token to a fingerprint, and creates an `accounts/<fp>.json` if none exists. The `vdm add` command is mostly a fallback for headless/CI flows. Don't add a manual-add UI without understanding why discovery is the primary path.
+- **Ports are configurable via `CSW_PORT` (dashboard) and `CSW_PROXY_PORT` (proxy)** — always read them from env, don't hardcode 3333/3334 in new code. Both `vdm` and `dashboard.mjs` honour these.
+- **Activity log is a ring buffer** capped at 500 entries / 7 days (`ACTIVITY_MAX_ENTRIES`, `ACTIVITY_MAX_AGE`). Don't log per-request — log state transitions (switch, rate-limit, refresh, settings change). The set of allowed event types is the `case` list in `renderHTML()` around the activity feed renderer.
+- **Hop-by-hop header rules are explicit.** `HOP_BY_HOP` in `lib.mjs` lists the headers that get stripped on forward. `accept-encoding` is stripped intentionally so the proxy can read uncompressed error bodies — don't "fix" that.
+- **The `.janitor/` directory at the repo root is not a project source folder** — it's runtime state for the `ai-maestro-janitor` plugin used in this user's Claude Code setup, unrelated to vdm's own code. Leave it alone.
