@@ -4234,11 +4234,27 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+// Bind to localhost only — never expose the dashboard or its mutating
+// API surface (`/api/switch`, `/api/refresh`, `/api/remove`, `/api/settings`)
+// to the network. Default Node bind is `::` / `0.0.0.0` which is a
+// multi-user-laptop and accidental-LAN exposure vector.
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`Dashboard running at http://localhost:${PORT}`);
   // Discover any existing keychain token on startup so the dashboard
   // shows accounts immediately (don't wait for the first proxy request)
   autoDiscoverAccount().catch(() => {});
+});
+
+// Without this, a duplicate spawn from the rc-snippet race (two terminals
+// opening within 100 ms) raises an UNHANDLED EADDRINUSE that silently
+// crashes the loser AFTER it has already set up timers. Exit 0 so the
+// already-bound dashboard wins cleanly.
+server.on('error', (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    console.error(`Dashboard port ${PORT} already in use — another instance is already running. Exiting.`);
+    process.exit(0);
+  }
+  throw e;
 });
 
 // ─────────────────────────────────────────────────
@@ -4622,7 +4638,7 @@ function buildForwardHeaders(originalHeaders, token) {
 
 // ── Forward request with timeout ──
 
-function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT) {
+function _forwardToAnthropicRaw(method, path, headers, body, timeout = PROXY_TIMEOUT) {
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: 'api.anthropic.com',
@@ -4635,6 +4651,96 @@ function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT
     if (body.length) req.write(body);
     req.end();
   });
+}
+
+// ── Per-account outbound RPS / concurrency limiter ──
+// Anthropic's anti-abuse heuristics flag burst patterns where many
+// concurrent requests fan onto a single bearer in the same Node tick.
+// With 20 Claude Code instances all routing through the same proxy and
+// the same active token, that is exactly the pattern we present without
+// throttling. We bound:
+//
+//   * concurrency: at most MAX_INFLIGHT_PER_ACCOUNT outstanding upstream
+//     requests per account at any moment (other CC instances queue);
+//   * burst rate: at least MIN_INTERVAL_PER_ACCOUNT_MS between successive
+//     dispatches against the same account (~ MAX_RPS_PER_ACCOUNT sustained).
+//
+// The limiter is keyed by fingerprint, NOT by token, so token rotation
+// during a refresh does not double-count the same account. Falls back to
+// a 'unknown' slot when no Bearer is present (the proxy's own probe /
+// summary calls).
+const MAX_INFLIGHT_PER_ACCOUNT = 4;
+const MIN_INTERVAL_PER_ACCOUNT_MS = 125; // ~8 RPS sustained, well under any per-account hard cap
+const MAX_PERMIT_WAIT_MS = 30_000;
+
+const _accountSlots = new Map(); // fp -> { inflight, lastDispatchAt, waiters: [] }
+
+function _slot(fp) {
+  let s = _accountSlots.get(fp);
+  if (!s) {
+    s = { inflight: 0, lastDispatchAt: 0, waiters: [] };
+    _accountSlots.set(fp, s);
+  }
+  return s;
+}
+
+function _tokenFromHeaders(headers) {
+  const a = headers && (headers.authorization || headers.Authorization || headers['authorization']);
+  if (typeof a !== 'string') return '';
+  const m = a.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : '';
+}
+
+async function acquireAccountPermit(fp) {
+  const s = _slot(fp);
+  if (s.inflight >= MAX_INFLIGHT_PER_ACCOUNT) {
+    // Wait for a permit. Bounded so a wedged limiter cannot pin a request
+    // forever — instead the await rejects and the caller surfaces a 504.
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = s.waiters.indexOf(entry);
+        if (idx !== -1) s.waiters.splice(idx, 1);
+        reject(new Error('account_permit_timeout'));
+      }, MAX_PERMIT_WAIT_MS);
+      const entry = () => { clearTimeout(timer); resolve(); };
+      s.waiters.push(entry);
+    });
+  }
+  s.inflight++;
+  // Spacing gate: prevent burst even if concurrency budget allows it.
+  const since = Date.now() - s.lastDispatchAt;
+  if (since < MIN_INTERVAL_PER_ACCOUNT_MS) {
+    await new Promise(r => setTimeout(r, MIN_INTERVAL_PER_ACCOUNT_MS - since));
+  }
+  s.lastDispatchAt = Date.now();
+}
+
+function releaseAccountPermit(fp) {
+  const s = _slot(fp);
+  s.inflight = Math.max(0, s.inflight - 1);
+  const next = s.waiters.shift();
+  if (next) next();
+}
+
+// Wraps the raw forward in the per-account limiter. Identical signature
+// so call sites are unchanged.
+async function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT) {
+  const tok = _tokenFromHeaders(headers);
+  const fp = tok ? getFingerprintFromToken(tok) : 'unknown';
+  await acquireAccountPermit(fp);
+  try {
+    return await _forwardToAnthropicRaw(method, path, headers, body, timeout);
+  } finally {
+    releaseAccountPermit(fp);
+  }
+}
+
+function getAccountSlotStats() {
+  const out = {};
+  for (const [fp, s] of _accountSlots) {
+    out[fp] = { inflight: s.inflight, queued: s.waiters.length };
+  }
+  return out;
 }
 
 // Drain a response and return the body (for error responses).
@@ -5108,7 +5214,11 @@ let _inflightCount = 0;
 const _requestQueue = [];
 
 function getQueueStats() {
-  return { inflight: _inflightCount, queued: _requestQueue.length };
+  return {
+    inflight: _inflightCount,
+    queued: _requestQueue.length,
+    accountSlots: getAccountSlotStats(),
+  };
 }
 
 function drainSerializationQueue() {
@@ -6779,7 +6889,18 @@ process.on('unhandledRejection', (reason) => {
   try { log('fatal', `Unhandled rejection: ${reason}`); } catch { /* swallow */ }
 });
 
-proxyServer.listen(PROXY_PORT, () => {
+// The proxy MUST be 127.0.0.1-only: it forwards Bearer tokens read from
+// the local Keychain to api.anthropic.com and would happily proxy them
+// for any host that can reach the listening interface.
+proxyServer.listen(PROXY_PORT, '127.0.0.1', () => {
   const s = settings;
   log('info', `API proxy on http://localhost:${PROXY_PORT} (proxy=${s.proxyEnabled ? 'on' : 'off'}, auto-switch=${s.autoSwitch ? 'on' : 'off'}, rotation=${s.rotationStrategy || 'conserve'}, ${loadAllAccountTokens().length} accounts)`);
+});
+
+proxyServer.on('error', (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    log('error', `Proxy port ${PROXY_PORT} already in use — another instance is already running. Exiting.`);
+    process.exit(0);
+  }
+  throw e;
 });
