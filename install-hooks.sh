@@ -239,7 +239,13 @@ fi
 REPO=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git/*$||') ||
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 LAST_TS=$(( $(git log -1 --format=%ct 2>/dev/null || echo 0) * 1000 ))
-USAGE=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/token-usage?repo=${REPO}&since=${LAST_TS}" 2>/dev/null) || exit 0
+# URL-encode the repo path. A path containing `&`, `?`, `#`, `=`, ` `, `+`,
+# or non-ASCII bytes corrupts the query string when interpolated raw —
+# `?repo=/foo/bar&baz` would parse as repo=`/foo/bar`, baz=``, hiding the
+# repo's usage from the dashboard. argv-pass to python avoids any escape
+# issues with the repo path itself.
+REPO_ENC=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$REPO" 2>/dev/null) || REPO_ENC="$REPO"
+USAGE=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/token-usage?repo=${REPO_ENC}&since=${LAST_TS}" 2>/dev/null) || exit 0
 
 # Parse JSON and append trailer if tokens > 0
 python3 -c "

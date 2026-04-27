@@ -1003,7 +1003,11 @@ async function handleAPI(req, res) {
       // Only register new sessions — don't overwrite startedAt on subsequent
       // UserPromptSubmit hooks (otherwise we'd lose usage from earlier prompts)
       if (!pendingSessions.has(sessionId)) {
-        let repo = cwd, branch = '(no git)', commitHash = '';
+        // Sentinel for non-git cwd. Without this every throwaway scratch
+        // directory (`/tmp/foo/bar`, `~/Desktop/notes`) ended up in the
+        // project dropdown as a separate "project" — polluting the list
+        // and making aggregate token-usage useless. (Concern 02.C2.)
+        let repo = '(non-git)', branch = '(no git)', commitHash = '';
         try {
           // Use --git-common-dir to resolve to main repo root (not worktree directory)
           // so worktree sessions group with the parent repo in the dashboard.
@@ -1014,7 +1018,7 @@ async function handleAPI(req, res) {
           }
           branch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
           commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        } catch { /* not a git repo */ }
+        } catch { /* not a git repo — keep sentinel `repo` */ }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
         ensureLocalCommitHook(cwd);
         log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);

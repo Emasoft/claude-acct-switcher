@@ -915,20 +915,25 @@ cmd_tokens() {
     esac
   done
 
-  # Auto-detect repo from cwd if not specified
+  # Auto-detect repo from cwd. Match the dashboard's storage key by using
+  # `--git-common-dir` (worktree-aware: returns the main repo root) instead
+  # of `--show-toplevel` (returns the worktree directory).
   if [[ -z "$repo" ]]; then
-    repo=$(git rev-parse --show-toplevel 2>/dev/null) || true
+    repo=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git/*$||') ||
+      repo=$(git rev-parse --show-toplevel 2>/dev/null) || true
   fi
 
   local since=$(( ($(date +%s) - days * 86400) * 1000 ))
 
-  # Build URL
+  # Build URL. Pass `$repo` / `$branch` to python via argv (sys.argv[1]) —
+  # interpolating them into a single-quoted python source string broke
+  # whenever a path contained an apostrophe (`/Users/foo/O'Brien-project`).
   local url="http://localhost:$DASHBOARD_PORT/api/token-usage?since=$since"
   if [[ -n "$repo" ]]; then
-    url="${url}&repo=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$repo'))" 2>/dev/null)"
+    url="${url}&repo=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$repo" 2>/dev/null)"
   fi
   if [[ -n "$branch" ]]; then
-    url="${url}&branch=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$branch'))" 2>/dev/null)"
+    url="${url}&branch=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$branch" 2>/dev/null)"
   fi
 
   local usage
@@ -947,66 +952,92 @@ cmd_tokens() {
     fi
     echo ""
 
-    python3 -c "
-import json, sys, subprocess, os
+    # Pass $usage and $repo via argv (sys.argv[1] / sys.argv[2]) instead of
+    # interpolating them into a single-quoted python source string. The old
+    # form crashed silently whenever the path contained an apostrophe.
+    python3 -c '
+import json, sys, subprocess
 
-usage = json.loads('''$usage''')
-repo = '$repo'
+usage = json.loads(sys.argv[1])
+repo = sys.argv[2]
 
 if not repo:
-    print('  No repo specified or detected.')
+    print("  No repo specified or detected.")
     sys.exit(0)
 
-# Get git log
 try:
     log = subprocess.check_output(
-        ['git', '-C', repo, 'log', '--format=%H %ct %s', '--reverse'],
-        stderr=subprocess.DEVNULL
-    ).decode().strip().split('\n')
-except:
-    print('  Could not read git log.')
+        ["git", "-C", repo, "log", "--format=%H %ct %s", "--reverse"],
+        stderr=subprocess.DEVNULL,
+    ).decode().strip().split("\n")
+except Exception:
+    print("  Could not read git log.")
     sys.exit(0)
 
 commits = []
 for line in log:
-    if not line.strip(): continue
-    parts = line.split(' ', 2)
+    if not line.strip():
+        continue
+    parts = line.split(" ", 2)
     if len(parts) >= 3:
-        commits.append({'hash': parts[0][:7], 'ts': int(parts[1]) * 1000, 'msg': parts[2]})
+        commits.append({"hash": parts[0][:7], "ts": int(parts[1]) * 1000, "msg": parts[2]})
 
 if not commits:
-    print('  No commits found.')
+    print("  No commits found.")
     sys.exit(0)
 
-# Build buckets: between consecutive commits
+# Bucket strategy:
+#   * Pre-history bucket: e.ts < commits[0].ts. The original code dropped
+#     pre-first-commit usage on the floor (Bug A).
+#   * Per-commit i bucket: commits[i].ts <= e.ts < commits[i+1].ts. The
+#     last commit gets a HALF-OPEN range — uncommitted work is NOT
+#     attributed to it (Bug B in the audit).
+#   * Uncommitted bucket: e.ts >= commits[-1].ts. Strictly after the last
+#     commit, partitioned cleanly so totals do not double-count.
+# Same-second commits (Bug C): bucket i and i+1 with c[i].ts == c[i+1].ts
+# yield an empty range for i. Those entries fall into i+1 deterministically
+# (left-inclusive boundary).
+pre_history = sum(e["inputTokens"] + e["outputTokens"]
+                  for e in usage if e["ts"] < commits[0]["ts"])
+
 buckets = []
+last_idx = len(commits) - 1
 for i, c in enumerate(commits):
-    start_ts = c['ts']
-    end_ts = commits[i+1]['ts'] if i+1 < len(commits) else float('inf')
-    tokens = sum(e['inputTokens'] + e['outputTokens'] for e in usage if start_ts <= e['ts'] < end_ts)
+    start_ts = c["ts"]
+    if i == last_idx:
+        # Last commit covers exactly its own timestamp through the moment
+        # before the uncommitted bucket starts. With the strict `>` below,
+        # equality at commits[-1].ts is included here.
+        end_ts = commits[-1]["ts"] + 1
+    else:
+        end_ts = commits[i + 1]["ts"]
+    tokens = sum(e["inputTokens"] + e["outputTokens"]
+                 for e in usage if start_ts <= e["ts"] < end_ts)
     if tokens > 0:
-        buckets.append({'hash': c['hash'], 'tokens': tokens, 'msg': c['msg'][:60]})
+        buckets.append({"hash": c["hash"], "tokens": tokens, "msg": c["msg"][:60]})
 
-# Uncommitted bucket (after last commit)
-if commits:
-    uncommitted = sum(e['inputTokens'] + e['outputTokens'] for e in usage if e['ts'] >= commits[-1]['ts'])
+uncommitted = sum(e["inputTokens"] + e["outputTokens"]
+                  for e in usage if e["ts"] > commits[-1]["ts"])
 
-if not buckets and uncommitted <= 0:
-    print('  No token usage found in this period.')
+if pre_history <= 0 and not buckets and uncommitted <= 0:
+    print("  No token usage found in this period.")
     sys.exit(0)
+
+if pre_history > 0:
+    print(f"  (pre-history)  {pre_history:>10,} tok  before first commit")
 
 for b in buckets:
-    tok = f'{b[\"tokens\"]:>10,}'
-    print(f'  {b[\"hash\"]}  {tok} tok  {b[\"msg\"]}')
+    tok = f"{b[\"tokens\"]:>10,}"
+    print(f"  {b[\"hash\"]}  {tok} tok  {b[\"msg\"]}")
 
 if uncommitted > 0:
-    tok = f'{uncommitted:>10,}'
-    print(f'  (uncommitted)  {tok} tok')
+    tok = f"{uncommitted:>10,}"
+    print(f"  (uncommitted)  {tok} tok")
 
-total = sum(b['tokens'] for b in buckets) + (uncommitted if uncommitted > 0 else 0)
-print(f'')
-print(f'  Total: {total:,} tokens')
-" 2>/dev/null
+total = pre_history + sum(b["tokens"] for b in buckets) + uncommitted
+print("")
+print(f"  Total: {total:,} tokens")
+' "$usage" "$repo" 2>/dev/null
     echo ""
     return 0
   fi
