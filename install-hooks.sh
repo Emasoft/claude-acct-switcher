@@ -93,6 +93,45 @@ if os.path.exists(settings_file):
 if not isinstance(settings, dict):
     settings = {}
 
+# Phase G — managed-settings preflight. If an enterprise admin has set
+# allowManagedHooksOnly:true (or disableAllHooks:true), every user-level
+# hook vdm writes will be silently dropped at session start. The proxy keeps
+# working (it sits below Claude Code via ANTHROPIC_BASE_URL) but
+# token-tracking, commit trailers, and session boundaries all stop firing.
+# We can't override the policy — only emit a warning so users notice.
+# allowedHttpHookUrls is a separate allowlist; if it's set and doesn't
+# permit our localhost URL, hooks are also silently dropped.
+def _peek_managed_settings():
+    candidates = [
+        '/Library/Application Support/ClaudeCode/managed-settings.json',  # macOS
+        '/etc/claude-code/managed-settings.json',                         # Linux/WSL
+    ]
+    drop_dir = '/Library/Application Support/ClaudeCode/managed-settings.d'  # macOS drop-in
+    for p in candidates:
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as f:
+                m = json.load(f)
+            if not isinstance(m, dict):
+                continue
+            if m.get('disableAllHooks') is True:
+                print(f'  [vdm] WARNING: {p} has disableAllHooks:true — vdm hooks will not fire', file=sys.stderr)
+            if m.get('allowManagedHooksOnly') is True:
+                print(f'  [vdm] WARNING: {p} has allowManagedHooksOnly:true — vdm hooks will be silently dropped at session start. Proxy still works; token tracking disabled.', file=sys.stderr)
+            allowed = m.get('allowedHttpHookUrls')
+            if isinstance(allowed, list) and allowed:
+                # Crude wildcard match (supports trailing *).
+                target = f'http://localhost:{port}'
+                ok = any(u.replace('*', '').startswith(target) for u in allowed if isinstance(u, str))
+                if not ok:
+                    print(f'  [vdm] WARNING: {p} allowedHttpHookUrls does not permit {target}/* — vdm hooks will be silently dropped', file=sys.stderr)
+        except Exception:
+            # Don't fail install on managed-settings parse errors.
+            pass
+
+_peek_managed_settings()
+
 # Ensure hooks structure
 if 'hooks' not in settings:
     settings['hooks'] = {}
@@ -188,8 +227,27 @@ def ensure_hook(event_name, url):
 #   * TaskCompleted      — pairs with TaskCreated to close out the
 #                          activeTaskIds set on the parent session.
 #   * TeammateIdle       — agent-teams idle marker. Activity-feed-only.
+#   * Notification       — Phase G: hooks "auth_success" to refresh keychain
+#                          immediately (otherwise vdm picks up the new
+#                          token only on the next proxy request via
+#                          autoDiscoverAccount). Also surfaces "idle_prompt"
+#                          and "permission_prompt" in activity feed.
+#   * ConfigChange       — Phase G: detects external rewrites of
+#                          ~/.claude/settings.json (e.g. devcontainer rebuild,
+#                          another tool installing hooks). vdm logs the event
+#                          so users notice when their hook block is stomped.
+#   * UserPromptExpansion— Phase G: fires on /skill-name and @-mention
+#                          expansion. Lets the activity feed show "skill X
+#                          ran" alongside the regular prompt.
+#
+# Phase G note: SessionStart was REMOVED from this list. The hook spec only
+# allows type: "command" or "mcp_tool" for SessionStart; vdm's HTTP-type
+# entry was being silently rejected by Claude Code. The duplicate
+# UserPromptSubmit subscription (which posts to the same /api/session-start
+# URL) covers the session-anchor signal with at most one prompt of latency.
+# Re-adding SessionStart would require a command-type hook (e.g. curl) which
+# adds a per-session-startup process spawn for marginal benefit.
 events = [
-    ('SessionStart',     f'http://localhost:{port}/api/session-start'),
     ('UserPromptSubmit', f'http://localhost:{port}/api/session-start'),
     ('Stop',             f'http://localhost:{port}/api/session-stop'),
     ('StopFailure',      f'http://localhost:{port}/api/session-stop'),
@@ -199,6 +257,10 @@ events = [
     ('PreCompact',       f'http://localhost:{port}/api/pre-compact'),
     ('PostCompact',      f'http://localhost:{port}/api/post-compact'),
     ('CwdChanged',       f'http://localhost:{port}/api/cwd-changed'),
+    # Phase G — auth + config + skill-expansion observability.
+    ('Notification',     f'http://localhost:{port}/api/notification'),
+    ('ConfigChange',     f'http://localhost:{port}/api/config-change'),
+    ('UserPromptExpansion', f'http://localhost:{port}/api/user-prompt-expansion'),
     # Phase E — worktree + agent-team event coverage. WorktreeRemove is
     # the load-bearing one: a session in a removed worktree must invalidate
     # its branch attribution. The others are mostly for activity-feed
@@ -311,6 +373,9 @@ def remove_hook(event_name, url):
 # absent now, a previous install with the flag enabled may have written
 # the entry. Idempotent uninstall must clean up regardless.
 events = [
+    # Phase G note: SessionStart removed from install but we KEEP it in
+    # uninstall in case a previous install (pre-Phase-G) wrote the entry.
+    # Idempotent uninstall must clean up legacy state regardless.
     ('SessionStart',     f'http://localhost:{port}/api/session-start'),
     ('UserPromptSubmit', f'http://localhost:{port}/api/session-start'),
     ('Stop',             f'http://localhost:{port}/api/session-stop'),
@@ -328,6 +393,10 @@ events = [
     ('TaskCreated',      f'http://localhost:{port}/api/task-created'),
     ('TaskCompleted',    f'http://localhost:{port}/api/task-completed'),
     ('TeammateIdle',     f'http://localhost:{port}/api/teammate-idle'),
+    # Phase G — auth + config + skill-expansion observability.
+    ('Notification',     f'http://localhost:{port}/api/notification'),
+    ('ConfigChange',     f'http://localhost:{port}/api/config-change'),
+    ('UserPromptExpansion', f'http://localhost:{port}/api/user-prompt-expansion'),
 ]
 
 for event_name, url in events:

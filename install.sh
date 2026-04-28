@@ -80,6 +80,46 @@ fi
 echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS, python3)"
 echo ""
 
+# ── Phase G: env-var conflict preflight ──
+# Five env vars silently bypass vdm's keychain rotation. If any of these is
+# set in the user's shell, Claude Code will read it FIRST and never touch
+# the keychain — vdm's whole credential-rotation model becomes a no-op.
+# Four cloud-provider env vars route Claude Code to a different backend
+# entirely (Bedrock / Vertex / Foundry / Mantle), bypassing the proxy.
+# We can't fix any of these — only emit a clear warning so users notice.
+_vdm_warned_envs=()
+for _v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_OAUTH_TOKEN \
+          CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN; do
+  if [[ -n "${!_v:-}" ]]; then
+    _vdm_warned_envs+=("$_v")
+  fi
+done
+if [[ ${#_vdm_warned_envs[@]} -gt 0 ]]; then
+  echo -e "  ${YELLOW}⚠${NC} ${BOLD}Env vars set that bypass vdm's keychain rotation:${NC}"
+  for _v in "${_vdm_warned_envs[@]}"; do
+    echo -e "      ${YELLOW}$_v${NC} — Claude Code will read this token instead of the keychain"
+  done
+  echo -e "      ${DIM}vdm will still proxy traffic, but credential switching becomes a no-op.${NC}"
+  echo -e "      ${DIM}Unset these to use vdm normally, or accept that the active account is fixed.${NC}"
+  echo ""
+fi
+
+_vdm_cloud_envs=()
+for _v in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+          CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE; do
+  if [[ -n "${!_v:-}" ]]; then
+    _vdm_cloud_envs+=("$_v")
+  fi
+done
+if [[ ${#_vdm_cloud_envs[@]} -gt 0 ]]; then
+  echo -e "  ${RED}⚠${NC} ${BOLD}Cloud-provider env vars set:${NC}"
+  for _v in "${_vdm_cloud_envs[@]}"; do
+    echo -e "      ${RED}$_v${NC} — Claude Code routes to a non-Anthropic backend, bypassing vdm entirely"
+  done
+  echo -e "      ${DIM}vdm targets api.anthropic.com only. Unset these to route through vdm.${NC}"
+  echo ""
+fi
+
 # ── Install files ──
 
 mkdir -p "$INSTALL_DIR"

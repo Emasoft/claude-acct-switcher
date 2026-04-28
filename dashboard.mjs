@@ -1700,6 +1700,101 @@ async function handleAPI(req, res) {
     return true;
   }
 
+  // Phase G — /api/notification: Notification hook fires for permission
+  // prompts, idle prompts, auth-success, and elicitation dialogs. The
+  // load-bearing case is `auth_success` — when a user runs /login, this
+  // hook fires immediately and lets vdm invalidate its keychain cache so
+  // the next proxy request reads the freshly-rotated token instead of
+  // the stale one. (Without this, the user has to wait up to 30 seconds
+  // for Claude Code's own keychain cache + vdm's KC_CACHE_TTL to expire.)
+  if (url.pathname === '/api/notification' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      if (!data || typeof data !== 'object') {
+        json(res, { ok: false, error: 'payload must be an object' }, 400);
+        return true;
+      }
+      const sessionId = typeof data.session_id === 'string' ? data.session_id : null;
+      const notifType = typeof data.notification_type === 'string' ? data.notification_type : 'unknown';
+      const notifMsg = typeof data.notification_message === 'string'
+        ? data.notification_message.slice(0, 200)
+        : '';
+      // auth_success: invalidate caches so vdm picks up new keychain state.
+      // Other types are activity-feed only.
+      if (notifType === 'auth_success') {
+        invalidateTokenCache();
+        invalidateAccountsCache();
+        log('tokens', `Auth success — keychain caches invalidated (session ${sessionId ? sessionId.slice(0, 8) + '…' : 'unknown'})`);
+        logActivity('auth_success', `User authenticated${notifMsg ? ': ' + notifMsg : ''}`);
+      } else {
+        logActivity(`notification_${notifType}`, notifMsg || `Notification: ${notifType}`);
+      }
+      json(res, { ok: true, type: notifType });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase G — /api/config-change: ConfigChange hook fires when settings.json
+  // changes mid-session. Useful because vdm itself rewrites the file when
+  // toggling per-tool-attribution.flag — we use this to detect when an
+  // EXTERNAL tool (devcontainer rebuild, Husky, another plugin install) has
+  // stomped on settings and may have removed vdm's hook block. The activity
+  // feed entry tells the user "your hooks may need re-installing".
+  if (url.pathname === '/api/config-change' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const settingsKey = (data && typeof data.setting_key === 'string') ? data.setting_key : '';
+      const filePath = (data && typeof data.file_path === 'string') ? data.file_path : '';
+      const detail = settingsKey
+        ? `key=${settingsKey}${filePath ? ' (' + filePath + ')' : ''}`
+        : filePath || 'unknown change';
+      logActivity('config_change', `Settings changed: ${detail}`);
+      log('tokens', `ConfigChange: ${detail}`);
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase G — /api/user-prompt-expansion: UserPromptExpansion fires after
+  // /skill-name or @-mention expansion. We log the expanded skill / mention
+  // to the activity feed so users can see what skill ran for a given turn.
+  // Per-skill token attribution (binding the next Stop's token deltas to
+  // this skill name) is a Phase H follow-up — would require a per-session
+  // state machine to remember "the next Stop fires for skill X".
+  if (url.pathname === '/api/user-prompt-expansion' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const expansionType = (data && typeof data.expansion_type === 'string') ? data.expansion_type : 'unknown';
+      const commandName = (data && typeof data.command_name === 'string') ? data.command_name : '';
+      const commandSource = (data && typeof data.command_source === 'string') ? data.command_source : '';
+      const sessionId = (data && typeof data.session_id === 'string') ? data.session_id : '';
+      const detail = commandName
+        ? `${expansionType}:${commandName}${commandSource ? ' (' + commandSource + ')' : ''}`
+        : expansionType;
+      logActivity('user_prompt_expansion', `Expansion: ${detail}`);
+      if (sessionId && commandName) {
+        log('tokens', `UserPromptExpansion: ${sessionId.slice(0, 8)}… ran ${detail}`);
+      }
+      json(res, { ok: true, type: expansionType });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
   // Phase E — /api/token-usage/by-tool: aggregate token usage by tool name
   // (with mcpServer disambiguation) for the dashboard's Tool Breakdown
   // panel. Range is parsed from query string (start, end as ms-since-epoch);
