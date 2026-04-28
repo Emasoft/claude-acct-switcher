@@ -42,6 +42,11 @@ import {
   aggregateByTool,
   // Phase G — transcript-path → parent_session derivation
   parseParentSessionFromTranscriptPath,
+  // Phase H — OTLP/HTTP/JSON parsers
+  unwrapOtlpValue,
+  otlpAttrsToObject,
+  parseOtlpLogs,
+  parseOtlpMetrics,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -2029,5 +2034,239 @@ describe('aggregateByTool', () => {
     assert.equal(out[0].inputTokens, 100);
     assert.equal(out[0].outputTokens, 50);
     assert.equal(out[0].count, 2);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Phase H — OTLP/HTTP/JSON parser tests
+// ─────────────────────────────────────────────────
+
+describe('unwrapOtlpValue', () => {
+  it('unwraps stringValue', () => {
+    assert.equal(unwrapOtlpValue({ stringValue: 'hello' }), 'hello');
+  });
+  it('unwraps intValue (string-encoded int64)', () => {
+    assert.equal(unwrapOtlpValue({ intValue: '42' }), 42);
+    assert.equal(unwrapOtlpValue({ intValue: 100 }), 100);
+  });
+  it('unwraps doubleValue', () => {
+    assert.equal(unwrapOtlpValue({ doubleValue: 3.14 }), 3.14);
+  });
+  it('unwraps boolValue', () => {
+    assert.equal(unwrapOtlpValue({ boolValue: true }), true);
+    assert.equal(unwrapOtlpValue({ boolValue: false }), false);
+  });
+  it('unwraps arrayValue recursively', () => {
+    const v = {
+      arrayValue: { values: [{ stringValue: 'a' }, { intValue: '1' }, { boolValue: true }] },
+    };
+    assert.deepEqual(unwrapOtlpValue(v), ['a', 1, true]);
+  });
+  it('unwraps nested kvlistValue', () => {
+    const v = {
+      kvlistValue: {
+        values: [
+          { key: 'name', value: { stringValue: 'claude' } },
+          { key: 'count', value: { intValue: '7' } },
+        ],
+      },
+    };
+    assert.deepEqual(unwrapOtlpValue(v), { name: 'claude', count: 7 });
+  });
+  it('returns null for empty / malformed values', () => {
+    assert.equal(unwrapOtlpValue(null), null);
+    assert.equal(unwrapOtlpValue(undefined), null);
+    assert.equal(unwrapOtlpValue({}), null);
+    assert.equal(unwrapOtlpValue('not an object'), null);
+  });
+});
+
+describe('otlpAttrsToObject', () => {
+  it('flattens an attribute array to a plain object', () => {
+    const attrs = [
+      { key: 'service.name', value: { stringValue: 'claude_code' } },
+      { key: 'app.version', value: { stringValue: '2.1.121' } },
+      { key: 'session.id', value: { stringValue: 'abc-123' } },
+    ];
+    const obj = otlpAttrsToObject(attrs);
+    assert.equal(obj['service.name'], 'claude_code');
+    assert.equal(obj['session.id'], 'abc-123');
+  });
+  it('skips entries missing key or value', () => {
+    const attrs = [
+      { key: 'a', value: { stringValue: '1' } },
+      { value: { stringValue: 'no-key' } },
+      null,
+      'not an object',
+    ];
+    const obj = otlpAttrsToObject(attrs);
+    assert.equal(Object.keys(obj).length, 1);
+    assert.equal(obj.a, '1');
+  });
+  it('returns empty object on non-array input', () => {
+    assert.deepEqual(otlpAttrsToObject(null), {});
+    assert.deepEqual(otlpAttrsToObject({}), {});
+  });
+});
+
+describe('parseOtlpLogs', () => {
+  it('extracts log records from a Claude Code-shaped payload', () => {
+    const payload = {
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: 'service.name', value: { stringValue: 'claude_code' } },
+              { key: 'user.account_id', value: { stringValue: 'user-1' } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: 'com.anthropic.claude_code', version: '2.1.121' },
+              logRecords: [
+                {
+                  timeUnixNano: '1735000000000000000', // ms = 1735000000000
+                  severityText: 'INFO',
+                  severityNumber: 9,
+                  body: { stringValue: 'claude_code.api_request' },
+                  attributes: [
+                    { key: 'model', value: { stringValue: 'claude-opus-4-7' } },
+                    { key: 'input_tokens', value: { intValue: '12345' } },
+                    { key: 'output_tokens', value: { intValue: '6789' } },
+                    { key: 'cache_read_tokens', value: { intValue: '50000' } },
+                    { key: 'cost_usd', value: { doubleValue: 0.5043 } },
+                    { key: 'request_id', value: { stringValue: 'req-abc' } },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const recs = parseOtlpLogs(payload);
+    assert.equal(recs.length, 1);
+    const r = recs[0];
+    assert.equal(r.body, 'claude_code.api_request');
+    assert.equal(r.severity, 'INFO');
+    assert.equal(r.scope, 'com.anthropic.claude_code');
+    assert.equal(r.ts, 1735000000000);
+    // attributes merge resource + record
+    assert.equal(r.attributes['service.name'], 'claude_code');
+    assert.equal(r.attributes.model, 'claude-opus-4-7');
+    assert.equal(r.attributes.input_tokens, 12345);
+    assert.equal(r.attributes.output_tokens, 6789);
+    assert.equal(r.attributes.cache_read_tokens, 50000);
+    assert.equal(r.attributes.cost_usd, 0.5043);
+    assert.equal(r.attributes.request_id, 'req-abc');
+  });
+
+  it('handles missing/optional fields gracefully', () => {
+    const recs = parseOtlpLogs({ resourceLogs: [{ scopeLogs: [{ logRecords: [{}] }] }] });
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].body, null);
+    assert(recs[0].ts > 0); // falls back to Date.now
+  });
+
+  it('returns [] for empty / malformed payload', () => {
+    assert.deepEqual(parseOtlpLogs(null), []);
+    assert.deepEqual(parseOtlpLogs({}), []);
+    assert.deepEqual(parseOtlpLogs({ resourceLogs: 'not an array' }), []);
+  });
+
+  it('iterates multiple resource scopes and records', () => {
+    const payload = {
+      resourceLogs: [
+        {
+          scopeLogs: [
+            { logRecords: [{ body: { stringValue: 'a' } }, { body: { stringValue: 'b' } }] },
+            { logRecords: [{ body: { stringValue: 'c' } }] },
+          ],
+        },
+      ],
+    };
+    const recs = parseOtlpLogs(payload);
+    assert.equal(recs.length, 3);
+    assert.deepEqual(recs.map(r => r.body), ['a', 'b', 'c']);
+  });
+});
+
+describe('parseOtlpMetrics', () => {
+  it('extracts a sum data point (Claude Code token.usage shape)', () => {
+    const payload = {
+      resourceMetrics: [
+        {
+          resource: {
+            attributes: [{ key: 'service.name', value: { stringValue: 'claude_code' } }],
+          },
+          scopeMetrics: [
+            {
+              metrics: [
+                {
+                  name: 'claude_code.token.usage',
+                  sum: {
+                    dataPoints: [
+                      {
+                        timeUnixNano: '1735000000000000000',
+                        asInt: '12345',
+                        attributes: [
+                          { key: 'type', value: { stringValue: 'input' } },
+                          { key: 'model', value: { stringValue: 'claude-sonnet-4-7' } },
+                        ],
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const recs = parseOtlpMetrics(payload);
+    assert.equal(recs.length, 1);
+    const r = recs[0];
+    assert.equal(r.name, 'claude_code.token.usage');
+    assert.equal(r.kind, 'sum');
+    assert.equal(r.value, 12345);
+    assert.equal(r.attributes.type, 'input');
+    assert.equal(r.attributes.model, 'claude-sonnet-4-7');
+    assert.equal(r.attributes['service.name'], 'claude_code'); // resource merged
+  });
+
+  it('extracts gauge and histogram data points', () => {
+    const payload = {
+      resourceMetrics: [
+        {
+          scopeMetrics: [
+            {
+              metrics: [
+                { name: 'claude_code.session.active', gauge: { dataPoints: [{ asInt: '3' }] } },
+                { name: 'claude_code.api_request.duration', histogram: { dataPoints: [{ count: 5, sum: 1234.5 }] } },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const recs = parseOtlpMetrics(payload);
+    assert.equal(recs.length, 2);
+    assert.equal(recs[0].kind, 'gauge');
+    assert.equal(recs[0].value, 3);
+    assert.equal(recs[1].kind, 'histogram');
+    assert.equal(recs[1].value, 5); // count
+  });
+
+  it('returns [] for empty / malformed payload', () => {
+    assert.deepEqual(parseOtlpMetrics(null), []);
+    assert.deepEqual(parseOtlpMetrics({}), []);
+  });
+
+  it('produces null value when no numeric field is present', () => {
+    const recs = parseOtlpMetrics({
+      resourceMetrics: [{ scopeMetrics: [{ metrics: [{ name: 'x', sum: { dataPoints: [{}] } }] }] }],
+    });
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].value, null);
   });
 });

@@ -296,6 +296,9 @@ import {
   parseTaskEventPayload,
   parseTeammateIdlePayload,
   aggregateByTool,
+  // Phase H — OTLP/HTTP/JSON parsers (CSW_OTEL_ENABLED=1)
+  parseOtlpLogs,
+  parseOtlpMetrics,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -1789,6 +1792,43 @@ async function handleAPI(req, res) {
         log('tokens', `UserPromptExpansion: ${sessionId.slice(0, 8)}… ran ${detail}`);
       }
       json(res, { ok: true, type: expansionType });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase H — /api/otel-events: query the in-memory OTel ring buffers.
+  // Read-only; activates when CSW_OTEL_ENABLED=1 (returns empty otherwise).
+  // Query params:
+  //   kind=logs|metrics|both (default: both)
+  //   name=<event-name>      filter by event body (logs) or metric name (metrics)
+  //   limit=<N>              cap result count (default 500, max OTEL_BUFFER_MAX)
+  //   since=<ts-ms>          only entries with ts >= since
+  if (url.pathname === '/api/otel-events' && req.method === 'GET') {
+    try {
+      const kind = url.searchParams.get('kind') || 'both';
+      const nameFilter = url.searchParams.get('name') || '';
+      const sinceStr = url.searchParams.get('since');
+      const limitStr = url.searchParams.get('limit');
+      const since = sinceStr ? Number(sinceStr) : 0;
+      const limit = Math.min(limitStr ? Number(limitStr) : 500, OTEL_BUFFER_MAX);
+      const filter = (rec, isLog) => {
+        if (since && rec.ts < since) return false;
+        if (nameFilter) {
+          const cmp = isLog ? (typeof rec.body === 'string' ? rec.body : '') : rec.name;
+          if (cmp !== nameFilter) return false;
+        }
+        return true;
+      };
+      const out = { ok: true, enabled: OTEL_ENABLED, stats: _otelStats };
+      if (kind === 'logs' || kind === 'both') {
+        out.logs = _otelLogs.filter(r => filter(r, true)).slice(-limit);
+      }
+      if (kind === 'metrics' || kind === 'both') {
+        out.metrics = _otelMetrics.filter(r => filter(r, false)).slice(-limit);
+      }
+      json(res, out);
     } catch (e) {
       json(res, { ok: false, error: e.message }, 500);
     }
@@ -5915,6 +5955,23 @@ const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
 const PROXY_TIMEOUT = parseInt(process.env.CSW_PROXY_TIMEOUT_MS || '900000', 10);          // 15 min
 const REQUEST_DEADLINE_MS = parseInt(process.env.CSW_REQUEST_DEADLINE_MS || '600000', 10); // 10 min
 
+// Phase H — opt-in OTLP/HTTP/JSON receiver for cross-checking vdm's
+// hook-derived counts against Claude Code's first-party telemetry. Off by
+// default (CSW_OTEL_ENABLED=1 to enable). When enabled, opens a third HTTP
+// listener on CSW_OTLP_PORT (default 3335) accepting POST /v1/logs and
+// POST /v1/metrics. The user must also set, in their shell or in
+// ~/.claude/settings.json env block:
+//   CLAUDE_CODE_ENABLE_TELEMETRY=1
+//   OTEL_LOGS_EXPORTER=otlp  OTEL_METRICS_EXPORTER=otlp
+//   OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+//   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3335
+// vdm does NOT auto-mutate settings.json for this — opt-in only because
+// turning telemetry on has privacy implications (the user_prompt event
+// contains prompt text when OTEL_LOG_USER_PROMPTS=1).
+const OTEL_ENABLED = process.env.CSW_OTEL_ENABLED === '1';
+const OTLP_PORT = parseInt(process.env.CSW_OTLP_PORT || '3335', 10);
+const OTEL_BUFFER_MAX = parseInt(process.env.CSW_OTEL_BUFFER_MAX || '5000', 10);
+
 // ── Structured logger ──
 
 // ── Live log streaming (SSE subscribers for `vdm logs`) ──
@@ -9247,3 +9304,117 @@ proxyServer.on('error', (e) => {
   }
   throw e;
 });
+
+// ─────────────────────────────────────────────────
+// Phase H — OTLP/HTTP/JSON receiver (opt-in via CSW_OTEL_ENABLED=1)
+// ─────────────────────────────────────────────────
+//
+// Cross-checks vdm's hook-derived counts against Claude Code's first-party
+// telemetry. The user must (a) set CSW_OTEL_ENABLED=1 in the dashboard env
+// AND (b) configure Claude Code's own telemetry (CLAUDE_CODE_ENABLE_TELEMETRY,
+// OTEL_LOGS_EXPORTER=otlp, OTEL_METRICS_EXPORTER=otlp,
+// OTEL_EXPORTER_OTLP_PROTOCOL=http/json,
+// OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3335).
+//
+// Stored as in-memory ring buffers (not persisted) — this is observability
+// not source-of-truth; if vdm restarts, telemetry resumes from the next
+// upstream OTLP send. Buffer cap configurable via CSW_OTEL_BUFFER_MAX
+// (default 5000 entries each for logs / metrics).
+const _otelLogs = [];     // [{ts, severity, body, scope, attributes}, ...]
+const _otelMetrics = [];  // [{ts, name, value, kind, attributes}, ...]
+let _otelStats = { logs: 0, metrics: 0, errors: 0, lastReceivedAt: 0 };
+
+function _appendOtelLogs(records) {
+  for (const r of records) {
+    _otelLogs.push(r);
+    _otelStats.logs++;
+  }
+  while (_otelLogs.length > OTEL_BUFFER_MAX) _otelLogs.shift();
+}
+
+function _appendOtelMetrics(records) {
+  for (const r of records) {
+    _otelMetrics.push(r);
+    _otelStats.metrics++;
+  }
+  while (_otelMetrics.length > OTEL_BUFFER_MAX) _otelMetrics.shift();
+}
+
+if (OTEL_ENABLED) {
+  const otlpServer = createServer(async (req, res) => {
+    // Only handle the two endpoints we care about; everything else 404s.
+    const u = new URL(req.url, `http://localhost:${OTLP_PORT}`);
+    const isLogs = u.pathname === '/v1/logs';
+    const isMetrics = u.pathname === '/v1/metrics';
+    // Internal status endpoint for the dashboard UI.
+    if (u.pathname === '/internal/stats' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, ..._otelStats, bufferedLogs: _otelLogs.length, bufferedMetrics: _otelMetrics.length }));
+      return;
+    }
+    if (req.method !== 'POST' || (!isLogs && !isMetrics)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+    // Buffer the body. OTLP/HTTP/JSON payloads are small — typical CC export
+    // is < 50 KB; cap at 8 MB for safety.
+    let bytes = 0;
+    const chunks = [];
+    const cap = 8 * 1024 * 1024;
+    let aborted = false;
+    req.on('data', (c) => {
+      if (aborted) return;
+      bytes += c.length;
+      if (bytes > cap) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'payload too large' }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      try {
+        // OTLP/HTTP/JSON declares Content-Type: application/json. Some
+        // exporters use protobuf at the same path; we reject those because
+        // we have no protobuf parser (would violate zero-deps).
+        const ct = (req.headers['content-type'] || '').toLowerCase();
+        if (!ct.includes('application/json')) {
+          res.writeHead(415, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unsupported media type — vdm OTLP receiver only accepts application/json (set OTEL_EXPORTER_OTLP_PROTOCOL=http/json)' }));
+          return;
+        }
+        const body = Buffer.concat(chunks).toString('utf8');
+        const payload = JSON.parse(body);
+        const records = isLogs ? parseOtlpLogs(payload) : parseOtlpMetrics(payload);
+        if (isLogs) _appendOtelLogs(records);
+        else _appendOtelMetrics(records);
+        _otelStats.lastReceivedAt = Date.now();
+        // OTLP wants the partial-success shape; we accept everything.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      } catch (e) {
+        _otelStats.errors++;
+        log('warn', `OTLP parse error: ${e.message}`);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'parse error: ' + e.message }));
+      }
+    });
+    req.on('error', () => { /* socket closed early — drop */ });
+  });
+
+  otlpServer.listen(OTLP_PORT, '127.0.0.1', () => {
+    log('info', `OTLP/HTTP/JSON receiver on http://localhost:${OTLP_PORT} (logs at /v1/logs, metrics at /v1/metrics; buffer cap ${OTEL_BUFFER_MAX})`);
+  });
+
+  otlpServer.on('error', (e) => {
+    if (e && e.code === 'EADDRINUSE') {
+      log('error', `OTLP port ${OTLP_PORT} already in use — set CSW_OTLP_PORT to an unused port. Continuing without OTel.`);
+      return;
+    }
+    log('error', `OTLP server error: ${e.message}`);
+  });
+}

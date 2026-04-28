@@ -1415,3 +1415,176 @@ export function aggregateByTool(rows, range = null) {
   }
   return Array.from(buckets.values()).sort((a, b) => b.totalTokens - a.totalTokens);
 }
+
+// ─── Phase H — OTLP/HTTP/JSON parser helpers ───
+//
+// vdm exposes an opt-in OTLP receiver (CSW_OTEL_ENABLED=1) so users can
+// cross-check vdm's hook-derived token counts against Claude Code's
+// first-party telemetry. We support the JSON-flavoured OTLP protocol only
+// (http/json), not protobuf — JSON is widely understood, is what most
+// users default to, and avoids pulling in a protobuf dependency (which
+// would violate vdm's zero-deps rule anyway).
+//
+// Reference shape (subset of the OTLP/HTTP/JSON v1 schema):
+//   POST /v1/logs
+//   {
+//     "resourceLogs": [
+//       {
+//         "resource":  { "attributes": [ {key, value:{...}}, ... ] },
+//         "scopeLogs": [
+//           { "scope": {...},
+//             "logRecords": [
+//               { "timeUnixNano": "169...", "severityNumber": 9,
+//                 "severityText": "INFO",
+//                 "body": { "stringValue": "claude_code.api_request" },
+//                 "attributes": [...] } ]
+//           }
+//         ]
+//       }
+//     ]
+//   }
+//
+// The parsers below are FORGIVING — Claude Code's exact payload shape can
+// vary by version, so we accept any reasonable subset of the schema and
+// flatten attributes into a plain JS object for downstream queries.
+
+/**
+ * Phase H — Convert one OTLP attribute-value object to a plain JS scalar.
+ * OTLP wraps every value in a typed envelope: {stringValue, intValue,
+ * doubleValue, boolValue, arrayValue, kvlistValue, bytesValue}. We unwrap
+ * recursively so downstream code sees just numbers/strings/etc.
+ */
+export function unwrapOtlpValue(v) {
+  if (!v || typeof v !== 'object') return null;
+  if (typeof v.stringValue === 'string') return v.stringValue;
+  // intValue is documented as a string-encoded int64 (JSON has no 64-bit
+  // ints) — accept either form and return a JS number when safe.
+  if (v.intValue !== undefined && v.intValue !== null) {
+    const n = typeof v.intValue === 'string' ? Number(v.intValue) : v.intValue;
+    return Number.isFinite(n) ? n : null;
+  }
+  if (typeof v.doubleValue === 'number') return v.doubleValue;
+  if (typeof v.boolValue === 'boolean') return v.boolValue;
+  if (Array.isArray(v.arrayValue?.values)) {
+    return v.arrayValue.values.map(unwrapOtlpValue);
+  }
+  if (Array.isArray(v.kvlistValue?.values)) {
+    return otlpAttrsToObject(v.kvlistValue.values);
+  }
+  if (typeof v.bytesValue === 'string') return v.bytesValue; // base64 — keep as-is
+  return null;
+}
+
+/**
+ * Phase H — Flatten an OTLP attributes array (`[{key, value}, ...]`) into a
+ * plain object. Last-write-wins on duplicate keys (rare, but possible).
+ */
+export function otlpAttrsToObject(attrs) {
+  const out = {};
+  if (!Array.isArray(attrs)) return out;
+  for (const a of attrs) {
+    if (!a || typeof a !== 'object' || typeof a.key !== 'string') continue;
+    out[a.key] = unwrapOtlpValue(a.value);
+  }
+  return out;
+}
+
+/**
+ * Phase H — Parse an OTLP/HTTP/JSON `ExportLogsServiceRequest` into a flat
+ * array of records, each: { ts, severity, body, resource, scope, attributes }.
+ *
+ * `ts` is a JS Date.now()-style number in ms. OTLP carries time in Unix
+ * nanoseconds (string), so we divide by 1e6. If `timeUnixNano` is missing
+ * or unparseable we fall back to the current wall-clock time.
+ *
+ * `body` is the unwrapped Body field (commonly a string for events;
+ * structured logs would yield an object).
+ *
+ * `attributes` merges the LogRecord-level attrs with resource+scope context
+ * (resource attrs are duplicated onto each record so downstream queries can
+ * filter by `service.name` / `user.account_id` / etc. without cross-walks).
+ */
+export function parseOtlpLogs(payload) {
+  const out = [];
+  if (!payload || typeof payload !== 'object') return out;
+  const resourceLogs = Array.isArray(payload.resourceLogs) ? payload.resourceLogs : [];
+  for (const rl of resourceLogs) {
+    const resourceAttrs = otlpAttrsToObject(rl?.resource?.attributes);
+    const scopeLogs = Array.isArray(rl?.scopeLogs) ? rl.scopeLogs : [];
+    for (const sl of scopeLogs) {
+      const scopeName = sl?.scope?.name || '';
+      const logRecords = Array.isArray(sl?.logRecords) ? sl.logRecords : [];
+      for (const lr of logRecords) {
+        const recordAttrs = otlpAttrsToObject(lr.attributes);
+        // OTLP nanos are encoded as strings (JSON int64 limitation). Be
+        // generous about format: accept string OR number.
+        const nanos = lr.timeUnixNano !== undefined ? Number(lr.timeUnixNano) : 0;
+        const ts = nanos > 0 && Number.isFinite(nanos) ? Math.floor(nanos / 1e6) : Date.now();
+        out.push({
+          ts,
+          severity: lr.severityText || (lr.severityNumber != null ? String(lr.severityNumber) : ''),
+          body: unwrapOtlpValue(lr.body),
+          scope: scopeName,
+          resource: resourceAttrs,
+          attributes: { ...resourceAttrs, ...recordAttrs },
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Phase H — Parse an OTLP/HTTP/JSON `ExportMetricsServiceRequest` into a
+ * flat array of data-point records: { ts, name, value, attributes, kind }.
+ *
+ * Supports `sum`, `gauge`, `histogram` (count only), `summary` (sum only).
+ * Histograms / summaries lose their distribution information; vdm is
+ * interested in totals (token counts), not buckets.
+ */
+export function parseOtlpMetrics(payload) {
+  const out = [];
+  if (!payload || typeof payload !== 'object') return out;
+  const resourceMetrics = Array.isArray(payload.resourceMetrics) ? payload.resourceMetrics : [];
+  for (const rm of resourceMetrics) {
+    const resourceAttrs = otlpAttrsToObject(rm?.resource?.attributes);
+    const scopeMetrics = Array.isArray(rm?.scopeMetrics) ? rm.scopeMetrics : [];
+    for (const sm of scopeMetrics) {
+      const metrics = Array.isArray(sm?.metrics) ? sm.metrics : [];
+      for (const m of metrics) {
+        const name = m.name || '';
+        const dataPoints =
+          (m.sum?.dataPoints) ||
+          (m.gauge?.dataPoints) ||
+          (m.histogram?.dataPoints) ||
+          (m.exponentialHistogram?.dataPoints) ||
+          (m.summary?.dataPoints) ||
+          [];
+        const kind = m.sum ? 'sum' : m.gauge ? 'gauge'
+          : m.histogram ? 'histogram'
+          : m.exponentialHistogram ? 'expHistogram'
+          : m.summary ? 'summary' : 'unknown';
+        for (const dp of dataPoints) {
+          // For sum/gauge: asInt or asDouble. For histogram/summary: count.
+          let value = null;
+          if (dp.asDouble !== undefined) value = Number(dp.asDouble);
+          else if (dp.asInt !== undefined) value = Number(dp.asInt);
+          else if (dp.count !== undefined) value = Number(dp.count);
+          else if (dp.sum !== undefined) value = Number(dp.sum);
+          if (value !== null && !Number.isFinite(value)) value = null;
+          const dpAttrs = otlpAttrsToObject(dp.attributes);
+          const nanos = dp.timeUnixNano !== undefined ? Number(dp.timeUnixNano) : 0;
+          const ts = nanos > 0 && Number.isFinite(nanos) ? Math.floor(nanos / 1e6) : Date.now();
+          out.push({
+            ts,
+            name,
+            value,
+            kind,
+            attributes: { ...resourceAttrs, ...dpAttrs },
+          });
+        }
+      }
+    }
+  }
+  return out;
+}

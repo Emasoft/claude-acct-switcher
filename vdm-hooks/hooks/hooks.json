@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/session-start", "timeout": 5 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/session-stop", "timeout": 5 }] }
+    ],
+    "StopFailure": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/session-stop", "timeout": 5 }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/session-stop", "timeout": 5 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/session-end", "timeout": 5 }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/subagent-start", "timeout": 5 }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/pre-compact", "timeout": 5 }] }
+    ],
+    "PostCompact": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/post-compact", "timeout": 5 }] }
+    ],
+    "CwdChanged": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/cwd-changed", "timeout": 5 }] }
+    ],
+    "WorktreeCreate": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/worktree-create", "timeout": 5 }] }
+    ],
+    "WorktreeRemove": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/worktree-remove", "timeout": 5 }] }
+    ],
+    "TaskCreated": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/task-created", "timeout": 5 }] }
+    ],
+    "TaskCompleted": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/task-completed", "timeout": 5 }] }
+    ],
+    "TeammateIdle": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/teammate-idle", "timeout": 5 }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/notification", "timeout": 5 }] }
+    ],
+    "ConfigChange": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/config-change", "timeout": 5 }] }
+    ],
+    "UserPromptExpansion": [
+      { "hooks": [{ "type": "http", "url": "http://localhost:3333/api/user-prompt-expansion", "timeout": 5 }] }
+    ]
+  }
+}
