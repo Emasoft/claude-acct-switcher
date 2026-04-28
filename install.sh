@@ -360,6 +360,22 @@ if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   install_hooks && echo -e "  ${GREEN}✓${NC} Token tracking hooks installed" || true
 fi
 
+# ── Install user slash commands (~/.claude/commands/) ──
+# Each command is a single .md file with frontmatter + body. Install
+# is idempotent: cp -f overwrites prior copies so an upgrade picks up
+# the new content. Uninstall removes the files we copied here, leaving
+# unrelated commands alone.
+COMMANDS_SRC_DIR="$SCRIPT_DIR/commands"
+COMMANDS_DST_DIR="$HOME/.claude/commands"
+if [[ -d "$COMMANDS_SRC_DIR" ]]; then
+  mkdir -p "$COMMANDS_DST_DIR"
+  for cmd_file in "$COMMANDS_SRC_DIR"/*.md; do
+    [[ -f "$cmd_file" ]] || continue
+    cp -f "$cmd_file" "$COMMANDS_DST_DIR/"
+    echo -e "  ${GREEN}✓${NC} Installed slash command ${CYAN}/$(basename "$cmd_file" .md)${NC}"
+  done
+fi
+
 echo ""
 echo -e "  ${BOLD}${GREEN}Installation complete!${NC}"
 echo ""

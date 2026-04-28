@@ -29,25 +29,35 @@ echo -e "    1. Stop the running dashboard/proxy"
 echo -e "    2. Remove the shell config block from your shell rc file"
 echo -e "    3. Remove the ${CYAN}vdm${NC} symlink from PATH"
 echo -e "    4. Remove ${CYAN}$INSTALL_DIR${NC}"
+echo -e "    5. Optionally delete saved ${CYAN}vdm-account-*${NC} Keychain entries"
+echo -e "    6. Remove vdm-installed slash commands from ${CYAN}~/.claude/commands/${NC}"
 echo ""
 
-# Track whether the user explicitly chose to KEEP saved account profiles
-# (the cached refresh-token JSONs in $INSTALL_DIR/accounts/). Default to
-# preserve — these files are user data, not vdm-owned scaffolding, and
-# blowing them away as a side-effect of "uninstall the tool" loses every
-# saved login. The `rm -rf $INSTALL_DIR` step at section 5 honours this
-# flag by relocating accounts/ outside the install dir before deletion.
+# Track whether the user explicitly chose to KEEP saved account profiles.
+# Saved accounts live in the macOS Keychain as `vdm-account-*` entries
+# (no longer plaintext files). Default to preserve — these are user data,
+# not vdm-owned scaffolding. The keychain cleanup step at section 5b
+# honours this flag.
 preserve_accounts=true
 ACCT_COUNT=0
 
-if [[ -d "$INSTALL_DIR/accounts" ]]; then
-  ACCT_COUNT=$(find "$INSTALL_DIR/accounts" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
-  if [[ "$ACCT_COUNT" -gt 0 ]]; then
-    echo -e "  ${YELLOW}Note:${NC} You have ${BOLD}$ACCT_COUNT saved account profile(s)${NC} in $INSTALL_DIR/accounts/"
-    echo -e "  ${DIM}(These hold OAuth refresh tokens vdm cached for fast switching.${NC}"
-    echo -e "  ${DIM} Your active Keychain entry written by Claude Code itself is not touched.)${NC}"
-    echo ""
-  fi
+# Count saved keychain entries. `security dump-keychain` lists every
+# generic-password entry in the user's login keychain; we filter by the
+# vdm-account- prefix and count distinct names.
+_VDM_ACCOUNT_NAMES_RAW="$(security dump-keychain 2>/dev/null \
+  | grep -E '"svce"<blob>="vdm-account-' \
+  | sed -E 's/.*"svce"<blob>="vdm-account-([^"]+)".*/\1/' \
+  | grep -E '^[a-zA-Z0-9._@-]+$' \
+  | sort -u || true)"
+if [[ -n "$_VDM_ACCOUNT_NAMES_RAW" ]]; then
+  ACCT_COUNT=$(printf '%s\n' "$_VDM_ACCOUNT_NAMES_RAW" | wc -l | tr -d ' ')
+fi
+
+if [[ "$ACCT_COUNT" -gt 0 ]]; then
+  echo -e "  ${YELLOW}Note:${NC} You have ${BOLD}$ACCT_COUNT saved account profile(s)${NC} in the macOS Keychain"
+  echo -e "  ${DIM}(stored as ${CYAN}vdm-account-*${DIM} entries — OAuth tokens cached for fast switching.${NC}"
+  echo -e "  ${DIM} Your ACTIVE Keychain entry written by Claude Code itself is NOT touched.)${NC}"
+  echo ""
 fi
 
 # `read` in a stand-alone statement under `set -e` exits the script on
@@ -68,22 +78,20 @@ fi
 # can't lose all their saved logins by reflexively typing y/Enter.
 if [[ "$ACCT_COUNT" -gt 0 ]]; then
   echo ""
-  echo -e "  ${RED}⚠  SECURITY:${NC} ${BOLD}$ACCT_COUNT${NC} saved account profile(s) in ${CYAN}$INSTALL_DIR/accounts/${NC}"
-  echo -e "     ${BOLD}contain plaintext OAuth access + refresh tokens.${NC}"
-  echo -e "     ${DIM}vdm cached these for fast switching. Anyone with read access to your${NC}"
-  echo -e "     ${DIM}home directory can use them to authenticate against Anthropic as you${NC}"
-  echo -e "     ${DIM}until they expire (access ~ 1 hour, refresh ~ 90 days).${NC}"
+  echo -e "  ${BOLD}$ACCT_COUNT${NC} saved profile(s) live as ${CYAN}vdm-account-*${NC} entries in the macOS Keychain."
+  echo -e "  ${DIM}They hold OAuth access + refresh tokens. Keychain entries are encrypted at rest${NC}"
+  echo -e "  ${DIM}by macOS, but anything with the user's login keychain unlocked can read them.${NC}"
   echo ""
-  echo -e "     ${BOLD}purge${NC}  delete them now (recommended for privacy / shared machines)"
-  echo -e "     ${BOLD}keep${NC}   move to ${DIM}~/.claude/vdm-accounts-backup-<timestamp>/${NC} (so re-install can restore them)"
+  echo -e "     ${BOLD}purge${NC}  delete the keychain entries (recommended on shared machines)"
+  echo -e "     ${BOLD}keep${NC}   leave them in the Keychain (so a re-install picks them up automatically)"
   echo ""
   purge_input=""
   read -rp "  How should saved profiles be handled? [purge / keep] " purge_input || purge_input=""
   if [[ "$purge_input" == "purge" ]]; then
     preserve_accounts=false
-    echo -e "  ${YELLOW}!${NC} Saved profiles will be DELETED with the install dir."
+    echo -e "  ${YELLOW}!${NC} Saved keychain entries will be DELETED."
   else
-    echo -e "  ${GREEN}✓${NC} Saved profiles will be moved to a backup dir (still on disk — not deleted)."
+    echo -e "  ${GREEN}✓${NC} Saved keychain entries will be kept."
   fi
 fi
 
@@ -383,38 +391,59 @@ if [[ -n "$HOOKS_LIB" ]]; then
 fi
 
 # ── 5. Remove install directory ──
-# If the user chose to keep their saved profiles, relocate the accounts/
-# directory (and only that directory) out of $INSTALL_DIR before the
-# `rm -rf`. The relocated path is timestamped so multiple uninstall
-# attempts don't clobber each other. We also copy the .label sidecar
-# files alongside so the rename history survives a future re-install.
+# Account credentials live in the macOS Keychain (vdm-account-*) so
+# there is no plaintext-tokens dir to back up. The accounts/ directory
+# may still hold *.label files (just email/display names — no secrets);
+# those go away with the rest of $INSTALL_DIR.
 ACCOUNTS_BACKUP=""
-if [[ "$preserve_accounts" == "true" ]] && [[ -d "$INSTALL_DIR/accounts" ]] && [[ "$ACCT_COUNT" -gt 0 ]]; then
-  # Use UTC-free local timestamp + GMT offset so two runs in the same
-  # second from different timezones don't collide. The directory lives
-  # next to the install dir under ~/.claude/ so it's easy to find later.
-  _BACKUP_TS="$(date +%Y%m%d_%H%M%S%z 2>/dev/null || date +%Y%m%d_%H%M%S)"
-  ACCOUNTS_BACKUP="$HOME/.claude/vdm-accounts-backup-${_BACKUP_TS}"
-  if mkdir -p "$ACCOUNTS_BACKUP" 2>/dev/null \
-     && cp -R "$INSTALL_DIR/accounts/." "$ACCOUNTS_BACKUP/" 2>/dev/null; then
-    echo -e "  ${GREEN}✓${NC} Saved profiles preserved at ${CYAN}$ACCOUNTS_BACKUP${NC}"
-  else
-    # Backup failed — DO NOT proceed to rm -rf, that would silently lose
-    # the user's data. Tell them, leave $INSTALL_DIR intact, and let them
-    # rescue manually. Subsequent steps still run; the dir simply isn't
-    # removed this pass.
-    echo -e "  ${RED}!${NC} Could not back up accounts/ to $ACCOUNTS_BACKUP — leaving $INSTALL_DIR in place."
-    echo -e "    ${DIM}Move ${INSTALL_DIR}/accounts/ somewhere safe and re-run uninstall.sh.${NC}"
-    ACCOUNTS_BACKUP=""
-    INSTALL_DIR=""   # signal the next block to skip the rm
-  fi
-fi
 
 if [[ -n "$INSTALL_DIR" && -d "$INSTALL_DIR" ]]; then
   rm -rf "$INSTALL_DIR"
   echo -e "  ${GREEN}✓${NC} Removed ${CYAN}$INSTALL_DIR${NC}"
 elif [[ -n "$INSTALL_DIR" ]]; then
   echo -e "  ${DIM}$INSTALL_DIR does not exist (already clean)${NC}"
+fi
+
+# ── 5b. Remove vdm-account-* Keychain entries (when purge requested) ──
+# The earlier prompt asked "purge / keep". Keep is the default and leaves
+# every saved account intact in the keychain so a future re-install picks
+# them up. Purge enumerates every vdm-account-<name> entry and deletes
+# it. We deliberately do not touch the canonical Claude Code-credentials
+# slot here — that's the active account written by Claude Code itself.
+if [[ "$preserve_accounts" != "true" ]] && [[ "$ACCT_COUNT" -gt 0 ]]; then
+  while IFS= read -r _vdm_acct; do
+    [[ -z "$_vdm_acct" ]] && continue
+    security delete-generic-password \
+      -s "vdm-account-${_vdm_acct}" \
+      -a "$USER" >/dev/null 2>&1 \
+      && echo -e "  ${GREEN}✓${NC} Removed Keychain entry ${CYAN}vdm-account-${_vdm_acct}${NC}" \
+      || echo -e "  ${YELLOW}!${NC} Could not remove vdm-account-${_vdm_acct} (may already be gone)"
+  done < <(printf '%s\n' "$_VDM_ACCOUNT_NAMES_RAW")
+elif [[ "$ACCT_COUNT" -gt 0 ]]; then
+  echo -e "  ${DIM}Saved Keychain entries kept (run with 'purge' to delete them).${NC}"
+fi
+
+# ── 5c. Remove vdm-installed slash commands ──
+# install.sh copies every commands/*.md into ~/.claude/commands/. Remove
+# only those copies — leave unrelated user commands untouched. We match
+# by the source file basenames so no other commands are accidentally
+# touched, regardless of what other plugins put in there.
+_UNINST_DIR="$(cd "$(dirname "$0")" && pwd -P 2>/dev/null || true)"
+COMMANDS_SRC_DIR=""
+if [[ -d "$_UNINST_DIR/commands" ]]; then
+  COMMANDS_SRC_DIR="$_UNINST_DIR/commands"
+fi
+if [[ -n "$COMMANDS_SRC_DIR" ]] && [[ -d "$HOME/.claude/commands" ]]; then
+  for cmd_file in "$COMMANDS_SRC_DIR"/*.md; do
+    [[ -f "$cmd_file" ]] || continue
+    local_cmd_name="$(basename "$cmd_file")"
+    target="$HOME/.claude/commands/$local_cmd_name"
+    if [[ -f "$target" ]]; then
+      rm -f -- "$target" \
+        && echo -e "  ${GREEN}✓${NC} Removed slash command ${CYAN}/$(basename "$local_cmd_name" .md)${NC}" \
+        || echo -e "  ${YELLOW}!${NC} Could not remove $target"
+    fi
+  done
 fi
 
 # ── 6. Offer to clean up backup files ──
@@ -576,6 +605,18 @@ for _rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" \
     LEFT_ARTIFACTS+=("$_rc [contains 'claude-account-switcher' marker]")
   fi
 done
+# Slash commands installed by install.sh — anything we recognise from
+# the source `commands/` dir that still exists under ~/.claude/commands/
+# is a leftover.
+if [[ -n "${COMMANDS_SRC_DIR:-}" ]] && [[ -d "$HOME/.claude/commands" ]]; then
+  for _cmd in "$COMMANDS_SRC_DIR"/*.md; do
+    [[ -f "$_cmd" ]] || continue
+    _bn="$(basename "$_cmd")"
+    if [[ -f "$HOME/.claude/commands/$_bn" ]]; then
+      LEFT_ARTIFACTS+=("$HOME/.claude/commands/$_bn [vdm slash command not removed]")
+    fi
+  done
+fi
 
 if (( ${#LEFT_ARTIFACTS[@]} == 0 )); then
   echo -e "  ${GREEN}✓${NC} No vdm artefacts detected. Uninstall is clean."
@@ -587,9 +628,12 @@ else
   echo -e "  ${DIM}(These were not auto-removed — investigate and clean manually.)${NC}"
 fi
 
-# Apple Keychain — read-only audit. vdm itself never adds entries; the only
-# Claude-related entry is `Claude Code-credentials` which is owned by Claude
-# Code. We list it for transparency but explicitly note it's not a vdm leak.
+# Apple Keychain — audit. Two distinct entry classes live here:
+#   1. `Claude Code-credentials` — owned by Claude Code itself, holds the
+#      ACTIVE account. We never touch this.
+#   2. `vdm-account-*` — owned by vdm, one per saved profile. Section 5b
+#      already removed these when the user asked to purge; otherwise they
+#      stay. List anything still on disk so the user can audit.
 KC_ENTRIES=()
 for _svc in "Claude Code-credentials" "Claude" "Claude Code"; do
   if security find-generic-password -s "$_svc" -a "$USER" >/dev/null 2>&1; then
@@ -605,18 +649,34 @@ if (( ${#KC_ENTRIES[@]} > 0 )); then
   echo -e "  ${DIM}To remove: \`claude logout\` (then \`security delete-generic-password -s \"<service>\" -a \"$USER\"\` to verify).${NC}"
 fi
 
+# Re-enumerate vdm-account-* entries in case some survived (purge was
+# declined, or a delete failed).
+VDM_KC_REMAINING=()
+while IFS= read -r _name; do
+  [[ -z "$_name" ]] && continue
+  VDM_KC_REMAINING+=("vdm-account-$_name")
+done < <(security dump-keychain 2>/dev/null \
+  | grep -E '"svce"<blob>="vdm-account-' \
+  | sed -E 's/.*"svce"<blob>="vdm-account-([^"]+)".*/\1/' \
+  | grep -E '^[a-zA-Z0-9._@-]+$' \
+  | sort -u)
+if (( ${#VDM_KC_REMAINING[@]} > 0 )); then
+  echo ""
+  if [[ "$preserve_accounts" == "true" ]]; then
+    echo -e "  ${DIM}vdm-managed Keychain entries kept (run uninstall again with 'purge' to delete):${NC}"
+  else
+    echo -e "  ${YELLOW}⚠${NC}  ${BOLD}vdm-managed Keychain entries STILL PRESENT after purge:${NC}"
+  fi
+  for _e in "${VDM_KC_REMAINING[@]}"; do
+    echo -e "    ${DIM}• \"$_e\" (account: $USER)${NC}"
+  done
+fi
+
 echo ""
 echo -e "  ${BOLD}${GREEN}Uninstall complete.${NC}"
 echo ""
 echo -e "  ${BOLD}To finish:${NC}"
 echo -e "    1. Restart your terminal (or run: ${DIM}source \"${SHELL_RC:-$HOME/.zshrc}\"${NC})"
-echo -e "    2. Your Keychain credentials are untouched  - Claude Code will"
+echo -e "    2. Your active Keychain credentials are untouched  - Claude Code will"
 echo -e "       continue to work normally with whichever account was last active."
-# Tell the user where their saved profiles ended up if we relocated them.
-# They almost certainly want to know — these are the files the next vdm
-# install would auto-discover from. Restoring is a single `cp -R` away.
-if [[ -n "${ACCOUNTS_BACKUP:-}" ]] && [[ -d "$ACCOUNTS_BACKUP" ]]; then
-  echo -e "    3. Saved profiles are at ${CYAN}$ACCOUNTS_BACKUP${NC}"
-  echo -e "       ${DIM}Restore on re-install: cp -R \"$ACCOUNTS_BACKUP\"/. \"\$HOME/.claude/account-switcher/accounts/\"${NC}"
-fi
 echo ""

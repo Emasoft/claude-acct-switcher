@@ -3,7 +3,7 @@
 // Zero dependencies, uses Node.js built-in modules only.
 
 import { createServer } from 'node:http';
-import { readdir, readFile, writeFile, unlink, chmod, rename } from 'node:fs/promises';
+import { readFile, writeFile, unlink, rename } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -212,6 +212,17 @@ let _lastKeychainWriteAt = 0;
 // while > 0.
 let _refreshesInProgress = 0;
 
+// Saved-accounts cache. Declared up here (rather than next to
+// loadAllAccountTokens further down the file) because the startup
+// sequence in this same module calls rehydrateAccountStateFromPersisted
+// → loadAllAccountTokens before the bottom of the file is evaluated, and
+// `let` is in TDZ until its declaration line runs. Declaring here keeps
+// the cache state next to the other module-level keychain bookkeeping
+// and side-steps the temporal-dead-zone fault.
+let _accountsCache = null;
+let _accountsCacheAt = 0;
+const ACCOUNTS_CACHE_TTL = 5000; // 5s — covers hot path without stale data
+
 function writeKeychain(creds) {
   // Atomic: `add-generic-password -U` updates in place if the entry exists,
   // creates it otherwise. Single syscall — no delete-then-add window where
@@ -223,6 +234,164 @@ function writeKeychain(creds) {
     { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }
   );
   _lastKeychainWriteAt = Date.now();
+}
+
+// ── Phase J — per-account keychain ops ──
+// Each saved account's OAuth blob lives at service `vdm-account-<name>`
+// instead of `<INSTALL_DIR>/accounts/<name>.json`. Pre-Phase-J the JSON
+// files were world-readable on default umask, leaking refresh tokens to
+// anyone with $HOME read access. The keychain enforces per-user ACLs
+// AND prompts on first read from a new binary, so even a process running
+// as the user must have been granted access (which `security` provides
+// transparently to subprocesses started by the original installer).
+//
+// Why per-account services rather than one combined JSON-array entry:
+//   - keeps each account independently revocable (`security delete-...`)
+//   - no critical section across N accounts on read/write (would need a
+//     mutex — keychain has no built-in transactions)
+//   - uninstall enumeration via `dump-keychain | grep` works
+//   - swap-in is just `vdm-account-<name>` → `KEYCHAIN_SERVICE` (one read,
+//     one write, no merge logic)
+
+function readAccountKeychain(name) {
+  const svc = vdmAccountServiceName(name);
+  try {
+    const out = execFileSync(
+      'security',
+      ['find-generic-password', '-s', svc, '-a', KEYCHAIN_ACCOUNT, '-w'],
+      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    return JSON.parse(out.trim());
+  } catch (e) {
+    // exit 44 = SecKeychainItemNotFound. Treat as "no account by this name".
+    if (e && e.status === 44) return null;
+    // Anything else: log + return null (don't crash the dashboard).
+    log('warn', `readAccountKeychain(${name}) failed: ${e.message}`);
+    return null;
+  }
+}
+
+function writeAccountKeychain(name, creds) {
+  const svc = vdmAccountServiceName(name);
+  const json = JSON.stringify(creds);
+  execFileSync(
+    'security',
+    ['add-generic-password', '-U', '-s', svc, '-a', KEYCHAIN_ACCOUNT, '-w', json],
+    { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }
+  );
+}
+
+function deleteAccountKeychain(name) {
+  const svc = vdmAccountServiceName(name);
+  try {
+    execFileSync(
+      'security',
+      ['delete-generic-password', '-s', svc, '-a', KEYCHAIN_ACCOUNT],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }
+    );
+  } catch (e) {
+    // Already gone (status 44) is fine — uninstall path may double-call.
+    if (e && e.status === 44) return;
+    log('warn', `deleteAccountKeychain(${name}) failed: ${e.message}`);
+  }
+}
+
+/**
+ * Phase J — enumerate vdm account keychain entries.
+ *
+ * macOS `security` CLI has no native "list entries by service-prefix" verb,
+ * so we shell out to `security dump-keychain` and grep the SecAttr blocks.
+ * The dump format is line-noisy; we look for `"svce"<blob>="vdm-account-..."`
+ * lines and parse the service name out. This works across all macOS
+ * versions vdm targets (14+).
+ *
+ * For typical use (1-10 accounts) this is plenty fast. If a user ever has
+ * thousands of accounts, dump-keychain is O(n) on the whole keychain — we
+ * can revisit with a sidecar index file then.
+ */
+function listVdmAccountKeychainEntries() {
+  try {
+    const out = execFileSync(
+      'sh',
+      ['-c', `security dump-keychain 2>/dev/null | grep -oE '"svce"<blob>="${VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX}[^"]+"' | sed -E 's/.*"(${VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX}[^"]+)".*/\\1/' | LC_ALL=C sort -u`],
+      { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    return out.split('\n')
+      .map(s => s.trim())
+      .map(vdmAccountNameFromService)
+      .filter(n => typeof n === 'string' && n.length > 0);
+  } catch (e) {
+    log('warn', `listVdmAccountKeychainEntries failed: ${e.message}`);
+    return [];
+  }
+}
+
+/**
+ * Phase J — Migrate plaintext accounts/<name>.json files to keychain.
+ *
+ * Idempotent — runs every dashboard startup. For each `.json` file:
+ *   1. Parse it. If it has an accessToken, write to keychain under
+ *      `vdm-account-<name>`.
+ *   2. Only after the keychain write succeeds, delete the file.
+ *
+ * Order matters — write-first-then-delete-file means an interrupted
+ * migration leaves data on BOTH sides (file + keychain), which next run
+ * will reconcile harmlessly (keychain write is idempotent via -U). The
+ * reverse order would risk losing tokens to a SIGKILL.
+ *
+ * The .label sidecars are not touched (labels are not secrets).
+ */
+function migrateAccountsToKeychain() {
+  if (!existsSync(ACCOUNTS_DIR)) return 0;
+  let migrated = 0;
+  let files;
+  try { files = readdirSync(ACCOUNTS_DIR); }
+  catch { return 0; }
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    const name = basename(f, '.json');
+    let valid = true;
+    try { vdmAccountServiceName(name); } catch { valid = false; }
+    if (!valid) {
+      log('warn', `Migration skipped: invalid account name "${name}"`);
+      continue;
+    }
+    const filePath = join(ACCOUNTS_DIR, f);
+    let creds;
+    try {
+      const raw = readFileSync(filePath, 'utf8');
+      creds = JSON.parse(raw);
+    } catch (e) {
+      log('warn', `Migration skipped ${f}: parse error: ${e.message}`);
+      continue;
+    }
+    if (!creds?.claudeAiOauth?.accessToken) {
+      // No token in the file — just delete it; nothing to migrate.
+      try { unlinkSync(filePath); } catch { /* ignore */ }
+      continue;
+    }
+    try {
+      writeAccountKeychain(name, creds);
+    } catch (e) {
+      log('error', `Migration FAILED for ${name} (file kept, retry next run): ${e.message}`);
+      continue;
+    }
+    // Keychain write succeeded — safe to delete the file.
+    try {
+      unlinkSync(filePath);
+      migrated++;
+    } catch (e) {
+      // Keychain has the data; file delete failed (permissions?). Log loud
+      // so the user notices: the file still holds plaintext tokens.
+      log('error', `Migration partial for ${name}: keychain OK but ${filePath} unlink failed: ${e.message}. DELETE THIS FILE MANUALLY — it contains plaintext OAuth tokens.`);
+    }
+  }
+  if (migrated > 0) {
+    log('info', `Phase J migration: moved ${migrated} OAuth token(s) from plaintext files to Keychain (service "${VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX}<name>")`);
+    try { logActivity('keychain-migration', `Migrated ${migrated} account(s) from plaintext files to Keychain`); }
+    catch { /* logActivity not yet defined at startup — best-effort */ }
+  }
+  return migrated;
 }
 
 // Atomic file write: write to .tmp, then rename over the target. POSIX
@@ -299,6 +468,10 @@ import {
   // Phase H — OTLP/HTTP/JSON parsers (CSW_OTEL_ENABLED=1)
   parseOtlpLogs,
   parseOtlpMetrics,
+  // Phase J — keychain-based account storage
+  vdmAccountServiceName,
+  vdmAccountNameFromService,
+  VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -424,37 +597,24 @@ async function autoDiscoverAccount() {
   if (!creds?.claudeAiOauth?.accessToken) return;
   const fp = getFingerprint(creds);
 
-  // Check all saved profiles for a fingerprint match
-  let files;
-  try {
-    files = (await readdir(ACCOUNTS_DIR)).filter(f => f.endsWith('.json'));
-  } catch {
-    // accounts dir might not exist yet
-    try { mkdirSync(ACCOUNTS_DIR, { recursive: true }); } catch {}
-    files = [];
-  }
+  // Enumerate saved profiles from the keychain (vdm-account-* entries)
+  const savedNames = listVdmAccountKeychainEntries();
 
   // Resolve email for the new token so we can deduplicate by identity
   const token = creds.claudeAiOauth.accessToken;
   const email = await fetchAccountEmail(token);
 
-  for (const file of files) {
-    const savedName = basename(file, '.json');
+  for (const savedName of savedNames) {
     try {
-      const raw = await readFile(join(ACCOUNTS_DIR, file), 'utf8');
-      const saved = JSON.parse(raw);
+      const saved = readAccountKeychain(savedName);
+      if (!saved) continue;
       if (getFingerprint(saved) === fp) return; // exact same token already saved
 
       // Same refresh token = same underlying account, even when email fetch failed
       const savedRefresh = saved.claudeAiOauth?.refreshToken;
       const currentRefresh = creds.claudeAiOauth.refreshToken;
       if (savedRefresh && currentRefresh && savedRefresh === currentRefresh) {
-        // atomicWriteFileSync writes to <file>.tmp then renames over <file>
-        // — a SIGKILL/OOM/power-loss between truncate and the final byte
-        // never leaves a half-written JSON file that crashes the next
-        // load() call. The previous direct writeFileSync was a corruption
-        // window for the dashboard's own state.
-        atomicWriteFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+        writeAccountKeychain(savedName, creds);
         const oldFp = getFingerprint(saved);
         migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
         console.log(`[auto-discover] Updated "${savedName}" with refreshed token (same refreshToken)`);
@@ -468,7 +628,7 @@ async function autoDiscoverAccount() {
         let savedEmail = '';
         try { savedEmail = (await readFile(join(ACCOUNTS_DIR, `${savedName}.label`), 'utf8')).trim(); } catch {}
         if (savedEmail === email) {
-          atomicWriteFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+          writeAccountKeychain(savedName, creds);
           // Migrate persisted state / history from old fingerprint to new
           const oldFp = getFingerprint(saved);
           migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
@@ -481,9 +641,15 @@ async function autoDiscoverAccount() {
     } catch { /* skip */ }
   }
 
-  // Truly new account  - save it
+  // Truly new account  - save it. Pick the lowest free auto-N slot,
+  // checking both the keychain (the new home) and the leftover label
+  // files in ACCOUNTS_DIR (pre-migration label files outlive the move).
+  const usedNames = new Set(savedNames);
   let idx = 1;
-  while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
+  while (
+    usedNames.has(`auto-${idx}`) ||
+    existsSync(join(ACCOUNTS_DIR, `auto-${idx}.label`))
+  ) idx++;
 
   // Cap auto-discovered accounts to prevent runaway creation during error spirals
   const MAX_AUTO_ACCOUNTS = 5;
@@ -494,10 +660,10 @@ async function autoDiscoverAccount() {
 
   const name = `auto-${idx}`;
 
-  try { mkdirSync(ACCOUNTS_DIR, { recursive: true }); } catch {}
-  atomicWriteFileSync(join(ACCOUNTS_DIR, `${name}.json`), JSON.stringify(creds, null, 2));
+  writeAccountKeychain(name, creds);
 
   if (email) {
+    try { mkdirSync(ACCOUNTS_DIR, { recursive: true }); } catch {}
     atomicWriteFileSync(join(ACCOUNTS_DIR, `${name}.label`), email);
   }
 
@@ -745,19 +911,16 @@ async function loadProfiles() {
   const activeCreds = readKeychain();
   const activeFp = activeCreds ? getFingerprint(activeCreds) : '';
 
-  let files;
-  try {
-    files = (await readdir(ACCOUNTS_DIR)).filter(f => f.endsWith('.json'));
-  } catch {
-    files = [];
-  }
+  // Account credentials live in the keychain (vdm-account-* services).
+  // Display labels (email addresses) still live as plaintext .label files
+  // alongside ACCOUNTS_DIR — those carry no secrets, just human names.
+  const accountNames = listVdmAccountKeychainEntries();
 
   const profiles = [];
-  for (const file of files) {
-    const name = basename(file, '.json');
+  for (const name of accountNames) {
     try {
-      const raw = await readFile(join(ACCOUNTS_DIR, file), 'utf8');
-      const creds = JSON.parse(raw);
+      const creds = readAccountKeychain(name);
+      if (!creds) continue;
       const oauth = creds.claudeAiOauth || {};
       const fp = getFingerprint(creds);
 
@@ -827,14 +990,14 @@ async function loadProfiles() {
       const rlTier = (isActive && activeOauth.rateLimitTier) ? activeOauth.rateLimitTier
         : (oauth.rateLimitTier || 'unknown');
 
-      // Backfill: if the stored file has stale/missing tier data but keychain has it,
-      // update the file so the data persists even when this account is inactive.
-      // atomic temp+rename so a crash mid-write never produces a corrupt
-      // account JSON the next loadProfiles() call would skip.
+      // Backfill: if the stored entry has stale/missing tier data but keychain
+      // has it, update the saved entry so the data persists even when this
+      // account is inactive. The keychain ops use security(1) `add -U` which
+      // is itself atomic, so there's no half-written-blob window.
       if (isActive && activeOauth.rateLimitTier && activeOauth.rateLimitTier !== oauth.rateLimitTier) {
         try {
           const updatedCreds = { ...creds, claudeAiOauth: { ...oauth, subscriptionType: subType, rateLimitTier: rlTier } };
-          atomicWriteFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(updatedCreds, null, 2));
+          writeAccountKeychain(name, updatedCreds);
         } catch { /* non-critical */ }
       }
 
@@ -874,11 +1037,11 @@ async function loadProfiles() {
       const loser = profiles[loserIdx];
       toRemove.push(loserIdx);
       try {
-        unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
+        deleteAccountKeychain(loser.name);
         try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
         log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
       } catch (e) {
-        log('warn', `Failed to remove duplicate account file "${loser.name}": ${e.message}`);
+        log('warn', `Failed to remove duplicate account "${loser.name}": ${e.message}`);
       }
       if (keepNew) seen.set(p.label, i);
     } else {
@@ -952,11 +1115,48 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/switch' && req.method === 'POST') {
     const body = await readBody(req);
-    const { name } = JSON.parse(body);
-    const file = join(ACCOUNTS_DIR, `${name}.json`);
+    let parsed;
+    try { parsed = JSON.parse(body || '{}'); } catch { parsed = {}; }
+    const auto = url.searchParams.get('auto') === 'true' || parsed.auto === true;
+    let { name } = parsed;
     try {
-      const raw = await readFile(file, 'utf8');
-      const creds = JSON.parse(raw);
+      // --auto: pick the next available account using the current rotation
+      // strategy. Bypasses the interactive name lookup so it can be wired
+      // into a slash command (/vdm-switch) without a UI prompt.
+      if (auto) {
+        const all = loadAllAccountTokens();
+        if (all.length === 0) {
+          json(res, { ok: false, error: 'No accounts available' }, 400);
+          return true;
+        }
+        const activeCredsNow = readKeychain();
+        const activeFp = activeCredsNow ? getFingerprint(activeCredsNow) : '';
+        // Exclude the currently-active token so --auto truly switches
+        const excludeTokens = new Set();
+        if (activeCredsNow?.claudeAiOauth?.accessToken) {
+          excludeTokens.add(activeCredsNow.claudeAiOauth.accessToken);
+        }
+        const picked = pickBestAccount(excludeTokens) || pickAnyUntried(excludeTokens);
+        if (!picked) {
+          json(res, { ok: false, error: 'No alternative account available' }, 400);
+          return true;
+        }
+        // Sanity: don't switch to the same fingerprint we already have
+        if (activeFp && getFingerprintFromToken(picked.token) === activeFp) {
+          json(res, { ok: false, error: 'Only one account configured' }, 400);
+          return true;
+        }
+        name = picked.name;
+      }
+      if (!name) {
+        json(res, { ok: false, error: 'name required (or pass auto=true)' }, 400);
+        return true;
+      }
+      const creds = readAccountKeychain(name);
+      if (!creds) {
+        json(res, { ok: false, error: `account "${name}" not found` }, 404);
+        return true;
+      }
       // Serialize manual switches against proxy-side rotations. Without
       // this, a UI click + an in-flight 429-driven swap can interleave
       // and leave the keychain pointing at the proxy's choice, not the
@@ -978,12 +1178,12 @@ async function handleAPI(req, res) {
         logActivity('settings-changed', {
           autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
           rotationStrategy: 'sticky', rotationIntervalMin: settings.rotationIntervalMin,
-          reason: 'manual-switch',
+          reason: auto ? 'auto-switch' : 'manual-switch',
         });
       }
       lastRotationTime = Date.now();
-      logActivity('manual-switch', { to: label || name });
-      json(res, { ok: true, switched: name, label: label || name, strategyChanged, strategy: settings.rotationStrategy });
+      logActivity(auto ? 'auto-switch' : 'manual-switch', { to: label || name });
+      json(res, { ok: true, switched: name, label: label || name, strategyChanged, strategy: settings.rotationStrategy, auto });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 400);
     }
@@ -997,19 +1197,22 @@ async function handleAPI(req, res) {
       json(res, { ok: false, error: 'name required' }, 400);
       return true;
     }
-    const file = join(ACCOUNTS_DIR, `${name}.json`);
     try {
-      // Verify the account exists
-      const raw = await readFile(file, 'utf8');
-      const creds = JSON.parse(raw);
+      // Verify the account exists in the keychain
+      const creds = readAccountKeychain(name);
+      if (!creds) {
+        json(res, { ok: false, error: `account "${name}" not found` }, 404);
+        return true;
+      }
       // Prevent removing the active account
       const activeCreds = readKeychain();
       if (activeCreds && getFingerprint(creds) === getFingerprint(activeCreds)) {
         json(res, { ok: false, error: 'Cannot remove the active account. Switch to another account first.' }, 400);
         return true;
       }
-      // Delete account files
-      await unlink(file);
+      // Delete keychain entry + label file (label file lives outside the
+      // keychain because it carries no secret)
+      deleteAccountKeychain(name);
       try { await unlink(join(ACCOUNTS_DIR, `${name}.label`)); } catch {}
       logActivity('account-removed', { name });
       if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
@@ -6254,6 +6457,12 @@ setInterval(clearStaleLimitedFlags, 60_000).unref();
 
 // Load on startup
 loadPersistedState();
+// Migrate any plaintext accounts/<name>.json files into the keychain
+// before any code path tries to read accounts. Idempotent — safe to
+// call repeatedly. Files with no matching keychain entry are migrated
+// then deleted; files that already have a matching entry are deleted
+// without re-writing.
+migrateAccountsToKeychain();
 // Re-mark `limited` / `expired` accounts that we knew about before the
 // last shutdown, so the first inbound request doesn't burn one wasted
 // round-trip per banned account rediscovering bans we already had on disk.
@@ -6357,25 +6566,23 @@ function markAccountExpired(token, name) {
   });
 }
 
-// ── Load saved accounts from disk ──
-
-let _accountsCache = null;
-let _accountsCacheAt = 0;
-const ACCOUNTS_CACHE_TTL = 5000; // 5s  - covers hot path without stale data
+// ── Load saved accounts from keychain ──
+// Declarations live higher up the file (next to `_lastKeychainWriteAt`)
+// because rehydrateAccountStateFromPersisted is called at startup and
+// references loadAllAccountTokens before this point would be reached
+// otherwise — `let` is in TDZ until its declaration is executed.
 
 function loadAllAccountTokens() {
   const now = Date.now();
   if (_accountsCache && now - _accountsCacheAt < ACCOUNTS_CACHE_TTL) return _accountsCache;
   try {
-    const files = readdirSync(ACCOUNTS_DIR).filter(f => f.endsWith('.json'));
+    const names = listVdmAccountKeychainEntries();
     const accounts = [];
-    for (const file of files) {
+    for (const name of names) {
       try {
-        const raw = readFileSync(join(ACCOUNTS_DIR, file), 'utf8');
-        const creds = JSON.parse(raw);
+        const creds = readAccountKeychain(name);
         const token = creds?.claudeAiOauth?.accessToken;
         if (!token) continue;
-        const name = basename(file, '.json');
         let label = '';
         try { label = readFileSync(join(ACCOUNTS_DIR, `${name}.label`), 'utf8').trim(); } catch {}
         const expiresAt = creds.claudeAiOauth?.expiresAt || 0;
@@ -6775,15 +6982,12 @@ const refreshFailures = new Map();
 const _refreshSem = createSemaphore(3);
 
 /**
- * Atomic file write: write to .tmp, chmod 600, rename over original.
+ * Persist account credentials. Backed by the macOS keychain
+ * (`security add-generic-password -U`), which is itself atomic — there is
+ * no half-written-blob window equivalent to a partial file rename.
  */
 async function atomicWriteAccountFile(name, creds) {
-  const filePath = join(ACCOUNTS_DIR, `${name}.json`);
-  const tmpPath = filePath + '.tmp';
-  const data = JSON.stringify(creds, null, 2);
-  await writeFile(tmpPath, data, 'utf8');
-  await chmod(tmpPath, 0o600);
-  await rename(tmpPath, filePath);
+  writeAccountKeychain(name, creds);
 }
 
 /**
@@ -6892,14 +7096,14 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
     // serialise on the lock first, and only the winner spends a
     // semaphore slot.
     return _refreshSem.run(async () => {
-    // 1. Re-read credentials from disk (may have been refreshed by concurrent request)
-    let rawCreds;
-    try {
-      const raw = readFileSync(join(ACCOUNTS_DIR, `${accountName}.json`), 'utf8');
-      rawCreds = JSON.parse(raw);
-    } catch (e) {
-      log('refresh', `Failed to read account file for ${accountName}: ${e.message}`);
-      return { ok: false, error: `Cannot read account file: ${e.message}` };
+    // 1. Re-read credentials from the keychain (may have been refreshed by
+    // a concurrent request that already updated the keychain entry under
+    // refreshLock. The keychain is the source of truth — there is no
+    // accounts/<name>.json file to consult anymore.)
+    const rawCreds = readAccountKeychain(accountName);
+    if (!rawCreds) {
+      log('refresh', `Failed to read keychain entry for ${accountName}`);
+      return { ok: false, error: `Cannot read keychain entry for ${accountName}` };
     }
 
     const oauth = rawCreds.claudeAiOauth;
@@ -6946,28 +7150,28 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
       return { ok: false, error: result.error };
     }
 
-    // 5. Build new credentials and atomic-write to disk
+    // 5. Build new credentials and write to the keychain
     const newExpiresAt = result.expiresIn
       ? computeExpiresAt(result.expiresIn)
       : Date.now() + 8 * 60 * 60 * 1000; // fallback: 8 hours
     const newCreds = buildUpdatedCreds(rawCreds, result.accessToken, result.refreshToken, newExpiresAt);
 
-    // Bracket the disk-write + keychain-write window with the in-progress
-    // counter so a concurrent autoDiscoverAccount cannot read the OLD
-    // keychain creds, match the just-refreshed file by email, and
-    // overwrite it with stale tokens. The decrement MUST happen on every
-    // exit path — if migrateAccountState / invalidateAccountsCache /
-    // logActivity throws, the counter would otherwise stay high forever
-    // and permanently disable autoDiscoverAccount. The whole post-
-    // increment region is wrapped in try/finally so the decrement is
-    // guaranteed.
+    // Bracket the per-account-keychain write + (potential) active-keychain
+    // write window with the in-progress counter so a concurrent
+    // autoDiscoverAccount cannot read the OLD keychain creds, match the
+    // just-refreshed entry by email, and overwrite it with stale tokens.
+    // The decrement MUST happen on every exit path — if migrateAccountState
+    // / invalidateAccountsCache / logActivity throws, the counter would
+    // otherwise stay high forever and permanently disable
+    // autoDiscoverAccount. The whole post-increment region is wrapped in
+    // try/finally so the decrement is guaranteed.
     _refreshesInProgress++;
     try {
       try {
         await atomicWriteAccountFile(accountName, newCreds);
       } catch (e) {
-        log('refresh', `CRITICAL: ${accountName}: refresh succeeded but file write failed: ${e.message}`);
-        return { ok: false, error: `File write failed: ${e.message}` };
+        log('refresh', `CRITICAL: ${accountName}: refresh succeeded but keychain write failed: ${e.message}`);
+        return { ok: false, error: `Keychain write failed: ${e.message}` };
       }
 
       const newFp = getFingerprintFromToken(result.accessToken);
@@ -7052,27 +7256,19 @@ setInterval(async () => {
   await refreshSweep();
 }, REFRESH_CHECK_INTERVAL);
 
-// ── Startup: clean orphaned .tmp files ──
-
+// ── Startup: clean orphaned .json.tmp files left over from the
+// pre-keychain era. Account credentials now live in the keychain via
+// `security add-generic-password -U`, which is itself atomic, so the
+// .tmp recovery path that used to recover from interrupted file
+// rename writes is no longer reachable. Any .tmp file we still find
+// is a relic of an upgrade that crashed mid-migration — safe to drop.
 (function cleanupTmpFiles() {
   try {
     const files = readdirSync(ACCOUNTS_DIR);
     for (const file of files) {
       if (!file.endsWith('.json.tmp')) continue;
-      const original = file.replace(/\.tmp$/, '');
       const tmpPath = join(ACCOUNTS_DIR, file);
-      const origPath = join(ACCOUNTS_DIR, original);
-      if (existsSync(origPath)) {
-        // Original exists  - tmp is leftover from interrupted write
-        try { unlinkSync(tmpPath); } catch {}
-        log('startup', `Cleaned orphaned tmp file: ${file}`);
-      } else {
-        // Original missing  - recover from crash after write, before rename
-        try {
-          renameSync(tmpPath, origPath);
-          log('startup', `Recovered account from tmp file: ${file} → ${original}`);
-        } catch {}
-      }
+      try { unlinkSync(tmpPath); log('startup', `Cleaned orphaned tmp file: ${file}`); } catch {}
     }
   } catch {}
 })();

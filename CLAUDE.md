@@ -67,7 +67,11 @@ The shell `install.sh` writes `export ANTHROPIC_BASE_URL=http://localhost:3334` 
 
 ### Credential storage — the load-bearing detail
 
-Active credentials live in **a single macOS Keychain entry**: service `Claude Code-credentials`, account `$USER`, value is the JSON blob Claude Code itself writes (`{ claudeAiOauth: { accessToken, refreshToken, expiresAt, ... } }`). Saved-but-inactive accounts are JSON files in `accounts/` (one per account) plus a sibling `<name>.label` text file holding the human-readable label. **Switching accounts means: read the JSON file → `security delete-generic-password` → `security add-generic-password` with the new blob.** Because Claude Code re-reads the keychain on each request, every running session sees the swap immediately. There is no IPC; the keychain *is* the IPC.
+Active credentials live in **a single macOS Keychain entry**: service `Claude Code-credentials`, account `$USER`, value is the JSON blob Claude Code itself writes (`{ claudeAiOauth: { accessToken, refreshToken, expiresAt, ... } }`).
+
+**Saved-but-inactive accounts ALSO live in the keychain**, as separate generic-password entries: service `vdm-account-<name>`, account `$USER`, value is the same `claudeAiOauth` JSON shape. The `vdmAccountServiceName(name)` helper in `lib.mjs` builds the service name and is the canonical place to enforce the allowed-character rule (`[a-zA-Z0-9._@-]`, no reserved name `"index"`). Display labels (email or human-readable name) still live as plaintext sibling files `accounts/<name>.label` because they carry no secret material. **Switching accounts means: read `vdm-account-<name>` from the keychain → `security add-generic-password -U` writing the new blob to `Claude Code-credentials`.** Because Claude Code re-reads the keychain on each request, every running session sees the swap immediately. There is no IPC; the keychain *is* the IPC.
+
+**Migration**: Older installs stored saved accounts as plaintext `accounts/<name>.json` files. Both `dashboard.mjs` (`migrateAccountsToKeychain` runs right after `loadPersistedState()` at startup) and `vdm` (the same step at the top of the dispatch block in the bash script) idempotently read each `*.json` file, write it to the matching `vdm-account-<name>` entry, and only delete the file on successful keychain write. `*.label` files stay where they are. Re-running migration on an already-migrated install is a no-op.
 
 `detectKeychainService()` (in both `vdm` and `dashboard.mjs`) exists because the service name has changed across Claude Code releases — don't hardcode `Claude Code-credentials`, always go through that helper.
 
@@ -76,8 +80,7 @@ Active credentials live in **a single macOS Keychain entry**: service `Claude Co
 | File | Written by | Holds |
 |---|---|---|
 | `config.json` | `saveSettings()` | user settings (rotation strategy, autoSwitch, proxyEnabled, intervals) |
-| `accounts/*.json` | discovery + add | per-account credential blobs |
-| `accounts/*.label` | rename | per-account human label |
+| `accounts/*.label` | rename + auto-discover | per-account human label (email/display name — no secrets) |
 | `account-state.json` | proxy on rate-limit responses | per-token rate-limit state (5h/7d resets, utilization) |
 | `activity-log.json` | `logActivity()` | rolling 500-event ring buffer (UI feed) |
 | `utilization-history.json` | `saveHistoryToDisk()` | 24h + 7d utilization series for trend graphs |
@@ -85,7 +88,7 @@ Active credentials live in **a single macOS Keychain entry**: service `Claude Co
 | `token-usage.json` | `/api/session-start` + `/api/session-stop` hooks | per-session token counters used by the git commit-message trailer |
 | `.dashboard.pid` | `vdm dashboard start` | PID file for the foreground-launched dashboard |
 
-These all use atomic-rename writes in the helpers; don't write directly with `writeFileSync` from new code — copy the existing pattern.
+Account credentials no longer live as plaintext JSON files — they're keychain entries (see "Credential storage" above). The remaining files in `accounts/` are just `*.label` text files. These all use atomic-rename writes in the helpers; don't write directly with `writeFileSync` from new code — copy the existing pattern.
 
 ### OAuth refresh
 
@@ -125,7 +128,8 @@ There is currently no integration test that exercises the full proxy server end-
 - **Zero dependencies is a hard rule.** No `package.json`, no `node_modules/`. If you need something, write it (the project ships its own activity-log ring buffer, utilization-history with sampling, per-account mutex, etc. for this reason).
 - **Two parallel implementations of the same helpers** exist in `vdm` (bash + python3 one-liners) and `dashboard.mjs` (Node) — `detectKeychainService`, `getFingerprint`, `read/writeKeychain`, etc. They MUST stay in sync; if you change behaviour in one, change the other.
 - **The dashboard HTML is in `renderHTML()` in `dashboard.mjs`** as a template string. There is no build step or framework — vanilla JS, fetch calls to `/api/*`. UI changes go directly in that function.
-- **Accounts are auto-discovered**, not manually added. `autoDiscoverAccount()` runs on every proxy request (and on hooks) — it reads the keychain, hashes the access token to a fingerprint, and creates an `accounts/<fp>.json` if none exists. The `vdm add` command is mostly a fallback for headless/CI flows. Don't add a manual-add UI without understanding why discovery is the primary path.
+- **Accounts are auto-discovered**, not manually added. `autoDiscoverAccount()` runs on every proxy request (and on hooks) — it reads the active keychain entry (`Claude Code-credentials`), hashes the access token to a fingerprint, and creates a new `vdm-account-auto-N` keychain entry if no saved account matches. The `vdm add` command is mostly a fallback for headless/CI flows. Don't add a manual-add UI without understanding why discovery is the primary path.
+- **Slash commands** ship in `commands/` (e.g. `commands/vdm-switch.md`). `install.sh` copies every `commands/*.md` to `~/.claude/commands/` so they're invokable as `/vdm-switch`. `uninstall.sh` removes only the `.md` files we own (matched by source-dir basename). When adding a new slash command, drop the file in `commands/` — install.sh's copy step picks it up automatically.
 - **Ports are configurable via `CSW_PORT` (dashboard) and `CSW_PROXY_PORT` (proxy)** — always read them from env, don't hardcode 3333/3334 in new code. Both `vdm` and `dashboard.mjs` honour these.
 - **Proxy queue + timeout knobs (Phase F) are env-var configurable** — read once at `dashboard.mjs` startup. Defaults reflect lessons from the Phase F audit (the 45 s deadline + per-account permit released at headers were causing false rate-limits and "Anthropic unresponsive" reports). Tunable via:
   - `CSW_PROXY_TIMEOUT_MS` — idle socket timeout per upstream call (default 900000 = 15 min). Bump if Opus 4 extended-thinking phases produce SSE gaps wider than this.

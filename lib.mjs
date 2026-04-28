@@ -1416,6 +1416,59 @@ export function aggregateByTool(rows, range = null) {
   return Array.from(buckets.values()).sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
+// ─── Phase J — keychain-based account storage ───
+//
+// Pre-Phase-J vdm cached every saved account's OAuth blob (accessToken +
+// refreshToken + expiresAt) at `<INSTALL_DIR>/accounts/<name>.json` in
+// plaintext, world-readable on default umask. Anyone with read access to
+// $HOME could grab the refresh tokens (~ 90-day lifetime) and authenticate
+// as the user against Anthropic. Phase J moves each account's blob into
+// its own macOS Keychain entry under service `vdm-account-<name>` (account
+// = $USER, same as the active CC entry). The user-visible label stays in
+// `accounts/<name>.label` because labels are not secrets.
+
+export const VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX = 'vdm-account-';
+
+/**
+ * Phase J — Derive the keychain service name for an account by name.
+ *
+ * Naming rules (intentionally tight to keep `security` CLI argv parsing
+ * predictable across BSD / GNU / future replacements):
+ *   - allowed chars: a-z A-Z 0-9 . _ @ -
+ *   - must be non-empty
+ *   - must not be the literal `index` (reserved for future index files)
+ *
+ * Throws on invalid input — callers should validate filenames upstream
+ * (the existing `vdm add <name>` validation already enforces a stricter
+ * subset, so this is defense-in-depth).
+ */
+export function vdmAccountServiceName(name) {
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new Error('account name required');
+  }
+  if (!/^[a-zA-Z0-9._@-]+$/.test(name)) {
+    throw new Error(`invalid account name: ${name} (allowed: a-z A-Z 0-9 . _ @ -)`);
+  }
+  if (name === 'index') {
+    throw new Error('"index" is reserved as an account name');
+  }
+  return `${VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX}${name}`;
+}
+
+/**
+ * Phase J — Inverse of vdmAccountServiceName: extract the account name from
+ * a keychain service string. Returns null if the service is not a vdm
+ * account entry. Used during keychain enumeration.
+ */
+export function vdmAccountNameFromService(service) {
+  if (typeof service !== 'string') return null;
+  if (!service.startsWith(VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX)) return null;
+  const name = service.slice(VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX.length);
+  if (name.length === 0) return null;
+  if (!/^[a-zA-Z0-9._@-]+$/.test(name)) return null;
+  return name;
+}
+
 // ─── Phase H — OTLP/HTTP/JSON parser helpers ───
 //
 // vdm exposes an opt-in OTLP receiver (CSW_OTEL_ENABLED=1) so users can

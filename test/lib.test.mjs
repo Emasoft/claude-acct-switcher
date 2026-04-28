@@ -47,6 +47,10 @@ import {
   otlpAttrsToObject,
   parseOtlpLogs,
   parseOtlpMetrics,
+  // Phase J — keychain account name helpers
+  vdmAccountServiceName,
+  vdmAccountNameFromService,
+  VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -2268,5 +2272,78 @@ describe('parseOtlpMetrics', () => {
     });
     assert.equal(recs.length, 1);
     assert.equal(recs[0].value, null);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Phase J — vdm-account-* keychain service-name helpers
+// ─────────────────────────────────────────────────
+
+describe('vdmAccountServiceName', () => {
+  it('prefixes a valid name with the canonical "vdm-account-" service prefix', () => {
+    assert.equal(vdmAccountServiceName('work'), 'vdm-account-work');
+    assert.equal(vdmAccountServiceName('auto-1'), 'vdm-account-auto-1');
+    assert.equal(vdmAccountServiceName('user.name'), 'vdm-account-user.name');
+    assert.equal(vdmAccountServiceName('user_name'), 'vdm-account-user_name');
+    assert.equal(vdmAccountServiceName('a@b'), 'vdm-account-a@b');
+  });
+
+  it('exports the prefix constant so callers can build service names directly', () => {
+    assert.equal(VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX, 'vdm-account-');
+  });
+
+  it('throws on empty / non-string names', () => {
+    assert.throws(() => vdmAccountServiceName(''), /account name required/);
+    assert.throws(() => vdmAccountServiceName(undefined), /account name required/);
+    assert.throws(() => vdmAccountServiceName(null), /account name required/);
+    assert.throws(() => vdmAccountServiceName(42), /account name required/);
+  });
+
+  it('rejects names containing characters outside the allow-list', () => {
+    // Characters that could turn into shell metacharacters or filesystem
+    // escape sequences if a buggy caller ever interpolates the result.
+    const bad = ['a/b', 'a b', 'a*', 'a?', 'a"b', 'a\\b', '../x', 'a;b', 'a$b', 'a\nb'];
+    for (const n of bad) {
+      assert.throws(() => vdmAccountServiceName(n), /invalid account name/, `should reject ${JSON.stringify(n)}`);
+    }
+  });
+
+  it('rejects the reserved name "index"', () => {
+    assert.throws(() => vdmAccountServiceName('index'), /reserved/);
+  });
+});
+
+describe('vdmAccountNameFromService', () => {
+  it('strips the "vdm-account-" prefix from a valid service name', () => {
+    assert.equal(vdmAccountNameFromService('vdm-account-work'), 'work');
+    assert.equal(vdmAccountNameFromService('vdm-account-auto-1'), 'auto-1');
+    assert.equal(vdmAccountNameFromService('vdm-account-user.name'), 'user.name');
+    assert.equal(vdmAccountNameFromService('vdm-account-a@b'), 'a@b');
+  });
+
+  it('returns null when the service does not start with the vdm prefix', () => {
+    assert.equal(vdmAccountNameFromService('Claude Code-credentials'), null);
+    assert.equal(vdmAccountNameFromService('something-else'), null);
+    assert.equal(vdmAccountNameFromService(''), null);
+  });
+
+  it('returns null for non-string input', () => {
+    assert.equal(vdmAccountNameFromService(undefined), null);
+    assert.equal(vdmAccountNameFromService(null), null);
+    assert.equal(vdmAccountNameFromService(42), null);
+  });
+
+  it('returns null when the suffix would itself fail validation', () => {
+    // Prefix present but the remainder contains disallowed characters —
+    // it can't have come from vdmAccountServiceName, so reject it.
+    assert.equal(vdmAccountNameFromService('vdm-account-'), null);          // empty suffix
+    assert.equal(vdmAccountNameFromService('vdm-account-bad/name'), null);  // slash
+    assert.equal(vdmAccountNameFromService('vdm-account-spa ce'), null);    // space
+  });
+
+  it('round-trips with vdmAccountServiceName for every valid name', () => {
+    for (const n of ['work', 'auto-1', 'auto.name', 'a@example.com', 'A_b']) {
+      assert.equal(vdmAccountNameFromService(vdmAccountServiceName(n)), n);
+    }
   });
 });
