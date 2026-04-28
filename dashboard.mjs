@@ -1841,6 +1841,8 @@ async function handleAPI(req, res) {
             branch: session.branch ?? null,
             commitHash: session.commitHash, model: entry.model,
             inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
+            cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+            cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
             account: entry.account,
           }));
         }
@@ -4907,9 +4909,11 @@ function renderTokenStats(data, prevData) {
   for (var i = 0; i < data.length; i++) {
     var inT = data[i].inputTokens || 0;
     var outT = data[i].outputTokens || 0;
+    var crT = data[i].cacheReadInputTokens || 0;
+    var ccT = data[i].cacheCreationInputTokens || 0;
     totalIn += inT;
     totalOut += outT;
-    totalCost += estimateCost(data[i].model, inT, outT);
+    totalCost += estimateCost(data[i].model, inT, outT, crT, ccT);
     requests++;
   }
   var trendHtml = '';
@@ -4969,9 +4973,11 @@ function renderModelBreakdown(data) {
   var modelMap = {};
   for (var i = 0; i < data.length; i++) {
     var m = data[i].model || 'unknown';
-    if (!modelMap[m]) modelMap[m] = { input: 0, output: 0, total: 0 };
+    if (!modelMap[m]) modelMap[m] = { input: 0, output: 0, total: 0, cacheRead: 0, cacheCreation: 0 };
     modelMap[m].input += data[i].inputTokens || 0;
     modelMap[m].output += data[i].outputTokens || 0;
+    modelMap[m].cacheRead += data[i].cacheReadInputTokens || 0;
+    modelMap[m].cacheCreation += data[i].cacheCreationInputTokens || 0;
     modelMap[m].total += (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
   }
   var sortedModels = Object.keys(modelMap).sort().filter(function(k) { return modelMap[k].total > 0; });
@@ -4989,7 +4995,7 @@ function renderModelBreakdown(data) {
   for (var r = 0; r < sortedModels.length; r++) {
     var md = modelMap[sortedModels[r]];
     var pctR = Math.round((md.total / grandTotal) * 100);
-    var mdCost = estimateCost(sortedModels[r], md.input, md.output);
+    var mdCost = estimateCost(sortedModels[r], md.input, md.output, md.cacheRead, md.cacheCreation);
     rows += '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:'+getModelColor(sortedModels[r], sortedModels)+'"></div>' +
       '<div class="tok-model-name">'+escHtml(shortModel(sortedModels[r]))+'</div>' +
@@ -5165,7 +5171,7 @@ function renderCostSavingsChart() {
     var idx = Math.floor(elapsed / dayMs);
     if (idx >= bucketCount) idx = bucketCount - 1;
     if (idx < 0) idx = 0;
-    dailyCosts[idx] += estimateCost(data[i].model, data[i].inputTokens || 0, data[i].outputTokens || 0);
+    dailyCosts[idx] += estimateCost(data[i].model, data[i].inputTokens || 0, data[i].outputTokens || 0, data[i].cacheReadInputTokens || 0, data[i].cacheCreationInputTokens || 0);
   }
 
   // Accumulate
@@ -5264,10 +5270,12 @@ function renderAccountBreakdown(data) {
     if (!accountMap[acct]) accountMap[acct] = { input: 0, output: 0, total: 0, cost: 0 };
     var inT = data[i].inputTokens || 0;
     var outT = data[i].outputTokens || 0;
+    var crT = data[i].cacheReadInputTokens || 0;
+    var ccT = data[i].cacheCreationInputTokens || 0;
     accountMap[acct].input += inT;
     accountMap[acct].output += outT;
     accountMap[acct].total += inT + outT;
-    accountMap[acct].cost += estimateCost(data[i].model, inT, outT);
+    accountMap[acct].cost += estimateCost(data[i].model, inT, outT, crT, ccT);
   }
   var sortedAccounts = Object.keys(accountMap).sort(function(a,b) { return accountMap[b].total - accountMap[a].total; });
   if (!sortedAccounts.length) { el.innerHTML = ''; return; }
@@ -5311,13 +5319,15 @@ function renderRepoBranchBreakdown(data) {
     var branch = data[i].branch || 'unknown';
     var inTok = data[i].inputTokens || 0;
     var outTok = data[i].outputTokens || 0;
+    var crTok = data[i].cacheReadInputTokens || 0;
+    var ccTok = data[i].cacheCreationInputTokens || 0;
     var m = data[i].model || 'unknown';
     var ts = data[i].timestamp || data[i].ts || 0;
     allModels[m] = 1;
     if (!repoMap[repo]) repoMap[repo] = { totalIn: 0, totalOut: 0, lastTs: 0, cost: 0, branches: {} };
     repoMap[repo].totalIn += inTok;
     repoMap[repo].totalOut += outTok;
-    repoMap[repo].cost += estimateCost(m, inTok, outTok);
+    repoMap[repo].cost += estimateCost(m, inTok, outTok, crTok, ccTok);
     if (ts > repoMap[repo].lastTs) repoMap[repo].lastTs = ts;
     if (!repoMap[repo].branches[branch]) repoMap[repo].branches[branch] = { totalIn: 0, totalOut: 0, lastTs: 0, models: {} };
     var br = repoMap[repo].branches[branch];
@@ -7879,6 +7889,8 @@ function _claimAndPersistForSession(sessionId, payload, kind /* 'stop' | 'end' *
         model: entry.model,
         inputTokens: entry.inputTokens,
         outputTokens: entry.outputTokens,
+        cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+        cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
         account: entry.account,
       });
     } else {
@@ -7895,6 +7907,8 @@ function _claimAndPersistForSession(sessionId, payload, kind /* 'stop' | 'end' *
         model: entry.model,
         inputTokens: entry.inputTokens,
         outputTokens: entry.outputTokens,
+        cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+        cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
         account: entry.account,
       });
       row = { ...baseEntry, parentSessionId: resolvedId, agentType: null };
@@ -7938,6 +7952,8 @@ function _autoClaimSession(sessionId, session) {
       model: entry.model,
       inputTokens: entry.inputTokens,
       outputTokens: entry.outputTokens,
+      cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+      cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
       account: entry.account,
     }));
   }
@@ -7976,6 +7992,8 @@ setInterval(() => {
         model: entry.model,
         inputTokens: entry.inputTokens,
         outputTokens: entry.outputTokens,
+        cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+        cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
         account: entry.account,
       }));
     }
@@ -8108,6 +8126,8 @@ function appendTokenUsage(entry) {
     model: entry.model,
     inputTokens: entry.inputTokens,
     outputTokens: entry.outputTokens,
+    cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+    cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
     account: entry.account,
     sessionId: entry.sessionId ?? null,
     // Phase D additions
@@ -9143,6 +9163,8 @@ function shutdown(signal) {
             branch: session.branch ?? null,
             commitHash: session.commitHash, model: entry.model,
             inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
+            cacheReadInputTokens: entry.cacheReadInputTokens || 0,
+            cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
             account: entry.account,
           }));
         } catch { /* best-effort during shutdown */ }
