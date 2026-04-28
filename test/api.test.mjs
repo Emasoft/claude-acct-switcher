@@ -534,7 +534,8 @@ describe('PostToolBatch round-trip — gated', () => {
   it('PostToolBatch rejects malformed payload at parser (missing tools array)', () => {
     const r = parsePostToolBatchPayload({ session_id: 'a', cwd: '/tmp' });
     assert.equal(r.ok, false);
-    assert.match(r.error, /tools/);
+    // Phase G — error message references the spec field `tool_calls`.
+    assert.match(r.error, /tool_calls/);
   });
 
   it('PostToolBatch rejects malformed payload at parser (missing session_id)', () => {

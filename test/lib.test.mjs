@@ -1395,6 +1395,21 @@ describe('parseSubagentStartPayload', () => {
     const r = parseSubagentStartPayload(null);
     assert.equal(r.ok, false);
   });
+
+  it('Phase G — reads spec-correct agent_id field', () => {
+    const r = parseSubagentStartPayload({
+      session_id: 'sub-123',
+      agent_id: 'agent-instance-abc',
+      agent_type: 'Explore',
+      cwd: '/tmp/proj',
+      transcript_path: '/Users/x/.claude/projects/p/sub-123/subagents/agent-abc.jsonl',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.agentId, 'agent-instance-abc');
+    assert.equal(r.transcriptPath, '/Users/x/.claude/projects/p/sub-123/subagents/agent-abc.jsonl');
+    // Legacy parent_session_id absent — spec doesn't carry it; parser tolerates.
+    assert.equal(r.parentSessionId, null);
+  });
 });
 
 describe('parseCwdChangedPayload', () => {
@@ -1463,7 +1478,31 @@ describe('parsePostToolBatchPayload', () => {
   it('rejects non-array tools', () => {
     const r = parsePostToolBatchPayload({ session_id: 'abc', cwd: '/tmp', tools: 'oops' });
     assert.equal(r.ok, false);
-    assert.match(r.error, /tools/);
+    // Phase G — error message references tool_calls (the spec field name).
+    assert.match(r.error, /tool_calls/);
+  });
+
+  it('accepts spec-correct tool_calls field name', () => {
+    // Phase G — Anthropic spec sends `tool_calls`, not `tools`. vdm now reads
+    // both for forward-compat; this test guards the spec field path.
+    const r = parsePostToolBatchPayload({
+      session_id: 'abc',
+      cwd: '/tmp',
+      tool_calls: [{ tool_name: 'Bash' }, { tool_name: 'Read' }],
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.tools.length, 2);
+    assert.equal(r.tools[0].toolName, 'Bash');
+    assert.equal(r.tools[1].toolName, 'Read');
+  });
+
+  it('legacy `tools` field name still works for old fixtures', () => {
+    const r = parsePostToolBatchPayload({
+      session_id: 'abc',
+      tools: [{ tool_name: 'Edit' }],
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.tools[0].toolName, 'Edit');
   });
 
   it('skips malformed tool entries', () => {
@@ -1768,6 +1807,30 @@ describe('parseTaskEventPayload', () => {
     const r = parseTaskEventPayload(null);
     assert.equal(r.ok, false);
   });
+
+  it('Phase G — reads spec-correct task_title and task_description', () => {
+    const r = parseTaskEventPayload({
+      session_id: 's',
+      task_id: 't-abc',
+      task_title: 'Investigate auth race',
+      task_description: 'Reproduce the 401 → refresh → 401 loop seen in prod',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.taskTitle, 'Investigate auth race');
+    assert.equal(r.taskDescription, 'Reproduce the 401 → refresh → 401 loop seen in prod');
+    // description is kept as alias of taskDescription for backward-compat
+    assert.equal(r.description, r.taskDescription);
+  });
+
+  it('Phase G — task_title truncates to 200 chars', () => {
+    const r = parseTaskEventPayload({
+      session_id: 's',
+      task_id: 't',
+      task_title: 'X'.repeat(500),
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.taskTitle.length, 200);
+  });
 });
 
 describe('parseTeammateIdlePayload', () => {
@@ -1804,6 +1867,19 @@ describe('parseTeammateIdlePayload', () => {
   it('rejects null payload', () => {
     const r = parseTeammateIdlePayload(null);
     assert.equal(r.ok, false);
+  });
+
+  it('Phase G — reads spec-correct agent_id field', () => {
+    const r = parseTeammateIdlePayload({
+      session_id: 's',
+      agent_id: 'agent-instance-789',
+      agent_type: 'Plan',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.agentId, 'agent-instance-789');
+    assert.equal(r.agentType, 'Plan');
+    // teammateId is exposed as the canonical handle (alias of agentId)
+    assert.equal(r.teammateId, 'agent-instance-789');
   });
 });
 

@@ -4563,12 +4563,31 @@ async function changeInterval(value) {
 
 var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)'];
 
+// Phase G — pricing table updated to include current generations + cache
+// token rates. Pre-Phase-G: claude-opus-4-7 was missing entirely, falling
+// through to the Sonnet default — silent 5x undercount on every Opus 4.7
+// turn (this very session). Cache rates follow Anthropic published 1.25x
+// (creation) / 0.10x (read) ratios. Per-row override allowed if any model
+// ever diverges. Verify against https://claude.com/pricing if rates change.
+// (Backticks intentionally avoided in this comment block — TOK_PRICING is
+// declared inside renderHTML() template literal.)
 var TOK_PRICING = {
-  'claude-opus-4-6': { input: 15, output: 75 },
-  'claude-sonnet-4-6': { input: 3, output: 15 },
-  'claude-haiku-4-5': { input: 0.80, output: 4 },
+  // Opus generation — flat $15/$75 across 4-5 / 4-6 / 4-7
+  'claude-opus-4-7':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheCreation: 18.75 },
+  'claude-opus-4-6':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheCreation: 18.75 },
+  'claude-opus-4-5':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheCreation: 18.75 },
+  // Sonnet generation — flat $3/$15
+  'claude-sonnet-4-7': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheCreation: 3.75 },
+  'claude-sonnet-4-6': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheCreation: 3.75 },
+  'claude-sonnet-4-5': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheCreation: 3.75 },
+  // Haiku generation — $0.80/$4
+  'claude-haiku-4-6':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheCreation: 1.00 },
+  'claude-haiku-4-5':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheCreation: 1.00 },
 };
-var TOK_PRICING_DEFAULT = { input: 3, output: 15 };
+// Conservative default (Sonnet rates) for unknown models. Unknown-model hits
+// are logged via _warnedUnknownModels so the rate table can be kept current.
+var TOK_PRICING_DEFAULT = { input: 3, output: 15, cacheRead: 0.30, cacheCreation: 3.75 };
+var _warnedUnknownModels = new Set();
 var TOK_PLANS = {
   'pro':    { label: 'Pro ($20/mo)', monthly: 20 },
   'max5x':  { label: 'MAX 5x ($100/mo)', monthly: 100 },
@@ -4577,10 +4596,28 @@ var TOK_PLANS = {
 var _tokPrevPeriodData = [];
 var _tokRepoCollapsed = {};
 
-function estimateCost(model, inTok, outTok) {
+function estimateCost(model, inTok, outTok, cacheReadTok, cacheCreationTok) {
   var key = Object.keys(TOK_PRICING).find(function(k) { return model && model.indexOf(k) === 0; });
   var p = key ? TOK_PRICING[key] : TOK_PRICING_DEFAULT;
-  return (inTok / 1e6) * p.input + (outTok / 1e6) * p.output;
+  // Phase G — log first occurrence of each unknown model so rates can be kept
+  // current. Avoid spamming the activity log: one warning per model per session.
+  if (!key && model && !_warnedUnknownModels.has(model)) {
+    _warnedUnknownModels.add(model);
+    if (typeof logActivity === 'function') {
+      try { logActivity('unknown-model', 'Unknown model in cost estimate: ' + model + ' (using Sonnet default rates)'); }
+      catch { /* logActivity may not be defined in browser context — ignore */ }
+    }
+  }
+  // Cache rates default to 0 for backward compat with existing rows that lack
+  // cache token fields. New rows from Phase G+ will populate them.
+  var cacheRead = (typeof p.cacheRead === 'number') ? p.cacheRead : 0;
+  var cacheCreation = (typeof p.cacheCreation === 'number') ? p.cacheCreation : 0;
+  var crTok = Number(cacheReadTok) || 0;
+  var ccTok = Number(cacheCreationTok) || 0;
+  return (inTok / 1e6) * p.input
+       + (outTok / 1e6) * p.output
+       + (crTok / 1e6) * cacheRead
+       + (ccTok / 1e6) * cacheCreation;
 }
 
 function formatCost(dollars) {

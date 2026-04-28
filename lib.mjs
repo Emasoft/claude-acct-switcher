@@ -1004,14 +1004,26 @@ export function parseSubagentStartPayload(data) {
     return { ok: false, error: 'session_id required' };
   }
   const cwd = typeof data.cwd === 'string' && data.cwd.length > 0 ? data.cwd : null;
+  // Phase G — `agent_id` is the spec field (per-subagent instance ID).
+  // `parent_session_id` / `parentSessionId` / `transcript_id` are NOT in
+  // the documented payload — the parent's identity is implicit (Claude Code
+  // tracks it internally; the hook payload only carries the subagent's own
+  // session_id + agent_id + agent_type + transcript_path). We keep the
+  // legacy fallback chain so old tests/fixtures don't break, but in production
+  // these will all be null and parent attribution is best-effort via cwd
+  // matching at handler time. The `transcript_path` field IS in the spec
+  // and is the canonical handle for tail-reading the subagent's JSONL log.
   const parentSessionId = data.parent_session_id || data.parentSessionId || data.transcript_id || null;
+  const agentId = typeof data.agent_id === 'string' && data.agent_id.length > 0
+    ? data.agent_id
+    : null;
   const agentType = typeof data.agent_type === 'string' && data.agent_type.length > 0
     ? data.agent_type
     : null;
   const transcriptPath = typeof data.transcript_path === 'string'
     ? data.transcript_path
     : null;
-  return { ok: true, sessionId, cwd, parentSessionId, agentType, transcriptPath };
+  return { ok: true, sessionId, cwd, agentId, parentSessionId, agentType, transcriptPath };
 }
 
 /**
@@ -1159,12 +1171,20 @@ export function parsePostToolBatchPayload(data) {
     return { ok: false, error: 'session_id required' };
   }
   const cwd = typeof data.cwd === 'string' && data.cwd.length > 0 ? data.cwd : null;
-  if (!Array.isArray(data.tools)) {
-    return { ok: false, error: 'tools must be an array' };
+  // Phase G — the spec key is `tool_calls`; `tools` was a vdm-internal name
+  // used in early development. Reading the wrong key was making every
+  // PostToolBatch event return 400 — per-tool attribution was fully broken
+  // until this fix. Accept both for forward-compat with future schema renames
+  // and old test fixtures.
+  const arr = Array.isArray(data.tool_calls)
+    ? data.tool_calls
+    : (Array.isArray(data.tools) ? data.tools : null);
+  if (!arr) {
+    return { ok: false, error: 'tool_calls must be an array' };
   }
   const seen = new Set();
   const tools = [];
-  for (const t of data.tools) {
+  for (const t of arr) {
     if (!t || typeof t !== 'object') continue;
     const toolName = t.tool_name;
     if (typeof toolName !== 'string' || toolName.length === 0) continue;
@@ -1241,6 +1261,12 @@ export function parseTaskEventPayload(data) {
   if (!taskId) {
     return { ok: false, error: 'task_id required' };
   }
+  // Phase G — the spec payload for TaskCreated/TaskCompleted carries ONLY
+  // `task_id`, `task_title`, and (TaskCreated only) `task_description`.
+  // `parent_session_id`, `agent_type`, `status`, and `description` were
+  // vdm-internal guesses that never appear in real payloads. We keep them as
+  // legacy fallbacks (always null in production) so old test fixtures still
+  // work, and add the spec-correct `taskTitle` / `taskDescription` fields.
   const parentSessionId = data.parent_session_id || data.parentSessionId || null;
   const agentType = (typeof data.agent_type === 'string' && data.agent_type.length > 0)
     ? data.agent_type
@@ -1248,12 +1274,22 @@ export function parseTaskEventPayload(data) {
   const status = (typeof data.status === 'string' && data.status.length > 0)
     ? data.status
     : null;
+  const taskTitle = (typeof data.task_title === 'string' && data.task_title.length > 0)
+    ? data.task_title.slice(0, 200)
+    : null;
   // Truncate description to 500 chars — task descriptions can be long
   // (multi-paragraph prompts) and we don't want to bloat token-usage.json.
-  const description = (typeof data.description === 'string' && data.description.length > 0)
-    ? data.description.slice(0, 500)
-    : null;
-  return { ok: true, sessionId, taskId, parentSessionId, agentType, status, description };
+  // Spec field is `task_description`; older fixtures may use `description`.
+  const rawDescription = (typeof data.task_description === 'string' && data.task_description.length > 0)
+    ? data.task_description
+    : (typeof data.description === 'string' && data.description.length > 0
+        ? data.description
+        : null);
+  const taskDescription = rawDescription ? rawDescription.slice(0, 500) : null;
+  // Backward-compat: keep `description` as an alias of `taskDescription` so
+  // existing dashboard.mjs handlers don't need to be updated in lockstep.
+  const description = taskDescription;
+  return { ok: true, sessionId, taskId, taskTitle, taskDescription, parentSessionId, agentType, status, description };
 }
 
 /**
@@ -1276,10 +1312,20 @@ export function parseTeammateIdlePayload(data) {
   if (typeof sessionId !== 'string' || sessionId.length === 0) {
     return { ok: false, error: 'session_id required' };
   }
-  const teammateId = (typeof data.teammate_id === 'string' && data.teammate_id.length > 0)
-    ? data.teammate_id
-    : ((typeof data.team_id === 'string' && data.team_id.length > 0) ? data.team_id : null);
-  return { ok: true, sessionId, teammateId };
+  // Phase G — the spec payload uses `agent_id` (subagent instance ID) and
+  // `agent_type`. `teammate_id` / `team_id` were vdm-internal guesses and are
+  // never sent. Read both — the spec fields take precedence; the legacy names
+  // are accepted so old test fixtures still pass.
+  const agentId = (typeof data.agent_id === 'string' && data.agent_id.length > 0)
+    ? data.agent_id
+    : null;
+  const agentType = (typeof data.agent_type === 'string' && data.agent_type.length > 0)
+    ? data.agent_type
+    : null;
+  const teammateId = agentId
+    || ((typeof data.teammate_id === 'string' && data.teammate_id.length > 0) ? data.teammate_id : null)
+    || ((typeof data.team_id === 'string' && data.team_id.length > 0) ? data.team_id : null);
+  return { ok: true, sessionId, agentId, agentType, teammateId };
 }
 
 /**
