@@ -82,7 +82,9 @@ Per-session token usage tracking with breakdowns by model, repo, branch, and tim
 - **Model breakdown** — input/output split with proportional bars
 - **Repo/branch breakdown** — sorted by total tokens, with per-model detail
 
-Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees. vdm subscribes to the full lifecycle: `SessionStart`/`UserPromptSubmit` to anchor each turn, `Stop`/`StopFailure`/`SubagentStop`/`SessionEnd` to flush totals, plus `SubagentStart` so parallel sub-agent fan-outs aren't silently dropped, `PreCompact`/`PostCompact` so the input-token math survives Claude Code's auto-compaction, and `CwdChanged` so branch attribution stays fresh when a session `cd`s between turns. An opt-in `PostToolBatch` hook gives per-tool attribution when you set `perToolAttribution: true` in `config.json`.
+Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees. vdm subscribes to the full lifecycle: `UserPromptSubmit` to anchor each turn, `Stop`/`StopFailure`/`SubagentStop`/`SessionEnd` to flush totals, plus `SubagentStart` (parent attribution derived from the documented `transcript_path` layout — the spec doesn't carry parent_session_id in the payload), `PreCompact`/`PostCompact` so input-token math survives auto-compaction, `CwdChanged` so branch attribution stays fresh when a session `cd`s between turns, plus `WorktreeCreate`/`WorktreeRemove`/`TaskCreated`/`TaskCompleted`/`TeammateIdle` for full agent-team coverage. `Notification` triggers an immediate keychain re-read on `auth_success` so account rotation happens in milliseconds instead of waiting for the cache to expire. `ConfigChange` detects external rewrites of `~/.claude/settings.json` (devcontainer rebuild, another tool installing hooks) so users notice when vdm's hook block has been stomped. `UserPromptExpansion` logs `/skill-name` and `@`-mention expansions in the activity feed. An opt-in `PostToolBatch` hook gives per-tool attribution (a "Tool Breakdown" panel in the dashboard) when you set `perToolAttribution: true` in `config.json`.
+
+**Cost estimation** uses Anthropic's published rates per generation (Opus 4.5/4.6/4.7, Sonnet 4.5/4.6/4.7, Haiku 4.5/4.6) including cache token rates (1.25× for cache creation, 0.10× for cache reads). Unknown models log to the activity feed on first occurrence so the rate table can be kept current — verify against `https://claude.com/pricing` after Anthropic releases new generations.
 
 #### Commit Token Trailers
 
@@ -158,11 +160,27 @@ The proxy is designed to never kill your Claude Code sessions, even when things 
 3. Account switch — try a different account
 4. Minimal headers retry — strip all forwarded headers, retry with essentials only
 
-**Sleep recovery** — After laptop sleep, all tokens may expire simultaneously. The proxy detects this and refreshes tokens in parallel (~37s) instead of sequentially (37s × N accounts). A 45-second request deadline prevents indefinite hangs.
+**Sleep recovery** — After laptop sleep, all tokens may expire simultaneously. The proxy detects this and refreshes tokens in parallel (~37s) instead of sequentially (37s × N accounts). A configurable request deadline prevents indefinite hangs (default 10 min, see `CSW_REQUEST_DEADLINE_MS`).
+
+**Per-account stream throttling** — Up to N concurrent streams per bearer token (default 8, env: `CSW_MAX_INFLIGHT_PER_ACCOUNT`); excess requests queue. The cap is enforced for the **full SSE stream lifetime**, not just until headers arrive — so 20 Claude Code instances on one account don't all burst on Anthropic at once and trigger anti-abuse heuristics.
+
+**Server-vs-plan 429 distinction** — When Anthropic itself is overloaded (`error.type: "overloaded_error"`), the proxy passes the 429 through without rotating accounts. Rotation only helps for plan-side throttle (`rate_limit_error`), where each account has an independent budget.
 
 ### Worktree Support
 
 Sessions running in git worktrees are correctly grouped with the parent repo in the dashboard and token tracking. The proxy resolves the main repo root via `--git-common-dir` and re-reads the checked-out branch on every prompt.
+
+## Limitations / What Disables vdm
+
+vdm sits between Claude Code and Anthropic via `ANTHROPIC_BASE_URL`. There are **seven external conditions** that bypass it — `install.sh` warns about the first two at install time:
+
+1. **Auth env vars set** — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`. Claude Code reads these BEFORE the keychain → vdm's account rotation becomes a no-op (proxy still forwards traffic, but the active account is fixed).
+2. **Cloud-provider env vars** — `CLAUDE_CODE_USE_BEDROCK`/`USE_VERTEX`/`USE_FOUNDRY`/`USE_MANTLE`. Routes Claude Code to a non-Anthropic backend → proxy entirely bypassed.
+3. **`auto` permission mode** — Anthropic's spec says auto mode is "not available with Custom API endpoints via ANTHROPIC_BASE_URL". vdm users must use `default` / `acceptEdits` / `plan` / `bypassPermissions` instead.
+4. **`claude --bare`** — bare mode skips ALL hook auto-discovery, so vdm hooks don't fire and token attribution is silently absent for those scripted runs. (The proxy may still see traffic if the user supplies `ANTHROPIC_API_KEY`, but tracking is gone.)
+5. **Server-managed settings** — vdm's `ANTHROPIC_BASE_URL` setting bypasses Anthropic's server-managed-settings policy as a side effect. Enterprise admins should know that running vdm subverts their managed-settings deployment.
+6. **`allowManagedHooksOnly: true`** in managed settings — every user-level hook is silently dropped at session start. Proxy keeps working; token tracking, commit trailers, and session boundaries all stop firing. `install-hooks.sh` warns on detection. An admin can unblock by adding `"allowedHttpHookUrls": ["http://localhost:3333/*"]` to managed settings.
+7. **`disableAllHooks: true`** in managed settings — same effect, blanket disable.
 
 ## Ports
 
@@ -170,6 +188,18 @@ Sessions running in git worktrees are correctly grouped with the parent repo in 
 |------|---------|-------------|
 | 3333 | Web Dashboard | `CSW_PORT` |
 | 3334 | API Proxy | `CSW_PROXY_PORT` |
+
+## Tuning Knobs (env vars)
+
+The proxy queue + timeouts are tunable for different plans and workloads. All defaults reflect lessons from the audit cycle (the original 45 s deadline + per-account permit released at headers were causing false rate-limits and "Anthropic unresponsive" reports). Set in your shell rc before launching the dashboard:
+
+| Var | Default | What it controls |
+|-----|---------|-------------------|
+| `CSW_PROXY_TIMEOUT_MS` | 900000 (15 min) | Idle socket timeout per upstream request. Bump if Opus 4 extended thinking produces SSE gaps wider than this. |
+| `CSW_REQUEST_DEADLINE_MS` | 600000 (10 min) | Wall-clock cap on a single proxy request (incl. retries). Only checked at retry boundaries — successful first-attempt streams are not affected. |
+| `CSW_MAX_INFLIGHT_PER_ACCOUNT` | 8 | Concurrent streams per bearer token. Now actually enforced for the full SSE lifetime. |
+| `CSW_MIN_INTERVAL_PER_ACCOUNT_MS` | 100 | Minimum gap (ms) between successive dispatches against one bearer (≈ 10 RPS). |
+| `CSW_MAX_PERMIT_WAIT_MS` | 300000 (5 min) | How long a queued request waits for a per-account permit before failing. |
 
 ## Testing
 
