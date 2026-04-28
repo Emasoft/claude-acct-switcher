@@ -13,6 +13,9 @@ DIM='\033[2m'
 NC='\033[0m'
 
 INSTALL_DIR="$HOME/.claude/account-switcher"
+# Preserve the original path for the section-9 audit (the variable can be
+# blanked mid-script when the accounts/ backup fails — see section 5).
+INSTALL_DIR_ORIG="$INSTALL_DIR"
 
 echo ""
 echo -e "${BOLD}  Claude Account Switcher  - Uninstaller${NC}"
@@ -65,16 +68,22 @@ fi
 # can't lose all their saved logins by reflexively typing y/Enter.
 if [[ "$ACCT_COUNT" -gt 0 ]]; then
   echo ""
-  echo -e "  ${YELLOW}Saved account profiles:${NC} ${BOLD}$ACCT_COUNT${NC} file(s) in $INSTALL_DIR/accounts/"
-  echo -e "  ${DIM}Type ${BOLD}purge${NC}${DIM} to delete them. Anything else keeps them${NC}"
-  echo -e "  ${DIM}(they will be moved to ~/.claude/vdm-accounts-backup-<timestamp>/).${NC}"
+  echo -e "  ${RED}⚠  SECURITY:${NC} ${BOLD}$ACCT_COUNT${NC} saved account profile(s) in ${CYAN}$INSTALL_DIR/accounts/${NC}"
+  echo -e "     ${BOLD}contain plaintext OAuth access + refresh tokens.${NC}"
+  echo -e "     ${DIM}vdm cached these for fast switching. Anyone with read access to your${NC}"
+  echo -e "     ${DIM}home directory can use them to authenticate against Anthropic as you${NC}"
+  echo -e "     ${DIM}until they expire (access ~ 1 hour, refresh ~ 90 days).${NC}"
+  echo ""
+  echo -e "     ${BOLD}purge${NC}  delete them now (recommended for privacy / shared machines)"
+  echo -e "     ${BOLD}keep${NC}   move to ${DIM}~/.claude/vdm-accounts-backup-<timestamp>/${NC} (so re-install can restore them)"
+  echo ""
   purge_input=""
-  read -rp "  Delete saved profiles? [purge / keep] " purge_input || purge_input=""
+  read -rp "  How should saved profiles be handled? [purge / keep] " purge_input || purge_input=""
   if [[ "$purge_input" == "purge" ]]; then
     preserve_accounts=false
-    echo -e "  ${YELLOW}!${NC} Saved profiles will be deleted with the install dir."
+    echo -e "  ${YELLOW}!${NC} Saved profiles will be DELETED with the install dir."
   else
-    echo -e "  ${GREEN}✓${NC} Saved profiles will be preserved."
+    echo -e "  ${GREEN}✓${NC} Saved profiles will be moved to a backup dir (still on disk — not deleted)."
   fi
 fi
 
@@ -444,15 +453,156 @@ if (( ${#backup_candidates[@]} > 0 )); then
   fi
 fi
 
-# ── 7. Note about LaunchAgent + Keychain ──
+# ── 7. Cleanup install/uninstall mutex lock dirs ──
+# install.sh and install-hooks.sh use mkdir-based mutexes (no flock(1) on
+# stock macOS). Their `trap RETURN` / `trap EXIT` cleans them up on normal
+# exit, but a SIGKILL / OOM / power loss / Ctrl-C-during-rm can orphan the
+# dir. After uninstall there's no install or settings-rewriter that could
+# legitimately hold one, so any lock dir present is by definition stale.
+# Remove unconditionally — they're vdm-owned and uninstall has just deleted
+# everything that could legitimately depend on them.
+for _lock in "$HOME/.claude/.vdm-install.lock.d" \
+             "$HOME/.claude/.vdm-settings.lock.d"; do
+  if [[ -d "$_lock" ]]; then
+    rmdir "$_lock" 2>/dev/null && echo -e "  ${GREEN}✓${NC} Removed stale lock ${DIM}$_lock${NC}" || true
+  fi
+done
+
+# ── 7b. Old vdm-accounts-backup-* dirs from prior uninstalls ──
+# These accumulate across uninstall cycles. Listing them surfaces forgotten
+# token caches; offering to delete them gives the user a one-stop way to
+# wipe stale OAuth credentials. We never auto-delete — these contain
+# plaintext tokens that the user explicitly chose to KEEP at some prior
+# uninstall, so they're user data, not vdm scaffolding.
+ORPHAN_BACKUPS_DIRS=()
+for _bk in "$HOME/.claude"/vdm-accounts-backup-*; do
+  [[ -d "$_bk" ]] || continue
+  ORPHAN_BACKUPS_DIRS+=("$_bk")
+done
+# Don't list the backup we JUST created in this run as an "orphan".
+if [[ -n "${ACCOUNTS_BACKUP:-}" ]]; then
+  _filtered=()
+  for _bk in "${ORPHAN_BACKUPS_DIRS[@]}"; do
+    [[ "$_bk" == "$ACCOUNTS_BACKUP" ]] && continue
+    _filtered+=("$_bk")
+  done
+  ORPHAN_BACKUPS_DIRS=("${_filtered[@]}")
+fi
+if (( ${#ORPHAN_BACKUPS_DIRS[@]} > 0 )); then
+  echo ""
+  echo -e "  ${YELLOW}Older backup directories from prior uninstalls:${NC}"
+  for _bk in "${ORPHAN_BACKUPS_DIRS[@]}"; do
+    _size="$(du -sh "$_bk" 2>/dev/null | awk '{print $1}')"
+    _files="$(find "$_bk" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+    echo -e "    ${DIM}$_bk${NC} ${DIM}(${_files} profile(s), ${_size})${NC}"
+  done
+  echo -e "  ${DIM}Each contains plaintext OAuth tokens.${NC}"
+  rm_old_bks=""
+  read -rp "  Delete these older backups too? [y/N] " rm_old_bks || rm_old_bks=""
+  if [[ "$rm_old_bks" == "y" || "$rm_old_bks" == "Y" ]]; then
+    for _bk in "${ORPHAN_BACKUPS_DIRS[@]}"; do
+      rm -rf "$_bk" 2>/dev/null && echo -e "    ${GREEN}✓${NC} Removed $_bk" || true
+    done
+  else
+    echo -e "    ${DIM}Older backups kept. Remove manually if you don't need them.${NC}"
+  fi
+fi
+
+# ── 8. LaunchAgent (auto-cleanup if user agrees) ──
 LAUNCHAGENT_PLIST="$HOME/Library/LaunchAgents/com.loekj.vdm.dashboard.plist"
 if [[ -f "$LAUNCHAGENT_PLIST" ]]; then
   echo ""
-  echo -e "  ${YELLOW}Note:${NC} a LaunchAgent plist exists at"
+  echo -e "  ${YELLOW}LaunchAgent detected:${NC}"
   echo -e "    ${DIM}$LAUNCHAGENT_PLIST${NC}"
-  echo -e "  If you previously enabled the supervisor mode, run:"
-  echo -e "    ${DIM}launchctl bootout gui/\$(id -u) \"$LAUNCHAGENT_PLIST\" 2>/dev/null${NC}"
-  echo -e "    ${DIM}rm -f \"$LAUNCHAGENT_PLIST\"${NC}"
+  rm_la=""
+  read -rp "  Unload + remove this LaunchAgent? [y/N] " rm_la || rm_la=""
+  if [[ "$rm_la" == "y" || "$rm_la" == "Y" ]]; then
+    launchctl bootout "gui/$(id -u)" "$LAUNCHAGENT_PLIST" 2>/dev/null || true
+    rm -f "$LAUNCHAGENT_PLIST" && echo -e "    ${GREEN}✓${NC} LaunchAgent removed" || true
+  else
+    echo -e "    ${DIM}LaunchAgent kept. Remove later with:${NC}"
+    echo -e "      ${DIM}launchctl bootout gui/\$(id -u) \"$LAUNCHAGENT_PLIST\" 2>/dev/null${NC}"
+    echo -e "      ${DIM}rm -f \"$LAUNCHAGENT_PLIST\"${NC}"
+  fi
+fi
+
+# ── 9. Final verification audit ──
+# Independently scan the system for anything vdm-shaped that might still be
+# present. The user's main concern: hooks lingering in settings.json,
+# auth tokens on disk, any other artefact uninstall didn't catch. We
+# enumerate the same surfaces install touches and report any that still
+# show vdm content. This is read-only and best-effort — we don't try to
+# re-clean them automatically (the user just told us NOT to keep guessing
+# what they want).
+echo ""
+echo -e "  ${BOLD}Verification — scanning for remaining vdm artefacts...${NC}"
+
+LEFT_ARTIFACTS=()
+# The install dir itself.
+if [[ -d "$INSTALL_DIR_ORIG" ]] 2>/dev/null; then LEFT_ARTIFACTS+=("$INSTALL_DIR_ORIG"); fi
+[[ -d "$HOME/.claude/account-switcher" ]] && LEFT_ARTIFACTS+=("$HOME/.claude/account-switcher")
+# Lock dirs.
+[[ -d "$HOME/.claude/.vdm-install.lock.d"  ]] && LEFT_ARTIFACTS+=("$HOME/.claude/.vdm-install.lock.d")
+[[ -d "$HOME/.claude/.vdm-settings.lock.d" ]] && LEFT_ARTIFACTS+=("$HOME/.claude/.vdm-settings.lock.d")
+# Settings.json residual hooks.
+if [[ -f "$HOME/.claude/settings.json" ]]; then
+  if grep -q "localhost:[0-9]*/api/\(session-start\|session-stop\|session-end\|subagent-start\|pre-compact\|post-compact\|cwd-changed\|post-tool-batch\|worktree-create\|worktree-remove\|task-created\|task-completed\|teammate-idle\|notification\|config-change\|user-prompt-expansion\)" \
+        "$HOME/.claude/settings.json" 2>/dev/null; then
+    LEFT_ARTIFACTS+=("$HOME/.claude/settings.json [contains vdm hook URL(s)]")
+  fi
+fi
+# Symlinks.
+for _lnk in "$HOME/.local/bin/vdm" "$HOME/.local/bin/csw" \
+            "/opt/homebrew/bin/vdm" "/opt/homebrew/bin/csw" \
+            "/usr/local/bin/vdm"    "/usr/local/bin/csw"; do
+  if [[ -L "$_lnk" ]]; then
+    _t="$(readlink "$_lnk" 2>/dev/null || true)"
+    if [[ "$_t" == *"/.claude/account-switcher/"* ]]; then
+      LEFT_ARTIFACTS+=("$_lnk -> $_t")
+    fi
+  fi
+done
+# Global git hooksPath still pointing at our dir + marker still present.
+_gp="$(git config --global core.hooksPath 2>/dev/null || true)"
+_gp="${_gp/#\~/$HOME}"
+if [[ -n "$_gp" && -f "$_gp/.vdm-set-hooks-path" ]]; then
+  LEFT_ARTIFACTS+=("git config --global core.hooksPath = $_gp (vdm-marker still present)")
+fi
+# Shell rc residual markers.
+for _rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" \
+           "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+  [[ -f "$_rc" ]] || continue
+  if grep -q "claude-account-switcher" "$_rc" 2>/dev/null; then
+    LEFT_ARTIFACTS+=("$_rc [contains 'claude-account-switcher' marker]")
+  fi
+done
+
+if (( ${#LEFT_ARTIFACTS[@]} == 0 )); then
+  echo -e "  ${GREEN}✓${NC} No vdm artefacts detected. Uninstall is clean."
+else
+  echo -e "  ${YELLOW}⚠${NC}  ${BOLD}${#LEFT_ARTIFACTS[@]} artefact(s) remain:${NC}"
+  for _a in "${LEFT_ARTIFACTS[@]}"; do
+    echo -e "    ${YELLOW}•${NC} $_a"
+  done
+  echo -e "  ${DIM}(These were not auto-removed — investigate and clean manually.)${NC}"
+fi
+
+# Apple Keychain — read-only audit. vdm itself never adds entries; the only
+# Claude-related entry is `Claude Code-credentials` which is owned by Claude
+# Code. We list it for transparency but explicitly note it's not a vdm leak.
+KC_ENTRIES=()
+for _svc in "Claude Code-credentials" "Claude" "Claude Code"; do
+  if security find-generic-password -s "$_svc" -a "$USER" >/dev/null 2>&1; then
+    KC_ENTRIES+=("$_svc")
+  fi
+done
+if (( ${#KC_ENTRIES[@]} > 0 )); then
+  echo ""
+  echo -e "  ${DIM}Keychain entries (Claude Code-owned, NOT vdm — left intentionally):${NC}"
+  for _svc in "${KC_ENTRIES[@]}"; do
+    echo -e "    ${DIM}• \"$_svc\" (account: $USER)${NC}"
+  done
+  echo -e "  ${DIM}To remove: \`claude logout\` (then \`security delete-generic-password -s \"<service>\" -a \"$USER\"\` to verify).${NC}"
 fi
 
 echo ""
