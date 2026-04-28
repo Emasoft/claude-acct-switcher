@@ -3,7 +3,7 @@
 // Zero dependencies, uses Node.js built-in modules only.
 
 import { createServer } from 'node:http';
-import { readdir, readFile, writeFile, mkdir, unlink, chmod, rename } from 'node:fs/promises';
+import { readdir, readFile, writeFile, unlink, chmod, rename } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +26,10 @@ const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
 const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
 const SESSION_HISTORY_FILE = join(__dirname, 'session-history.json');
+// Phase C — date-range scrubber persistence. Kept next to the other state
+// files so it shares the same atomic-write contract and per-install scope.
+// Schema: { start: ms_epoch, end: ms_epoch, tierFilter: string[] }.
+const VIEWER_STATE_FILE = join(__dirname, 'viewer-state.json');
 const KEYCHAIN_ACCOUNT = process.env.USER || execSync('whoami').toString().trim();
 
 // Detect installed Claude Code version for User-Agent mimicry
@@ -60,28 +64,34 @@ function detectProjectVersion() {
 const PROJECT_VERSION = detectProjectVersion();
 
 // Auto-detect keychain service name for robustness against Claude Code updates.
-// Falls back to the known default if detection fails.
+//
+// Phase 6: deterministic preference order. The Claude Code CLI has shipped
+// the keychain entry under three different service names across releases.
+// We try a stable, ordered list of known names first — only falling back to
+// `dump-keychain` (sorted, head -1) when none of them exist. This mirrors
+// vdm's bash detect_keychain_service() byte-for-byte so the two
+// implementations can never diverge on which entry they pick.
 function detectKeychainService() {
-  try {
-    // Search for any keychain entry matching the Claude Code pattern
-    const out = execSync(
-      `security find-generic-password -a "${KEYCHAIN_ACCOUNT}" -s "Claude Code-credentials" -w 2>/dev/null && echo "Claude Code-credentials"`,
-      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    const lines = out.split('\n');
-    return lines[lines.length - 1]; // last line is the service name
-  } catch {
-    // Try a broader search for any "Claude" credential
+  const candidates = ['Claude Code-credentials', 'Claude-Code-credentials', 'claude.ai-credentials'];
+  for (const candidate of candidates) {
     try {
-      const dump = execSync(
-        `security dump-keychain 2>/dev/null | grep -A4 '"svce"' | grep -i claude | head -1`,
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-      ).trim();
-      const match = dump.match(/"svce"<blob>="([^"]+)"/);
-      if (match) return match[1];
-    } catch {}
+      execFileSync('security', ['find-generic-password', '-a', KEYCHAIN_ACCOUNT, '-s', candidate, '-w'],
+                   { stdio: ['ignore', 'pipe', 'ignore'] });
+      return candidate;
+    } catch { /* try next */ }
   }
-  return 'Claude Code-credentials'; // fallback
+  // Deterministic dump-keychain fallback: LC_ALL=C sort -u | head -1 ensures
+  // multiple Claude entries (e.g. dev + stable installs) always resolve to
+  // the same service, instead of whichever the keychain happened to list
+  // first this boot.
+  try {
+    const dump = execSync(
+      `security dump-keychain 2>/dev/null | grep -A4 '"svce"' | grep -i claude | sed -n 's/.*"svce"<blob>="\\([^"]*\\)".*/\\1/p' | LC_ALL=C sort -u | head -1`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim();
+    if (dump) return dump;
+  } catch { /* ignore */ }
+  return 'Claude Code-credentials';
 }
 
 const KEYCHAIN_SERVICE = detectKeychainService();
@@ -100,6 +110,13 @@ const DEFAULT_SETTINGS = {
   serializeDelayMs: 200,
   commitTokenUsage: false,
   sessionMonitor: false,
+  // Phase D — gate per-tool attribution behind a setting. When false, the
+  // /api/post-tool-batch endpoint replies 404 (so the install-hooks.sh
+  // SubagentStart-style installer can detect and skip subscribing). When
+  // true, PostToolBatch payloads tag the next appendTokenUsage() row with
+  // `tool` (and `mcpServer` if applicable) — see Refinement 1 in the
+  // contract.
+  perToolAttribution: false,
 };
 
 function loadSettings() {
@@ -218,6 +235,25 @@ function atomicWriteFileSync(filePath, content) {
   renameSync(tmpPath, filePath);
 }
 
+// Run a `git -C <cwd> ...` command without invoking a shell. cwd is passed
+// as a separate argv element, so any character in it (including ;, |, &,
+// `, $, ", newline, single-quote, glob) is treated as a literal directory
+// path by git itself — it is impossible for a hostile cwd from a /api/*
+// payload to inject extra commands. stderr is discarded the way the
+// previous `2>/dev/null` shell redirect did. Throws (like execSync) if
+// git exits non-zero or if cwd is not a non-empty string; callers wrap
+// in try/catch.
+function _runGit(cwd, args, timeout = 3000) {
+  if (typeof cwd !== 'string' || cwd.length === 0) {
+    throw new Error('git: cwd must be a non-empty string');
+  }
+  return execFileSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    timeout,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+}
+
 import https from 'node:https';
 import { execFile } from 'node:child_process';
 import http from 'node:http';
@@ -228,7 +264,6 @@ import {
   stripHopByHopHeaders,
   createAccountStateManager,
   isAccountAvailable as _isAccountAvailable,
-  scoreAccount as _scoreAccount,
   pickBestAccount as _pickBestAccount,
   pickDrainFirst as _pickDrainFirst,
   pickConserve as _pickConserve,
@@ -243,8 +278,19 @@ import {
   buildUpdatedCreds,
   shouldRefreshToken,
   createPerAccountLock,
+  createSemaphore,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
+  clampViewerState,
+  // Phase D — hook payload parsers and helpers
+  parseCompactPayload,
+  parseSubagentStartPayload,
+  parseCwdChangedPayload,
+  parsePostToolBatchPayload,
+  inferMcpServerFromToolName,
+  isUsageRow,
+  buildCompactBoundaryEntry,
+  mergeSessionAttribution,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -329,7 +375,7 @@ function logActivity(type, detail = {}) {
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Session Monitor — constants & data
+// Session Monitor — constants & data
 // ─────────────────────────────────────────────────
 
 const SESSION_INACTIVITY_MS = 10 * 60 * 1000; // 10 min → session considered completed
@@ -395,7 +441,12 @@ async function autoDiscoverAccount() {
       const savedRefresh = saved.claudeAiOauth?.refreshToken;
       const currentRefresh = creds.claudeAiOauth.refreshToken;
       if (savedRefresh && currentRefresh && savedRefresh === currentRefresh) {
-        writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+        // atomicWriteFileSync writes to <file>.tmp then renames over <file>
+        // — a SIGKILL/OOM/power-loss between truncate and the final byte
+        // never leaves a half-written JSON file that crashes the next
+        // load() call. The previous direct writeFileSync was a corruption
+        // window for the dashboard's own state.
+        atomicWriteFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
         const oldFp = getFingerprint(saved);
         migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
         console.log(`[auto-discover] Updated "${savedName}" with refreshed token (same refreshToken)`);
@@ -409,7 +460,7 @@ async function autoDiscoverAccount() {
         let savedEmail = '';
         try { savedEmail = (await readFile(join(ACCOUNTS_DIR, `${savedName}.label`), 'utf8')).trim(); } catch {}
         if (savedEmail === email) {
-          writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+          atomicWriteFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
           // Migrate persisted state / history from old fingerprint to new
           const oldFp = getFingerprint(saved);
           migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
@@ -436,10 +487,10 @@ async function autoDiscoverAccount() {
   const name = `auto-${idx}`;
 
   try { mkdirSync(ACCOUNTS_DIR, { recursive: true }); } catch {}
-  writeFileSync(join(ACCOUNTS_DIR, `${name}.json`), JSON.stringify(creds, null, 2));
+  atomicWriteFileSync(join(ACCOUNTS_DIR, `${name}.json`), JSON.stringify(creds, null, 2));
 
   if (email) {
-    writeFileSync(join(ACCOUNTS_DIR, `${name}.label`), email);
+    atomicWriteFileSync(join(ACCOUNTS_DIR, `${name}.label`), email);
   }
 
   const displayName = email || name;
@@ -770,10 +821,12 @@ async function loadProfiles() {
 
       // Backfill: if the stored file has stale/missing tier data but keychain has it,
       // update the file so the data persists even when this account is inactive.
+      // atomic temp+rename so a crash mid-write never produces a corrupt
+      // account JSON the next loadProfiles() call would skip.
       if (isActive && activeOauth.rateLimitTier && activeOauth.rateLimitTier !== oauth.rateLimitTier) {
         try {
           const updatedCreds = { ...creds, claudeAiOauth: { ...oauth, subscriptionType: subType, rateLimitTier: rlTier } };
-          writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(updatedCreds, null, 2));
+          atomicWriteFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(updatedCreds, null, 2));
         } catch { /* non-critical */ }
       }
 
@@ -857,14 +910,21 @@ async function handleAPI(req, res) {
       p.utilizationHistory = utilizationHistory.getHistory(p.fingerprint);
       p.weeklyHistory = weeklyHistory.getHistory(p.fingerprint);
       p.velocity5h = utilizationHistory.getVelocity(p.fingerprint);
-      // Pass the 5h reset epoch so the prediction is clamped against it.
-      // Without the clamp, a small positive velocity at 95% utilization can
-      // produce "Est. 6h to limit" even when the rolling window will reset
-      // in 30 minutes — the audit's "wrong estimation at end of cycle"
-      // failure mode. predictMinutesToLimit returns null when the
-      // projected limit is past the next reset, so the UI hides the badge.
+      p.velocity7d = weeklyHistory.getVelocity(p.fingerprint);
+      // Pass the reset epoch so each prediction is clamped against its
+      // own window. Without the clamp, a small positive velocity at 95%
+      // utilization can produce "Est. 6h to limit" even when the rolling
+      // window will reset in 30 minutes — the audit's "wrong estimation
+      // at end of cycle" failure mode. predictMinutesToLimit returns null
+      // when the projected limit is past the next reset, so the UI hides
+      // the badge.  Both windows are emitted so the dashboard's 7d/30d
+      // panels (the user's "30-day cycle wrong estimation" concern) get
+      // the same treatment as the 5h badge — the previous code only
+      // predicted the 5h window and the 7d ETA was effectively missing.
       const resetAt5h = (p.rateLimits && p.rateLimits.fiveH && p.rateLimits.fiveH.reset) || 0;
+      const resetAt7d = (p.rateLimits && p.rateLimits.sevenD && p.rateLimits.sevenD.reset) || 0;
       p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint, resetAt5h);
+      p.minutesToLimit7d = weeklyHistory.predictMinutesToLimit(p.fingerprint, resetAt7d);
     }
     const stats = await loadStats();
     const probeStats = getProbeStats();
@@ -1035,6 +1095,7 @@ async function handleAPI(req, res) {
     }
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
+    if (typeof patch.perToolAttribution === 'boolean') settings.perToolAttribution = patch.perToolAttribution;
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
@@ -1044,7 +1105,101 @@ async function handleAPI(req, res) {
     return true;
   }
 
-  // ── [BETA] Session tracking for token usage ──
+  // ── Phase C — viewer-state (date-range scrubber + tier filter) ──
+  // GET returns the persisted window plus a freshly-computed live data
+  // range so the client can clamp before render. POST validates and
+  // persists. Both endpoints reject malformed input with 400 instead of
+  // silently coercing — the client controls the values via drag/preset
+  // and a malformed POST signals a bug, not a user error to recover from.
+
+  if (url.pathname === '/api/viewer-state' && req.method === 'GET') {
+    const persisted = loadViewerState();
+    const dataRange = computeDataRange(); // null if no data
+    let start, end, tierFilter;
+    if (persisted && Number.isFinite(persisted.start) && Number.isFinite(persisted.end)) {
+      start = persisted.start;
+      end = persisted.end;
+      tierFilter = Array.isArray(persisted.tierFilter) ? persisted.tierFilter : ['all'];
+    } else if (dataRange) {
+      // Fresh install — no persisted state. Default to the full live
+      // window so every chart renders all available data on first load.
+      start = dataRange.oldest;
+      end = dataRange.newest;
+      tierFilter = ['all'];
+    } else {
+      // No data AND no persisted state: collapse to "now" and let the
+      // client hide the scrubber.
+      const now = Date.now();
+      start = now; end = now;
+      tierFilter = ['all'];
+    }
+    // Server-side clamp: if persisted values fell outside the live data
+    // range (e.g. data aged out), clampViewerState produces a sane
+    // window. We only apply the clamp when dataRange exists — collapsed
+    // [now,now] fallbacks already match the helper's output.
+    //
+    // knownTiers is left empty here on purpose: the server doesn't keep
+    // a live tier list (rateLimitTier lives in account JSON files and
+    // gets refreshed by /api/profiles). Empty knownTiers tells
+    // clampViewerState to pass tier entries through unchanged; the
+    // client revalidates against /api/profiles right after this GET.
+    if (dataRange) {
+      const clamped = clampViewerState({ start, end, tierFilter, dataRange, knownTiers: [] });
+      start = clamped.start;
+      end = clamped.end;
+      tierFilter = clamped.tierFilter;
+    }
+    json(res, { start, end, tierFilter, dataRange });
+    return true;
+  }
+
+  if (url.pathname === '/api/viewer-state' && req.method === 'POST') {
+    let body;
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch {
+      json(res, { ok: false, error: 'invalid JSON body' }, 400);
+      return true;
+    }
+    if (!body || typeof body !== 'object') {
+      json(res, { ok: false, error: 'body must be a JSON object' }, 400);
+      return true;
+    }
+    // Validate ms-epoch integers. Number.isFinite + Number.isInteger
+    // together reject NaN, Infinity, fractions, and non-numeric inputs.
+    // The MIN_WINDOW_MS check is delegated to the client UI (which
+    // clamps on drag) — we accept any valid window here and trust the
+    // clamp helper at read time to enforce sanity for stale persisted
+    // data. The one server-side invariant we DO enforce is start ≤ end,
+    // because saving start>end could break clients that don't run their
+    // own clamp.
+    const start = Number(body.start);
+    const end = Number(body.end);
+    if (!Number.isFinite(start) || !Number.isInteger(start) || start < 0) {
+      json(res, { ok: false, error: 'start must be a non-negative integer (ms epoch)' }, 400);
+      return true;
+    }
+    if (!Number.isFinite(end) || !Number.isInteger(end) || end < 0) {
+      json(res, { ok: false, error: 'end must be a non-negative integer (ms epoch)' }, 400);
+      return true;
+    }
+    if (start > end) {
+      json(res, { ok: false, error: 'start must be ≤ end' }, 400);
+      return true;
+    }
+    let tierFilter = body.tierFilter;
+    if (tierFilter == null) {
+      tierFilter = ['all'];
+    } else if (!Array.isArray(tierFilter) || tierFilter.some(t => typeof t !== 'string')) {
+      json(res, { ok: false, error: 'tierFilter must be an array of strings' }, 400);
+      return true;
+    }
+    saveViewerState({ start, end, tierFilter });
+    json(res, { ok: true });
+    return true;
+  }
+
+  // ── Session tracking for token usage ──
 
   if (url.pathname === '/api/session-start' && req.method === 'POST') {
     try {
@@ -1063,17 +1218,21 @@ async function handleAPI(req, res) {
         // directory (`/tmp/foo/bar`, `~/Desktop/notes`) ended up in the
         // project dropdown as a separate "project" — polluting the list
         // and making aggregate token-usage useless. (Concern 02.C2.)
+        // Phase 6: branch keeps its `'(no git)'` sentinel for backwards
+        // compatibility with the UI's grouping logic; appendTokenUsage
+        // sites coerce to null when persisting so the on-disk schema
+        // matches the spec (branchAtWriteTime: string|null).
         let repo = '(non-git)', branch = '(no git)', commitHash = '';
         try {
           // Use --git-common-dir to resolve to main repo root (not worktree directory)
           // so worktree sessions group with the parent repo in the dashboard.
           try {
-            repo = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().replace(/\/\.git\/?$/, '');
+            repo = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
           } catch {
-            repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+            repo = _runGit(cwd, ['rev-parse', '--show-toplevel']).trim();
           }
-          branch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-          commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          branch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
         } catch { /* not a git repo — keep sentinel `repo` */ }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
         ensureLocalCommitHook(cwd);
@@ -1084,11 +1243,11 @@ async function handleAPI(req, res) {
         // Keep cwd up to date so periodic persist and auto-claim use the latest directory
         if (cwd && cwd !== session.cwd) session.cwd = cwd;
         try {
-          const newBranch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
+          const newBranch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
           if (newBranch && newBranch !== session.branch) {
             log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
             session.branch = newBranch;
-            session.commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+            session.commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
           }
         } catch { /* ignore */ }
       }
@@ -1117,29 +1276,271 @@ async function handleAPI(req, res) {
         json(res, { ok: false, error: 'session_id required' }, 400);
         return true;
       }
-      const session = pendingSessions.get(sessionId);
-      if (!session) {
-        log('tokens', `Session stop: ${sessionId.slice(0, 8)}… (not found — may have been auto-claimed)`);
-        json(res, { ok: true, claimed: 0 });
+      const result = _claimAndPersistForSession(sessionId, data, 'stop');
+      json(res, { ok: true, claimed: result.claimed });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase 6 (Item 8h): /api/session-end — mirrors /api/session-stop but is
+  // wired to Claude Code's `SessionEnd` hook, which fires once when the
+  // user quits Claude Code (Cmd-Q, terminal close, /exit). Stop /
+  // StopFailure don't fire when the user quits mid-turn, so without
+  // SessionEnd that turn's usage would only be recovered by the 24h
+  // auto-claim sweep — and even then, attribution would be stale.
+  // Idempotent: an unknown sessionId is treated as already-claimed.
+  if (url.pathname === '/api/session-end' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = JSON.parse(body);
+      const sessionId = data.session_id;
+      if (!sessionId) {
+        json(res, { ok: false, error: 'session_id required' }, 400);
         return true;
       }
-      const stopAt = Date.now();
-      const claimed = claimUsageInRange(session.startedAt, stopAt);
-      for (const entry of claimed) {
-        appendTokenUsage({
-          ts: entry.ts,
-          repo: session.repo,
-          branch: session.branch,
-          commitHash: session.commitHash,
-          model: entry.model,
-          inputTokens: entry.inputTokens,
-          outputTokens: entry.outputTokens,
-          account: entry.account,
-        });
+      const result = _claimAndPersistForSession(sessionId, data, 'end');
+      json(res, { ok: true, claimed: result.claimed });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase D — /api/subagent-start: SubagentStart hook fires when Claude
+  // Code spawns a sub-agent. Without this endpoint, SubagentStop's
+  // session_id is unknown to the dashboard and usage gets either dropped
+  // or attributed to the parent via the CL-3 fallback (correct repo, wrong
+  // sessionId/agentType). Pre-registering here means SubagentStop fires
+  // with a known session_id and the row inherits parentSessionId/agentType
+  // automatically via _attachSessionAttribution.
+  if (url.pathname === '/api/subagent-start' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseSubagentStartPayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
       }
-      pendingSessions.delete(sessionId);
-      log('tokens', `Session stopped: ${sessionId.slice(0, 8)}… (claimed ${claimed.length} entries)`);
-      json(res, { ok: true, claimed: claimed.length });
+      const { sessionId, parentSessionId, agentType, cwd } = parsed;
+      // Idempotent: if we've already registered this sub-agent (e.g. the
+      // hook fired twice — Claude Code retries on transport failure), just
+      // refresh the branch via _runGit and return success.
+      if (pendingSessions.has(sessionId)) {
+        const existing = pendingSessions.get(sessionId);
+        if (cwd && cwd !== existing.cwd) existing.cwd = cwd;
+        if (existing.cwd) {
+          try {
+            const newBranch = _resolveWorktreeBranch(existing.cwd, _runGit(existing.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+            if (newBranch && newBranch !== existing.branch) existing.branch = newBranch;
+          } catch { /* ignore */ }
+        }
+        json(res, { ok: true, registered: 'subagent', idempotent: true });
+        return true;
+      }
+      // Locate the parent session. Two paths:
+      //   (a) parentSessionId is in pendingSessions → inherit repo/branch/commitHash
+      //       (the user's PR attribution stays with the orchestrator's session).
+      //   (b) parent unknown → register the sub-agent standalone, best-effort
+      //       attribution via cwd. Per the contract: "If parent not found:
+      //       register the subagent standalone (best-effort, attribute via cwd)."
+      let repo = '(non-git)', branch = '(no git)', commitHash = '';
+      const parent = parentSessionId ? pendingSessions.get(parentSessionId) : null;
+      if (parent) {
+        // Inherit parent's repo/branch but record the sub-agent's own cwd
+        // (a sub-agent in a worktree has a distinct cwd; the dashboard
+        // already rolls worktrees back to the parent repo via
+        // --git-common-dir).
+        repo = parent.repo;
+        branch = parent.branch;
+        commitHash = parent.commitHash;
+      } else if (cwd) {
+        try {
+          try {
+            repo = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
+          } catch {
+            repo = _runGit(cwd, ['rev-parse', '--show-toplevel']).trim();
+          }
+          branch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+        } catch { /* not a git repo — keep sentinel `repo` */ }
+      }
+      pendingSessions.set(sessionId, {
+        repo,
+        branch,
+        commitHash,
+        cwd: cwd || (parent ? parent.cwd : null),
+        startedAt: Date.now(),
+        // Phase D — sub-agent attribution
+        parentSessionId: parentSessionId || null,
+        agentType: agentType || null,
+      });
+      log('tokens', `Sub-agent started: ${sessionId.slice(0, 8)}… (parent ${(parentSessionId || 'unknown').slice(0, 8)}, type ${agentType || 'unknown'})`);
+      json(res, { ok: true, registered: 'subagent' });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase D — /api/pre-compact: PreCompact hook fires before context
+  // compaction. We append a compact_boundary marker row to token-usage.json
+  // so the dashboard can render a "compaction" tick at the right ts.
+  // Aggregation readers skip type !== 'usage' rows so the marker doesn't
+  // get summed as input/output tokens (see isUsageRow in lib.mjs).
+  if (url.pathname === '/api/pre-compact' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseCompactPayload(data, 'pre');
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, trigger, preTokens } = parsed;
+      const session = pendingSessions.get(sessionId);
+      appendCompactBoundary({
+        sessionId,
+        repo: session ? session.repo : '(non-git)',
+        branch: session ? (session.branch ?? null) : null,
+        commitHash: session ? session.commitHash : '',
+        trigger,
+        preTokens,
+        postTokens: null,
+        account: null,
+      });
+      log('tokens', `Pre-compact: ${sessionId.slice(0, 8)}… (trigger=${trigger}, preTokens=${preTokens})`);
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase D — /api/post-compact: PostCompact hook fires after compaction
+  // completes. We append a second compact_boundary marker (with postTokens)
+  // and clear the session's lastBatchToolNames so the next per-tool
+  // attribution claim doesn't double-count cache tokens that were already
+  // discarded during compaction. (Per the contract §3: "PostCompact also
+  // clears any in-flight cache-creation tracking for that session so the
+  // next claim doesn't double-count cache tokens.")
+  if (url.pathname === '/api/post-compact' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseCompactPayload(data, 'post');
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, trigger, preTokens, postTokens } = parsed;
+      const session = pendingSessions.get(sessionId);
+      appendCompactBoundary({
+        sessionId,
+        repo: session ? session.repo : '(non-git)',
+        branch: session ? (session.branch ?? null) : null,
+        commitHash: session ? session.commitHash : '',
+        trigger,
+        preTokens,
+        postTokens,
+        account: null,
+      });
+      // Clear in-flight per-tool tracking — compaction discards the cache
+      // and we MUST NOT attribute the next round-trip's cache_creation
+      // tokens to the tool that triggered compaction.
+      if (session) {
+        session.lastBatchToolNames = [];
+      }
+      log('tokens', `Post-compact: ${sessionId.slice(0, 8)}… (trigger=${trigger}, ${preTokens}→${postTokens})`);
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase D — /api/cwd-changed: CwdChanged hook fires when Claude Code's
+  // working directory changes (e.g. `cd` between prompts). We re-resolve
+  // the session's branch so subsequent appendTokenUsage calls record the
+  // post-cd branch. Already-buffered usage retains the old branch (good —
+  // it WAS emitted while in the old cwd).
+  if (url.pathname === '/api/cwd-changed' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseCwdChangedPayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, cwd } = parsed;
+      const session = pendingSessions.get(sessionId);
+      if (session) {
+        session.cwd = cwd;
+        try {
+          const newBranch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          if (newBranch && newBranch !== session.branch) {
+            log('tokens', `Cwd-changed: session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
+            session.branch = newBranch;
+            session.commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+          }
+        } catch { /* not a git repo — keep prior branch */ }
+      }
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase D — /api/post-tool-batch (gated): PostToolBatch hook fires after
+  // a batch of parallel tool calls resolves. Only registered when
+  // settings.perToolAttribution === true. Per the contract §3 (Refinement
+  // 1), we attach the batch's tool names to the session's
+  // lastBatchToolNames — `_attachSessionAttribution` then tags the next
+  // appendTokenUsage row with `tool` (comma-joined) and `mcpServer`
+  // (derived from the first mcp__ tool in the batch).
+  if (url.pathname === '/api/post-tool-batch' && req.method === 'POST') {
+    if (!settings.perToolAttribution) {
+      // Endpoint disabled when the gate is off — return 404 so the hook
+      // installer can detect "this endpoint isn't accepting events" and
+      // skip subscribing on the next install/uninstall cycle.
+      json(res, { ok: false, error: 'per-tool attribution disabled' }, 404);
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parsePostToolBatchPayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, tools } = parsed;
+      const session = pendingSessions.get(sessionId);
+      let recorded = 0;
+      if (session && tools.length > 0) {
+        // Per the contract: "the simpler choice is to attach a
+        // lastBatchToolNames: string[] array on the pendingSession at
+        // PostToolBatch time, and then when the next appendTokenUsage for
+        // that session fires, set tool: lastBatchToolNames.join(',') and
+        // mcpServer: <derived>. This avoids 10x row inflation."
+        session.lastBatchToolNames = tools.map(t => t.toolName);
+        recorded = tools.length;
+      }
+      json(res, { ok: true, recorded });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 500);
     }
@@ -1151,25 +1552,27 @@ async function handleAPI(req, res) {
     // Same logic as the periodic timer, but triggered on demand (used by commit hooks).
     try {
       let flushed = 0;
-      for (const [id, session] of pendingSessions) {
+      for (const [sessionId, session] of pendingSessions) {
         const now = Date.now();
         if (session.cwd) {
           try {
-            const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
+            const cur = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
             if (cur && cur !== session.branch) {
               session.branch = cur;
-              session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+              session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
             }
           } catch { /* ignore */ }
         }
         const claimed = claimUsageInRange(session.startedAt, now);
         for (const entry of claimed) {
-          appendTokenUsage({
-            ts: entry.ts, repo: session.repo, branch: session.branch,
+          appendTokenUsage(_attachSessionAttribution(sessionId, session, {
+            ts: entry.ts, repo: session.repo,
+            // Phase 6: branchAtWriteTime null-safe.
+            branch: session.branch ?? null,
             commitHash: session.commitHash, model: entry.model,
             inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
             account: entry.account,
-          });
+          }));
         }
         if (claimed.length > 0) {
           session.startedAt = now;
@@ -1187,7 +1590,12 @@ async function handleAPI(req, res) {
   if (url.pathname === '/api/token-usage' && req.method === 'GET') {
     try {
       const usage = loadTokenUsage();
-      let filtered = usage;
+      // Phase D — aggregation default: filter out compact_boundary rows so
+      // existing clients that sum inputTokens/outputTokens don't accidentally
+      // include marker rows. Clients that want compaction markers can pass
+      // ?includeMarkers=1 to get the full stream back.
+      const includeMarkers = url.searchParams.get('includeMarkers') === '1';
+      let filtered = includeMarkers ? usage : usage.filter(isUsageRow);
       const repo = url.searchParams.get('repo');
       const branch = url.searchParams.get('branch');
       const since = url.searchParams.get('since');
@@ -1203,7 +1611,7 @@ async function handleAPI(req, res) {
     return true;
   }
 
-  // ── [BETA] Session Monitor API ──
+  // ── Session Monitor API ──
 
   if (url.pathname === '/api/sessions' && req.method === 'GET') {
     const now = Date.now();
@@ -2411,6 +2819,147 @@ function renderHTML() {
   }
   .savings-chart-total .saved { color: var(--green); font-weight: 600; }
   .savings-chart-total .over { color: var(--red); font-weight: 600; }
+
+  /* ── Phase C — date-range scrubber ── */
+  .vs-bar {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    padding: 0.625rem 0.875rem;
+    margin-bottom: 0.875rem;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  .vs-bar.hidden { display: none; }
+  .vs-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    flex-wrap: wrap;
+  }
+  .vs-bar-row + .vs-bar-row { margin-top: 0.5rem; }
+  .vs-presets {
+    display: flex;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+  }
+  .vs-preset-btn {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground);
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .vs-preset-btn:hover { background: var(--bg); }
+  .vs-preset-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+  .vs-window-info {
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    margin-left: auto;
+  }
+  .vs-window-info b { color: var(--foreground); font-weight: 600; }
+  .vs-track-wrap {
+    flex: 1;
+    min-width: 200px;
+    position: relative;
+    height: 36px;
+    user-select: none;
+    touch-action: none;
+  }
+  .vs-track {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    transform: translateY(-50%);
+  }
+  .vs-track-fill {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    background: var(--primary);
+    border-radius: 3px;
+    opacity: 0.5;
+  }
+  .vs-thumb {
+    position: absolute;
+    top: 50%;
+    width: 16px;
+    height: 16px;
+    margin-left: -8px;
+    background: var(--primary);
+    border: 2px solid var(--card);
+    border-radius: 50%;
+    transform: translateY(-50%);
+    cursor: grab;
+    box-shadow: var(--shadow);
+    outline: none;
+  }
+  .vs-thumb:focus { box-shadow: 0 0 0 3px var(--blue-soft); }
+  .vs-thumb:active { cursor: grabbing; }
+  .vs-thumb-label {
+    position: absolute;
+    top: -22px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.6875rem;
+    color: var(--muted);
+    white-space: nowrap;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .vs-fallback-inputs {
+    display: none;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .vs-fallback-input {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground);
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    font-family: inherit;
+  }
+  @media (max-width: 600px) {
+    .vs-track-wrap { display: none; }
+    .vs-fallback-inputs { display: flex; }
+  }
+  /* Tier chips */
+  .vs-tier-chips {
+    display: flex;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .vs-tier-chip {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    font-size: 0.6875rem;
+    padding: 0.1875rem 0.5rem;
+    cursor: pointer;
+    font-family: inherit;
+    text-transform: capitalize;
+  }
+  .vs-tier-chip:hover { background: var(--bg); }
+  .vs-tier-chip.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+  .vs-tier-label {
+    font-size: 0.6875rem;
+    color: var(--muted);
+    margin-right: 0.25rem;
+  }
 </style>
 </head>
 <body>
@@ -2434,6 +2983,40 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('sessions')">Sessions<span id="sessions-badge" class="tab-badge" style="display:none"></span></button>
     <button class="tab" onclick="switchTab('config')">Config</button>
     <button class="tab" onclick="switchTab('logs')">Logs</button>
+  </div>
+
+  <!-- Phase C: date-range scrubber + tier filter. Hidden until at least one
+       data point exists; visible only on activity/usage tabs (it filters
+       time-series; it is meaningless on accounts/config/logs). -->
+  <div id="vs-bar" class="vs-bar hidden" role="group" aria-label="Date range and tier filter">
+    <div class="vs-bar-row">
+      <div class="vs-presets">
+        <button class="vs-preset-btn" data-preset="1h">Last hour</button>
+        <button class="vs-preset-btn" data-preset="24h">Last 24h</button>
+        <button class="vs-preset-btn" data-preset="7d">Last 7d</button>
+        <button class="vs-preset-btn" data-preset="30d">Last 30d</button>
+        <button class="vs-preset-btn" data-preset="all">All</button>
+      </div>
+      <div class="vs-track-wrap" id="vs-track-wrap">
+        <div class="vs-track"></div>
+        <div class="vs-track-fill" id="vs-track-fill"></div>
+        <div class="vs-thumb" id="vs-thumb-start" tabindex="0" role="slider" aria-label="Range start" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="vs-thumb-label" id="vs-label-start"></div>
+        </div>
+        <div class="vs-thumb" id="vs-thumb-end" tabindex="0" role="slider" aria-label="Range end" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+          <div class="vs-thumb-label" id="vs-label-end"></div>
+        </div>
+      </div>
+      <div class="vs-fallback-inputs">
+        <label style="font-size:0.6875rem;color:var(--muted)">From <input type="datetime-local" class="vs-fallback-input" id="vs-input-start"></label>
+        <label style="font-size:0.6875rem;color:var(--muted)">To <input type="datetime-local" class="vs-fallback-input" id="vs-input-end"></label>
+      </div>
+      <div class="vs-window-info"><b id="vs-window-text">--</b></div>
+    </div>
+    <div class="vs-bar-row">
+      <span class="vs-tier-label">Tier:</span>
+      <div class="vs-tier-chips" id="vs-tier-chips"></div>
+    </div>
   </div>
 
   <div id="tab-accounts" class="tab-content active">
@@ -2641,9 +3224,467 @@ function switchTab(id) {
   if (id === 'usage') refreshTokens();
   if (id === 'sessions') refreshSessions();
   if (id === 'logs') connectLogStream();
+  // Phase C: scrubber is meaningful only on tabs that show time-series.
+  // Hide it elsewhere to reclaim vertical space and avoid implying a
+  // filter that isn't actually applied to e.g. the accounts list.
+  vsApplyVisibility(id);
   const url = new URL(location);
   url.searchParams.set('tab', id);
   history.replaceState(null, '', url);
+}
+
+// ─────────────────────────────────────────────────
+// Phase C — date-range scrubber + tier filter
+// ─────────────────────────────────────────────────
+//
+// State machine: viewer-state.json on disk → /api/viewer-state →
+// _vsState in memory. Mutations go through vsSet() which (a) clamps
+// against the current dataRange, (b) updates the visual track, (c)
+// debounces a POST back to /api/viewer-state, and (d) re-renders the
+// time-series-dependent views (activity, token charts).
+//
+// The scrubber is hidden until at least one data point exists OR a
+// persisted state with a real window is found — empty-data installs
+// don't get a useless track.
+
+var _vsState = { start: null, end: null, tierFilter: ['all'] };
+var _vsDataRange = null;        // { oldest, newest } from /api/viewer-state
+var _vsKnownTiers = [];          // populated from /api/profiles
+var _vsAccountTierMap = {};      // accountName → tier (for filtering activity entries)
+var _vsDragging = null;          // 'start' | 'end' | null
+var _vsPostTimer = null;         // debounce handle for POST
+var _vsRenderTimer = null;       // debounce handle for chart re-render
+
+function vsSnapshot() {
+  // Return a defensive copy so consumers can't mutate _vsState through
+  // it. Kept minimal — chart renderers only need the three fields.
+  return {
+    start: _vsState.start,
+    end: _vsState.end,
+    tierFilter: (_vsState.tierFilter || ['all']).slice(),
+  };
+}
+
+function vsTierForAccount(name) {
+  if (!name) return null;
+  return _vsAccountTierMap[name] || null;
+}
+
+function vsTierMatchesEntry(entry, snap) {
+  // Pass-through if the filter is the "all" sentinel.
+  if (!snap || !Array.isArray(snap.tierFilter) || !snap.tierFilter.length) return true;
+  if (snap.tierFilter.indexOf('all') >= 0) return true;
+  var tier = vsTierForAccount(entry.account);
+  // Unattributed entries stay visible — better than silently dropping
+  // them and confusing the user about why their totals shrank.
+  if (!tier) return true;
+  return snap.tierFilter.indexOf(tier) >= 0;
+}
+
+function vsFormatStamp(ms) {
+  // Compact filesystem-safe timestamp for export filenames.
+  // Local time + GMT offset (matches the agent-reports-location rule).
+  if (!ms) return '0';
+  var d = new Date(ms);
+  var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+  var off = -d.getTimezoneOffset();
+  var sign = off >= 0 ? '+' : '-';
+  var oh = pad(Math.floor(Math.abs(off) / 60));
+  var om = pad(Math.abs(off) % 60);
+  return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+    '_' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) +
+    sign + oh + om;
+}
+
+function vsFormatLabel(ms) {
+  if (!ms) return '--';
+  var d = new Date(ms);
+  var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function vsFormatDuration(ms) {
+  if (!ms || ms < 0) return '--';
+  var sec = Math.floor(ms / 1000);
+  var min = Math.floor(sec / 60);
+  var hr  = Math.floor(min / 60);
+  var day = Math.floor(hr / 24);
+  if (day >= 14) return Math.floor(day / 7) + ' weeks';
+  if (day >= 1) return day + 'd ' + (hr % 24) + 'h';
+  if (hr  >= 1) return hr + 'h ' + (min % 60) + 'm';
+  if (min >= 1) return min + 'm';
+  return sec + 's';
+}
+
+function vsApplyVisibility(tabId) {
+  var bar = document.getElementById('vs-bar');
+  if (!bar) return;
+  var hasData = _vsDataRange && _vsDataRange.oldest && _vsDataRange.newest && _vsDataRange.newest > _vsDataRange.oldest;
+  // Tabs that benefit from the scrubber: usage (charts), activity (log).
+  // The scrubber is hidden on accounts/sessions/config/logs because
+  // those panes don't use the start/end window.
+  var useful = (tabId === 'usage' || tabId === 'activity');
+  // First-load case: tabId is whatever the URL says or 'accounts' default.
+  // Default to checking the currently-active tab if no id was provided.
+  if (!tabId) {
+    var act = document.querySelector('.tab-content.active');
+    useful = !!(act && (act.id === 'tab-usage' || act.id === 'tab-activity'));
+  }
+  if (useful && hasData) bar.classList.remove('hidden');
+  else bar.classList.add('hidden');
+}
+
+function vsClampLocal(start, end) {
+  // Mirror of clampViewerState's bound logic, JS side. Server-side
+  // clampViewerState handles the persistence path; the live drag uses
+  // the local mirror so we don't round-trip on every frame. Keep the
+  // two in sync.
+  if (!_vsDataRange) return { start: start, end: end };
+  var oldest = _vsDataRange.oldest, newest = _vsDataRange.newest;
+  if (start > end) { var tmp = start; start = end; end = tmp; }
+  start = Math.max(oldest, Math.min(start, newest));
+  end   = Math.max(oldest, Math.min(end, newest));
+  // Min-window: 5 minutes (matches VIEWER_STATE_MIN_WINDOW_MS).
+  var MIN = 5 * 60 * 1000;
+  if (newest - oldest >= MIN && (end - start) < MIN) {
+    if (_vsDragging === 'start') start = Math.max(oldest, end - MIN);
+    else end = Math.min(newest, start + MIN);
+  }
+  return { start: start, end: end };
+}
+
+function vsRenderTrack() {
+  var wrap = document.getElementById('vs-track-wrap');
+  var fill = document.getElementById('vs-track-fill');
+  var ts   = document.getElementById('vs-thumb-start');
+  var te   = document.getElementById('vs-thumb-end');
+  var ls   = document.getElementById('vs-label-start');
+  var le   = document.getElementById('vs-label-end');
+  var win  = document.getElementById('vs-window-text');
+  if (!wrap || !fill || !ts || !te) return;
+  if (!_vsDataRange) return;
+  var span = _vsDataRange.newest - _vsDataRange.oldest;
+  if (span <= 0) {
+    fill.style.left = '0%'; fill.style.width = '0%';
+    ts.style.left = '0%'; te.style.left = '100%';
+    return;
+  }
+  var sPct = ((_vsState.start - _vsDataRange.oldest) / span) * 100;
+  var ePct = ((_vsState.end   - _vsDataRange.oldest) / span) * 100;
+  sPct = Math.max(0, Math.min(100, sPct));
+  ePct = Math.max(0, Math.min(100, ePct));
+  fill.style.left = sPct + '%';
+  fill.style.width = (ePct - sPct) + '%';
+  ts.style.left = sPct + '%';
+  te.style.left = ePct + '%';
+  ts.setAttribute('aria-valuenow', String(Math.round(sPct)));
+  te.setAttribute('aria-valuenow', String(Math.round(ePct)));
+  if (ls) ls.textContent = vsFormatLabel(_vsState.start);
+  if (le) le.textContent = vsFormatLabel(_vsState.end);
+  if (win) win.textContent = vsFormatDuration(_vsState.end - _vsState.start);
+  // Fallback inputs for narrow viewports (kept in sync with the visual
+  // track so the user isn't presented with stale values when they
+  // resize the window).
+  var fis = document.getElementById('vs-input-start');
+  var fie = document.getElementById('vs-input-end');
+  if (fis && document.activeElement !== fis) fis.value = vsToInputLocal(_vsState.start);
+  if (fie && document.activeElement !== fie) fie.value = vsToInputLocal(_vsState.end);
+}
+
+function vsToInputLocal(ms) {
+  // datetime-local expects YYYY-MM-DDTHH:MM (no seconds, no timezone).
+  if (!ms) return '';
+  var d = new Date(ms);
+  var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function vsSet(start, end, tierFilter, opts) {
+  opts = opts || {};
+  var clamped = vsClampLocal(start != null ? start : _vsState.start, end != null ? end : _vsState.end);
+  _vsState.start = clamped.start;
+  _vsState.end   = clamped.end;
+  if (Array.isArray(tierFilter)) _vsState.tierFilter = tierFilter.slice();
+  vsRenderTrack();
+  vsRenderPresetActive();
+  vsRenderTierChips();
+  // Re-render time-series views with debouncing so a fast drag doesn't
+  // burn a chart redraw on every mouse-move event.
+  if (_vsRenderTimer) clearTimeout(_vsRenderTimer);
+  _vsRenderTimer = setTimeout(vsReRenderViews, 100);
+  // Persist (debounced — don't spam the endpoint on every drag tick).
+  if (!opts.noPersist) {
+    if (_vsPostTimer) clearTimeout(_vsPostTimer);
+    _vsPostTimer = setTimeout(vsPostState, 250);
+  }
+}
+
+function vsReRenderViews() {
+  // Re-render activity (uses cached log) — refresh() will repopulate
+  // soon enough but we want the user to see a snappy filter response.
+  // The activity log is already cached in _lastActivityHash machinery
+  // — passing the most recent log keeps the existing diff path alive.
+  // Token charts update through applyTokenModelFilter().
+  applyTokenModelFilter();
+  // Force activity re-render: clear hash so next /api/activity poll
+  // re-applies the filter, AND re-render immediately from the data we
+  // just rendered last. We do not keep a copy of the log, so we rely
+  // on the next refresh tick (5 s) for the activity feed; the token
+  // tab updates immediately via applyTokenModelFilter.
+  _lastActivityHash = '';
+}
+
+function vsPostState() {
+  // Round to integers — server validates Number.isInteger.
+  var body = {
+    start: Math.round(_vsState.start),
+    end: Math.round(_vsState.end),
+    tierFilter: _vsState.tierFilter.slice(),
+  };
+  fetch('/api/viewer-state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(function() { /* best-effort persistence — UI keeps working */ });
+}
+
+function vsRenderPresetActive() {
+  var btns = document.querySelectorAll('.vs-preset-btn');
+  if (!btns || !btns.length || !_vsDataRange) return;
+  // Find which preset (if any) matches the current window within 1 s.
+  var win = _vsState.end - _vsState.start;
+  var spanMap = {
+    '1h':  60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
+    '7d':  7 * 24 * 60 * 60 * 1000,
+    '30d': 30 * 24 * 60 * 60 * 1000,
+  };
+  var match = null;
+  // 'all' = full data range
+  if (Math.abs((_vsDataRange.newest - _vsDataRange.oldest) - win) < 60_000 &&
+      Math.abs(_vsDataRange.newest - _vsState.end) < 60_000) {
+    match = 'all';
+  } else {
+    Object.keys(spanMap).forEach(function(k) {
+      if (match) return;
+      // Preset windows always end at "now" (live data). We tolerate a
+      // 60 s skew so a preset stays "active" if the user clicked it
+      // moments ago and the data range has since drifted.
+      if (Math.abs(spanMap[k] - win) < 60_000) match = k;
+    });
+  }
+  btns.forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-preset') === match);
+  });
+}
+
+function vsApplyPreset(preset) {
+  if (!_vsDataRange) return;
+  var now = Date.now();
+  // Use the live "now" rather than _vsDataRange.newest so presets
+  // capture the most recent activity even if computeDataRange ran
+  // milliseconds ago. The server clamps; the client is forgiving.
+  var newest = Math.min(now, _vsDataRange.newest);
+  if (preset === 'all') {
+    vsSet(_vsDataRange.oldest, newest);
+    return;
+  }
+  var spans = { '1h': 3600_000, '24h': 86400_000, '7d': 7 * 86400_000, '30d': 30 * 86400_000 };
+  var span = spans[preset];
+  if (!span) return;
+  var start = Math.max(_vsDataRange.oldest, newest - span);
+  vsSet(start, newest);
+}
+
+function vsRenderTierChips() {
+  var holder = document.getElementById('vs-tier-chips');
+  if (!holder) return;
+  var tiers = ['all'].concat(_vsKnownTiers.slice());
+  // Dedupe ('all' may collide if some odd profile reports literal 'all')
+  var seen = {};
+  tiers = tiers.filter(function(t) { if (seen[t]) return false; seen[t] = 1; return true; });
+  var current = _vsState.tierFilter || ['all'];
+  holder.innerHTML = tiers.map(function(t) {
+    var active = (current.indexOf('all') >= 0 && t === 'all') || (current.indexOf(t) >= 0 && t !== 'all');
+    var label = t === 'all' ? 'All' : t.replace(/_/g, ' ');
+    return '<button class="vs-tier-chip' + (active ? ' active' : '') + '" data-tier="' + t.replace(/"/g, '&quot;') + '">' + label + '</button>';
+  }).join('');
+  holder.querySelectorAll('.vs-tier-chip').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var tier = btn.getAttribute('data-tier');
+      var cur = (_vsState.tierFilter || ['all']).slice();
+      if (tier === 'all') {
+        cur = ['all'];
+      } else {
+        // Strip the 'all' sentinel when picking a specific tier.
+        cur = cur.filter(function(x) { return x !== 'all'; });
+        var idx = cur.indexOf(tier);
+        if (idx >= 0) cur.splice(idx, 1);
+        else cur.push(tier);
+        if (cur.length === 0) cur = ['all'];
+      }
+      vsSet(null, null, cur);
+    });
+  });
+}
+
+function vsHandleThumbDown(which, ev) {
+  ev.preventDefault();
+  _vsDragging = which;
+  var thumb = document.getElementById('vs-thumb-' + which);
+  if (thumb) thumb.focus();
+  document.addEventListener('mousemove', vsHandleMove);
+  document.addEventListener('mouseup', vsHandleUp);
+  document.addEventListener('touchmove', vsHandleMove, { passive: false });
+  document.addEventListener('touchend', vsHandleUp);
+}
+
+function vsHandleMove(ev) {
+  if (!_vsDragging || !_vsDataRange) return;
+  ev.preventDefault();
+  var wrap = document.getElementById('vs-track-wrap');
+  if (!wrap) return;
+  var rect = wrap.getBoundingClientRect();
+  var x = (ev.touches && ev.touches[0]) ? ev.touches[0].clientX : ev.clientX;
+  var pct = (x - rect.left) / rect.width;
+  pct = Math.max(0, Math.min(1, pct));
+  var ms = _vsDataRange.oldest + pct * (_vsDataRange.newest - _vsDataRange.oldest);
+  if (_vsDragging === 'start') vsSet(ms, null, null, { noPersist: true });
+  else vsSet(null, ms, null, { noPersist: true });
+}
+
+function vsHandleUp() {
+  if (!_vsDragging) return;
+  _vsDragging = null;
+  document.removeEventListener('mousemove', vsHandleMove);
+  document.removeEventListener('mouseup', vsHandleUp);
+  document.removeEventListener('touchmove', vsHandleMove);
+  document.removeEventListener('touchend', vsHandleUp);
+  // Persist on drag-end (debounced 250 ms in vsSet).
+  if (_vsPostTimer) clearTimeout(_vsPostTimer);
+  _vsPostTimer = setTimeout(vsPostState, 100);
+}
+
+function vsHandleKey(which, ev) {
+  if (!_vsDataRange) return;
+  var step = (_vsDataRange.newest - _vsDataRange.oldest) / 100;
+  if (ev.shiftKey) step *= 5;
+  var delta = 0;
+  if (ev.key === 'ArrowLeft' || ev.key === 'ArrowDown') delta = -step;
+  else if (ev.key === 'ArrowRight' || ev.key === 'ArrowUp') delta = step;
+  else return;
+  ev.preventDefault();
+  if (which === 'start') vsSet(_vsState.start + delta, null);
+  else vsSet(null, _vsState.end + delta);
+}
+
+function vsHandleFallbackInput(which, value) {
+  // datetime-local returns YYYY-MM-DDTHH:MM in local time. new Date() with
+  // that string is interpreted as local time by browsers (per the HTML
+  // spec).
+  if (!value) return;
+  var d = new Date(value);
+  if (isNaN(d.getTime())) return;
+  var ms = d.getTime();
+  if (which === 'start') vsSet(ms, null);
+  else vsSet(null, ms);
+}
+
+async function vsBootstrap() {
+  // Populate known tiers from the live profile list. We hit /api/profiles
+  // directly so the chip set is correct on first paint, before the main
+  // refresh() cycle has run. Endpoint shape: { profiles, stats, ... }.
+  try {
+    var resp = await fetch('/api/profiles');
+    var payload = await resp.json();
+    var profiles = (payload && Array.isArray(payload.profiles)) ? payload.profiles : [];
+    var tierSet = {};
+    var map = {};
+    profiles.forEach(function(p) {
+      var t = p && p.rateLimitTier;
+      if (t && t !== 'unknown') tierSet[t] = 1;
+      if (p && p.name && t) map[p.name] = t;
+      if (p && p.label && t) map[p.label] = t;
+    });
+    _vsKnownTiers = Object.keys(tierSet).sort();
+    _vsAccountTierMap = map;
+  } catch {}
+  // Restore persisted state.
+  try {
+    var rs = await fetch('/api/viewer-state');
+    var st = await rs.json();
+    _vsDataRange = st.dataRange || null;
+    if (st.start != null && st.end != null) {
+      // Clamp restored values into the live range without persisting back.
+      var clamped = (function() {
+        if (!_vsDataRange) return { start: st.start, end: st.end };
+        var s = Math.max(_vsDataRange.oldest, Math.min(st.start, _vsDataRange.newest));
+        var e = Math.max(_vsDataRange.oldest, Math.min(st.end,   _vsDataRange.newest));
+        if (s > e) { var t = s; s = e; e = t; }
+        return { start: s, end: e };
+      })();
+      _vsState.start = clamped.start;
+      _vsState.end   = clamped.end;
+      _vsState.tierFilter = Array.isArray(st.tierFilter) ? st.tierFilter : ['all'];
+    }
+  } catch {}
+  vsRenderTrack();
+  vsRenderTierChips();
+  vsRenderPresetActive();
+  vsApplyVisibility();
+  // Wire interactions.
+  var thumbS = document.getElementById('vs-thumb-start');
+  var thumbE = document.getElementById('vs-thumb-end');
+  if (thumbS) {
+    thumbS.addEventListener('mousedown', function(e) { vsHandleThumbDown('start', e); });
+    thumbS.addEventListener('touchstart', function(e) { vsHandleThumbDown('start', e); }, { passive: false });
+    thumbS.addEventListener('keydown', function(e) { vsHandleKey('start', e); });
+  }
+  if (thumbE) {
+    thumbE.addEventListener('mousedown', function(e) { vsHandleThumbDown('end', e); });
+    thumbE.addEventListener('touchstart', function(e) { vsHandleThumbDown('end', e); }, { passive: false });
+    thumbE.addEventListener('keydown', function(e) { vsHandleKey('end', e); });
+  }
+  document.querySelectorAll('.vs-preset-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { vsApplyPreset(btn.getAttribute('data-preset')); });
+  });
+  var fis = document.getElementById('vs-input-start');
+  var fie = document.getElementById('vs-input-end');
+  if (fis) fis.addEventListener('change', function() { vsHandleFallbackInput('start', fis.value); });
+  if (fie) fie.addEventListener('change', function() { vsHandleFallbackInput('end', fie.value); });
+}
+
+// Refresh dataRange + tier map periodically so the scrubber tracks new
+// data points and live tier additions without requiring a page reload.
+async function vsRefreshDataRange() {
+  try {
+    var rs = await fetch('/api/viewer-state');
+    var st = await rs.json();
+    if (st.dataRange) {
+      var prev = _vsDataRange;
+      _vsDataRange = st.dataRange;
+      // If we had no data before and now do, reveal the bar.
+      if (!prev) vsApplyVisibility();
+      // Re-clamp the current selection: if data aged out, our window
+      // may now sit outside bounds.
+      var c = vsClampLocal(_vsState.start, _vsState.end);
+      if (c.start !== _vsState.start || c.end !== _vsState.end) {
+        // In-memory clamp only — don't push back to the server because
+        // the user didn't ask for this change. Their persisted preference
+        // stays untouched until they drag/preset/chip again.
+        _vsState.start = c.start;
+        _vsState.end   = c.end;
+        vsRenderTrack();
+        vsRenderPresetActive();
+      } else if (prev && (prev.oldest !== _vsDataRange.oldest || prev.newest !== _vsDataRange.newest)) {
+        // Bounds shifted — re-render the track positions with the new span.
+        vsRenderTrack();
+        vsRenderPresetActive();
+      }
+    }
+  } catch {}
 }
 
 function formatNum(n) {
@@ -2887,15 +3928,36 @@ function formatEta(minutes) {
 }
 
 function renderVelocityInline(p) {
-  if (p.minutesToLimit == null) return '';
-  const min = p.minutesToLimit;
-  let cls = 'velocity-badge';
-  let text;
-  if (min <= 0) { cls += ' velocity-crit'; text = 'at limit'; }
-  else if (min < 300) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
-  else { cls += ' velocity-ok'; text = '>5hr to limit'; }
-  return '<span class="card-token-sep">&middot;</span>' +
-    '<span class="' + cls + '" title="Estimated time until 5h rate limit is reached, based on current usage velocity">' + text + '</span>';
+  // 5h ETA badge — existing behavior unchanged.
+  let html = '';
+  if (p.minutesToLimit != null) {
+    const min = p.minutesToLimit;
+    let cls = 'velocity-badge';
+    let text;
+    if (min <= 0) { cls += ' velocity-crit'; text = 'at limit'; }
+    else if (min < 300) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
+    else { cls += ' velocity-ok'; text = '>5hr to limit'; }
+    html += '<span class="card-token-sep">&middot;</span>' +
+      '<span class="' + cls + '" title="Estimated time until 5h rate limit is reached, based on current usage velocity">' + text + '</span>';
+  }
+  // Phase 6 (Item 9): parallel 7d ETA badge using minutesToLimit7d (already
+  // emitted by /api/profiles via weeklyHistory.predictMinutesToLimit).
+  // Color thresholds: green > 24h (1440 min), yellow 4-24h (240-1440), red < 4h.
+  // The 7d window is independent of the 5h window — drain-first / spread
+  // strategies need both numbers visible to decide whether to keep the
+  // current account or rotate.
+  if (p.minutesToLimit7d != null) {
+    const min7 = p.minutesToLimit7d;
+    let cls7 = 'velocity-badge';
+    let text7;
+    if (min7 <= 0) { cls7 += ' velocity-crit'; text7 = '7d: at limit'; }
+    else if (min7 < 240) { cls7 += ' velocity-crit'; text7 = '7d ETA: ' + formatEta(min7); }
+    else if (min7 < 1440) { cls7 += ' velocity-warn'; text7 = '7d ETA: ' + formatEta(min7); }
+    else { cls7 += ' velocity-ok'; text7 = '7d ETA: ' + formatEta(min7); }
+    html += '<span class="card-token-sep">&middot;</span>' +
+      '<span class="' + cls7 + '" title="Estimated time until 7-day rate limit is reached, based on weekly usage velocity">' + text7 + '</span>';
+  }
+  return html;
 }
 
 let _lastProfilesHash = '';
@@ -2914,6 +3976,35 @@ async function refresh() {
     const resp = await fetch('/api/profiles');
     const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, queueStats } = await resp.json();
     _cachedProfiles = profiles;
+    // Phase C: keep the tier map / known-tier list in sync with live
+    // profiles so a newly-discovered account shows its chip immediately
+    // and a removed account's tier disappears from the chip strip.
+    if (Array.isArray(profiles)) {
+      var tierSet = {};
+      var map = {};
+      profiles.forEach(function(p) {
+        var t = p && p.rateLimitTier;
+        if (t && t !== 'unknown') tierSet[t] = 1;
+        if (p && p.name && t) map[p.name] = t;
+        if (p && p.label && t) map[p.label] = t;
+      });
+      var newTiers = Object.keys(tierSet).sort();
+      // Avoid re-rendering chips when nothing changed.
+      var changed = newTiers.length !== _vsKnownTiers.length ||
+                    newTiers.some(function(t, i) { return t !== _vsKnownTiers[i]; });
+      _vsKnownTiers = newTiers;
+      _vsAccountTierMap = map;
+      if (changed) {
+        // Drop tiers from the active filter that no longer exist; if all
+        // dropped, fall back to ['all'].
+        var current = (_vsState.tierFilter || ['all']).filter(function(t) {
+          return t === 'all' || tierSet[t];
+        });
+        if (current.length === 0) current = ['all'];
+        _vsState.tierFilter = current;
+        vsRenderTierChips();
+      }
+    }
     const ph = quickHash(profiles);
     if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
@@ -2925,7 +4016,7 @@ async function refresh() {
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
     }
     if (probeStats) renderProbeStats(probeStats);
-    // [BETA] Queue stats
+    // Queue stats
     if (queueStats) {
       var qEl = document.getElementById('queue-stats');
       if (queueStats.inflight > 0 || queueStats.queued > 0) {
@@ -3101,7 +4192,35 @@ function evtTime(ts) {
 function renderActivity(log) {
   const el = document.getElementById('activity-log');
   if (!log.length) { el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity yet</div>'; return; }
-  el.innerHTML = log.map(e => {
+  // Phase C: filter by scrubber window + tier. The activity log entries
+  // carry the source account in e.account (or e.from / e.to for switch
+  // events); for tier filtering we resolve the tier through
+  // vsTierForAccount which maps account-name to the live profile tier.
+  const snap = vsSnapshot();
+  let filtered = log;
+  if (snap && snap.start != null && snap.end != null) {
+    filtered = filtered.filter(e => {
+      const ts = Number(e.ts || 0);
+      if (!ts) return true;
+      return ts >= snap.start && ts <= snap.end;
+    });
+  }
+  if (snap && Array.isArray(snap.tierFilter) && snap.tierFilter.length && snap.tierFilter[0] !== 'all') {
+    filtered = filtered.filter(e => {
+      // Match if any of the related accounts matches the tier filter.
+      const candidates = [e.account, e.from, e.to, e.name].filter(Boolean);
+      if (candidates.length === 0) return true; // unattributed events stay visible
+      return candidates.some(name => {
+        const tier = vsTierForAccount(name);
+        return tier && snap.tierFilter.indexOf(tier) >= 0;
+      });
+    });
+  }
+  if (!filtered.length) {
+    el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity in selected window</div>';
+    return;
+  }
+  el.innerHTML = filtered.map(e => {
     const c = evtColors[e.type] || 'var(--muted)';
     return '<div class="evt">' +
       '<span class="evt-time">' + evtTime(e.ts) + '</span>' +
@@ -3174,7 +4293,7 @@ async function loadSettingsUI() {
     document.getElementById('sel-strategy').value = s.rotationStrategy || 'conserve';
     document.getElementById('sel-interval').value = s.rotationIntervalMin || 60;
     updateStrategyUI(s.rotationStrategy || 'conserve');
-    // [BETA] Serialization
+    // Serialization
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
     document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
@@ -3383,6 +4502,28 @@ function applyTokenModelFilter() {
   if (accountSel && accountSel.value) {
     data = data.filter(function(e) { return e.account === accountSel.value; });
     prevData = prevData.filter(function(e) { return e.account === accountSel.value; });
+  }
+  // Phase C: apply the scrubber window + tier filter on top of the
+  // existing select-based filters. Snapshot at filter time so a fast
+  // drag does not mutate data mid-render. populateTokenFilters runs
+  // against the unwindowed dataset so the dropdown options never
+  // collapse just because the scrubber narrows the timeline.
+  var snap = vsSnapshot();
+  if (snap && snap.start != null && snap.end != null) {
+    data = data.filter(function(e) {
+      var ts = Number(e.timestamp || e.ts || 0);
+      if (!ts) return true; // keep entries with no ts so we don't silently drop them
+      return ts >= snap.start && ts <= snap.end;
+    });
+    prevData = prevData.filter(function(e) {
+      var ts = Number(e.timestamp || e.ts || 0);
+      if (!ts) return true;
+      return ts >= snap.start && ts <= snap.end;
+    });
+  }
+  if (snap && Array.isArray(snap.tierFilter) && snap.tierFilter.length && snap.tierFilter[0] !== 'all') {
+    data = data.filter(function(e) { return vsTierMatchesEntry(e, snap); });
+    prevData = prevData.filter(function(e) { return vsTierMatchesEntry(e, snap); });
   }
   _tokFilteredData = data;
   populateTokenFilters(_tokensRawData);
@@ -3961,9 +5102,37 @@ function tokFilterChange(which) {
 }
 
 function exportUsageCsv() {
-  var data = _tokFilteredData || _tokensRawData;
+  // Phase C: snapshot scrubber values at the moment of click. The user
+  // may keep dragging while the download is queued — we intentionally
+  // freeze [start,end] and tierFilter HERE so the file matches what the
+  // dashboard showed when they clicked, not what is selected when the
+  // browser actually flushes the blob.
+  //
+  // Start from the model/account/repo/branch-filtered baseline
+  // (_tokFilteredData), then apply the SNAPSHOT scrubber + tier on top.
+  // We do NOT start from _tokFilteredData because that was filtered with
+  // the scrubber values at the time of the last applyTokenModelFilter()
+  // call — which may be out of sync with the click-moment values when
+  // the user drags then clicks export immediately. Starting from
+  // _tokensRawData and re-applying the SAME select filters gives the
+  // exact post-filter set the user sees right now.
+  var snap = vsSnapshot();
+  var modelSel   = document.getElementById('tok-model');
+  var accountSel = document.getElementById('tok-account');
+  var modelV   = modelSel   ? modelSel.value   : '';
+  var accountV = accountSel ? accountSel.value : '';
+  var data = (_tokensRawData || []).filter(function(e) {
+    if (modelV   && e.model   !== modelV)   return false;
+    if (accountV && e.account !== accountV) return false;
+    var ts = Number(e.timestamp || e.ts || 0);
+    if (!ts) return false;
+    if (snap.start != null && ts < snap.start) return false;
+    if (snap.end   != null && ts > snap.end)   return false;
+    if (!vsTierMatchesEntry(e, snap)) return false;
+    return true;
+  });
   if (!data.length) { showToast('No data to export'); return; }
-  var lines = ['timestamp,repo,branch,model,account,input_tokens,output_tokens'];
+  var lines = ['timestamp,repo,branch,model,account,tier,input_tokens,output_tokens'];
   for (var i = 0; i < data.length; i++) {
     var e = data[i];
     var ts = e.timestamp || e.ts || '';
@@ -3974,6 +5143,7 @@ function exportUsageCsv() {
       '"' + (e.branch || '').replace(/"/g, '""') + '"',
       '"' + (e.model || '').replace(/"/g, '""') + '"',
       '"' + (e.account || '').replace(/"/g, '""') + '"',
+      '"' + (vsTierForAccount(e.account) || '').replace(/"/g, '""') + '"',
       e.inputTokens || 0,
       e.outputTokens || 0
     ].join(','));
@@ -3982,7 +5152,9 @@ function exportUsageCsv() {
   var url = URL.createObjectURL(blob);
   var a = document.createElement('a');
   a.href = url;
-  a.download = 'usage-export-' + new Date().toISOString().slice(0,10) + '.csv';
+  // Filename includes the window in YYYYMMDD_HHMMSS form so multiple
+  // exports from the same day don't clobber each other in Downloads.
+  a.download = 'vdm-export-' + vsFormatStamp(snap.start) + '_to_' + vsFormatStamp(snap.end) + '.csv';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -3991,8 +5163,12 @@ function exportUsageCsv() {
 
 refresh();
 loadSettingsUI();
+vsBootstrap();
 setInterval(refresh, 5000);
 setInterval(tickCountdowns, 1000);
+// Phase C: poll data-range / tier map every 10 s so the scrubber tracks
+// fresh data points and newly-discovered accounts without a reload.
+setInterval(vsRefreshDataRange, 10000);
 // Restore tab from URL query param
 const _initTab = new URLSearchParams(location.search).get('tab');
 if (_initTab && document.getElementById('tab-' + _initTab)) switchTab(_initTab);
@@ -4336,7 +5512,6 @@ server.on('error', (e) => {
 const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
 const PROXY_TIMEOUT = 5 * 60 * 1000; // 5 min per upstream request
 const REQUEST_DEADLINE_MS = 45_000;   // hard cap on total handleProxyRequest time
-const MAX_EVENT_LOG = 50;
 
 // ── Structured logger ──
 
@@ -4360,9 +5535,13 @@ function log(tag, msg, extra = '') {
   }
 }
 
-// ── Event log (exposed to dashboard via /api/proxy-log) ──
-
-const proxyEventLog = []; // { ts, type, from, to, reason }
+// ── Event log (proxy state transitions) ──
+//
+// Phase 6 cleanup: the in-memory `proxyEventLog` ring buffer was a dead
+// pipeline — exposed via /api/proxy-status as `recentEvents` but never
+// consumed by the UI (the activity log already covers the same content
+// via logActivity()). Removing it eliminates duplicate state and ~50
+// entries of redundant in-memory data per dashboard process.
 
 // Dedup noisy events (rate-limited / all-exhausted) so the activity log
 // doesn't fill up when Claude Code retries against an already-limited account.
@@ -4377,10 +5556,7 @@ function logEvent(type, detail = {}) {
     _eventDedupMap.set(dedupKey, Date.now());
   }
 
-  const entry = { ts: Date.now(), type, ...detail };
-  proxyEventLog.unshift(entry);
-  if (proxyEventLog.length > MAX_EVENT_LOG) proxyEventLog.length = MAX_EVENT_LOG;
-  // Also persist to the activity log
+  // Persist to the activity log (the only consumer — UI reads /api/activity-log).
   logActivity(type, detail);
 }
 
@@ -4428,6 +5604,95 @@ function savePersistedState() {
   try {
     atomicWriteFileSync(STATE_FILE, JSON.stringify(persistedState));
   } catch {}
+}
+
+// ── Viewer-state (Phase C — date-range scrubber + tier filter) ──
+// Persisted shape: { start: ms_epoch, end: ms_epoch, tierFilter: string[] }.
+// Defaults are computed at load time against the live data range, so a
+// fresh install with no on-disk state still gets a sensible window.
+//
+// Why GET fabricates `dataRange` per-call instead of caching it:
+// token-usage.json + activity-log.json change continuously while the
+// process is running (every proxy request, every settings toggle), so a
+// cached oldest/newest would drift seconds-stale. The lookup is O(N) over
+// two arrays we already pay to keep in memory — cheap on every hit.
+
+let _viewerStateCache = null;
+
+function loadViewerState() {
+  if (_viewerStateCache) return _viewerStateCache;
+  let recovered = false;
+  try {
+    if (existsSync(VIEWER_STATE_FILE)) {
+      const raw = readFileSync(VIEWER_STATE_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      // Sanity check: must be a plain object with the right shape.
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        _viewerStateCache = {
+          start: Number.isFinite(parsed.start) ? Number(parsed.start) : null,
+          end: Number.isFinite(parsed.end) ? Number(parsed.end) : null,
+          tierFilter: Array.isArray(parsed.tierFilter) ? parsed.tierFilter : ['all'],
+        };
+        return _viewerStateCache;
+      }
+      log('warn', 'viewer-state.json malformed — overwriting with defaults');
+      recovered = true;
+    }
+  } catch (e) {
+    // Malformed JSON / unreadable / partial write survived a crash. Write
+    // a fresh defaults file atomically so the next read succeeds and
+    // the user doesn't get the same warning every page load.
+    log('warn', `viewer-state.json read failed (${e.message}) — overwriting with defaults`);
+    recovered = true;
+  }
+  if (recovered) {
+    // Don't recursively invoke saveViewerState (which sets _viewerStateCache);
+    // write defaults inline, then leave the cache null so the next caller
+    // re-reads from disk.
+    try {
+      const defaults = { start: null, end: null, tierFilter: ['all'] };
+      atomicWriteFileSync(VIEWER_STATE_FILE, JSON.stringify(defaults));
+    } catch { /* best-effort recovery */ }
+  }
+  _viewerStateCache = null;
+  return null;
+}
+
+function saveViewerState(state) {
+  try {
+    atomicWriteFileSync(VIEWER_STATE_FILE, JSON.stringify(state));
+    _viewerStateCache = state;
+  } catch (e) {
+    log('warn', `viewer-state.json write failed: ${e.message}`);
+  }
+}
+
+// Compute the live data range across token-usage and activity-log.
+// Returns { oldest, newest } in ms epoch, or null if there's no data on
+// disk yet (caller hides the scrubber). The activity log already lives
+// in memory; loadTokenUsage caches the parsed JSON so this is one
+// in-memory linear scan per array — N is bounded by ACTIVITY_MAX_ENTRIES
+// (500) and TOKEN_USAGE_MAX_ENTRIES (50_000).
+function computeDataRange() {
+  let oldest = Infinity;
+  let newest = -Infinity;
+  try {
+    const usage = loadTokenUsage();
+    for (let i = 0; i < usage.length; i++) {
+      const ts = Number(usage[i].ts || usage[i].timestamp || 0);
+      if (!Number.isFinite(ts) || ts <= 0) continue;
+      if (ts < oldest) oldest = ts;
+      if (ts > newest) newest = ts;
+    }
+  } catch { /* empty / unreadable */ }
+  for (let i = 0; i < activityLog.length; i++) {
+    const ts = Number(activityLog[i].ts || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts < oldest) oldest = ts;
+    if (ts > newest) newest = ts;
+  }
+  if (!Number.isFinite(oldest) || !Number.isFinite(newest)) return null;
+  return { oldest, newest };
 }
 
 function updatePersistedState(fingerprint, data) {
@@ -4675,10 +5940,6 @@ function invalidateAccountsCache() {
 
 function isAccountAvailable(token, expiresAt) {
   return _isAccountAvailable(token, expiresAt, accountState);
-}
-
-function scoreAccount(token) {
-  return _scoreAccount(token, accountState);
 }
 
 function pickBestAccount(excludeTokens = new Set()) {
@@ -4988,7 +6249,15 @@ function withSwitchLock(fn) {
 // OAuth Token Refresh
 // ─────────────────────────────────────────────────
 
-const OAUTH_TOKEN_URL = process.env.OAUTH_TOKEN_URL || 'https://platform.claude.com/v1/oauth/token';
+// OAuth token endpoint. The historical default (`platform.claude.com/v1/oauth/token`)
+// is the OLD endpoint that Anthropic retired during the platform.claude.com →
+// console.anthropic.com migration; refreshes against it now silently 404, so a
+// dashboard built against the old default would log "refresh failed" forever and
+// never recover. The correct endpoint as of Claude Code 2.x is
+// `console.anthropic.com/v1/oauth/token` (verified against the leaked Claude
+// Code OAuth flow gist and current Claude Code authentication docs). Tests
+// override via `OAUTH_TOKEN_URL` env var pointing at an in-process mock.
+const OAUTH_TOKEN_URL = process.env.OAUTH_TOKEN_URL || 'https://console.anthropic.com/v1/oauth/token';
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_DEFAULT_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers';
 const REFRESH_BUFFER_MS = 60 * 60 * 1000; // 1 hour
@@ -4999,6 +6268,21 @@ const REFRESH_BACKOFF_BASE = 1000; // 1s, 2s, 4s
 const refreshLock = createPerAccountLock();
 // Track refresh failures per account: name → { error, retriable, ts }
 const refreshFailures = new Map();
+
+// Phase 6: cross-account refresh storm cap.
+//
+// `refreshLock` (per-account mutex) dedupes concurrent refreshes for the
+// SAME account — two parallel requests can't double-spend the same
+// refresh token. But it does NOT cap refreshes ACROSS accounts: the
+// 400-empty-body bulk-recovery path runs Promise.allSettled across N
+// accounts, which can fire 10+ parallel POSTs to platform.claude.com from
+// a single IP. That's a textbook way to get the OAuth endpoint
+// rate-limited from the upstream side.
+//
+// `_refreshSem` caps *concurrent* OAuth POSTs at 3 regardless of which
+// account each one targets. Pending acquirers queue FIFO; throughput is
+// unaffected for low-N refreshes.
+const _refreshSem = createSemaphore(3);
 
 /**
  * Atomic file write: write to .tmp, chmod 600, rename over original.
@@ -5108,6 +6392,16 @@ function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
  */
 async function refreshAccountToken(accountName, { force = false } = {}) {
   return refreshLock.withLock(accountName, async () => {
+    // Phase 6: cap concurrent OAuth POSTs across all accounts at 3 to
+    // avoid IP-level rate limiting on platform.claude.com. The
+    // per-account `refreshLock` (above) only dedupes refreshes for the
+    // SAME account; the 400-recovery bulk path can run
+    // Promise.allSettled across N accounts and fire N parallel POSTs
+    // from a single IP without this semaphore. The wrap is *inside* the
+    // per-account lock so two concurrent calls for the same account
+    // serialise on the lock first, and only the winner spends a
+    // semaphore slot.
+    return _refreshSem.run(async () => {
     // 1. Re-read credentials from disk (may have been refreshed by concurrent request)
     let rawCreds;
     try {
@@ -5171,48 +6465,54 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
     // Bracket the disk-write + keychain-write window with the in-progress
     // counter so a concurrent autoDiscoverAccount cannot read the OLD
     // keychain creds, match the just-refreshed file by email, and
-    // overwrite it with stale tokens. The decrement happens once the
-    // keychain has been updated (or the function returns without
-    // touching it). Increment-before / decrement-after pattern with a
-    // try/finally below.
+    // overwrite it with stale tokens. The decrement MUST happen on every
+    // exit path — if migrateAccountState / invalidateAccountsCache /
+    // logActivity throws, the counter would otherwise stay high forever
+    // and permanently disable autoDiscoverAccount. The whole post-
+    // increment region is wrapped in try/finally so the decrement is
+    // guaranteed.
     _refreshesInProgress++;
     try {
-      await atomicWriteAccountFile(accountName, newCreds);
-    } catch (e) {
-      _refreshesInProgress--;
-      log('refresh', `CRITICAL: ${accountName}: refresh succeeded but file write failed: ${e.message}`);
-      return { ok: false, error: `File write failed: ${e.message}` };
-    }
-
-    const newFp = getFingerprintFromToken(result.accessToken);
-    log('refresh', `${accountName}: token refreshed successfully (fp ${oldFp} → ${newFp}, expires ${new Date(newExpiresAt).toISOString()})`);
-
-    // 6. Migrate state from old fingerprint to new fingerprint
-    migrateAccountState(oldToken, result.accessToken, oldFp, newFp, accountName);
-
-    // 7. Update keychain if this is the active account
-    const activeToken = getActiveToken();
-    if (activeToken === oldToken) {
       try {
-        await withSwitchLock(() => {
-          writeKeychain(newCreds);
-          invalidateTokenCache();
-        });
-        log('refresh', `${accountName}: updated keychain (was active account)`);
+        await atomicWriteAccountFile(accountName, newCreds);
       } catch (e) {
-        log('warn', `${accountName}: keychain update failed after refresh: ${e.message}`);
+        log('refresh', `CRITICAL: ${accountName}: refresh succeeded but file write failed: ${e.message}`);
+        return { ok: false, error: `File write failed: ${e.message}` };
       }
+
+      const newFp = getFingerprintFromToken(result.accessToken);
+      log('refresh', `${accountName}: token refreshed successfully (fp ${oldFp} → ${newFp}, expires ${new Date(newExpiresAt).toISOString()})`);
+
+      // 6. Migrate state from old fingerprint to new fingerprint
+      migrateAccountState(oldToken, result.accessToken, oldFp, newFp, accountName);
+
+      // 7. Update keychain if this is the active account
+      const activeToken = getActiveToken();
+      if (activeToken === oldToken) {
+        try {
+          await withSwitchLock(() => {
+            writeKeychain(newCreds);
+            invalidateTokenCache();
+          });
+          log('refresh', `${accountName}: updated keychain (was active account)`);
+        } catch (e) {
+          log('warn', `${accountName}: keychain update failed after refresh: ${e.message}`);
+        }
+      }
+
+      // 8. Invalidate caches
+      invalidateAccountsCache();
+      refreshFailures.delete(accountName);
+      logActivity('token-refreshed', { account: accountLabel });
+
+      return { ok: true, accessToken: result.accessToken, expiresAt: newExpiresAt };
+    } finally {
+      // The disk-write + keychain-write window is closed; allow
+      // autoDiscoverAccount to run again. Math.max guard keeps the
+      // counter from going negative if some prior bug double-decremented.
+      _refreshesInProgress = Math.max(0, _refreshesInProgress - 1);
     }
-
-    // 8. Invalidate caches
-    invalidateAccountsCache();
-    refreshFailures.delete(accountName);
-    logActivity('token-refreshed', { account: accountLabel });
-    // The disk-write + keychain-write window is closed; allow
-    // autoDiscoverAccount to run again.
-    _refreshesInProgress--;
-
-    return { ok: true, accessToken: result.accessToken, expiresAt: newExpiresAt };
+    });
   });
 }
 
@@ -5288,7 +6588,7 @@ setInterval(async () => {
 })();
 
 // ─────────────────────────────────────────────────
-// [BETA] Request Serialization Queue
+// Request Serialization Queue
 // ─────────────────────────────────────────────────
 
 let _inflightCount = 0;
@@ -5361,7 +6661,7 @@ function _dispatchNext() {
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Token Usage Extractor (SSE Transform Stream)
+// Token Usage Extractor (SSE Transform Stream)
 // ─────────────────────────────────────────────────
 
 function createUsageExtractor() {
@@ -5377,7 +6677,10 @@ function createUsageExtractor() {
   let nextEventType = '';
 
   const extractor = new Transform({
-    transform(chunk, encoding, callback) {
+    // `_encoding` is required by the Transform API positional signature
+    // (transform(chunk, encoding, callback)) but unused — chunks are always
+    // Buffers here because the upstream is an http.IncomingMessage.
+    transform(chunk, _encoding, callback) {
       // Pass through bytes unchanged
       this.push(chunk);
 
@@ -5458,7 +6761,7 @@ function createUsageExtractor() {
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Session Monitor — server-side functions
+// Session Monitor — server-side functions
 // ─────────────────────────────────────────────────
 
 // FNV-1a hash (32-bit) — fast, deterministic, good distribution
@@ -5683,7 +6986,7 @@ function formatTurnFallback(userText, toolUses) {
   return { input: input || 'working...', actions };
 }
 
-function updateSessionTimeline(bodyObj, acctName, usage, token) {
+function updateSessionTimeline(bodyObj, acctName, usage) {
   const cwd = extractCwd(bodyObj);
   const sessionId = deriveSessionId(cwd, acctName);
   const model = bodyObj.model || '';
@@ -5693,12 +6996,14 @@ function updateSessionTimeline(bodyObj, acctName, usage, token) {
   const cwdStr = typeof cwd === 'string' && !cwd.startsWith('_sys_') ? cwd : '';
   if (cwdStr) {
     repo = basename(cwdStr);
-    // Sanitize for shell: reject paths with characters that could escape double quotes
-    if (!/["$`\\]/.test(cwdStr)) {
-      try {
-        branch = execSync(`git -C "${cwdStr}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 2000 }).trim();
-      } catch {}
-    }
+    // _runGit uses execFileSync with argv[]: cwd is passed as a separate
+    // argument so shell metacharacters in it cannot inject commands. The
+    // previous regex `/["$`\\]/` blocked only chars that broke out of a
+    // shell-interpolated double-quoted form — not enough (newline still
+    // worked). This is the correct fix: no shell at all.
+    try {
+      branch = _runGit(cwdStr, ['rev-parse', '--abbrev-ref', 'HEAD'], 2000).trim();
+    } catch {}
   }
 
   // Create or retrieve session
@@ -5793,11 +7098,15 @@ function updateSessionTimeline(bodyObj, acctName, usage, token) {
       if (session.queuedTurns.length > 0) {
         session._batchTimer = setTimeout(() => {
           session._batchTimer = null;
-          // Re-trigger by pushing a synthetic empty turn check
+          // Re-trigger with the rule-based fallback (no Haiku call here —
+          // this branch fires when more turns piled up while we were
+          // waiting on the first Haiku response, and we don't want to
+          // double-charge the user's tokens for back-to-back summaries).
+          // formatTurnFallback only consumes user text + tool list, so
+          // assistant context is intentionally dropped.
           const next = session.queuedTurns.splice(0);
           if (!next.length) return;
           const mu = next.map(t => t.userText).join(' | ');
-          const mc = next[next.length - 1].assistantContext;
           const mt = next.flatMap(t => t.toolUses);
           const fb = formatTurnFallback(mu, mt);
           if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
@@ -5873,7 +7182,7 @@ setInterval(() => {
 }, 30000);
 
 // ─────────────────────────────────────────────────
-// [BETA] Ensure prepare-commit-msg hook in repos with local core.hooksPath
+// Ensure prepare-commit-msg hook in repos with local core.hooksPath
 // ─────────────────────────────────────────────────
 
 const _hookedRepoPaths = new Set(); // avoid re-checking the same repo
@@ -5884,14 +7193,14 @@ function ensureLocalCommitHook(cwd) {
     // Check for local core.hooksPath override
     let localHooksPath;
     try {
-      localHooksPath = execSync(`git -C "${cwd}" config --local core.hooksPath 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+      localHooksPath = _runGit(cwd, ['config', '--local', 'core.hooksPath']).trim();
     } catch { return; } // no local override
     if (!localHooksPath) return;
 
     // Resolve relative paths
     let repoRoot;
     try {
-      repoRoot = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+      repoRoot = _runGit(cwd, ['rev-parse', '--show-toplevel']).trim();
     } catch { return; }
 
     const resolvedLocal = localHooksPath.startsWith('/') ? localHooksPath : join(repoRoot, localHooksPath);
@@ -5900,10 +7209,15 @@ function ensureLocalCommitHook(cwd) {
     if (_hookedRepoPaths.has(resolvedLocal)) return;
     _hookedRepoPaths.add(resolvedLocal);
 
-    // Check for global hooks path
+    // Check for global hooks path. This is a `git config --global` call —
+    // no cwd argument needed, no injection vector — execFileSync still
+    // bypasses shell interpolation. Suppress stderr the way the previous
+    // `2>/dev/null` redirect did.
     let globalHooksPath;
     try {
-      globalHooksPath = execSync('git config --global core.hooksPath 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
+      globalHooksPath = execFileSync('git', ['config', '--global', 'core.hooksPath'], {
+        encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
     } catch { return; }
     if (!globalHooksPath) return;
     globalHooksPath = globalHooksPath.replace(/^~/, process.env.HOME || '');
@@ -5929,13 +7243,19 @@ function ensureLocalCommitHook(cwd) {
     // Copy global hook to local hooks dir
     mkdirSync(resolvedLocal, { recursive: true });
     writeFileSync(localHookFile, globalHookContent);
-    try { execSync(`chmod +x "${localHookFile}"`, { timeout: 2000 }); } catch {}
+    // chmod via execFileSync — argv[] form, no shell, no injection. The
+    // previous shell-interpolated form was safe in practice (localHookFile
+    // is composed from git config output) but this is defense-in-depth
+    // and matches the rest of the file's exec hygiene.
+    try {
+      execFileSync('chmod', ['+x', localHookFile], { timeout: 2000, stdio: ['ignore', 'ignore', 'ignore'] });
+    } catch {}
     log('tokens', `Installed commit hook in ${resolvedLocal} (local hooksPath override detected)`);
   } catch { /* silent — best effort */ }
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Token Usage Ring Buffer
+// Token Usage Ring Buffer
 // ─────────────────────────────────────────────────
 
 const recentUsage = []; // { ts, inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens, model, account, claimed }
@@ -6002,14 +7322,14 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
   if (!detectedBranch.startsWith('worktree-')) return detectedBranch;
   try {
     // Confirm we're actually in a worktree (git-dir != git-common-dir)
-    const gitDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    const commonDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+    const gitDir = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-dir']).trim();
+    const commonDir = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim();
     if (gitDir === commonDir) return detectedBranch;
   } catch { return detectedBranch; }
 
   // Strategy 1: find a non-worktree branch at the exact same commit
   try {
-    const candidates = execSync(`git -C "${cwd}" branch --points-at HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 })
+    const candidates = _runGit(cwd, ['branch', '--points-at', 'HEAD'])
       .trim().split('\n')
       .map(b => b.replace(/^[*+]?\s+/, '').trim())
       .filter(b => b && !b.startsWith('worktree-'));
@@ -6019,7 +7339,7 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
 
   // Strategy 2: walk recent commits for the closest decorated non-worktree branch
   try {
-    const lines = execSync(`git -C "${cwd}" log --format=%D --max-count=30 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().split('\n');
+    const lines = _runGit(cwd, ['log', '--format=%D', '--max-count=30']).trim().split('\n');
     for (const line of lines) {
       if (!line.trim()) continue;
       const refs = line.split(',').map(r => r.trim())
@@ -6032,35 +7352,171 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Session Tracking
+// Session Tracking
 // ─────────────────────────────────────────────────
 
-const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, cwd, startedAt }
+// Phase D — pendingSessions entries grew from
+//   { repo, branch, commitHash, cwd, startedAt }
+// to
+//   { repo, branch, commitHash, cwd, startedAt,
+//     parentSessionId,    // sub-agent → parent linkage (null for primary sessions)
+//     agentType,          // sub-agent matcher value (null for primary)
+//     lastBatchToolNames, // most recent PostToolBatch tool list (gated by perToolAttribution)
+//     teamId }            // agent-teams rollup (reserved; null until §4 wiring)
+//
+// Existing call sites that didn't set these fields rely on the spread
+// pattern in registerSubagent / appendTokenUsage callers — `?? null`
+// always wins so a session built by /api/session-start (which doesn't
+// touch the new fields) becomes a primary session row with parentSessionId
+// === null on persist.
+const pendingSessions = new Map();
+
+// Phase 6 (CL-3): SubagentStop and SessionEnd hooks may fire with a
+// session_id that pendingSessions has never seen — for SubagentStop
+// because Claude Code subagents (CLAUDE_CODE_FORK_SUBAGENT=1) get their
+// own session_id distinct from the parent's; for SessionEnd because the
+// user might quit before the dashboard ever saw a session-start hook.
+// Resolve in this order:
+//   (a) If the hook payload includes a parent session id field
+//       (parent_session_id, parentSessionId, transcript_id are all known
+//       Claude Code shapes across CC 2.1.117/120/121), use that.
+//   (b) Otherwise fall back to the most-recently-active session in the
+//       same cwd as the hook payload — the orchestrator that spawned the
+//       subagent has the strongest claim on the unattributed usage.
+//   (c) If neither resolves, return null and let the caller log the
+//       drop in activity log so the user can see it.
+function _resolveSessionForHook(payload) {
+  if (!payload) return null;
+  const sid = payload.session_id;
+  if (sid && pendingSessions.has(sid)) return sid;
+  const parentId = payload.parent_session_id || payload.parentSessionId || payload.transcript_id;
+  if (parentId && pendingSessions.has(parentId)) return parentId;
+  // Fallback (b): most-recently-active session in the same cwd.
+  const cwd = payload.cwd;
+  if (cwd) {
+    let bestId = null, bestStart = -Infinity;
+    for (const [id, s] of pendingSessions) {
+      if (s.cwd === cwd && s.startedAt > bestStart) {
+        bestStart = s.startedAt;
+        bestId = id;
+      }
+    }
+    if (bestId) return bestId;
+  }
+  return null;
+}
+
+// Phase 6 (Item 8h): shared logic between /api/session-stop and
+// /api/session-end. Idempotent — unknown sessions return claimed:0
+// without erroring. CL-3 attribution: if the incoming session_id is
+// unknown, try to resolve it via parent_session_id / cwd before dropping.
+function _claimAndPersistForSession(sessionId, payload, kind /* 'stop' | 'end' */) {
+  let session = pendingSessions.get(sessionId);
+  let resolvedId = sessionId;
+  if (!session) {
+    const fallbackId = _resolveSessionForHook(payload);
+    if (fallbackId) {
+      resolvedId = fallbackId;
+      session = pendingSessions.get(fallbackId);
+      log('tokens', `Session ${kind}: ${sessionId.slice(0, 8)}… unknown — attributing to parent/cwd ${fallbackId.slice(0, 8)}…`);
+    }
+  }
+  if (!session) {
+    // Unknown sessionId AND no parent/cwd match — log to activity log so
+    // the user can see unattributed usage in the UI instead of silently
+    // dropping it.
+    if (kind === 'end') {
+      log('tokens', `Session end: ${sessionId.slice(0, 8)}… (not found — already auto-claimed)`);
+    } else {
+      log('tokens', `Session ${kind}: ${sessionId.slice(0, 8)}… (not found — may have been auto-claimed)`);
+      try {
+        logActivity('session-unattributed', { sessionId, kind, cwd: payload?.cwd || null });
+      } catch { /* best-effort */ }
+    }
+    return { claimed: 0 };
+  }
+  const stopAt = Date.now();
+  const claimed = claimUsageInRange(session.startedAt, stopAt);
+  // Phase D — when this is a CL-3 fallback (resolvedId !== sessionId), we
+  // attribute to the parent session BUT preserve the sub-agent's session_id
+  // and synthesise parentSessionId so the on-disk row still tells the user
+  // "this came from a sub-agent of <parent>". When the resolved id matches
+  // the wire id, we use the session's own attribution (it was registered
+  // either as a primary session via /api/session-start or as a sub-agent
+  // via /api/subagent-start — either way `_attachSessionAttribution`
+  // already does the right thing).
+  for (const entry of claimed) {
+    let row;
+    if (resolvedId === sessionId) {
+      row = _attachSessionAttribution(sessionId, session, {
+        ts: entry.ts,
+        repo: session.repo,
+        branch: session.branch ?? null,
+        commitHash: session.commitHash,
+        model: entry.model,
+        inputTokens: entry.inputTokens,
+        outputTokens: entry.outputTokens,
+        account: entry.account,
+      });
+    } else {
+      // Fallback path — sub-agent's session_id never registered. Tag the
+      // row with the sub-agent's id (so the user sees the right cardinality)
+      // and parentSessionId === resolvedId. agentType stays null because we
+      // never saw the SubagentStart hook for this sub-agent — payload type
+      // is unknown.
+      const baseEntry = _attachSessionAttribution(sessionId, session, {
+        ts: entry.ts,
+        repo: session.repo,
+        branch: session.branch ?? null,
+        commitHash: session.commitHash,
+        model: entry.model,
+        inputTokens: entry.inputTokens,
+        outputTokens: entry.outputTokens,
+        account: entry.account,
+      });
+      row = { ...baseEntry, parentSessionId: resolvedId, agentType: null };
+    }
+    appendTokenUsage(row);
+  }
+  // Only delete the pendingSessions entry on a primary stop/end for the
+  // matching id — a subagent-stop attributed to its parent must NOT
+  // delete the parent's session.
+  if (resolvedId === sessionId) {
+    pendingSessions.delete(sessionId);
+  } else if (claimed.length > 0) {
+    // Advance startedAt so the parent doesn't re-claim the same window
+    // when its own stop arrives.
+    session.startedAt = stopAt;
+  }
+  log('tokens', `Session ${kind}: ${sessionId.slice(0, 8)}… (claimed ${claimed.length} entries)`);
+  return { claimed: claimed.length };
+}
 
 // Claim and persist usage for a session (used by auto-claim and stale pruning)
 function _autoClaimSession(sessionId, session) {
   // Re-read branch before persisting (handles worktree branch switches)
   if (session.cwd) {
     try {
-      const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
+      const cur = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
       if (cur && cur !== session.branch) {
         session.branch = cur;
-        session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
       }
     } catch { /* ignore */ }
   }
   const claimed = claimUsageInRange(session.startedAt, Date.now());
   for (const entry of claimed) {
-    appendTokenUsage({
+    appendTokenUsage(_attachSessionAttribution(sessionId, session, {
       ts: entry.ts,
       repo: session.repo,
-      branch: session.branch,
+      // Phase 6: branchAtWriteTime null-safe.
+      branch: session.branch ?? null,
       commitHash: session.commitHash,
       model: entry.model,
       inputTokens: entry.inputTokens,
       outputTokens: entry.outputTokens,
       account: entry.account,
-    });
+    }));
   }
   if (claimed.length > 0) {
     log('tokens', `Auto-claimed ${claimed.length} entries for session ${sessionId.slice(0, 8)}…`);
@@ -6078,26 +7534,27 @@ setInterval(() => {
     // Re-read branch before persisting (handles worktree branch switches)
     if (session.cwd) {
       try {
-        const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
+        const cur = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
         if (cur && cur !== session.branch) {
           log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${session.branch} → ${cur}`);
           session.branch = cur;
-          session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
         }
       } catch { /* ignore */ }
     }
     const claimed = claimUsageInRange(session.startedAt, now);
     for (const entry of claimed) {
-      appendTokenUsage({
+      appendTokenUsage(_attachSessionAttribution(id, session, {
         ts: entry.ts,
         repo: session.repo,
-        branch: session.branch,
+        // Phase 6: branchAtWriteTime null-safe.
+        branch: session.branch ?? null,
         commitHash: session.commitHash,
         model: entry.model,
         inputTokens: entry.inputTokens,
         outputTokens: entry.outputTokens,
         account: entry.account,
-      });
+      }));
     }
     if (claimed.length > 0) {
       session.startedAt = now; // advance so we don't re-claim
@@ -6110,7 +7567,7 @@ setInterval(() => {
 }, TOKEN_AUTO_PERSIST_INTERVAL);
 
 // ─────────────────────────────────────────────────
-// [BETA] Token Usage Storage (token-usage.json)
+// Token Usage Storage (token-usage.json)
 // ─────────────────────────────────────────────────
 
 const TOKEN_USAGE_MAX_ENTRIES = 50_000;
@@ -6130,9 +7587,119 @@ function loadTokenUsage() {
   return _tokenUsageCache;
 }
 
+/**
+ * Phase D — wrapper around mergeSessionAttribution (lib.mjs) that reads
+ * the perToolAttribution gate from current settings. Centralises the rule
+ * so the five appendTokenUsage call sites (flush endpoint,
+ * _claimAndPersistForSession, _autoClaimSession, periodic timer, shutdown
+ * handler) all attach the same attribution.
+ *
+ * Per-tool attribution (Refinement 1) is gated by settings.perToolAttribution.
+ * When the gate is OFF, mergeSessionAttribution returns null tool/mcpServer.
+ */
+function _attachSessionAttribution(sessionId, session, entry) {
+  return mergeSessionAttribution(sessionId, session, entry, {
+    perToolAttributionEnabled: settings && settings.perToolAttribution === true,
+  });
+}
+
+/**
+ * Persist a token-usage entry to disk (token-usage.json).
+ *
+ * Schema (Phase D — extended for sub-agent attribution + compaction):
+ *   {
+ *     // Always-present base fields
+ *     ts: number,                    // ms epoch when usage was observed
+ *     type: 'usage'|'compact_boundary', // row kind. Defaults to 'usage'
+ *                                    //   so existing rows on disk
+ *                                    //   (pre-Phase-D) remain valid; the
+ *                                    //   reader path treats absent type
+ *                                    //   as 'usage' for backward compat.
+ *     repo: string,                  // git remote-name or '(non-git)'
+ *     branch: string|null,           // branchAtWriteTime — git branch at
+ *                                    //   the moment of persistence; null
+ *                                    //   if no git, captured eagerly at
+ *                                    //   session-start and re-read at
+ *                                    //   periodic-flush / session-stop /
+ *                                    //   shutdown to reflect mid-session
+ *                                    //   branch switches.
+ *     commitHash: string,            // short HEAD SHA at write time
+ *
+ *     // Usage rows (type === 'usage')
+ *     model: string,                 // anthropic model id
+ *     inputTokens: number,
+ *     outputTokens: number,
+ *     account: string,               // account label/name attribution
+ *     sessionId: string|null,        // session_id of the registered window
+ *
+ *     // Phase D — sub-agent attribution (Refinement 3)
+ *     parentSessionId: string|null,  // parent session for sub-agents (null for
+ *                                    //   primary sessions). Populated from
+ *                                    //   the SubagentStart hook payload.
+ *     agentType: string|null,        // 'Bash' | 'Explore' | 'Plan' | custom.
+ *                                    //   Distinguishes parallel sub-agents
+ *                                    //   from the same parent.
+ *
+ *     // Phase D — per-tool attribution (Refinement 1, gated)
+ *     tool: string|null,             // comma-joined tool names from the most
+ *                                    //   recent PostToolBatch hook (when
+ *                                    //   perToolAttribution: true). Null when
+ *                                    //   the gate is off OR for the
+ *                                    //   pre-tool LLM turn (planning step).
+ *     mcpServer: string|null,        // server segment of an mcp__ tool name.
+ *                                    //   Set when `tool` starts with mcp__.
+ *
+ *     // Phase D — agent-teams rollup (Refinement 4, stub)
+ *     teamId: string|null,           // ~/.claude/teams/<team>/config.json id.
+ *                                    //   Schema field reserved; wiring is a
+ *                                    //   later-phase task per the contract.
+ *
+ *     // Compact-boundary rows (type === 'compact_boundary')
+ *     trigger: string|null,          // 'manual' | 'auto' (PreCompact/PostCompact matcher)
+ *     preTokens: number|null,        // context size before compaction
+ *     postTokens: number|null,       // context size after (PostCompact only)
+ *   }
+ *
+ * Existing readers that pre-date these fields tolerate the addition (JSON
+ * consumers ignore unknown keys). Aggregation readers MUST skip rows where
+ * type === 'compact_boundary' so the marker rows aren't summed as usage —
+ * see `isUsageRow` in lib.mjs.
+ *
+ * Callers MUST pass `branch: session.branch ?? null` — a literal `null`
+ * sentinel beats `undefined` because JSON.stringify drops undefined keys
+ * and downstream filters that test `e.branch === null` would silently
+ * miss those entries.
+ */
 function appendTokenUsage(entry) {
+  // Phase D — normalise the entry against the extended schema. Every new
+  // nullable field defaults to null (NOT undefined — JSON.stringify drops
+  // undefined keys). type defaults to 'usage' so callers that pre-date
+  // Phase D don't have to thread the field through. Any caller passing
+  // explicit null/undefined for these fields is honored (null wins).
+  const normalized = {
+    ts: entry.ts,
+    type: entry.type || 'usage',
+    repo: entry.repo,
+    branch: entry.branch ?? null,
+    commitHash: entry.commitHash,
+    model: entry.model,
+    inputTokens: entry.inputTokens,
+    outputTokens: entry.outputTokens,
+    account: entry.account,
+    sessionId: entry.sessionId ?? null,
+    // Phase D additions
+    parentSessionId: entry.parentSessionId ?? null,
+    agentType: entry.agentType ?? null,
+    tool: entry.tool ?? null,
+    mcpServer: entry.mcpServer ?? null,
+    teamId: entry.teamId ?? null,
+    // compact_boundary fields (null on usage rows)
+    trigger: entry.trigger ?? null,
+    preTokens: entry.preTokens ?? null,
+    postTokens: entry.postTokens ?? null,
+  };
   const usage = loadTokenUsage();
-  usage.push(entry);
+  usage.push(normalized);
   // Prune old entries
   const cutoff = Date.now() - TOKEN_USAGE_MAX_AGE;
   const pruned = usage.filter(e => e.ts >= cutoff);
@@ -6150,8 +7717,26 @@ function appendTokenUsage(entry) {
   }
 }
 
+/**
+ * Phase D — append a compact_boundary marker row from PreCompact/PostCompact.
+ *
+ * The marker is recorded in the same token-usage.json buffer so the dashboard
+ * can render compaction tick marks alongside usage rows on the same time axis.
+ * Callers MUST NOT pass model/inputTokens/outputTokens — those are the usage
+ * row's territory; here they're left null and aggregation readers skip the
+ * row via isUsageRow (lib.mjs).
+ *
+ * Row shape is built by buildCompactBoundaryEntry (lib.mjs) which is unit-tested.
+ */
+function appendCompactBoundary({ sessionId, repo, branch, commitHash, trigger, preTokens, postTokens, account }) {
+  appendTokenUsage(buildCompactBoundaryEntry({
+    ts: Date.now(),
+    sessionId, repo, branch, commitHash, trigger, preTokens, postTokens, account,
+  }));
+}
+
 // ─────────────────────────────────────────────────
-// [BETA] Pipe helper — waits for stream to complete
+// Pipe helper — waits for stream to complete
 // ─────────────────────────────────────────────────
 
 function pipeAndWait(src, dst) {
@@ -6526,6 +8111,35 @@ async function handleProxyRequest(clientReq, clientRes) {
       // marking the account as limited, or sending notifications.
       const isTransient = retryAfter < 60;
 
+      // Phase 6: thundering-herd dedup — late-arriving 429s from N
+      // concurrent requests get retried against the new active without N
+      // rotations. When N in-flight requests all hit 429 against the same
+      // active token, the first one rotates AWAY and marks the source
+      // token; the rest must NOT independently pick + writeKeychain again
+      // (that produces N rotations in 100 ms when 1 was sufficient and
+      // can ping-pong the keychain across accounts the user never asked
+      // to use). Window is 500 ms — long enough to absorb the typical
+      // burst of streaming-completion 429s, short enough that genuinely
+      // new rate limits on the new token still trigger normal rotation.
+      if (!isTransient && accountState.wasRecentlySwitchedFrom(token, 500)) {
+        log('switch', `${acctName} → 429 dedup: token was recently rotated away, retrying against new active`);
+        await drainResponse(proxyRes);
+        triedTokens.add(token);
+        try {
+          const fresh = readKeychain();
+          const freshToken = fresh?.claudeAiOauth?.accessToken;
+          if (freshToken && freshToken !== token) {
+            token = freshToken;
+            continue;
+          }
+        } catch (e) {
+          log('warn', `Keychain re-read failed during 429 dedup: ${e.message}`);
+        }
+        // Fallback: keychain re-read produced same token (or failed) —
+        // fall through to the normal rotation path so the request still
+        // makes progress.
+      }
+
       if (!isTransient) {
         markAccountLimited(token, acctName, retryAfter);
         logEvent('rate-limited', { account: acctName, retryAfter });
@@ -6542,6 +8156,13 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
 
       await drainResponse(proxyRes);
+
+      // Phase 6: mark the source token as just-rotated-away BEFORE the
+      // keychain swap so any concurrent in-flight 429 lands in the dedup
+      // branch above instead of independently rotating again. Order
+      // matters — markSwitchedFrom() must precede pickBestAccount() so
+      // even a sub-millisecond race observes the marker.
+      accountState.markSwitchedFrom(token);
 
       // Try next best account
       const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
@@ -6956,7 +8577,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
     clientRes.on('close', () => { proxyRes.destroy(); });
 
-    // [BETA] Extract token usage from SSE streaming responses
+    // Extract token usage from SSE streaming responses
     const contentType = proxyRes.headers['content-type'] || '';
     if (contentType.includes('text/event-stream')) {
       const extractor = createUsageExtractor();
@@ -6969,7 +8590,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         clientRes.on('close', finish);
       });
       recordUsage(extractor.getUsage(), acctName);
-      // [BETA] Session Monitor — extract timeline from completed request
+      // Session Monitor — extract timeline from completed request
       setImmediate(() => {
         try {
           if (!settings.sessionMonitor) return;
@@ -6986,7 +8607,7 @@ async function handleProxyRequest(clientReq, clientRes) {
             return;
           }
           const bodyObj = JSON.parse(body.toString('utf8'));
-          updateSessionTimeline(bodyObj, acctName, extractor.getUsage(), token);
+          updateSessionTimeline(bodyObj, acctName, extractor.getUsage());
         } catch {}
       });
     } else {
@@ -7023,6 +8644,9 @@ function getEarliestReset() {
 
 function getProxyStatus() {
   const accounts = loadAllAccountTokens();
+  // Phase 6: dropped `recentEvents` field — proxyEventLog ring buffer was a
+  // dead pipeline (UI never rendered it). Activity log via /api/activity-log
+  // is the single source for proxy state transitions.
   return {
     accounts: accounts.map(a => {
       const state = accountState.get(a.token);
@@ -7033,25 +8657,66 @@ function getProxyStatus() {
         ...(state || {}),
       };
     }),
-    recentEvents: proxyEventLog.slice(0, 20),
   };
 }
 
 // ── Graceful shutdown ──
-
+//
+// Called on SIGINT/SIGTERM. Three responsibilities, in order:
+//   (1) Flush every pendingSessions entry so the in-flight token-usage
+//       claim window for each active Claude Code session is persisted to
+//       token-usage.json. WITHOUT this, killing the dashboard while a
+//       session is mid-flight silently drops every unclaimed entry — the
+//       Tokens tab would underreport and the prepare-commit-msg trailer
+//       would lose tokens. Mirrors the periodic auto-claim timer logic.
+//   (2) Persist every active monitored session (Session Monitor beta).
+//   (3) Tell both HTTP servers to stop accepting new connections, then
+//       exit. We DO NOT await server.close() because long-poll SSE
+//       subscribers (`/api/logs/stream`) keep the listener open
+//       indefinitely — calling close() flips its accept flag and we exit
+//       on the next tick. process.exit() then unwinds open sockets.
+let _shuttingDown = false;
 function shutdown(signal) {
+  if (_shuttingDown) return;   // SIGINT after SIGTERM races otherwise
+  _shuttingDown = true;
   log('info', `Received ${signal}, shutting down...`);
-  // Persist all active monitored sessions before exit
+  // (1) Flush in-flight token-usage claims for every active session.
+  try {
+    const now = Date.now();
+    let totalClaimed = 0;
+    for (const [sessionId, session] of pendingSessions) {
+      const claimed = claimUsageInRange(session.startedAt, now);
+      for (const entry of claimed) {
+        try {
+          appendTokenUsage(_attachSessionAttribution(sessionId, session, {
+            ts: entry.ts, repo: session.repo,
+            // Phase 6: branchAtWriteTime null-safe.
+            branch: session.branch ?? null,
+            commitHash: session.commitHash, model: entry.model,
+            inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
+            account: entry.account,
+          }));
+        } catch { /* best-effort during shutdown */ }
+      }
+      totalClaimed += claimed.length;
+    }
+    if (totalClaimed > 0) log('info', `Shutdown flush: persisted ${totalClaimed} token-usage entries`);
+  } catch (e) {
+    try { log('warn', `Shutdown token-usage flush failed: ${e.message}`); } catch {}
+  }
+  // (2) Persist active monitored sessions.
   for (const [id, session] of monitoredSessions) {
-    persistCompletedSession(session);
+    try { persistCompletedSession(session); } catch {}
     monitoredSessions.delete(id);
   }
-  proxyServer.close();
-  server.close();
+  // (3) Stop accepting new connections and exit.
+  try { proxyServer.close(); } catch {}
+  try { server.close(); } catch {}
   process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGHUP', () => shutdown('SIGHUP'));
 let _inExceptionHandler = false;
 process.on('uncaughtException', (err) => {
   if (_inExceptionHandler) return;        // break recursive EIO death spiral

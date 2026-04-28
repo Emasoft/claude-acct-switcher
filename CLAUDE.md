@@ -89,7 +89,7 @@ These all use atomic-rename writes in the helpers; don't write directly with `wr
 
 ### OAuth refresh
 
-`OAUTH_TOKEN_URL` defaults to `https://platform.claude.com/v1/oauth/token`, `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.
+`OAUTH_TOKEN_URL` defaults to `https://console.anthropic.com/v1/oauth/token` (Anthropic retired the older `platform.claude.com` host during the platform→console migration; the old URL silently 404s and refreshes against it never recover), `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.
 
 ### Rotation strategies
 
@@ -99,7 +99,13 @@ Defined in `lib.mjs` as `ROTATION_STRATEGIES` and implemented by `pickByStrategy
 
 `install-hooks.sh` is sourced by `install.sh`/`uninstall.sh` and on every `vdm` startup (the migration block at the top of `vdm` re-installs hooks if they're missing). It installs:
 
-1. **Claude Code hooks** (`UserPromptSubmit`, `Stop`) into `~/.claude/settings.json`, pointing at `/api/session-start` and `/api/session-stop` on the dashboard. Hook entries are matched by URL marker so re-install is idempotent.
+1. **Claude Code hooks** into `~/.claude/settings.json`, pointing at the dashboard's session-tracking endpoints. Hook entries are matched by URL marker so re-install is idempotent. The full subscription set is:
+   - `SessionStart` / `UserPromptSubmit` — anchor a session and stamp the active git repo + branch on every prompt.
+   - `Stop` / `StopFailure` / `SubagentStop` / `SessionEnd` — close out a turn (or sub-agent fan-out) so the input/output token totals are flushed before the next turn starts.
+   - `SubagentStart` — pairs with `SubagentStop` so parallel sub-agent fan-outs get their tokens attributed to the right repo+branch instead of being silently dropped.
+   - `PreCompact` / `PostCompact` — record context-compaction boundaries so the running input-token math doesn't double-count messages that Claude Code has just collapsed.
+   - `CwdChanged` — re-resolves the active branch when a session `cd`s between turns, keeping branch attribution fresh in long-lived sessions.
+   - `PostToolBatch` (gated) — opt-in per-tool token attribution; enable by setting `perToolAttribution: true` in `config.json` (or the equivalent UI toggle). Off by default because it materially increases the size of `token-usage.json`.
 2. **Global git `prepare-commit-msg` hook** in `git config --global core.hooksPath` (created at `~/.config/git/hooks/` if not already set). It chains to any pre-existing repo-local or global hook, then queries `/api/token-usage` and appends a `Token-Usage:` trailer. Look for `_VDM_HOOKS_MARKER` and `_VDM_HOOKS_PATH_MARKER` to see how it tracks ownership for clean uninstall.
 
 If you change the hook payload format, update both ends in lock-step: the writer in `install-hooks.sh` and the reader in the `/api/session-*` handlers and `cmd_tokens` in `vdm`.
@@ -109,7 +115,7 @@ If you change the hook payload format, update both ends in lock-step: the writer
 Tests use Node's built-in `node:test` and `node:assert/strict` — no Jest, no mocha, no test config. Two files:
 
 - `test/lib.test.mjs` — unit tests against the pure functions in `lib.mjs`. Add tests here when you add a function to `lib.mjs`.
-- `test/api.test.mjs` — integration tests for the OAuth refresh flow against an in-process mock OAuth server (`createMockOAuthServer`). The pattern is: spin up the mock on `127.0.0.1:0` (random port), point `OAUTH_TOKEN_URL` at it via env, run the flow, assert. Use this pattern for any new test that exercises an outbound HTTP call — never let tests touch the real Anthropic or `platform.claude.com` endpoints.
+- `test/api.test.mjs` — integration tests for the OAuth refresh flow against an in-process mock OAuth server (`createMockOAuthServer`). The pattern is: spin up the mock on `127.0.0.1:0` (random port), point `OAUTH_TOKEN_URL` at it via env, run the flow, assert. Use this pattern for any new test that exercises an outbound HTTP call — never let tests touch the real Anthropic or `console.anthropic.com` endpoints.
 
 There is currently no integration test that exercises the full proxy server end-to-end; the proxy is only covered indirectly through `lib.mjs` units. If you find yourself testing proxy logic, first check whether the logic can be extracted to `lib.mjs` as a pure function.
 

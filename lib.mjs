@@ -43,9 +43,16 @@ export const HOP_BY_HOP = new Set([
  * Also strips any custom hop-by-hop headers declared in the Connection header.
  */
 export function stripHopByHopHeaders(originalHeaders) {
-  const connVal = originalHeaders['connection'] || originalHeaders['Connection'] || '';
+  // Locate the Connection header without assuming a specific casing. Node's
+  // server normalises to lowercase, but raw callers (tests, custom clients,
+  // header objects built by hand) can pass `Connection`, `CONNECTION`, or
+  // any mixed form. Walking the keys once is the only correct lookup.
+  let connVal = '';
+  for (const k of Object.keys(originalHeaders)) {
+    if (k.toLowerCase() === 'connection') { connVal = originalHeaders[k] || ''; break; }
+  }
   const extraHop = new Set(
-    connVal.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    String(connVal).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   );
   const fwd = {};
   for (const [k, v] of Object.entries(originalHeaders)) {
@@ -61,10 +68,23 @@ export function buildForwardHeaders(originalHeaders, token) {
   if (!token || typeof token !== 'string') {
     throw new Error(`Cannot forward request: token is ${token === null ? 'null' : typeof token}`);
   }
+  // Strip any case-variant of headers we're about to set canonically.
+  // Without this, an inbound `Authorization` (capital A) preserved by
+  // stripHopByHopHeaders would coexist with our lowercase `authorization`,
+  // causing Node to emit two Authorization headers and the upstream API
+  // to reject the request. Same goes for `Anthropic-Beta` vs `anthropic-beta`.
+  const TO_REPLACE = new Set(['authorization', 'anthropic-beta']);
+  let existingBetas = '';
+  for (const k of Object.keys(fwd)) {
+    const lk = k.toLowerCase();
+    if (!TO_REPLACE.has(lk)) continue;
+    if (lk === 'anthropic-beta' && !existingBetas) existingBetas = fwd[k] || '';
+    delete fwd[k];
+  }
   fwd['authorization'] = `Bearer ${token}`;
   fwd['host'] = 'api.anthropic.com';
   // Ensure OAuth beta
-  const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
+  const betas = existingBetas.split(',').map(s => s.trim()).filter(Boolean);
   if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
   fwd['anthropic-beta'] = betas.join(',');
   return fwd;
@@ -117,6 +137,23 @@ export function createAccountStateManager() {
     }
   }
 
+  // Per-source-account switch tracking. Used by the proxy's 429 handler to
+  // dedupe thundering-herd cascades: when N concurrent in-flight requests
+  // all hit 429 against the same just-rotated-away token, only the first
+  // should trigger a rotation. The rest must observe the recent switch and
+  // retry against the new active token instead of independently picking
+  // another "next best" account (N rotations in 100 ms when 1 was enough).
+  function markSwitchedFrom(token) {
+    const prev = state.get(token) || {};
+    state.set(token, { ...prev, lastSwitchAtMs: Date.now(), updatedAt: Date.now() });
+  }
+
+  function wasRecentlySwitchedFrom(token, windowMs = 500, nowMs = Date.now()) {
+    const acctState = state.get(token);
+    if (!acctState || !acctState.lastSwitchAtMs) return false;
+    return nowMs - acctState.lastSwitchAtMs < windowMs;
+  }
+
   function get(token) {
     return state.get(token);
   }
@@ -133,7 +170,11 @@ export function createAccountStateManager() {
     state.delete(token);
   }
 
-  return { update, markLimited, markExpired, clearBillingCooldown, get, entries, clear, remove };
+  return {
+    update, markLimited, markExpired, clearBillingCooldown,
+    markSwitchedFrom, wasRecentlySwitchedFrom,
+    get, entries, clear, remove,
+  };
 }
 
 // ─────────────────────────────────────────────────
@@ -148,10 +189,16 @@ export function isAccountAvailable(token, expiresAt, stateManager, now = Date.no
   if (expiresAt && expiresAt < now) return false;
   // Marked expired by a 401
   if (acctState?.expired) return false;
-  // Limited: unavailable if ANY active cooldown hasn't passed yet
+  // Limited: unavailable if ANY active cooldown hasn't passed yet.
+  // Comparisons use `>` (strict): the rate-limit reset epoch is the moment
+  // the account becomes available again, so equality counts as available.
+  // The 7-day window is checked alongside the 5-hour one — a weekly cap
+  // outlives a 5-hour reset, so missing it would mark a still-limited
+  // account available the moment the 5h window rolls over.
   if (acctState?.limited) {
-    if (acctState.retryAfter && acctState.retryAfter >= now) return false;   // billing cooldown active
-    if (acctState.resetAt && acctState.resetAt >= nowSec) return false;      // 5h rate-limit active
+    if (acctState.retryAfter && acctState.retryAfter > now) return false;        // billing cooldown active
+    if (acctState.resetAt && acctState.resetAt > nowSec) return false;            // 5h rate-limit active
+    if (acctState.resetAt7d && acctState.resetAt7d > nowSec) return false;        // 7d rate-limit active
     return true; // all cooldowns expired
   }
   return true;
@@ -373,9 +420,13 @@ export function createProbeTracker(maxAge = PROBE_LOG_MAX_AGE) {
   }
 
   function load(entries) {
-    if (!entries || !entries.length) return;
+    // load() is a "replace state" operation — an empty array must clear
+    // the in-memory log, not silently keep stale entries from a previous
+    // load. Only a non-array (null/undefined/garbage) is a no-op, which
+    // matches createUtilizationHistory.load below.
+    if (!Array.isArray(entries)) return;
     const cutoff = Date.now() - maxAge;
-    const valid = entries.filter(e => e.ts >= cutoff);
+    const valid = entries.filter(e => e && typeof e.ts === 'number' && e.ts >= cutoff);
     log.length = 0;
     for (const e of valid) log.push(e);
   }
@@ -422,10 +473,24 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
   }
 
   /**
-   * Calculate utilization velocity (change per hour) for the 5h window.
-   * Uses only the last 30 minutes of data to reflect current usage rate,
-   * not stale history from hours ago that inflates the slope.
-   * Returns null if insufficient data.
+   * Calculate utilization velocity (change per hour) for the 5h window
+   * using ordinary least-squares (OLS) linear regression over the last
+   * 30 minutes of data.
+   *
+   * Why regression instead of (last - first)/(last.ts - first.ts):
+   * the naive 2-point delta is dominated by the noise on the two endpoints.
+   * A single sample landing at a quota tick boundary makes the velocity
+   * jump ±2x the true rate, which is what users perceive as "imprecise
+   * estimations" and "the prediction keeps swinging". OLS over all points
+   * in the window averages out per-sample noise and reduces back to the
+   * 2-point formula in the trivial 2-point case (so existing behaviour is
+   * preserved for short histories).
+   *
+   * Returns null when:
+   *   - fewer than 2 points exist in the window
+   *   - the window spans less than ~9.6 min (preserved from the old impl)
+   *   - the slope is non-positive (utilization is flat or dropping; happens
+   *     post-reset and would otherwise produce a misleading negative ETA)
    */
   function getVelocity(fingerprint) {
     const arr = history.get(fingerprint);
@@ -436,10 +501,27 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
     if (recent.length < 2) return null;
     const first = recent[0];
     const last = recent[recent.length - 1];
-    const timeDeltaHrs = (last.ts - first.ts) / (1000 * 60 * 60);
-    if (timeDeltaHrs < 0.16) return null; // need at least ~10 min of recent data
-    const utilizationDelta = last.u5h - first.u5h;
-    return utilizationDelta / timeDeltaHrs; // change per hour (0-1 scale)
+    if (last.ts - first.ts < 0.16 * 3600 * 1000) return null; // need ≥ ~9.6 min span
+    // OLS slope of u5h regressed on time-in-hours.
+    // Convert ts to hours-since-firstTs to keep the numerics small —
+    // raw ms timestamps would overflow the squared sums on long-running
+    // dashboards and produce subtly wrong slopes.
+    const firstTs = first.ts;
+    const n = recent.length;
+    let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+    for (const p of recent) {
+      const x = (p.ts - firstTs) / 3600000; // hours
+      const y = p.u5h;
+      sumX += x;
+      sumY += y;
+      sumXY += x * y;
+      sumXX += x * x;
+    }
+    const denom = n * sumXX - sumX * sumX;
+    if (denom === 0) return null; // all x identical (shouldn't happen post span-check)
+    const slope = (n * sumXY - sumX * sumY) / denom; // utilization-per-hour
+    if (slope <= 0) return null; // non-positive slope: dropping or flat
+    return slope;
   }
 
   /**
@@ -476,12 +558,22 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
   }
 
   function load(fingerprint, entries) {
-    if (!entries || !entries.length) {
+    // Mirror createProbeTracker.load semantics (Phase 5 contract):
+    //   - Non-array (null/undefined/garbage) is a no-op — do NOT touch the
+    //     in-memory state. Callers that explicitly want to clear an entry
+    //     must pass an empty array.
+    //   - Empty array is a "replace state" operation that clears the slot
+    //     so stale entries from a previous load() don't linger.
+    // Without this, `load(fp, undefined)` (e.g. from a partially-malformed
+    // history JSON whose `fiveH[fp]` is missing) would silently wipe an
+    // in-memory entry that the caller never intended to clear.
+    if (!Array.isArray(entries)) return;
+    if (entries.length === 0) {
       history.set(fingerprint, []);
       return;
     }
     const cutoff = Date.now() - maxAge;
-    const valid = entries.filter(e => e.ts >= cutoff);
+    const valid = entries.filter(e => e && typeof e.ts === 'number' && e.ts >= cutoff);
     history.set(fingerprint, valid);
   }
 
@@ -579,6 +671,13 @@ export function shouldRefreshToken(expiresAt, bufferMs = 60 * 60 * 1000, now = D
 /**
  * Promise-chain mutex keyed by account name.
  * Ensures only one refresh runs per account at a time.
+ *
+ * Eviction note: when a chain finishes and no later caller has chained
+ * onto its tail, the Map entry is deleted so the lock table doesn't grow
+ * unboundedly across the lifetime of the dashboard process. Without this,
+ * every distinct key (account name, fingerprint, etc.) ever passed in
+ * would leak a settled promise reference, and `accountState.remove()`
+ * (added in Phase 5) would have no symmetric cleanup here.
  */
 export function createPerAccountLock() {
   const locks = new Map();
@@ -588,8 +687,490 @@ export function createPerAccountLock() {
     let release;
     const next = new Promise(r => { release = r; });
     locks.set(key, next);
-    return prev.then(fn).finally(release);
+    // The eviction step folds into the same .finally that releases `next`,
+    // so the caller-visible chain settles with the original outcome of
+    // `fn`. The identity check `locks.get(key) === next` is load-bearing:
+    // if a later caller B has already chained onto our tail, locks.get(key)
+    // is now B's `next`, and we must NOT delete it — doing so would let a
+    // future call C bypass B and run in parallel. The check guarantees
+    // we only evict tails that nobody is queued behind.
+    return prev.then(fn).finally(() => {
+      release();
+      if (locks.get(key) === next) locks.delete(key);
+    });
   }
 
-  return { withLock };
+  // Test-only diagnostic: number of live lock entries. Exposed so the
+  // memory-growth audit fix can be verified deterministically without
+  // peeking at module internals. Production code MUST NOT depend on this.
+  function _size() { return locks.size; }
+
+  return { withLock, _size };
+}
+
+// ─────────────────────────────────────────────────
+// Counting semaphore (FIFO queue)
+// ─────────────────────────────────────────────────
+
+/**
+ * Counting semaphore that caps the number of concurrent runs.
+ *
+ * Designed to throttle bulk OAuth-refresh fan-out: the 400-recovery path
+ * in dashboard.mjs does `Promise.allSettled(toRefresh.map(refreshAccount))`
+ * which can fire 10+ parallel POSTs from one IP and trigger Anthropic-side
+ * rate limiting on the OAuth endpoint itself. Wrapping each refresh call
+ * in `sem.run(fn)` caps in-flight requests at maxConcurrent.
+ *
+ * Contract:
+ *   const sem = createSemaphore(3);
+ *   await sem.acquire();
+ *   try { ... } finally { sem.release(); }
+ *   // or:
+ *   await sem.run(asyncFn);
+ *
+ * Pending acquirers are released in FIFO order. release() is reentrant-safe:
+ * calling more times than acquire is a no-op (counter is clamped at 0),
+ * not an underflow that would let extra runs slip past the cap.
+ */
+export function createSemaphore(maxConcurrent) {
+  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+    throw new Error(`createSemaphore: maxConcurrent must be a positive integer, got ${maxConcurrent}`);
+  }
+  const max = maxConcurrent;
+  let inFlight = 0;
+  const pending = []; // FIFO queue of resolvers
+
+  function acquire() {
+    if (inFlight < max) {
+      inFlight++;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => { pending.push(resolve); });
+  }
+
+  function release() {
+    // Reentrant safety: if a caller releases more times than it acquired
+    // (or releases without an acquire at all), the counter must NOT go
+    // negative — that would silently let extra runs bypass the cap on the
+    // next acquire(). Clamp at 0 and treat the extra release as a no-op.
+    if (pending.length > 0) {
+      // Hand the slot directly to the next waiter without dipping inFlight,
+      // so a fresh acquire() racing with release() can't sneak past the
+      // queued caller. The waiter inherits the slot we already counted.
+      const next = pending.shift();
+      next();
+      return;
+    }
+    if (inFlight > 0) inFlight--;
+  }
+
+  async function run(fn) {
+    await acquire();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  // Test-only diagnostic: current in-flight count. Exposed so concurrency
+  // tests can assert the cap deterministically. Production code MUST NOT
+  // depend on this.
+  function _inFlight() { return inFlight; }
+  function _pending() { return pending.length; }
+
+  return { acquire, release, run, _inFlight, _pending };
+}
+
+// ─────────────────────────────────────────────────
+// Viewer-state helpers (Phase C — date-range scrubber)
+// ─────────────────────────────────────────────────
+
+/**
+ * Clamp a persisted viewer-state record against a live data-range and
+ * the set of currently-known subscription tiers.
+ *
+ * Why this is its own function:
+ *   - Persisted state outlives data: a window persisted before token-usage
+ *     entries aged out will reference timestamps no longer covered by the
+ *     archive, so the UI must clamp into the live bounds before rendering.
+ *   - Persisted state outlives tiers: an account producing a previously-
+ *     unique tier may be removed, leaving stale entries in `tierFilter`
+ *     that no longer correspond to any live profile. Drop them silently.
+ *   - Persisted state may be malformed: start > end (clock skew, race),
+ *     non-finite numbers, missing fields. Always emit a sane window.
+ *
+ * Inputs (all optional — missing fields default to a reasonable value):
+ *   start         — ms epoch (number); falls back to dataRange.oldest
+ *   end           — ms epoch (number); falls back to dataRange.newest
+ *   tierFilter    — string[]; falls back to ['all']
+ *   dataRange     — { oldest: number, newest: number }; required (caller
+ *                   computes from token-usage + activity-log)
+ *   knownTiers    — string[]; the tiers actually present on live profiles.
+ *                   When empty/undefined the filter passes through unchanged
+ *                   (no live profiles → nothing to validate against).
+ *
+ * Output:
+ *   { start, end, tierFilter } — always a valid record where:
+ *     - start ≤ end (swap on inversion)
+ *     - start ≥ dataRange.oldest, end ≤ dataRange.newest
+ *     - end - start ≥ MIN_WINDOW_MS (5 minutes), unless dataRange itself
+ *       is narrower than that — in which case both bounds collapse to
+ *       dataRange.{oldest,newest}
+ *     - tierFilter is either ['all'] or a deduped subset of knownTiers
+ *       (entries referencing tiers no longer present are silently dropped)
+ *
+ * The MIN_WINDOW_MS guard prevents zero-width selections (a user could
+ * otherwise persist start === end, then every chart shows "no data" with
+ * no obvious recovery).
+ */
+export const VIEWER_STATE_MIN_WINDOW_MS = 5 * 60 * 1000;
+
+export function clampViewerState({ start, end, tierFilter, dataRange, knownTiers } = {}) {
+  // Normalise dataRange. Caller is expected to supply both oldest/newest;
+  // we tolerate missing/invalid by collapsing to a single instant at "now"
+  // — the empty-data path the UI uses to hide the scrubber.
+  const now = Date.now();
+  const dr = dataRange && Number.isFinite(dataRange.oldest) && Number.isFinite(dataRange.newest)
+    ? dataRange
+    : { oldest: now, newest: now };
+  const oldest = Math.min(dr.oldest, dr.newest);
+  const newest = Math.max(dr.oldest, dr.newest);
+
+  // Normalise start/end. Non-finite or missing values fall back to the
+  // dataRange edges so the UI can render with safe defaults the moment a
+  // fresh viewer-state.json appears (no first-render flicker).
+  let s = Number.isFinite(start) ? Number(start) : oldest;
+  let e = Number.isFinite(end)   ? Number(end)   : newest;
+
+  // Swap on inversion. Clock-skew during a session can produce start>end
+  // when a preset's "Last 24h" computes against an older `now` than the
+  // current. Swapping is cheaper than asking the user to fix the JSON.
+  if (s > e) { const tmp = s; s = e; e = tmp; }
+
+  // Clamp into bounds. If the persisted window is fully outside the live
+  // data range (e.g. all data aged out and the user's last selection
+  // pointed at older entries), the clamp collapses both ends to the
+  // nearest live edge.
+  s = Math.max(oldest, Math.min(s, newest));
+  e = Math.max(oldest, Math.min(e, newest));
+
+  // Enforce MIN_WINDOW_MS — but only if the live data range itself is
+  // wide enough to host a 5-minute window. For brand-new installs with
+  // a single data point, oldest === newest and the window is [now,now]
+  // by design (the UI hides the scrubber in that state).
+  const dataWidth = newest - oldest;
+  if (dataWidth >= VIEWER_STATE_MIN_WINDOW_MS && (e - s) < VIEWER_STATE_MIN_WINDOW_MS) {
+    // Pad symmetrically around the midpoint so neither edge punches out
+    // of dataRange. If centring would cross a bound, anchor at that bound
+    // and extend the other side.
+    const mid = (s + e) / 2;
+    let ns = mid - VIEWER_STATE_MIN_WINDOW_MS / 2;
+    let ne = mid + VIEWER_STATE_MIN_WINDOW_MS / 2;
+    if (ns < oldest) { ns = oldest; ne = oldest + VIEWER_STATE_MIN_WINDOW_MS; }
+    if (ne > newest) { ne = newest; ns = newest - VIEWER_STATE_MIN_WINDOW_MS; }
+    s = ns; e = ne;
+  }
+
+  // Tier filter. Sentinel ['all'] means "no filter" — pass through.
+  // Otherwise drop any entries not present in knownTiers; if the result
+  // is empty, fall back to ['all'] (an empty filter would render zero
+  // data for no obvious reason; the user has to actively re-select a
+  // tier to filter again).
+  let tf;
+  if (!Array.isArray(tierFilter) || tierFilter.length === 0) {
+    tf = ['all'];
+  } else if (tierFilter.includes('all')) {
+    tf = ['all'];
+  } else if (Array.isArray(knownTiers) && knownTiers.length > 0) {
+    const known = new Set(knownTiers);
+    const filtered = tierFilter.filter(t => typeof t === 'string' && known.has(t));
+    tf = filtered.length > 0 ? Array.from(new Set(filtered)) : ['all'];
+  } else {
+    // No knownTiers context — preserve the filter as-is (deduped, string-only).
+    const cleaned = tierFilter.filter(t => typeof t === 'string' && t.length > 0);
+    tf = cleaned.length > 0 ? Array.from(new Set(cleaned)) : ['all'];
+  }
+
+  return { start: s, end: e, tierFilter: tf };
+}
+
+// ─────────────────────────────────────────────────
+// Phase D — Hook payload parsers
+// ─────────────────────────────────────────────────
+
+/**
+ * Validate and normalise a PreCompact / PostCompact hook payload.
+ *
+ * Both events share the same shape on the wire. The ONLY difference is that
+ * PostCompact carries postTokens and PreCompact does not. Caller decides
+ * which kind it is via the `kind` parameter ('pre' | 'post').
+ *
+ * Returns:
+ *   { ok: true,  sessionId, cwd, trigger, preTokens, postTokens, transcriptPath }
+ *   { ok: false, error: string }   // for malformed payloads
+ *
+ * Why a pure parser:
+ *   The HTTP handler used to embed the validation inline, mixing JSON parsing
+ *   errors with schema errors. Splitting the parse step lets us unit-test the
+ *   schema rules without spinning up an HTTP server, and produces consistent
+ *   400-error messages so the tests can assert on them.
+ */
+export function parseCompactPayload(data, kind) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  if (kind !== 'pre' && kind !== 'post') {
+    return { ok: false, error: 'kind must be "pre" or "post"' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  // cwd is documented as required on every hook payload but we don't reject
+  // missing cwd here — compact_boundary rows survive without it (it's only
+  // used to refresh branch resolution downstream).
+  const cwd = typeof data.cwd === 'string' && data.cwd.length > 0 ? data.cwd : null;
+  // trigger comes from the hook matcher — 'manual' | 'auto'. Tolerate
+  // missing trigger by defaulting to 'auto' (the documented default in
+  // hooks-guide §"Hook input").
+  let trigger = data.trigger;
+  if (trigger !== 'manual' && trigger !== 'auto') {
+    trigger = 'auto';
+  }
+  // preTokens is required on BOTH PreCompact and PostCompact (from
+  // sub-agents.txt §"Compaction metadata"). Coerce to a finite number; if
+  // it's missing or NaN, fall back to null so the row still persists
+  // without injecting bogus arithmetic into downstream graphs.
+  const preTokens = Number.isFinite(Number(data.preTokens))
+    ? Number(data.preTokens)
+    : null;
+  // postTokens MUST be null on PreCompact (event hasn't fired yet) and is
+  // best-effort on PostCompact — if Claude Code sends it, we record it; if
+  // not, we leave it null and the UI can compute postTokens = preTokens
+  // minus the next turn's input delta.
+  const postTokens = kind === 'post' && Number.isFinite(Number(data.postTokens))
+    ? Number(data.postTokens)
+    : null;
+  const transcriptPath = typeof data.transcript_path === 'string'
+    ? data.transcript_path
+    : null;
+  return { ok: true, sessionId, cwd, trigger, preTokens, postTokens, transcriptPath };
+}
+
+/**
+ * Derive the MCP server name from a tool_name like "mcp__github__create_pr".
+ *
+ * Returns the server segment (e.g. "github") for tools matching the
+ * `mcp__<server>__<tool>` convention. Returns null for tools that don't
+ * follow the MCP naming pattern (Bash, Read, Edit, Glob, etc.).
+ *
+ * Why pure: the dispatch code in dashboard.mjs builds two fields from one
+ * input string — `tool` (full name) and `mcpServer` (derived). Putting the
+ * derivation here keeps the rule in one place and makes the "is this an
+ * MCP tool?" check trivially testable.
+ */
+export function inferMcpServerFromToolName(toolName) {
+  if (typeof toolName !== 'string' || toolName.length === 0) return null;
+  if (!toolName.startsWith('mcp__')) return null;
+  // Format: mcp__<server>__<tool>. Reject malformed (mcp__foo with no
+  // __<tool> suffix) — those aren't real MCP tools.
+  const parts = toolName.split('__');
+  if (parts.length < 3) return null;
+  const server = parts[1];
+  if (!server || server.length === 0) return null;
+  return server;
+}
+
+/**
+ * Validate and normalise a SubagentStart hook payload.
+ *
+ * Returns:
+ *   { ok: true,  sessionId, parentSessionId, agentType, cwd, transcriptPath }
+ *   { ok: false, error: string }
+ *
+ * agentType is the matcher value from the hook (Bash, Explore, Plan, or any
+ * custom plugin agent name). parent_session_id is documented as always
+ * present on SubagentStart — we still tolerate missing parent because some
+ * Claude Code releases (per the contract §2) sometimes use parentSessionId
+ * or transcript_id instead.
+ */
+export function parseSubagentStartPayload(data) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  const cwd = typeof data.cwd === 'string' && data.cwd.length > 0 ? data.cwd : null;
+  const parentSessionId = data.parent_session_id || data.parentSessionId || data.transcript_id || null;
+  const agentType = typeof data.agent_type === 'string' && data.agent_type.length > 0
+    ? data.agent_type
+    : null;
+  const transcriptPath = typeof data.transcript_path === 'string'
+    ? data.transcript_path
+    : null;
+  return { ok: true, sessionId, cwd, parentSessionId, agentType, transcriptPath };
+}
+
+/**
+ * Validate and normalise a CwdChanged hook payload.
+ *
+ * Returns:
+ *   { ok: true,  sessionId, previousCwd, cwd }
+ *   { ok: false, error: string }
+ */
+export function parseCwdChangedPayload(data) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  const cwd = data.cwd;
+  if (typeof cwd !== 'string' || cwd.length === 0) {
+    return { ok: false, error: 'cwd required' };
+  }
+  // previous_cwd is informational — may be null/missing if Claude Code
+  // doesn't know the prior dir (first cd in a session, for example).
+  const previousCwd = typeof data.previous_cwd === 'string' && data.previous_cwd.length > 0
+    ? data.previous_cwd
+    : null;
+  return { ok: true, sessionId, cwd, previousCwd };
+}
+
+/**
+ * Phase D — predicate that returns true when an entry is a usage row.
+ *
+ * Aggregation readers MUST skip rows where this returns false (currently
+ * only compact_boundary rows). Pre-Phase-D rows on disk lack the `type`
+ * field — those are usage rows by definition (forward-compat).
+ */
+export function isUsageRow(entry) {
+  return !entry || entry.type === undefined || entry.type === 'usage';
+}
+
+/**
+ * Phase D — build a compact_boundary entry shape (without the ts).
+ *
+ * This is the pure shape-builder used by appendCompactBoundary in
+ * dashboard.mjs. Pulling it here lets us unit-test the rules around
+ * preTokens / postTokens coercion and ensures the schema stays stable.
+ *
+ * The caller (appendCompactBoundary) injects ts: Date.now() at write time;
+ * this function is deterministic given its inputs.
+ */
+export function buildCompactBoundaryEntry({ ts, sessionId, repo, branch, commitHash, trigger, preTokens, postTokens, account }) {
+  // Number coercion guard: Number(null) === 0 and Number.isFinite(0) === true,
+  // so a literal null preTokens/postTokens would silently turn into 0
+  // unless we short-circuit on null/undefined first. The 0 would then poison
+  // downstream graphs that distinguish "no data" (null) from "compaction
+  // discarded everything" (0).
+  const _coerce = (v) => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    ts,
+    type: 'compact_boundary',
+    repo: repo || '(non-git)',
+    branch: branch ?? null,
+    commitHash: commitHash || '',
+    // Usage fields are explicitly nulled — aggregation readers skip
+    // type !== 'usage' rows but the row format MUST stay homogeneous so
+    // a stale reader that ignores the type discriminator still parses
+    // each row without crashing.
+    model: null,
+    inputTokens: null,
+    outputTokens: null,
+    account: account ?? null,
+    sessionId: sessionId ?? null,
+    parentSessionId: null,
+    agentType: null,
+    tool: null,
+    mcpServer: null,
+    teamId: null,
+    trigger: trigger ?? null,
+    preTokens: _coerce(preTokens),
+    postTokens: _coerce(postTokens),
+  };
+}
+
+/**
+ * Phase D — merge a session's sub-agent attribution into a usage entry.
+ *
+ * Used by appendTokenUsage call sites in dashboard.mjs to thread
+ * parentSessionId / agentType / teamId / tool / mcpServer onto every
+ * persisted row consistently. perToolAttributionEnabled gates the
+ * `tool` / `mcpServer` fields — when false, both are nulled out.
+ *
+ * Inputs:
+ *   sessionId — the session to attribute the row to
+ *   session   — pendingSessions entry (may carry parentSessionId, agentType,
+ *               teamId, lastBatchToolNames)
+ *   entry     — base entry (ts, repo, branch, commitHash, model,
+ *               inputTokens, outputTokens, account)
+ *   options.perToolAttributionEnabled — gates the tool/mcpServer derivation
+ *
+ * Returns a NEW object (entry is not mutated).
+ */
+export function mergeSessionAttribution(sessionId, session, entry, { perToolAttributionEnabled = false } = {}) {
+  const s = session || {};
+  let tool = null;
+  let mcpServer = null;
+  if (perToolAttributionEnabled && Array.isArray(s.lastBatchToolNames) && s.lastBatchToolNames.length > 0) {
+    tool = s.lastBatchToolNames.join(',');
+    for (const t of s.lastBatchToolNames) {
+      const srv = inferMcpServerFromToolName(t);
+      if (srv) { mcpServer = srv; break; }
+    }
+  }
+  return {
+    ...entry,
+    sessionId,
+    parentSessionId: s.parentSessionId ?? null,
+    agentType: s.agentType ?? null,
+    teamId: s.teamId ?? null,
+    tool,
+    mcpServer,
+  };
+}
+
+/**
+ * Validate and normalise a PostToolBatch hook payload.
+ *
+ * Returns:
+ *   { ok: true,  sessionId, cwd, tools: Array<{toolName, mcpServer}> }
+ *   { ok: false, error: string }
+ *
+ * Tool entries are deduped while preserving order so a turn that ran Bash
+ * three times shows as ['Bash'] not ['Bash','Bash','Bash']. mcpServer is
+ * derived per-entry via inferMcpServerFromToolName.
+ */
+export function parsePostToolBatchPayload(data) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  const cwd = typeof data.cwd === 'string' && data.cwd.length > 0 ? data.cwd : null;
+  if (!Array.isArray(data.tools)) {
+    return { ok: false, error: 'tools must be an array' };
+  }
+  const seen = new Set();
+  const tools = [];
+  for (const t of data.tools) {
+    if (!t || typeof t !== 'object') continue;
+    const toolName = t.tool_name;
+    if (typeof toolName !== 'string' || toolName.length === 0) continue;
+    if (seen.has(toolName)) continue;
+    seen.add(toolName);
+    tools.push({ toolName, mcpServer: inferMcpServerFromToolName(toolName) });
+  }
+  return { ok: true, sessionId, cwd, tools };
 }

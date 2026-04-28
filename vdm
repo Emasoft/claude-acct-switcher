@@ -6,7 +6,25 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+# Resolve SCRIPT_DIR canonically, BSD-portable.
+# Stock macOS lacks GNU `readlink -f` and `realpath`; the previous chain
+# silently fell back to `echo "$0"` which left the path uncanonicalised
+# whenever vdm was invoked through a symlink. We instead walk the symlink
+# chain manually with plain `readlink` (POSIX), then `cd … && pwd -P`.
+_vdm_resolve_script_path() {
+  local p="$1"
+  local target
+  while [[ -L "$p" ]]; do
+    target="$(readlink "$p")"
+    if [[ "$target" = /* ]]; then
+      p="$target"
+    else
+      p="$(dirname "$p")/$target"
+    fi
+  done
+  printf '%s' "$p"
+}
+SCRIPT_DIR="$(cd "$(dirname "$(_vdm_resolve_script_path "$0")")" && pwd -P)"
 ACCOUNTS_DIR="$SCRIPT_DIR/accounts"
 KEYCHAIN_ACCOUNT="$(whoami)"
 DASHBOARD_PORT="${CSW_PORT:-3333}"
@@ -33,11 +51,11 @@ mkdir -p "$ACCOUNTS_DIR"
 # ─────────────────────────────────────────────────────────
 
 if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
-  # Opt-out sentinel: a user who deliberately removed the BETA hooks
-  # (perhaps because they're noisy or they're testing alternative tracking)
-  # can place this file to keep them removed across vdm invocations.
-  # Without this, the migration silently re-installed disabled hooks
-  # every time any vdm subcommand ran (audit finding 05.C10).
+  # Opt-out sentinel: a user who deliberately removed the token-tracking
+  # hooks (perhaps because they're noisy or they're testing alternative
+  # tracking) can place this file to keep them removed across vdm
+  # invocations. Without this, the migration silently re-installed disabled
+  # hooks every time any vdm subcommand ran (audit finding 05.C10).
   if [[ -f "$HOME/.claude/account-switcher/.hooks-disabled" ]]; then
     : # respect user's opt-out
   else
@@ -53,7 +71,7 @@ if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
     fi
     if [[ "$_needs_hooks" == "true" ]]; then
       source "$SCRIPT_DIR/install-hooks.sh"
-      install_beta_hooks 2>/dev/null || true
+      install_hooks 2>/dev/null || true
     fi
     unset _needs_hooks
   fi
@@ -64,14 +82,26 @@ fi
 # ─────────────────────────────────────────────────────────
 
 detect_keychain_service() {
-  # Try the known default first
+  # Mirror dashboard.mjs::detectKeychainService byte-for-byte: try the
+  # canonical name "Claude Code-credentials" first, then fall back to
+  # `security dump-keychain` and pick the first "Claude*" entry. The bash and
+  # Node sides MUST agree; otherwise vdm and the dashboard read different
+  # keychain entries on the same machine, the active token diverges, and
+  # rotation logic loses the ground truth.
   if security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "Claude Code-credentials" -w &>/dev/null; then
     echo "Claude Code-credentials"
     return
   fi
-  # Broader search for any Claude credential
+  # Broader search — same `head -1` as dashboard.mjs (intentionally NOT sorted
+  # so both sides return the same arbitrary-but-equal first match). NB: the
+  # determinism fix should be applied symmetrically to both sides; tracked as
+  # NEEDS_DESIGN in the audit report.
   local svc
-  svc=$(security dump-keychain 2>/dev/null | grep -A4 '"svce"' | grep -i claude | head -1 | sed -n 's/.*"svce"<blob>="\([^"]*\)".*/\1/p') || true
+  svc=$(security dump-keychain 2>/dev/null \
+    | grep -A4 '"svce"' \
+    | grep -i claude \
+    | sed -n 's/.*"svce"<blob>="\([^"]*\)".*/\1/p' \
+    | head -1) || true
   if [[ -n "$svc" ]]; then
     echo "$svc"
     return
@@ -85,6 +115,33 @@ KEYCHAIN_SERVICE="$(detect_keychain_service)"
 # ─────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────
+
+# Strict profile-name sanitiser. Profile names land directly in filesystem
+# paths (`accounts/<name>.json`, `accounts/<name>.label`) and in shell
+# arguments to `rm`, `cp`, `cat`, `>`. The previous one-line tr-only
+# normaliser kept characters that are dangerous in those contexts:
+#   * `..`, `/` — directory traversal out of accounts/
+#   * `*`, `?`, `[` — glob expansion on `rm -f "$ACCOUNTS_DIR/${name}.json"`
+#   * backticks, `;`, `$()`, `&` — command substitution if the name is ever
+#     re-quoted incorrectly downstream
+#   * leading `-` — interpreted as an option flag by some commands
+# We collapse to a strict whitelist (alnum, `_`, `.`, `-`) AFTER the
+# space-and-case normaliser, then reject the empty string, `.`, `..`, and
+# any name starting with `-`.
+sanitize_profile_name() {
+  local raw="${1:-}"
+  local name
+  # Step 1 (existing behaviour): spaces → dashes, lowercase.
+  name=$(printf '%s' "$raw" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  # Step 2: drop everything outside the strict whitelist.
+  name=$(printf '%s' "$name" | LC_ALL=C tr -cd '[:alnum:]_.-')
+  # Step 3: reject empty / traversal / leading-dash names.
+  case "$name" in
+    "" | "." | "..") return 1 ;;
+    -*)              return 1 ;;
+  esac
+  printf '%s' "$name"
+}
 
 read_keychain() {
   security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null
@@ -110,54 +167,64 @@ print(hashlib.sha256(token.encode()).hexdigest()[:16])
 
 get_profile_fingerprint() {
   local file="$1"
-  python3 -c "
+  # Single-quoted python source — bash performs no expansion inside it.
+  # `$file` is passed as a positional arg, so a path containing `'`,
+  # `$(…)`, or any other shell metacharacter cannot break out of the
+  # python string literal. Same fix applied to every python -c call below.
+  # NOTE: we deliberately do NOT use `--` between the script and the
+  # argument — `python -c` consumes `--` into sys.argv[1] (it is not
+  # recognised as a separator after `-c`), which would shift our path
+  # to sys.argv[2] and break access.
+  python3 -c '
 import sys, json, hashlib
-with open('$file') as f:
+with open(sys.argv[1]) as f:
     d = json.load(f)
-token = d.get('claudeAiOauth', {}).get('accessToken', '')
+token = d.get("claudeAiOauth", {}).get("accessToken", "")
 print(hashlib.sha256(token.encode()).hexdigest()[:16])
-" 2>/dev/null
+' "$file" 2>/dev/null
 }
 
 get_profile_info() {
   local file="$1"
-  python3 -c "
+  python3 -c '
 import sys, json, datetime
-with open('$file') as f:
+with open(sys.argv[1]) as f:
     d = json.load(f)
-oauth = d.get('claudeAiOauth', {})
-sub = oauth.get('subscriptionType', 'unknown')
-tier = oauth.get('rateLimitTier', 'unknown')
-expires = oauth.get('expiresAt', 0)
-exp_str = datetime.datetime.fromtimestamp(expires/1000).strftime('%Y-%m-%d %H:%M') if expires else 'unknown'
-# Clean up tier display
-tier_short = tier.split('_')[-1] if '_' in tier else tier
-print(f'{sub}|{tier_short}|{exp_str}')
-" 2>/dev/null
+oauth = d.get("claudeAiOauth", {})
+sub = oauth.get("subscriptionType", "unknown")
+tier = oauth.get("rateLimitTier", "unknown")
+expires = oauth.get("expiresAt", 0)
+exp_str = datetime.datetime.fromtimestamp(expires/1000).strftime("%Y-%m-%d %H:%M") if expires else "unknown"
+tier_short = tier.split("_")[-1] if "_" in tier else tier
+print(f"{sub}|{tier_short}|{exp_str}")
+' "$file" 2>/dev/null
 }
 
 fetch_account_email() {
   local token="$1"
   local org_name
+  # Single-quoted python source. The API response is read from stdin; no
+  # bash variable is interpolated into the python literal, so a malicious
+  # `organization_name` value cannot escape the JSON loader.
   org_name=$(curl -s \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
     -H "User-Agent: claude-code/vdm" \
     "https://api.anthropic.com/api/oauth/claude_cli/roles" 2>/dev/null \
-    | python3 -c "
+    | python3 -c '
 import sys, json, re
 try:
     d = json.load(sys.stdin)
-    name = d.get('organization_name', '')
-    # Extract email from 'user@email.com'\''s Organization'
-    match = re.match(r\"(.+?)(?:'s Organization| Organization)$\", name)
+    name = d.get("organization_name", "")
+    # Extract email from "user@email.com'"'"'s Organization"
+    match = re.match(r"(.+?)(?:'"'"'s Organization| Organization)$", name)
     if match:
         print(match.group(1))
     else:
         print(name)
-except:
+except Exception:
     pass
-" 2>/dev/null)
+' 2>/dev/null)
   echo "$org_name"
 }
 
@@ -178,16 +245,22 @@ log_activity() {
   local type="$1"
   shift
   # Build JSON entry: { "ts": <epoch_ms>, "type": "<type>", ...extra }
-  python3 -c "
-import json, time, sys, os
+  # Single-quoted python source. The log-file path and the type string are
+  # passed as the first two positional args (via `--`). Extra key=value
+  # pairs follow. Previously `$ACTIVITY_LOG_FILE` and `$type` were
+  # interpolated into a double-quoted python source string — a path or
+  # type name containing `'`, `$(…)`, or `\n` could escape the literal.
+  python3 -c '
+import json, time, sys
 
-log_file = '$ACTIVITY_LOG_FILE'
-entry = {'ts': int(time.time() * 1000), 'type': '$type'}
+log_file = sys.argv[1]
+type_name = sys.argv[2]
+entry = {"ts": int(time.time() * 1000), "type": type_name}
 
 # Parse extra key=value args
-for arg in sys.argv[1:]:
-    if '=' in arg:
-        k, v = arg.split('=', 1)
+for arg in sys.argv[3:]:
+    if "=" in arg:
+        k, v = arg.split("=", 1)
         entry[k] = v
 
 # Load existing log
@@ -195,15 +268,15 @@ log = []
 try:
     with open(log_file) as f:
         log = json.load(f)
-except:
+except Exception:
     pass
 
 log.insert(0, entry)
 log = log[:200]  # max 200 entries
 
-with open(log_file, 'w') as f:
+with open(log_file, "w") as f:
     json.dump(log, f, indent=2)
-" "$@" 2>/dev/null || true
+' "$ACTIVITY_LOG_FILE" "$type" "$@" 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────────────────
@@ -224,60 +297,84 @@ write_config() {
 
 get_config_value() {
   local key="$1"
-  read_config | python3 -c "import sys,json; print(json.load(sys.stdin).get('$key', ''))" 2>/dev/null
+  # Pass `$key` via argv so a key containing `'` cannot break the python
+  # string literal. `python -c` does NOT honour `--` as a separator
+  # (it ends up in sys.argv[1]), so we omit it everywhere below.
+  read_config | python3 -c '
+import sys, json
+print(json.load(sys.stdin).get(sys.argv[1], ""))
+' "$key" 2>/dev/null
 }
 
 set_config_value() {
   local key="$1"
   local value="$2"
-  python3 -c "
-import json
+  # `$value` for booleans is the literal text "True" or "False" (validated
+  # by cmd_config). We pass it as a string and convert it inside python so
+  # `$value` can never be interpolated as raw python code.
+  python3 -c '
+import json, sys
+config_file = sys.argv[1]
+key = sys.argv[2]
+raw = sys.argv[3]
 try:
-    with open('$CONFIG_FILE') as f:
+    with open(config_file) as f:
         cfg = json.load(f)
-except:
-    cfg = {'autoSwitch': True, 'proxyEnabled': True}
-cfg['$key'] = $value
-with open('$CONFIG_FILE', 'w') as f:
+except Exception:
+    cfg = {"autoSwitch": True, "proxyEnabled": True}
+cfg[key] = (raw == "True")
+with open(config_file, "w") as f:
     json.dump(cfg, f, indent=2)
-" 2>/dev/null
+' "$CONFIG_FILE" "$key" "$value" 2>/dev/null
 }
 
 get_config_string() {
   local key="$1"
-  read_config | python3 -c "import sys,json; print(json.load(sys.stdin).get('$key', ''))" 2>/dev/null
+  read_config | python3 -c '
+import sys, json
+print(json.load(sys.stdin).get(sys.argv[1], ""))
+' "$key" 2>/dev/null
 }
 
 set_config_string() {
   local key="$1"
   local value="$2"
-  python3 -c "
-import json
+  python3 -c '
+import json, sys
+config_file = sys.argv[1]
+key = sys.argv[2]
+value = sys.argv[3]
 try:
-    with open('$CONFIG_FILE') as f:
+    with open(config_file) as f:
         cfg = json.load(f)
-except:
+except Exception:
     cfg = {}
-cfg['$key'] = '$value'
-with open('$CONFIG_FILE', 'w') as f:
+cfg[key] = value
+with open(config_file, "w") as f:
     json.dump(cfg, f, indent=2)
-" 2>/dev/null
+' "$CONFIG_FILE" "$key" "$value" 2>/dev/null
 }
 
 set_config_number() {
   local key="$1"
   local value="$2"
-  python3 -c "
-import json
+  python3 -c '
+import json, sys
+config_file = sys.argv[1]
+key = sys.argv[2]
+raw = sys.argv[3]
 try:
-    with open('$CONFIG_FILE') as f:
+    with open(config_file) as f:
         cfg = json.load(f)
-except:
+except Exception:
     cfg = {}
-cfg['$key'] = $value
-with open('$CONFIG_FILE', 'w') as f:
+# Reject anything that is not a finite int — `$value` is validated by the
+# caller (cmd_config restricts it to a fixed allow-list) but we re-validate
+# here so a future caller cannot smuggle in a non-numeric literal.
+cfg[key] = int(raw)
+with open(config_file, "w") as f:
     json.dump(cfg, f, indent=2)
-" 2>/dev/null
+' "$CONFIG_FILE" "$key" "$value" 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────────────
@@ -293,8 +390,12 @@ cmd_add() {
     return 1
   fi
 
-  # Sanitize name
-  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  # Sanitize name through the strict whitelist (rejects path traversal,
+  # glob metacharacters, command-substitution chars, leading dashes).
+  if ! name=$(sanitize_profile_name "$name"); then
+    echo -e "${RED}Invalid profile name. Use alphanumerics, '_', '.', or '-'.${NC}"
+    return 1
+  fi
   local file="$ACCOUNTS_DIR/${name}.json"
 
   local creds
@@ -315,12 +416,17 @@ cmd_add() {
 
   # Auto-fetch email from API
   local token
-  token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  token=$(echo "$creds" | python3 -c '
+import sys, json
+print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])
+' 2>/dev/null)
   local email=""
   if [[ -n "$token" ]]; then
     email=$(fetch_account_email "$token")
   fi
   if [[ -n "$email" ]]; then
+    # `$name` has already been validated through sanitize_profile_name so the
+    # `>` redirection target cannot be turned into a command substitution.
     echo "$email" > "$ACCOUNTS_DIR/${name}.label"
   fi
 
@@ -344,7 +450,10 @@ cmd_label() {
     return 1
   fi
 
-  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  if ! name=$(sanitize_profile_name "$name"); then
+    echo -e "${RED}Invalid profile name. Use alphanumerics, '_', '.', or '-'.${NC}"
+    return 1
+  fi
   local file="$ACCOUNTS_DIR/${name}.json"
   if [[ ! -f "$file" ]]; then
     echo -e "${RED}Profile '$name' not found.${NC}"
@@ -449,13 +558,24 @@ cmd_switch() {
     fi
   fi
 
-  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  if ! name=$(sanitize_profile_name "$name"); then
+    echo -e "${RED}Invalid profile name. Use alphanumerics, '_', '.', or '-'.${NC}"
+    return 1
+  fi
   local file="$ACCOUNTS_DIR/${name}.json"
 
   if [[ ! -f "$file" ]]; then
     echo -e "${RED}Profile '$name' not found.${NC}"
-    echo "Available profiles:"
-    ls "$ACCOUNTS_DIR"/*.json 2>/dev/null | xargs -I{} basename {} .json | sed 's/^/  /'
+    # On macOS BSD `xargs` runs the helper command once even when stdin is
+    # empty, printing a spurious "." (basename of nothing). Guard with a
+    # glob existence check instead of piping `ls` into `xargs`.
+    if compgen -G "$ACCOUNTS_DIR/*.json" > /dev/null; then
+      echo "Available profiles:"
+      local _profile
+      for _profile in "$ACCOUNTS_DIR"/*.json; do
+        echo "  $(basename "$_profile" .json)"
+      done
+    fi
     return 1
   fi
 
@@ -490,7 +610,14 @@ cmd_remove() {
     return 1
   fi
 
-  name=$(echo "$name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+  # `sanitize_profile_name` strips glob meta-characters (`*`, `?`, `[`),
+  # so `vdm remove '*'` cannot expand to `rm -f accounts/*.json` and wipe
+  # every saved profile. It also blocks `..` traversal so the rm cannot
+  # escape `accounts/`.
+  if ! name=$(sanitize_profile_name "$name"); then
+    echo -e "${RED}Invalid profile name. Use alphanumerics, '_', '.', or '-'.${NC}"
+    return 1
+  fi
   local file="$ACCOUNTS_DIR/${name}.json"
 
   if [[ ! -f "$file" ]]; then
@@ -498,7 +625,7 @@ cmd_remove() {
     return 1
   fi
 
-  rm -f "$file" "$ACCOUNTS_DIR/${name}.label"
+  rm -f -- "$file" "$ACCOUNTS_DIR/${name}.label"
   echo -e "${GREEN}✓${NC} Removed profile ${BOLD}$name${NC}"
 }
 
@@ -523,17 +650,17 @@ cmd_status() {
   done
 
   local info
-  info=$(echo "$creds" | python3 -c "
+  info=$(echo "$creds" | python3 -c '
 import sys, json, datetime
 d = json.load(sys.stdin)
-oauth = d.get('claudeAiOauth', {})
-sub = oauth.get('subscriptionType', 'unknown')
-tier = oauth.get('rateLimitTier', 'unknown')
-expires = oauth.get('expiresAt', 0)
-exp_str = datetime.datetime.fromtimestamp(expires/1000).strftime('%Y-%m-%d %H:%M') if expires else 'unknown'
-scopes = ', '.join(oauth.get('scopes', []))
-print(f'{sub}|{tier}|{exp_str}|{scopes}')
-")
+oauth = d.get("claudeAiOauth", {})
+sub = oauth.get("subscriptionType", "unknown")
+tier = oauth.get("rateLimitTier", "unknown")
+expires = oauth.get("expiresAt", 0)
+exp_str = datetime.datetime.fromtimestamp(expires/1000).strftime("%Y-%m-%d %H:%M") if expires else "unknown"
+scopes = ", ".join(oauth.get("scopes", []))
+print(f"{sub}|{tier}|{exp_str}|{scopes}")
+')
 
   local sub_type=$(echo "$info" | cut -d'|' -f1)
   local tier=$(echo "$info" | cut -d'|' -f2)
@@ -542,7 +669,10 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
 
   # Fetch email
   local token
-  token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  token=$(echo "$creds" | python3 -c '
+import sys, json
+print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])
+' 2>/dev/null)
   local email=""
   if [[ -n "$token" ]]; then
     email=$(fetch_account_email "$token")
@@ -632,12 +762,12 @@ cmd_config() {
     echo -e "  rotationIntervalMin: ${interval:-60}"
     local serialize=$(get_config_value "serializeRequests")
     if [[ "$serialize" == "True" ]]; then
-      echo -e "  serializeRequests:  ${GREEN}on${NC}  ${DIM}[BETA]${NC}"
+      echo -e "  serializeRequests:  ${GREEN}on${NC}"
     else
-      echo -e "  serializeRequests:  ${DIM}off${NC}  ${DIM}[BETA]${NC}"
+      echo -e "  serializeRequests:  ${DIM}off${NC}"
     fi
     local delay=$(get_config_string "serializeDelayMs")
-    echo -e "  serializeDelayMs:   ${delay:-200}  ${DIM}[BETA]${NC}"
+    echo -e "  serializeDelayMs:   ${delay:-200}"
     local commit_tokens=$(get_config_value "commitTokenUsage")
     if [[ "$commit_tokens" == "True" ]]; then
       echo -e "  commitTokenUsage:   ${GREEN}on${NC}"
@@ -651,8 +781,8 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config notifications off${NC}"
     echo -e "  ${DIM}  vdm config rotation sticky|conserve|round-robin|spread|drain-first${NC}"
     echo -e "  ${DIM}  vdm config interval 15|30|60|120${NC}"
-    echo -e "  ${DIM}  vdm config serialize on|off${NC}  ${DIM}[BETA]${NC}"
-    echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
+    echo -e "  ${DIM}  vdm config serialize on|off${NC}"
+    echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}"
     echo -e "  ${DIM}  vdm config commit-tokens on|off${NC}"
     return 0
   fi
@@ -738,27 +868,70 @@ cmd_config() {
   log_activity "settings-changed" "$key=$value"
 }
 
+# Read a numeric PID from a pidfile; echoes nothing if the file is missing,
+# unreadable, or contains anything other than a positive integer (with
+# optional surrounding whitespace). Without this guard `kill "$(cat …)"`
+# would either error noisily on garbage content or, worse, send SIGTERM to
+# an unrelated PID if a tampered pidfile happened to hold a valid integer
+# from another user. Callers MUST treat the empty output as "no live PID".
+read_pidfile() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local raw
+  raw=$(cat "$file" 2>/dev/null) || return 0
+  # Trim whitespace; reject anything that is not a positive integer.
+  local trimmed="${raw//[[:space:]]/}"
+  if [[ "$trimmed" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$trimmed"
+  fi
+}
+
 cmd_dashboard() {
   local action="${1:-start}"
 
   case "$action" in
     stop)
-      # Try PID file first, then fall back to port-based detection
+      # Try PID file first, then fall back to port-based detection.
+      # `read_pidfile` returns "" for a missing/garbage/non-numeric pidfile,
+      # so we never pass arbitrary text to `kill` (which would otherwise
+      # send SIGTERM to whatever PID a tampered pidfile happens to hold).
       local stopped=false
-      if [[ -f "$DASHBOARD_PID_FILE" ]]; then
-        local pid=$(cat "$DASHBOARD_PID_FILE")
+      local pid
+      pid=$(read_pidfile "$DASHBOARD_PID_FILE")
+      if [[ -n "$pid" ]]; then
         if kill "$pid" 2>/dev/null; then
+          # SIGKILL escalation: if SIGTERM left the process alive (hung
+          # event loop, refusing the signal), wait briefly then force-kill.
+          # Without this, a wedged dashboard kept the port bound and the
+          # next `vdm dashboard start` reported "already running" forever.
+          local i=0
+          while [[ $i -lt 20 ]] && kill -0 "$pid" 2>/dev/null; do
+            sleep 0.1
+            i=$((i + 1))
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+          fi
           stopped=true
         fi
-        rm -f "$DASHBOARD_PID_FILE"
       fi
+      rm -f "$DASHBOARD_PID_FILE"
       if [[ "$stopped" != "true" ]]; then
         # Find by port
-        local pid
-        pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
-        if [[ -n "$pid" ]]; then
-          kill "$pid" 2>/dev/null
-          stopped=true
+        local port_pid
+        port_pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+        if [[ -n "$port_pid" && "$port_pid" =~ ^[1-9][0-9]*$ ]]; then
+          if kill "$port_pid" 2>/dev/null; then
+            local j=0
+            while [[ $j -lt 20 ]] && kill -0 "$port_pid" 2>/dev/null; do
+              sleep 0.1
+              j=$((j + 1))
+            done
+            if kill -0 "$port_pid" 2>/dev/null; then
+              kill -9 "$port_pid" 2>/dev/null || true
+            fi
+            stopped=true
+          fi
         fi
       fi
       if [[ "$stopped" == "true" ]]; then
@@ -768,16 +941,18 @@ cmd_dashboard() {
       fi
       ;;
     start|"")
-      # Check if already running (by PID file or port)
-      if [[ -f "$DASHBOARD_PID_FILE" ]]; then
-        local pid=$(cat "$DASHBOARD_PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-          echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
-          echo -e "${DIM}Use 'vdm dashboard stop' to stop it.${NC}"
-          return 0
-        fi
-        rm -f "$DASHBOARD_PID_FILE"
+      # Check if already running (by PID file or port). Stale or tampered
+      # pidfiles fail the integer check and are removed below so the start
+      # path can proceed.
+      local pid
+      pid=$(read_pidfile "$DASHBOARD_PID_FILE")
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
+        echo -e "${DIM}Use 'vdm dashboard stop' to stop it.${NC}"
+        return 0
       fi
+      # Stale pidfile (or non-numeric content): clean it up.
+      [[ -f "$DASHBOARD_PID_FILE" ]] && rm -f "$DASHBOARD_PID_FILE"
       # Also check by port
       if lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
         echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
@@ -787,13 +962,13 @@ cmd_dashboard() {
 
       echo -e "${BLUE}Starting dashboard on http://localhost:$DASHBOARD_PORT${NC}"
       node "$SCRIPT_DIR/dashboard.mjs" &
-      local pid=$!
-      echo "$pid" > "$DASHBOARD_PID_FILE"
+      local new_pid=$!
+      echo "$new_pid" > "$DASHBOARD_PID_FILE"
 
       # Wait a moment then open
       sleep 0.5
-      if kill -0 "$pid" 2>/dev/null; then
-        echo -e "${GREEN}✓${NC} Dashboard running (PID $pid)"
+      if kill -0 "$new_pid" 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} Dashboard running (PID $new_pid)"
         echo -e "  Dashboard: ${CYAN}http://localhost:$DASHBOARD_PORT${NC}"
         echo -e "  API Proxy: ${CYAN}http://localhost:$PROXY_PORT${NC}"
         open "http://localhost:$DASHBOARD_PORT" 2>/dev/null || echo -e "  Open http://localhost:$DASHBOARD_PORT in your browser"
@@ -829,17 +1004,45 @@ cmd_upgrade() {
   # Shallow clone may miss tags — fetch them explicitly
   git -C "$tmpdir" fetch --tags --quiet 2>/dev/null || true
 
-  # Compare versions (prefer semver tag, fall back to commit hash)
-  local current_hash=""
+  # Compare versions using the full commit hash as the canonical form.
+  # The previous code stored either a tag (`v1.0.0` from `git describe`) or
+  # a 7-char short hash, then compared the two literal strings — so an
+  # install that had been tagged on disk but later compared against a short
+  # hash (or vice versa) reported a false "outdated" and re-downloaded
+  # everything on every invocation. By always resolving both sides to the
+  # 40-char SHA-1 we get a stable equality comparison; the human-readable
+  # tag/short-hash is computed separately for display only.
+  local current_full=""
+  local current_display=""
   if [[ -f "$SCRIPT_DIR/.version" ]]; then
-    current_hash=$(cat "$SCRIPT_DIR/.version")
+    current_display=$(cat "$SCRIPT_DIR/.version")
+    # `.version` may hold either a tag (`v1.0.0`) or a full/short hash from
+    # an older install. Resolve to a full hash if the local clone knows the
+    # ref; otherwise leave empty and force the upgrade.
+    current_full=$(git -C "$tmpdir" rev-parse "$current_display" 2>/dev/null \
+      || git -C "$tmpdir" rev-parse "${current_display}^{commit}" 2>/dev/null \
+      || echo "")
   fi
-  local latest_hash
-  latest_hash=$(git -C "$tmpdir" describe --tags --abbrev=0 2>/dev/null \
-    || git -C "$tmpdir" rev-parse --short HEAD 2>/dev/null)
+  local latest_full
+  latest_full=$(git -C "$tmpdir" rev-parse HEAD 2>/dev/null) || latest_full=""
+  local latest_display
+  latest_display=$(git -C "$tmpdir" describe --tags --abbrev=0 2>/dev/null \
+    || git -C "$tmpdir" rev-parse --short HEAD 2>/dev/null) || latest_display=""
 
-  if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" ]]; then
-    echo -e "  ${GREEN}✓${NC} Already on the latest version (${DIM}$current_hash${NC})"
+  # Fail-fast: if `git rev-parse HEAD` could not resolve in the freshly
+  # cloned tmpdir (network glitch, partial clone, .git corruption between
+  # `git clone` and the rev-parse), bail out without touching the install.
+  # The previous code happily proceeded with an empty `latest_full`, wrote
+  # an empty `.version`, and forced a re-download on every subsequent run
+  # (the `current_full == latest_full` guard is a no-op when both are "").
+  if [[ -z "$latest_full" ]]; then
+    echo -e "  ${RED}Could not resolve latest version from $REPO_URL — aborting.${NC}"
+    echo -e "  ${DIM}No files were modified.${NC}"
+    return 1
+  fi
+
+  if [[ -n "$current_full" && "$current_full" == "$latest_full" ]]; then
+    echo -e "  ${GREEN}✓${NC} Already on the latest version (${DIM}${current_display:-$current_full}${NC})"
     return 0
   fi
 
@@ -851,9 +1054,13 @@ cmd_upgrade() {
     fi
   done
 
-  # Check if dashboard is running (PID file or listening on port)
+  # Check if dashboard is running (PID file or listening on port). Use the
+  # validated `read_pidfile` helper so a tampered/garbage pidfile does not
+  # cause `kill -0` to error or send a signal to an unrelated PID.
   local dashboard_was_running=false
-  if [[ -f "$DASHBOARD_PID_FILE" ]] && kill -0 "$(cat "$DASHBOARD_PID_FILE")" 2>/dev/null; then
+  local _dash_pid
+  _dash_pid=$(read_pidfile "$DASHBOARD_PID_FILE")
+  if [[ -n "$_dash_pid" ]] && kill -0 "$_dash_pid" 2>/dev/null; then
     dashboard_was_running=true
   elif lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
     dashboard_was_running=true
@@ -863,10 +1070,12 @@ cmd_upgrade() {
   if [[ "$dashboard_was_running" == "true" ]]; then
     echo -e "  ${DIM}Stopping dashboard…${NC}"
     cmd_dashboard stop
-    # Also kill any process on the port not tracked by PID file (e.g. shell auto-start)
+    # Also kill any process on the port not tracked by PID file (e.g. shell
+    # auto-start). lsof always emits a numeric PID, but we re-validate to
+    # match the contract used elsewhere in this file.
     local port_pid
     port_pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
-    if [[ -n "$port_pid" ]]; then
+    if [[ -n "$port_pid" && "$port_pid" =~ ^[1-9][0-9]*$ ]]; then
       kill "$port_pid" 2>/dev/null || true
     fi
   fi
@@ -884,13 +1093,15 @@ cmd_upgrade() {
   cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh.new"  && mv -f "$SCRIPT_DIR/install-hooks.sh.new"  "$SCRIPT_DIR/install-hooks.sh"
   chmod +x "$SCRIPT_DIR/vdm"
 
-  # Write version marker
-  echo "$latest_hash" > "$SCRIPT_DIR/.version"
+  # Write version marker — full SHA-1 so future upgrades can compare without
+  # ambiguity. Display value remains the tag/short-hash in the user-facing
+  # messages below.
+  echo "$latest_full" > "$SCRIPT_DIR/.version"
 
-  # [BETA] Install hooks if not yet present
+  # Install hooks if not yet present
   if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
     source "$SCRIPT_DIR/install-hooks.sh"
-    install_beta_hooks && echo -e "  ${GREEN}✓${NC} [BETA] Token tracking hooks installed" || true
+    install_hooks && echo -e "  ${GREEN}✓${NC} Token tracking hooks installed" || true
   fi
 
   # Restart dashboard if it was running
@@ -900,18 +1111,18 @@ cmd_upgrade() {
   fi
 
   echo ""
-  if [[ -n "$current_hash" ]]; then
-    echo -e "  ${GREEN}✓${NC} Upgraded ${DIM}$current_hash${NC} → ${BOLD}$latest_hash${NC}"
+  if [[ -n "$current_display" ]]; then
+    echo -e "  ${GREEN}✓${NC} Upgraded ${DIM}$current_display${NC} → ${BOLD}$latest_display${NC}"
   else
-    echo -e "  ${GREEN}✓${NC} Upgraded to ${BOLD}$latest_hash${NC}"
+    echo -e "  ${GREEN}✓${NC} Upgraded to ${BOLD}$latest_display${NC}"
   fi
   echo ""
 
-  log_activity "upgrade" "from=${current_hash:-unknown}" "to=$latest_hash"
+  log_activity "upgrade" "from=${current_display:-unknown}" "to=$latest_display"
 }
 
 cmd_tokens() {
-  # [BETA] Token usage tracking
+  # Token usage tracking
   local repo=""
   local branch=""
   local days=1
@@ -924,6 +1135,24 @@ cmd_tokens() {
       --branch)   branch="$2"; shift 2 ;;
       --days)     days="$2"; shift 2 ;;
       --per-commit) per_commit=true; shift ;;
+      --help|-h)
+        echo ""
+        echo -e "${BOLD}  vdm tokens${NC}  - show token usage"
+        echo ""
+        echo -e "  ${BOLD}USAGE${NC}"
+        echo -e "    vdm tokens [--days N] [--repo PATH] [--branch NAME] [--per-commit]"
+        echo ""
+        echo -e "  ${BOLD}OPTIONS${NC}"
+        echo -e "    ${CYAN}--days N${NC}        Window in days (default: 1)"
+        echo -e "    ${CYAN}--repo PATH${NC}     Filter to a specific repo (auto-detected from cwd)"
+        echo -e "    ${CYAN}--branch NAME${NC}   Filter to a specific branch"
+        echo -e "    ${CYAN}--per-commit${NC}    Group tokens by branch, then by commit within each"
+        echo -e "                    branch. Active branch renders first. Legacy"
+        echo -e "                    entries (recorded before branch tracking)"
+        echo -e "                    appear in their own '(legacy)' section."
+        echo ""
+        return 0
+        ;;
       *)          shift ;;
     esac
   done
@@ -956,108 +1185,232 @@ cmd_tokens() {
   }
 
   if [[ "$per_commit" == "true" && -n "$repo" ]]; then
-    # Per-commit breakdown
+    # Per-commit breakdown, bucketed first by branch and then by commit
+    # within that branch. This is the only way to attribute tokens to
+    # commits that landed on parallel-worktree branches that were never
+    # merged into the main worktree's HEAD — the previous version walked
+    # only the main HEAD's git log and silently dropped those commits
+    # into "(uncommitted)".
     echo ""
-    echo -e "${BOLD}  Token Usage per Commit  ${DIM}[BETA]${NC}"
+    echo -e "${BOLD}  Token Usage per Commit${NC}"
     echo -e "  ────────────────────────────────────────────"
     if [[ -n "$repo" ]]; then
       echo -e "  ${DIM}Repo: $repo${NC}"
     fi
     echo ""
 
-    # Pass $usage and $repo via argv (sys.argv[1] / sys.argv[2]) instead of
-    # interpolating them into a single-quoted python source string. The old
-    # form crashed silently whenever the path contained an apostrophe.
-    python3 -c '
+    # Resolve the active branch in the calling shell's worktree (NOT the
+    # main repo path stored in `$repo`) so the section ordering surfaces
+    # what the user is currently working on. `--abbrev-ref HEAD` returns
+    # `HEAD` when detached — treat that as "no active branch".
+    local active_branch
+    active_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [[ "$active_branch" == "HEAD" ]]; then
+      active_branch=""
+    fi
+
+    # Pipe `$usage` (potentially many MB of JSON) via stdin and pass
+    # `$repo` + `$active_branch` via argv. Single-quoted python source so
+    # bash performs no expansion inside it — branch names from the JSON
+    # entries cannot escape the python literal.
+    printf '%s' "$usage" | python3 -c '
 import json, sys, subprocess
 
-usage = json.loads(sys.argv[1])
-repo = sys.argv[2]
+raw = sys.stdin.read()
+try:
+    usage = json.loads(raw)
+except Exception:
+    usage = []
+repo = sys.argv[1]
+active_branch = sys.argv[2] if len(sys.argv) > 2 else ""
 
 if not repo:
     print("  No repo specified or detected.")
     sys.exit(0)
 
-try:
-    log = subprocess.check_output(
-        ["git", "-C", repo, "log", "--format=%H %ct %s", "--reverse"],
-        stderr=subprocess.DEVNULL,
-    ).decode().strip().split("\n")
-except Exception:
-    print("  Could not read git log.")
-    sys.exit(0)
+def git_log(branch_or_head):
+    """Return list of {hash, ts, msg} commits oldest-first for the given
+    refspec ("HEAD" or a branch name). Empty list on any failure."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", repo, "log", "--format=%H %ct %s", "--reverse",
+             branch_or_head],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip().split("\n")
+    except Exception:
+        return []
+    commits = []
+    for line in out:
+        if not line.strip():
+            continue
+        parts = line.split(" ", 2)
+        if len(parts) >= 3:
+            commits.append({
+                "hash": parts[0][:7],
+                "ts": int(parts[1]) * 1000,
+                "msg": parts[2],
+            })
+    return commits
 
-commits = []
-for line in log:
-    if not line.strip():
-        continue
-    parts = line.split(" ", 2)
-    if len(parts) >= 3:
-        commits.append({"hash": parts[0][:7], "ts": int(parts[1]) * 1000, "msg": parts[2]})
+def branch_exists(branch):
+    """True if `branch` resolves to a ref in the repo."""
+    if not branch:
+        return False
+    try:
+        subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", branch],
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
 
-if not commits:
-    print("  No commits found.")
-    sys.exit(0)
+def render_per_commit(entries, commits):
+    """Render the per-commit breakdown for one slice of entries.
 
-# Bucket strategy:
-#   * Pre-history bucket: e.ts < commits[0].ts. The original code dropped
-#     pre-first-commit usage on the floor (Bug A).
-#   * Per-commit i bucket: commits[i].ts <= e.ts < commits[i+1].ts. The
-#     last commit gets a HALF-OPEN range — uncommitted work is NOT
-#     attributed to it (Bug B in the audit).
-#   * Uncommitted bucket: e.ts >= commits[-1].ts. Strictly after the last
-#     commit, partitioned cleanly so totals do not double-count.
-# Same-second commits (Bug C): bucket i and i+1 with c[i].ts == c[i+1].ts
-# yield an empty range for i. Those entries fall into i+1 deterministically
-# (left-inclusive boundary).
-pre_history = sum(e["inputTokens"] + e["outputTokens"]
-                  for e in usage if e["ts"] < commits[0]["ts"])
+    Returns the slice total (so the caller can sum branches into a grand
+    total). If `commits` is empty (e.g. the branch was deleted AND we
+    cannot read HEAD either), falls back to a single "(uncommitted)" line.
+    """
+    if not commits:
+        bucket_total = sum(e.get("inputTokens", 0) + e.get("outputTokens", 0)
+                           for e in entries)
+        if bucket_total > 0:
+            print(f"  (uncommitted)  {bucket_total:>10,} tok")
+        return bucket_total
 
-buckets = []
-last_idx = len(commits) - 1
-for i, c in enumerate(commits):
-    start_ts = c["ts"]
-    if i == last_idx:
-        # Last commit covers exactly its own timestamp through the moment
-        # before the uncommitted bucket starts. With the strict `>` below,
-        # equality at commits[-1].ts is included here.
-        end_ts = commits[-1]["ts"] + 1
+    # Same bucket strategy as the original (Bug A/B/C fixes preserved):
+    #   * pre-history: ts < commits[0].ts
+    #   * commit i:    commits[i].ts <= ts < commits[i+1].ts
+    #     (last commit i: commits[-1].ts <= ts < commits[-1].ts + 1, so
+    #     uncommitted strictly comes after — no double-counting)
+    #   * uncommitted: ts > commits[-1].ts
+    pre_history = sum(e.get("inputTokens", 0) + e.get("outputTokens", 0)
+                      for e in entries if e["ts"] < commits[0]["ts"])
+
+    buckets = []
+    last_idx = len(commits) - 1
+    for i, c in enumerate(commits):
+        start_ts = c["ts"]
+        end_ts = commits[-1]["ts"] + 1 if i == last_idx else commits[i + 1]["ts"]
+        tokens = sum(e.get("inputTokens", 0) + e.get("outputTokens", 0)
+                     for e in entries if start_ts <= e["ts"] < end_ts)
+        if tokens > 0:
+            buckets.append({
+                "hash": c["hash"],
+                "tokens": tokens,
+                "msg": c["msg"][:60],
+            })
+
+    uncommitted = sum(e.get("inputTokens", 0) + e.get("outputTokens", 0)
+                      for e in entries if e["ts"] > commits[-1]["ts"])
+
+    if pre_history > 0:
+        print(f"  (pre-history)  {pre_history:>10,} tok  before first commit")
+
+    # NOTE: f-strings cannot contain `\"` inside their expression — even in
+    # Python 3.14 (PEP 701 lifted nesting restrictions but the lexer still
+    # parses backslash inside the expression as a continuation, so
+    # `f"{b[\"x\"]}"` is a SyntaxError). The original aggregator had this
+    # same bug but `2>/dev/null` on the python invocation silently swallowed
+    # the SyntaxError, leaving an empty per-commit table for users. We
+    # extract the dict access first, then format — no quote nesting needed.
+    for b in buckets:
+        bh = b["hash"]
+        bt = b["tokens"]
+        bm = b["msg"]
+        print(f"  {bh}  {bt:>10,} tok  {bm}")
+
+    if uncommitted > 0:
+        print(f"  (uncommitted)  {uncommitted:>10,} tok")
+
+    return pre_history + sum(b["tokens"] for b in buckets) + uncommitted
+
+# Group entries by branch. Entries without a `branch` field (legacy data
+# written before dashboard.mjs started recording it) collect into a single
+# "(legacy)" pseudo-group. Entries whose branch field is the empty string
+# or null are also legacy.
+groups = {}      # branch_name -> list[entry]
+legacy = []
+for e in usage:
+    br = e.get("branch")
+    if br:
+        groups.setdefault(br, []).append(e)
     else:
-        end_ts = commits[i + 1]["ts"]
-    tokens = sum(e["inputTokens"] + e["outputTokens"]
-                 for e in usage if start_ts <= e["ts"] < end_ts)
-    if tokens > 0:
-        buckets.append({"hash": c["hash"], "tokens": tokens, "msg": c["msg"][:60]})
+        legacy.append(e)
 
-uncommitted = sum(e["inputTokens"] + e["outputTokens"]
-                  for e in usage if e["ts"] > commits[-1]["ts"])
+# Legacy-only fast path: keep the old flat per-commit table for installs
+# that still hold pre-branch-tracking history. Behaviour-identical to the
+# original aggregator on that data.
+if not groups:
+    if not legacy:
+        print("  No token usage found in this period.")
+        sys.exit(0)
+    commits = git_log("HEAD")
+    total = render_per_commit(legacy, commits)
+    if total <= 0:
+        print("  No token usage found in this period.")
+        sys.exit(0)
+    print("")
+    print(f"  Total: {total:,} tokens")
+    sys.exit(0)
 
-if pre_history <= 0 and not buckets and uncommitted <= 0:
+# Cache `git rev-parse --verify` per branch (called once per group, NOT
+# once per entry). We also cache the resolved git log so the fallback HEAD
+# log is fetched at most once even if many branches were deleted.
+log_cache = {}   # cache key (str) -> commits list
+
+def commits_for_branch(branch):
+    """Resolve the commit list to bucket against for a given branch.
+    If the branch ref still exists, use its log. Otherwise fall back to
+    the main HEAD log so deleted branches still attribute work to commits
+    that landed on the integration branch."""
+    if branch_exists(branch):
+        key = f"branch:{branch}"
+        if key not in log_cache:
+            log_cache[key] = git_log(branch)
+        return log_cache[key]
+    if "head" not in log_cache:
+        log_cache["head"] = git_log("HEAD")
+    return log_cache["head"]
+
+# Sort: active branch first (if it exists in groups), then the rest
+# alphabetically. Stable, predictable output regardless of dict order.
+sorted_branches = sorted(groups.keys())
+if active_branch and active_branch in groups:
+    sorted_branches.remove(active_branch)
+    sorted_branches.insert(0, active_branch)
+
+grand_total = 0
+first_section = True
+for branch in sorted_branches:
+    if not first_section:
+        print("")
+    first_section = False
+    print(f"=== Branch: {branch} ===")
+    commits = commits_for_branch(branch)
+    grand_total += render_per_commit(groups[branch], commits)
+
+if legacy:
+    if not first_section:
+        print("")
+    print("=== Legacy (pre-branch-tracking) ===")
+    grand_total += render_per_commit(legacy, git_log("HEAD"))
+
+if grand_total <= 0:
     print("  No token usage found in this period.")
     sys.exit(0)
 
-if pre_history > 0:
-    print(f"  (pre-history)  {pre_history:>10,} tok  before first commit")
-
-for b in buckets:
-    tok = f"{b[\"tokens\"]:>10,}"
-    print(f"  {b[\"hash\"]}  {tok} tok  {b[\"msg\"]}")
-
-if uncommitted > 0:
-    tok = f"{uncommitted:>10,}"
-    print(f"  (uncommitted)  {tok} tok")
-
-total = pre_history + sum(b["tokens"] for b in buckets) + uncommitted
 print("")
-print(f"  Total: {total:,} tokens")
-' "$usage" "$repo" 2>/dev/null
+print(f"  Total: {grand_total:,} tokens")
+' "$repo" "$active_branch" 2>/dev/null
     echo ""
     return 0
   fi
 
   # Standard summary view
   echo ""
-  echo -e "${BOLD}  Token Usage Summary  ${DIM}[BETA]${NC}"
+  echo -e "${BOLD}  Token Usage Summary${NC}"
   echo -e "  ────────────────────────────────────────────"
   if [[ -n "$repo" ]]; then
     echo -e "  ${DIM}Repo: $repo${NC}"
@@ -1068,12 +1421,22 @@ print(f"  Total: {total:,} tokens")
   echo -e "  ${DIM}Period: last $days day(s)${NC}"
   echo ""
 
-  python3 -c "
+  # Pipe `$usage` (the dashboard's JSON response) into python via stdin
+  # instead of interpolating it into a `'''…'''` triple-quoted python
+  # literal. The previous form crashed with SyntaxError when the JSON
+  # response happened to contain `'''`, and was bound by the OS ARG_MAX
+  # ceiling (~256 KB on macOS) when the activity log grew large.
+  printf '%s' "$usage" | python3 -c '
 import json, sys
 
-usage = json.loads('''$usage''')
+raw = sys.stdin.read()
+try:
+    usage = json.loads(raw)
+except Exception:
+    usage = []
+
 if not usage:
-    print('  No token usage recorded in this period.')
+    print("  No token usage recorded in this period.")
     sys.exit(0)
 
 # Group by model
@@ -1081,26 +1444,28 @@ models = {}
 total_in = 0
 total_out = 0
 for e in usage:
-    m = e.get('model', 'unknown')
+    m = e.get("model", "unknown")
     if m not in models:
-        models[m] = {'input': 0, 'output': 0}
-    models[m]['input'] += e.get('inputTokens', 0)
-    models[m]['output'] += e.get('outputTokens', 0)
-    total_in += e.get('inputTokens', 0)
-    total_out += e.get('outputTokens', 0)
+        models[m] = {"input": 0, "output": 0}
+    models[m]["input"] += e.get("inputTokens", 0)
+    models[m]["output"] += e.get("outputTokens", 0)
+    total_in += e.get("inputTokens", 0)
+    total_out += e.get("outputTokens", 0)
 
 for model, counts in sorted(models.items()):
-    total = counts['input'] + counts['output']
-    print(f'  {model}')
-    print(f'    Input:  {counts[\"input\"]:>10,} tokens')
-    print(f'    Output: {counts[\"output\"]:>10,} tokens')
-    print(f'    Total:  {total:>10,} tokens')
+    total = counts["input"] + counts["output"]
+    print(f"  {model}")
+    inp = counts["input"]
+    out = counts["output"]
+    print(f"    Input:  {inp:>10,} tokens")
+    print(f"    Output: {out:>10,} tokens")
+    print(f"    Total:  {total:>10,} tokens")
     print()
 
 grand = total_in + total_out
-print(f'  Grand Total: {grand:,} tokens ({total_in:,} in / {total_out:,} out)')
-print(f'  Entries: {len(usage)}')
-" 2>/dev/null
+print(f"  Grand Total: {grand:,} tokens ({total_in:,} in / {total_out:,} out)")
+print(f"  Entries: {len(usage)}")
+' 2>/dev/null
   echo ""
 }
 
@@ -1121,36 +1486,45 @@ cmd_logs() {
   echo -e "  ${DIM}Press Ctrl-C to stop${NC}"
   echo ""
 
-  # Stream SSE logs, parse the JSON data lines, colorize by tag
+  # Stream SSE logs, parse the JSON data lines, colorize by tag.
+  # Single-quoted python source — bash does no expansion inside it. The
+  # JSON payload is read from stdin. We emit `color + line + reset` via
+  # plain string concatenation rather than an f-string `f'{color}{line}{reset}'`
+  # so the printer cannot accidentally interpret a `{...}` substring inside
+  # `line` as a format-spec on Python builds where future PEP changes
+  # alter f-string parsing.
   curl -s -N "http://localhost:$DASHBOARD_PORT/api/logs/stream" 2>/dev/null | while IFS= read -r line; do
     # SSE format: "data: {...}"
     if [[ "$line" == data:* ]]; then
-      local json="${line#data: }"
+      local json_payload="${line#data: }"
       local log_line
-      log_line=$(echo "$json" | python3 -c "
+      log_line=$(echo "$json_payload" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
-    tag = d.get('tag', '')
-    line = d.get('line', d.get('msg', ''))
-    # Color coding
+    tag = d.get("tag", "")
+    line = d.get("line", d.get("msg", ""))
     colors = {
-        'error': '\033[0;31m',     # red
-        'warn': '\033[1;33m',      # yellow
-        'switch': '\033[0;36m',    # cyan
-        'refresh': '\033[0;34m',   # blue
-        'proactive': '\033[0;35m', # magenta
-        'info': '\033[0m',         # default
-        'system': '\033[0;32m',    # green
+        "error":     "\033[0;31m",
+        "warn":      "\033[1;33m",
+        "switch":    "\033[0;36m",
+        "refresh":   "\033[0;34m",
+        "proactive": "\033[0;35m",
+        "info":      "\033[0m",
+        "system":    "\033[0;32m",
     }
-    color = colors.get(tag, '\033[2m')  # dim for unknown
-    reset = '\033[0m'
-    print(f'{color}{line}{reset}')
-except:
+    color = colors.get(tag, "\033[2m")
+    reset = "\033[0m"
+    print(color + line + reset)
+except Exception:
     pass
-" 2>/dev/null)
+' 2>/dev/null)
       if [[ -n "$log_line" ]]; then
-        if [[ -z "$filter" ]] || echo "$log_line" | grep -qi "$filter" 2>/dev/null; then
+        # Filter is a fixed substring, not a regex. Use `-F` so metachars
+        # like `.`, `*`, `[`, `\` in the user's filter are matched literally
+        # (e.g. `vdm logs '['` previously failed with "Unmatched [" from
+        # BRE parsing). `--` guards against filter starting with `-`.
+        if [[ -z "$filter" ]] || echo "$log_line" | grep -qiF -- "$filter" 2>/dev/null; then
           echo -e "  $log_line"
         fi
       fi
@@ -1167,13 +1541,16 @@ cmd_help() {
   echo ""
   echo -e "  ${BOLD}COMMANDS${NC}"
   echo -e "    ${CYAN}list${NC}                    List all saved profiles"
+  echo -e "    ${CYAN}add${NC} <name>              Save the current Keychain credentials as a named profile"
+  echo -e "    ${CYAN}label${NC} <name> <label>    Set a human-readable label (e.g. email) on a profile"
   echo -e "    ${CYAN}switch${NC} [name]           Switch to a profile (interactive if no name)"
   echo -e "    ${CYAN}remove${NC} <name>           Delete a saved profile"
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
   echo -e "    ${CYAN}logs${NC} [filter]            Stream live proxy logs"
-  echo -e "    ${CYAN}tokens${NC} [options]        Show token usage [BETA]"
+  echo -e "    ${CYAN}tokens${NC} [options]        Show token usage (use --per-commit for"
+  echo -e "                            per-branch + per-commit breakdown; --help for options)"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""

@@ -64,7 +64,7 @@ vdm status                  Current account + settings
 vdm config [key] [on|off]   View/toggle settings
 vdm dashboard [start|stop]  Dashboard control
 vdm logs [filter]           Stream live proxy logs
-vdm tokens [options]        Show token usage (BETA)
+vdm tokens [options]        Show token usage
 vdm upgrade                 Update to latest version
 ```
 
@@ -72,7 +72,7 @@ vdm upgrade                 Update to latest version
 
 `http://localhost:3333` — accounts, rate limits, token usage, activity log.
 
-#### Tokens Tab (BETA)
+#### Tokens Tab
 
 Per-session token usage tracking with breakdowns by model, repo, branch, and time range.
 
@@ -82,7 +82,7 @@ Per-session token usage tracking with breakdowns by model, repo, branch, and tim
 - **Model breakdown** — input/output split with proportional bars
 - **Repo/branch breakdown** — sorted by total tokens, with per-model detail
 
-Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees.
+Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees. vdm subscribes to the full lifecycle: `SessionStart`/`UserPromptSubmit` to anchor each turn, `Stop`/`StopFailure`/`SubagentStop`/`SessionEnd` to flush totals, plus `SubagentStart` so parallel sub-agent fan-outs aren't silently dropped, `PreCompact`/`PostCompact` so the input-token math survives Claude Code's auto-compaction, and `CwdChanged` so branch attribution stays fresh when a session `cd`s between turns. An opt-in `PostToolBatch` hook gives per-tool attribution when you set `perToolAttribution: true` in `config.json`.
 
 #### Commit Token Trailers
 
