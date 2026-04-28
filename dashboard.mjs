@@ -5753,8 +5753,25 @@ server.on('error', (e) => {
 // ─────────────────────────────────────────────────
 
 const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
-const PROXY_TIMEOUT = 5 * 60 * 1000; // 5 min per upstream request
-const REQUEST_DEADLINE_MS = 45_000;   // hard cap on total handleProxyRequest time
+
+// Phase F — proxy queue + timeout tuning. All env-var configurable so users
+// on different plans / load profiles can adjust without code changes.
+//
+// Defaults reflect lessons from Phase F's audit:
+//   - PROXY_TIMEOUT (idle socket timeout per upstream call): 15 min.
+//     Was 5 min, which can be too short for Opus 4 extended-thinking
+//     phases where SSE chunks arrive sparsely.
+//   - REQUEST_DEADLINE_MS (total handleProxyRequest wall-clock cap): 10 min.
+//     Was 45 s, which routinely killed legitimate refresh+retry chains.
+//     Successful first-attempt streams are not affected (the deadline is
+//     only checked at retry boundaries). For pathological loops only.
+//   - MAX_INFLIGHT_PER_ACCOUNT: 8 (was 4). Now actually enforced for the
+//     full stream lifetime — see forwardToAnthropic().
+//   - MIN_INTERVAL_PER_ACCOUNT_MS: 100 (was 125). Slightly less conservative.
+//   - MAX_PERMIT_WAIT_MS: 5 min (was 30 s). Combined with REQUEST_DEADLINE_MS
+//     this means high-load queueing no longer manufactures false 504s.
+const PROXY_TIMEOUT = parseInt(process.env.CSW_PROXY_TIMEOUT_MS || '900000', 10);          // 15 min
+const REQUEST_DEADLINE_MS = parseInt(process.env.CSW_REQUEST_DEADLINE_MS || '600000', 10); // 10 min
 
 // ── Structured logger ──
 
@@ -6233,9 +6250,11 @@ function _forwardToAnthropicRaw(method, path, headers, body, timeout = PROXY_TIM
 // during a refresh does not double-count the same account. Falls back to
 // a 'unknown' slot when no Bearer is present (the proxy's own probe /
 // summary calls).
-const MAX_INFLIGHT_PER_ACCOUNT = 4;
-const MIN_INTERVAL_PER_ACCOUNT_MS = 125; // ~8 RPS sustained, well under any per-account hard cap
-const MAX_PERMIT_WAIT_MS = 30_000;
+// Phase F — env-var configurable limiter knobs. See PROXY_TIMEOUT comment
+// above for the rationale on the new defaults.
+const MAX_INFLIGHT_PER_ACCOUNT = parseInt(process.env.CSW_MAX_INFLIGHT_PER_ACCOUNT || '8', 10);
+const MIN_INTERVAL_PER_ACCOUNT_MS = parseInt(process.env.CSW_MIN_INTERVAL_PER_ACCOUNT_MS || '100', 10);
+const MAX_PERMIT_WAIT_MS = parseInt(process.env.CSW_MAX_PERMIT_WAIT_MS || '300000', 10); // 5 min
 
 const _accountSlots = new Map(); // fp -> { inflight, lastDispatchAt, waiters: [] }
 
@@ -6286,16 +6305,45 @@ function releaseAccountPermit(fp) {
   if (next) next();
 }
 
-// Wraps the raw forward in the per-account limiter. Identical signature
-// so call sites are unchanged.
+// Wraps the raw forward in the per-account limiter. Backward-compatible
+// signature — call sites are unchanged.
+//
+// Phase F bug-fix: the permit is held until the response stream is fully
+// consumed (or aborted/errored), NOT released at headers. This is the
+// load-bearing change for streaming responses (Anthropic's default for all
+// Claude Code traffic): _forwardToAnthropicRaw resolves with the response
+// when HEADERS arrive — which for SSE is milliseconds — but the actual
+// body streams for seconds-to-minutes. The previous implementation released
+// the permit at headers, so the documented MAX_INFLIGHT_PER_ACCOUNT cap
+// was silently bypassed for streams. Result: with N>4 concurrent CC
+// instances on one bearer, all N streams ran concurrently against
+// upstream, triggering Anthropic's anti-abuse heuristics (false 429s,
+// connection drops, "rate limited" reports). Now permits actually cap
+// concurrent streams.
 async function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT) {
   const tok = _tokenFromHeaders(headers);
   const fp = tok ? getFingerprintFromToken(tok) : 'unknown';
   await acquireAccountPermit(fp);
-  try {
-    return await _forwardToAnthropicRaw(method, path, headers, body, timeout);
-  } finally {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
     releaseAccountPermit(fp);
+  };
+  try {
+    const res = await _forwardToAnthropicRaw(method, path, headers, body, timeout);
+    // Hold the permit until the response stream finishes. The first of
+    // these events to fire wins; release() is idempotent so duplicate
+    // events (rare but possible during destroy) are harmless.
+    res.once('end', release);
+    res.once('error', release);
+    res.once('close', release);
+    return res;
+  } catch (e) {
+    // _forwardToAnthropicRaw rejected before headers — release immediately
+    // (no response stream exists to hook auto-release onto).
+    release();
+    throw e;
   }
 }
 
@@ -8013,15 +8061,33 @@ const proxyServer = createServer((clientReq, clientRes) => {
     if (err.message === 'queue_timeout') {
       log('warn', 'Request timed out in serialization queue');
       if (!clientRes.headersSent) {
-        clientRes.writeHead(504, { 'Content-Type': 'application/json' });
-        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'timeout_error', message: 'Request queued too long (serialization timeout)' } }));
+        // Phase F — return 503 + overloaded_error (with explicit "[vdm proxy]"
+        // prefix in message and x-vdm-proxy header) so Claude Code's retry
+        // logic treats this as a transient backpressure event from OUR proxy,
+        // not a timeout from Anthropic. Without this, CC reported the proxy's
+        // own queue-full as "Anthropic unresponsive".
+        clientRes.writeHead(503, {
+          'Content-Type': 'application/json',
+          'Retry-After': '5',
+          'x-vdm-proxy': 'true',
+        });
+        clientRes.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            message: '[vdm proxy] request queued too long (serialization queue timeout). Anthropic upstream was not contacted.',
+          },
+        }));
       }
       return;
     }
     log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
     if (!clientRes.headersSent) {
-      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Proxy error: ${err.message}` } }));
+      clientRes.writeHead(502, {
+        'Content-Type': 'application/json',
+        'x-vdm-proxy': 'true',
+      });
+      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `[vdm proxy] ${err.message}` } }));
     }
   });
 });
@@ -8276,12 +8342,20 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (attempt > 0 && isDeadlineExceeded()) {
       log('deadline', `Request deadline exceeded after ${attempt} attempts (${REQUEST_DEADLINE_MS}ms) — trying passthrough`);
       if (await _passthroughFallback(clientReq, clientRes, body, 'deadline-exceeded')) return;
-      clientRes.writeHead(504, { 'Content-Type': 'application/json' });
+      // Phase F — return 503 with explicit proxy-side framing instead of
+      // 504/timeout_error. The deadline cap is OUR retry-budget, not an
+      // Anthropic timeout — old wording made CC report this as "Anthropic
+      // unresponsive". Retry-After:10 gives CC's retry loop a sane delay.
+      clientRes.writeHead(503, {
+        'Content-Type': 'application/json',
+        'Retry-After': '10',
+        'x-vdm-proxy': 'true',
+      });
       clientRes.end(JSON.stringify({
         type: 'error',
         error: {
-          type: 'timeout_error',
-          message: `Proxy request deadline exceeded (${REQUEST_DEADLINE_MS / 1000}s). All token refreshes may have timed out.`,
+          type: 'overloaded_error',
+          message: `[vdm proxy] retry-budget exhausted after ${attempt} attempts (${REQUEST_DEADLINE_MS / 1000}s). All token refreshes/rotations took too long. Tune CSW_REQUEST_DEADLINE_MS if this recurs.`,
         },
       }));
       return;
