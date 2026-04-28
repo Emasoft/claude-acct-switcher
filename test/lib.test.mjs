@@ -40,6 +40,8 @@ import {
   parseTaskEventPayload,
   parseTeammateIdlePayload,
   aggregateByTool,
+  // Phase G — transcript-path → parent_session derivation
+  parseParentSessionFromTranscriptPath,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -1396,19 +1398,70 @@ describe('parseSubagentStartPayload', () => {
     assert.equal(r.ok, false);
   });
 
-  it('Phase G — reads spec-correct agent_id field', () => {
+  it('Phase G — reads spec-correct agent_id field + derives parent from transcript_path', () => {
     const r = parseSubagentStartPayload({
       session_id: 'sub-123',
       agent_id: 'agent-instance-abc',
       agent_type: 'Explore',
       cwd: '/tmp/proj',
-      transcript_path: '/Users/x/.claude/projects/p/sub-123/subagents/agent-abc.jsonl',
+      // Documented layout: ~/.claude/projects/{project}/{parentSessionId}/subagents/agent-{agentId}.jsonl
+      transcript_path: '/Users/x/.claude/projects/p/parent-uuid-xyz/subagents/agent-abc.jsonl',
     });
     assert.equal(r.ok, true);
     assert.equal(r.agentId, 'agent-instance-abc');
-    assert.equal(r.transcriptPath, '/Users/x/.claude/projects/p/sub-123/subagents/agent-abc.jsonl');
-    // Legacy parent_session_id absent — spec doesn't carry it; parser tolerates.
+    assert.equal(r.transcriptPath, '/Users/x/.claude/projects/p/parent-uuid-xyz/subagents/agent-abc.jsonl');
+    // Phase G — parent derived from path even though payload omits parent_session_id.
+    assert.equal(r.parentSessionId, 'parent-uuid-xyz');
+  });
+
+  it('Phase G — parent_session_id in payload takes precedence over path-derived parent', () => {
+    const r = parseSubagentStartPayload({
+      session_id: 'sub-1',
+      agent_id: 'agent-1',
+      parent_session_id: 'explicit-parent',
+      transcript_path: '/p/path-derived-parent/subagents/agent-1.jsonl',
+    });
+    assert.equal(r.parentSessionId, 'explicit-parent');
+  });
+
+  it('Phase G — falls back to null when transcript_path is malformed', () => {
+    const r = parseSubagentStartPayload({
+      session_id: 'sub-1',
+      agent_id: 'agent-1',
+      transcript_path: '/some/non-conforming/path.txt',
+    });
     assert.equal(r.parentSessionId, null);
+  });
+});
+
+describe('parseParentSessionFromTranscriptPath', () => {
+  it('extracts parent UUID from canonical transcript path', () => {
+    const p = '/Users/me/.claude/projects/proj-key/abc-123-def/subagents/agent-xyz.jsonl';
+    assert.equal(parseParentSessionFromTranscriptPath(p), 'abc-123-def');
+  });
+
+  it('handles Windows backslash paths', () => {
+    const p = 'C:\\Users\\me\\.claude\\projects\\proj\\parent-456\\subagents\\agent-ggg.jsonl';
+    assert.equal(parseParentSessionFromTranscriptPath(p), 'parent-456');
+  });
+
+  it('returns null for paths without /subagents/ anchor', () => {
+    assert.equal(parseParentSessionFromTranscriptPath('/foo/bar/baz.jsonl'), null);
+    assert.equal(parseParentSessionFromTranscriptPath('/sessions/abc/main.jsonl'), null);
+  });
+
+  it('returns null for non-string / empty input', () => {
+    assert.equal(parseParentSessionFromTranscriptPath(null), null);
+    assert.equal(parseParentSessionFromTranscriptPath(undefined), null);
+    assert.equal(parseParentSessionFromTranscriptPath(''), null);
+    assert.equal(parseParentSessionFromTranscriptPath(42), null);
+  });
+
+  it('accepts arbitrary opaque session IDs (not RFC-4122 strict)', () => {
+    // The spec says session_id is opaque — we shouldn't reject test fixtures
+    // that use simple strings like "session-1" instead of full UUIDs.
+    const p = '/p/session-1/subagents/agent-2.jsonl';
+    assert.equal(parseParentSessionFromTranscriptPath(p), 'session-1');
   });
 });
 

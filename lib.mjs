@@ -1023,7 +1023,40 @@ export function parseSubagentStartPayload(data) {
   const transcriptPath = typeof data.transcript_path === 'string'
     ? data.transcript_path
     : null;
-  return { ok: true, sessionId, cwd, agentId, parentSessionId, agentType, transcriptPath };
+  // Phase G — derive the PARENT session_id from transcript_path. The spec
+  // doesn't carry parent_session_id in the SubagentStart payload, but the
+  // canonical Claude Code transcript layout is:
+  //   ~/.claude/projects/{project}/{parentSessionId}/subagents/agent-{agentId}.jsonl
+  // …so the second-to-last directory component IS the parent's session_id.
+  // Falls back to the legacy parent_session_id chain (always null in
+  // production) if the path doesn't match the documented layout.
+  const derivedParent = parentSessionId || parseParentSessionFromTranscriptPath(transcriptPath);
+  return { ok: true, sessionId, cwd, agentId, parentSessionId: derivedParent, agentType, transcriptPath };
+}
+
+/**
+ * Phase G — Extract the parent session_id from a subagent transcript path.
+ *
+ * Documented layout per the sub-agents spec:
+ *   ~/.claude/projects/{project}/{parentSessionId}/subagents/agent-{agentId}.jsonl
+ *
+ * We accept either '/' or '\\' separators (cross-platform) and tolerate
+ * surrounding noise — only the structural anchor (`/subagents/agent-…jsonl`)
+ * needs to match. UUID validation is intentionally relaxed: the spec doesn't
+ * formally require RFC-4122, just a unique opaque session_id, so we accept
+ * any non-empty string in that position.
+ *
+ * Returns: parent session_id string, or null if the path doesn't match.
+ */
+export function parseParentSessionFromTranscriptPath(transcriptPath) {
+  if (typeof transcriptPath !== 'string' || transcriptPath.length === 0) return null;
+  // Normalise separators so the regex works on any platform.
+  const norm = transcriptPath.replace(/\\/g, '/');
+  // Capture the directory component immediately preceding `/subagents/`.
+  // Anchor is structural (last `/subagents/agent-*.jsonl` boundary) so
+  // arbitrary prefixes (~/.claude/, /private/var/, /tmp/test/, etc.) all work.
+  const m = norm.match(/\/([^/]+)\/subagents\/agent-[^/]*\.jsonl$/);
+  return m && m[1] ? m[1] : null;
 }
 
 /**
