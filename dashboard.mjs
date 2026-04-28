@@ -8575,10 +8575,34 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (status === 429) {
       const retryAfter = parseInt(proxyRes.headers['retry-after'] || '0', 10);
 
+      // Phase G — drain the body once and parse error.type so we can
+      // distinguish PLAN-side throttle (rate_limit_error → rotating to
+      // another account helps) from SERVER-side throttle (overloaded_error
+      // → rotating doesn't help; every account hits the same surge).
+      // Pre-Phase-G vdm rotated on every long-retry-after 429, burning
+      // accounts during Anthropic-wide capacity events.
+      //
+      // We need the body buffered anyway for both the pass-through and
+      // rotation paths (the rotation path already calls drainResponse).
+      // Buffering once + holding the bytes lets us inspect AND replay
+      // them to the client. _drainBuf429 is the small captured body
+      // (always small for a 429 — single error JSON object).
+      const _drainBuf429 = await drainResponse(proxyRes);
+      let _is429Server = false;
+      try {
+        const parsed = JSON.parse(_drainBuf429.toString('utf8'));
+        const etype = parsed && parsed.error && parsed.error.type;
+        _is429Server = etype === 'overloaded_error';
+      } catch { /* not JSON or empty body — treat as plan-side */ }
+
       // Transient burst 429s (short retry-after) are normal — Claude Code
       // retries on its own.  Pass through silently without noisy logging,
       // marking the account as limited, or sending notifications.
-      const isTransient = retryAfter < 60;
+      // Phase G — server-side overloaded_error is also "transient" from
+      // vdm's perspective: rotating to another account just hits the same
+      // upstream surge, so the right move is to pass it through and let
+      // CC's own retry-with-backoff handle it.
+      const isTransient = retryAfter < 60 || _is429Server;
 
       // Phase 6: thundering-herd dedup — late-arriving 429s from N
       // concurrent requests get retried against the new active without N
@@ -8591,8 +8615,9 @@ async function handleProxyRequest(clientReq, clientRes) {
       // burst of streaming-completion 429s, short enough that genuinely
       // new rate limits on the new token still trigger normal rotation.
       if (!isTransient && accountState.wasRecentlySwitchedFrom(token, 500)) {
+        // Phase G: body already drained into _drainBuf429 above — no need
+        // to drain again. Just continue to the next attempt.
         log('switch', `${acctName} → 429 dedup: token was recently rotated away, retrying against new active`);
-        await drainResponse(proxyRes);
         triedTokens.add(token);
         try {
           const fresh = readKeychain();
@@ -8613,18 +8638,22 @@ async function handleProxyRequest(clientReq, clientRes) {
         markAccountLimited(token, acctName, retryAfter);
         logEvent('rate-limited', { account: acctName, retryAfter });
       }
-      log('switch', `${acctName} → 429 ${isTransient ? 'transient' : 'rate limited'} (retry-after: ${retryAfter}s)`);
+      const _429kind = _is429Server
+        ? 'server overload (overloaded_error)'
+        : (isTransient ? 'transient' : 'rate limited');
+      log('switch', `${acctName} → 429 ${_429kind} (retry-after: ${retryAfter}s)`);
 
       if (!settings.autoSwitch || isTransient) {
         if (!isTransient) log('switch', '  → auto-switch OFF, returning 429 as-is');
+        if (_is429Server) log('switch', '  → server-side 429: passing through (rotation would not help)');
+        // Phase G — body was drained above into _drainBuf429; replay it to
+        // the client instead of trying to pipe a now-consumed stream.
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
-        clientRes.on('close', () => { proxyRes.destroy(); });
-        await pipeAndWait(proxyRes, clientRes);
+        clientRes.end(_drainBuf429);
         return;
       }
 
-      await drainResponse(proxyRes);
+      // Phase G: body already drained above; no second drain needed.
 
       // Phase 6: mark the source token as just-rotated-away BEFORE the
       // keychain swap so any concurrent in-flight 429 lands in the dedup
