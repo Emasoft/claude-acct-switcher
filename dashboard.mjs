@@ -291,6 +291,11 @@ import {
   isUsageRow,
   buildCompactBoundaryEntry,
   mergeSessionAttribution,
+  // Phase E — additional hook parsers + breakdown helper
+  parseWorktreeEventPayload,
+  parseTaskEventPayload,
+  parseTeammateIdlePayload,
+  aggregateByTool,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -1541,6 +1546,176 @@ async function handleAPI(req, res) {
         recorded = tools.length;
       }
       json(res, { ok: true, recorded });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase E — /api/worktree-create: WorktreeCreate hook fires when Claude
+  // Code (or a sub-agent) creates a new git worktree. We log the event to
+  // the activity feed but DON'T mutate the session's branch — Claude Code
+  // doesn't `cd` into the new worktree on creation, only on a subsequent
+  // CwdChanged. This is mostly here for completeness so the event isn't
+  // silently dropped, and so the activity feed can correlate worktree
+  // lifecycle with token-attribution shifts.
+  if (url.pathname === '/api/worktree-create' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseWorktreeEventPayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, worktreePath, branch } = parsed;
+      logActivity('worktree_create', `Worktree created at ${worktreePath}${branch ? ` (branch ${branch})` : ''}`);
+      log('tokens', `Worktree created: ${sessionId.slice(0, 8)}… → ${worktreePath}${branch ? ` (${branch})` : ''}`);
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase E — /api/worktree-remove: WorktreeRemove hook fires when a git
+  // worktree is removed. The critical case: a session was attributed to
+  // that worktree's branch and continues running. Without this event, the
+  // session keeps writing token rows tagged with the now-deleted branch.
+  // We re-resolve the session's branch from its current cwd (if the cwd
+  // still exists post-removal — a session in the removed worktree's own
+  // dir will fail and fall back to '(no git)' which is the truthful
+  // outcome).
+  if (url.pathname === '/api/worktree-remove' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseWorktreeEventPayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, worktreePath, branch } = parsed;
+      const session = pendingSessions.get(sessionId);
+      let rebranched = false;
+      if (session && session.cwd) {
+        // If the session's cwd is INSIDE the removed worktree, _runGit will
+        // throw — that's the correct signal that the branch is now invalid.
+        try {
+          const newBranch = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          if (newBranch && newBranch !== session.branch) {
+            session.branch = newBranch;
+            try {
+              session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
+            } catch { /* ignore */ }
+            rebranched = true;
+          }
+        } catch {
+          // cwd is gone — mark branch as unresolvable; future appendTokenUsage
+          // calls will record null branch (worktree-aware aggregation handles
+          // this correctly).
+          if (session.branch !== '(no git)') {
+            session.branch = '(no git)';
+            session.commitHash = '';
+            rebranched = true;
+          }
+        }
+      }
+      logActivity('worktree_remove', `Worktree removed: ${worktreePath}${branch ? ` (was ${branch})` : ''}`);
+      log('tokens', `Worktree removed: ${sessionId.slice(0, 8)}… → ${worktreePath}${rebranched ? ` (rebranched)` : ''}`);
+      json(res, { ok: true, rebranched });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase E — /api/task-created and /api/task-completed: agent-team task
+  // lifecycle events. These complement SubagentStart/Stop with task-level
+  // metadata (the Task tool's description, status). When the parent session
+  // is in pendingSessions we link the taskId so SubagentStop can include
+  // task context in its log line; otherwise the event is recorded for the
+  // activity feed only.
+  if ((url.pathname === '/api/task-created' || url.pathname === '/api/task-completed') && req.method === 'POST') {
+    const kind = url.pathname === '/api/task-created' ? 'created' : 'completed';
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseTaskEventPayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, taskId, parentSessionId, agentType, status, description } = parsed;
+      // Link the task to the parent session so SubagentStart/Stop log lines
+      // can reference it. We DO NOT register the task as a separate session
+      // — sub-agent events are still the source of truth for token
+      // attribution; tasks are pure metadata.
+      const parent = parentSessionId ? pendingSessions.get(parentSessionId) : null;
+      if (parent) {
+        if (!parent.activeTaskIds) parent.activeTaskIds = new Set();
+        if (kind === 'created') {
+          parent.activeTaskIds.add(taskId);
+        } else {
+          parent.activeTaskIds.delete(taskId);
+        }
+      }
+      const detail = description ? ` — ${description.slice(0, 80)}${description.length > 80 ? '…' : ''}` : '';
+      logActivity(`task_${kind}`, `Task ${kind}: ${taskId.slice(0, 12)}…${agentType ? ` [${agentType}]` : ''}${status ? ` (${status})` : ''}${detail}`);
+      log('tokens', `Task ${kind}: ${taskId.slice(0, 12)}… session=${sessionId.slice(0, 8)}…${parent ? ' (parent linked)' : ''}`);
+      json(res, { ok: true, linked: !!parent });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase E — /api/teammate-idle: TeammateIdle hook fires when an
+  // agent-teams teammate goes idle. Purely informational — we log it to
+  // the activity feed so users can correlate idle gaps with the timeline,
+  // but it doesn't affect token attribution.
+  if (url.pathname === '/api/teammate-idle' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const parsed = parseTeammateIdlePayload(data);
+      if (!parsed.ok) {
+        json(res, { ok: false, error: parsed.error }, 400);
+        return true;
+      }
+      const { sessionId, teammateId } = parsed;
+      logActivity('teammate_idle', `Teammate idle${teammateId ? ` (${teammateId})` : ''} session=${sessionId.slice(0, 8)}…`);
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  // Phase E — /api/token-usage/by-tool: aggregate token usage by tool name
+  // (with mcpServer disambiguation) for the dashboard's Tool Breakdown
+  // panel. Range is parsed from query string (start, end as ms-since-epoch);
+  // both are optional. Skips compact_boundary rows via aggregateByTool's
+  // built-in isUsageRow filter.
+  if (url.pathname === '/api/token-usage/by-tool' && req.method === 'GET') {
+    try {
+      const rows = loadTokenUsage();
+      const startStr = url.searchParams.get('start');
+      const endStr = url.searchParams.get('end');
+      const range = (startStr || endStr) ? {
+        start: startStr ? Number(startStr) : null,
+        end: endStr ? Number(endStr) : null,
+      } : null;
+      const buckets = aggregateByTool(rows, range);
+      json(res, { ok: true, buckets });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 500);
     }
@@ -3084,6 +3259,10 @@ function renderHTML() {
         <div class="usage-title">Repository &amp; Branch</div>
         <div id="tok-repos"></div>
       </div>
+      <div class="usage-card" id="tok-tools-card" style="margin-top:1rem">
+        <div class="usage-title">Tool Breakdown</div>
+        <div id="tok-tools"></div>
+      </div>
     </div>
   </div>
 
@@ -4533,6 +4712,7 @@ function applyTokenModelFilter() {
   renderModelBreakdown(data);
   renderAccountBreakdown(data);
   renderRepoBranchBreakdown(data);
+  renderToolBreakdown(data);
 }
 
 function populateTokenFilters(data) {
@@ -5085,6 +5265,69 @@ function renderRepoBranchBreakdown(data) {
     for (var n = 0; n < inactive.length; n++) html += renderRepoGroup(inactive[n], true);
   }
   el.innerHTML = html;
+}
+
+// Phase E — Tool Breakdown panel. Mirrors renderModelBreakdown's structure
+// (proportion bar + per-row stats). Auto-hides when there's no per-tool
+// attribution data so users don't get an empty panel — the gate flag is
+// off by default. Bucketing is server-side via /api/token-usage/by-tool.
+function renderToolBreakdown(data) {
+  var el = document.getElementById('tok-tools');
+  var card = document.getElementById('tok-tools-card');
+  if (!el || !card) return;
+  // Compute client-side from the same filtered data the other breakdowns
+  // use so the totals reconcile. (Server endpoint /api/token-usage/by-tool
+  // exists for external consumers but the dashboard uses the in-memory data
+  // to keep the scrubber's window filtering in sync.)
+  var buckets = {};
+  var hasAttributed = false;
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var inT = row.inputTokens || 0;
+    var outT = row.outputTokens || 0;
+    if (inT === 0 && outT === 0) continue;
+    var tool = (typeof row.tool === 'string' && row.tool.length > 0) ? row.tool : '(no per-tool attribution)';
+    var mcp = (typeof row.mcpServer === 'string' && row.mcpServer.length > 0) ? row.mcpServer : null;
+    if (tool !== '(no per-tool attribution)') hasAttributed = true;
+    var key = mcp ? mcp + ':' + tool : tool;
+    if (!buckets[key]) buckets[key] = { tool: tool, mcp: mcp, input: 0, output: 0, total: 0, count: 0 };
+    buckets[key].input += inT;
+    buckets[key].output += outT;
+    buckets[key].total += inT + outT;
+    buckets[key].count += 1;
+  }
+  // Hide the card entirely when no row has a tool field — the gate is off
+  // and showing only "(no per-tool attribution)" would be useless.
+  if (!hasAttributed) {
+    card.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  card.style.display = '';
+  var keys = Object.keys(buckets).sort(function(a,b) { return buckets[b].total - buckets[a].total; });
+  var grandTotal = 0;
+  for (var k = 0; k < keys.length; k++) grandTotal += buckets[keys[k]].total;
+  if (!grandTotal) grandTotal = 1;
+  var propBar = '<div class="tok-proportion">';
+  for (var p = 0; p < keys.length; p++) {
+    var pct = (buckets[keys[p]].total / grandTotal) * 100;
+    propBar += '<div class="tok-proportion-seg" style="width:' + pct + '%;background:' + TOK_COLORS[p % TOK_COLORS.length] + '"></div>';
+  }
+  propBar += '</div>';
+  var rows = '';
+  for (var r = 0; r < keys.length; r++) {
+    var b = buckets[keys[r]];
+    var pctR = Math.round((b.total / grandTotal) * 100);
+    var label = b.mcp ? b.mcp + '/' + b.tool : b.tool;
+    rows += '<div class="tok-model-row">' +
+      '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
+      '<div class="tok-model-name">' + escHtml(label) + '</div>' +
+      '<div class="tok-model-detail">' + formatNum(b.input) + ' in / ' + formatNum(b.output) + ' out · ' + b.count + ' calls</div>' +
+      '<div class="tok-model-total">' + formatNum(b.total) + '</div>' +
+      '<div class="tok-model-pct">' + pctR + '%</div>' +
+    '</div>';
+  }
+  el.innerHTML = propBar + rows;
 }
 
 function tokFilterChange(which) {

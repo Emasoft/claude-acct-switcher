@@ -174,6 +174,20 @@ def ensure_hook(event_name, url):
 #                          off because this fires once per tool batch
 #                          and would flood the dashboard). Enabled via
 #                          `touch ~/.claude/account-switcher/per-tool-attribution.flag`.
+#   * WorktreeCreate     — log new worktree to activity feed; mostly for
+#                          correlation with branch-attribution shifts.
+#   * WorktreeRemove     — load-bearing: a session in a removed worktree
+#                          must invalidate its branch attribution so
+#                          subsequent token rows don't reference a path
+#                          that no longer exists. Re-resolves via the
+#                          session's current cwd.
+#   * TaskCreated        — agent-team task lifecycle; links the task_id
+#                          to the parent session for SubagentStart/Stop
+#                          log correlation. Attribution still flows
+#                          through Subagent events.
+#   * TaskCompleted      — pairs with TaskCreated to close out the
+#                          activeTaskIds set on the parent session.
+#   * TeammateIdle       — agent-teams idle marker. Activity-feed-only.
 events = [
     ('SessionStart',     f'http://localhost:{port}/api/session-start'),
     ('UserPromptSubmit', f'http://localhost:{port}/api/session-start'),
@@ -185,6 +199,15 @@ events = [
     ('PreCompact',       f'http://localhost:{port}/api/pre-compact'),
     ('PostCompact',      f'http://localhost:{port}/api/post-compact'),
     ('CwdChanged',       f'http://localhost:{port}/api/cwd-changed'),
+    # Phase E — worktree + agent-team event coverage. WorktreeRemove is
+    # the load-bearing one: a session in a removed worktree must invalidate
+    # its branch attribution. The others are mostly for activity-feed
+    # correlation but are subscribed unconditionally for completeness.
+    ('WorktreeCreate',   f'http://localhost:{port}/api/worktree-create'),
+    ('WorktreeRemove',   f'http://localhost:{port}/api/worktree-remove'),
+    ('TaskCreated',      f'http://localhost:{port}/api/task-created'),
+    ('TaskCompleted',    f'http://localhost:{port}/api/task-completed'),
+    ('TeammateIdle',     f'http://localhost:{port}/api/teammate-idle'),
 ]
 if per_tool_enabled:
     events.append(('PostToolBatch', f'http://localhost:{port}/api/post-tool-batch'))
@@ -299,6 +322,12 @@ events = [
     ('PostCompact',      f'http://localhost:{port}/api/post-compact'),
     ('CwdChanged',       f'http://localhost:{port}/api/cwd-changed'),
     ('PostToolBatch',    f'http://localhost:{port}/api/post-tool-batch'),
+    # Phase E — worktree + agent-team event coverage (must mirror install).
+    ('WorktreeCreate',   f'http://localhost:{port}/api/worktree-create'),
+    ('WorktreeRemove',   f'http://localhost:{port}/api/worktree-remove'),
+    ('TaskCreated',      f'http://localhost:{port}/api/task-created'),
+    ('TaskCompleted',    f'http://localhost:{port}/api/task-completed'),
+    ('TeammateIdle',     f'http://localhost:{port}/api/teammate-idle'),
 ]
 
 for event_name, url in events:

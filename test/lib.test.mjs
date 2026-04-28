@@ -35,6 +35,11 @@ import {
   isUsageRow,
   buildCompactBoundaryEntry,
   mergeSessionAttribution,
+  // Phase E — additional hook parsers + breakdown helper
+  parseWorktreeEventPayload,
+  parseTaskEventPayload,
+  parseTeammateIdlePayload,
+  aggregateByTool,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -1642,5 +1647,258 @@ describe('mergeSessionAttribution', () => {
     const r = mergeSessionAttribution('s', null, { ts: 1 });
     assert.equal(r.sessionId, 's');
     assert.equal(r.parentSessionId, null);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Phase E — worktree + agent-team parsers + tool aggregation
+// ─────────────────────────────────────────────────
+
+describe('parseWorktreeEventPayload', () => {
+  it('accepts a valid payload with worktree_path', () => {
+    const r = parseWorktreeEventPayload({
+      session_id: 's-1',
+      worktree_path: '/tmp/proj-worktree',
+      branch: 'feature/foo',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.sessionId, 's-1');
+    assert.equal(r.worktreePath, '/tmp/proj-worktree');
+    assert.equal(r.branch, 'feature/foo');
+  });
+
+  it('accepts the alternate "path" field name', () => {
+    const r = parseWorktreeEventPayload({
+      session_id: 's-1',
+      path: '/tmp/wt',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.worktreePath, '/tmp/wt');
+    assert.equal(r.branch, null);
+  });
+
+  it('rejects missing session_id', () => {
+    const r = parseWorktreeEventPayload({ worktree_path: '/tmp/wt' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /session_id/);
+  });
+
+  it('rejects missing worktree_path AND path', () => {
+    const r = parseWorktreeEventPayload({ session_id: 's', branch: 'main' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /worktree_path/);
+  });
+
+  it('rejects empty-string worktree_path (not a valid path)', () => {
+    const r = parseWorktreeEventPayload({ session_id: 's', worktree_path: '' });
+    assert.equal(r.ok, false);
+  });
+
+  it('rejects null payload', () => {
+    const r = parseWorktreeEventPayload(null);
+    assert.equal(r.ok, false);
+  });
+
+  it('rejects non-object payload (string)', () => {
+    const r = parseWorktreeEventPayload('not an object');
+    assert.equal(r.ok, false);
+  });
+});
+
+describe('parseTaskEventPayload', () => {
+  it('accepts a valid TaskCreated-shaped payload', () => {
+    const r = parseTaskEventPayload({
+      session_id: 's-1',
+      task_id: 't-abc',
+      parent_session_id: 'parent-1',
+      agent_type: 'Explore',
+      status: 'running',
+      description: 'Investigate auth bug',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.taskId, 't-abc');
+    assert.equal(r.parentSessionId, 'parent-1');
+    assert.equal(r.agentType, 'Explore');
+    assert.equal(r.status, 'running');
+    assert.equal(r.description, 'Investigate auth bug');
+  });
+
+  it('falls back to parentSessionId field name', () => {
+    const r = parseTaskEventPayload({
+      session_id: 's',
+      task_id: 't',
+      parentSessionId: 'p',
+    });
+    assert.equal(r.parentSessionId, 'p');
+  });
+
+  it('truncates oversized description to 500 chars', () => {
+    const big = 'x'.repeat(2000);
+    const r = parseTaskEventPayload({
+      session_id: 's',
+      task_id: 't',
+      description: big,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.description.length, 500);
+  });
+
+  it('rejects missing session_id', () => {
+    const r = parseTaskEventPayload({ task_id: 't' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /session_id/);
+  });
+
+  it('rejects missing task_id', () => {
+    const r = parseTaskEventPayload({ session_id: 's' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /task_id/);
+  });
+
+  it('tolerates missing optional fields (best-effort metadata)', () => {
+    const r = parseTaskEventPayload({ session_id: 's', task_id: 't' });
+    assert.equal(r.ok, true);
+    assert.equal(r.parentSessionId, null);
+    assert.equal(r.agentType, null);
+    assert.equal(r.status, null);
+    assert.equal(r.description, null);
+  });
+
+  it('rejects null payload', () => {
+    const r = parseTaskEventPayload(null);
+    assert.equal(r.ok, false);
+  });
+});
+
+describe('parseTeammateIdlePayload', () => {
+  it('accepts a valid payload with teammate_id', () => {
+    const r = parseTeammateIdlePayload({
+      session_id: 's-1',
+      teammate_id: 'tm-abc',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.sessionId, 's-1');
+    assert.equal(r.teammateId, 'tm-abc');
+  });
+
+  it('falls back to team_id field name', () => {
+    const r = parseTeammateIdlePayload({
+      session_id: 's-1',
+      team_id: 'team-xyz',
+    });
+    assert.equal(r.teammateId, 'team-xyz');
+  });
+
+  it('tolerates missing teammate_id (informational event)', () => {
+    const r = parseTeammateIdlePayload({ session_id: 's-1' });
+    assert.equal(r.ok, true);
+    assert.equal(r.teammateId, null);
+  });
+
+  it('rejects missing session_id', () => {
+    const r = parseTeammateIdlePayload({ teammate_id: 'tm' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /session_id/);
+  });
+
+  it('rejects null payload', () => {
+    const r = parseTeammateIdlePayload(null);
+    assert.equal(r.ok, false);
+  });
+});
+
+describe('aggregateByTool', () => {
+  it('buckets rows by tool name and sums input/output tokens', () => {
+    const rows = [
+      { ts: 100, tool: 'Bash', inputTokens: 100, outputTokens: 50 },
+      { ts: 200, tool: 'Bash', inputTokens: 200, outputTokens: 100 },
+      { ts: 300, tool: 'Read', inputTokens: 50, outputTokens: 25 },
+    ];
+    const out = aggregateByTool(rows);
+    assert.equal(out.length, 2);
+    // Sorted by totalTokens desc — Bash should be first (450 vs 75)
+    assert.equal(out[0].tool, 'Bash');
+    assert.equal(out[0].inputTokens, 300);
+    assert.equal(out[0].outputTokens, 150);
+    assert.equal(out[0].totalTokens, 450);
+    assert.equal(out[0].count, 2);
+    assert.equal(out[1].tool, 'Read');
+    assert.equal(out[1].count, 1);
+  });
+
+  it('disambiguates same-named tools from different MCP servers', () => {
+    const rows = [
+      { ts: 1, tool: 'fetch', mcpServer: 'serena', inputTokens: 100, outputTokens: 0 },
+      { ts: 2, tool: 'fetch', mcpServer: 'grepika', inputTokens: 50, outputTokens: 0 },
+      { ts: 3, tool: 'fetch', mcpServer: 'serena', inputTokens: 75, outputTokens: 0 },
+    ];
+    const out = aggregateByTool(rows);
+    assert.equal(out.length, 2);
+    const serena = out.find(b => b.mcpServer === 'serena');
+    assert.equal(serena.inputTokens, 175);
+    assert.equal(serena.count, 2);
+  });
+
+  it('buckets rows without a tool field under "(no per-tool attribution)"', () => {
+    const rows = [
+      { ts: 1, inputTokens: 100, outputTokens: 50 },
+      { ts: 2, tool: 'Bash', inputTokens: 30, outputTokens: 10 },
+    ];
+    const out = aggregateByTool(rows);
+    assert.equal(out.length, 2);
+    const unattributed = out.find(b => b.tool === '(no per-tool attribution)');
+    assert(unattributed, 'expected an unattributed bucket');
+    assert.equal(unattributed.totalTokens, 150);
+  });
+
+  it('skips compact_boundary rows via isUsageRow', () => {
+    const rows = [
+      { ts: 1, type: 'usage', tool: 'Bash', inputTokens: 100, outputTokens: 0 },
+      { ts: 2, type: 'compact_boundary', preTokens: 50000, postTokens: 10000 },
+      { ts: 3, type: 'usage', tool: 'Read', inputTokens: 50, outputTokens: 0 },
+    ];
+    const out = aggregateByTool(rows);
+    assert.equal(out.length, 2);
+    assert(!out.some(b => b.tool && b.tool.includes('compact')), 'compact_boundary should not be a tool bucket');
+  });
+
+  it('filters by ts range when provided', () => {
+    const rows = [
+      { ts: 100, tool: 'Bash', inputTokens: 10, outputTokens: 0 },
+      { ts: 200, tool: 'Bash', inputTokens: 20, outputTokens: 0 },
+      { ts: 300, tool: 'Bash', inputTokens: 30, outputTokens: 0 },
+    ];
+    const out = aggregateByTool(rows, { start: 150, end: 250 });
+    assert.equal(out.length, 1);
+    assert.equal(out[0].inputTokens, 20);
+    assert.equal(out[0].count, 1);
+  });
+
+  it('half-open range with only start filter', () => {
+    const rows = [
+      { ts: 100, tool: 'Bash', inputTokens: 10, outputTokens: 0 },
+      { ts: 200, tool: 'Bash', inputTokens: 20, outputTokens: 0 },
+      { ts: 300, tool: 'Bash', inputTokens: 30, outputTokens: 0 },
+    ];
+    const out = aggregateByTool(rows, { start: 200 });
+    assert.equal(out.length, 1);
+    assert.equal(out[0].inputTokens, 50); // 20 + 30
+  });
+
+  it('returns empty array on empty input', () => {
+    assert.deepEqual(aggregateByTool([]), []);
+    assert.deepEqual(aggregateByTool(null), []);
+    assert.deepEqual(aggregateByTool(undefined), []);
+  });
+
+  it('coerces non-numeric token fields to 0', () => {
+    const rows = [
+      { ts: 1, tool: 'Bash', inputTokens: 'NaN', outputTokens: undefined },
+      { ts: 2, tool: 'Bash', inputTokens: 100, outputTokens: 50 },
+    ];
+    const out = aggregateByTool(rows);
+    assert.equal(out[0].inputTokens, 100);
+    assert.equal(out[0].outputTokens, 50);
+    assert.equal(out[0].count, 2);
   });
 });

@@ -1174,3 +1174,165 @@ export function parsePostToolBatchPayload(data) {
   }
   return { ok: true, sessionId, cwd, tools };
 }
+
+// ─── Phase E — additional hook payload parsers + breakdown helpers ───
+//
+// These complete the Phase D hook-coverage plan (worktree events, agent-team
+// events) and surface the per-tool data we already collect (tool breakdown).
+
+/**
+ * Phase E — Validate and normalise a WorktreeCreate / WorktreeRemove payload.
+ *
+ * Both events emit the same shape — the dashboard caller passes `kind`
+ * ('create' or 'remove') to disambiguate. Why subscribe at all when
+ * CwdChanged covers `cd`-into-worktree? Because a worktree can be
+ * REMOVED while a session is still attributed to it: without this hook,
+ * subsequent token rows still record the now-deleted branch path.
+ *
+ * Returns:
+ *   { ok: true,  sessionId, worktreePath, branch }
+ *   { ok: false, error: string }
+ */
+export function parseWorktreeEventPayload(data) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  const worktreePath = (typeof data.worktree_path === 'string' && data.worktree_path.length > 0)
+    ? data.worktree_path
+    : ((typeof data.path === 'string' && data.path.length > 0) ? data.path : null);
+  if (!worktreePath) {
+    return { ok: false, error: 'worktree_path required' };
+  }
+  const branch = (typeof data.branch === 'string' && data.branch.length > 0)
+    ? data.branch
+    : null;
+  return { ok: true, sessionId, worktreePath, branch };
+}
+
+/**
+ * Phase E — Validate and normalise a TaskCreated / TaskCompleted payload.
+ *
+ * Both events emit the same field set; the dashboard caller passes `kind`
+ * ('created' or 'completed'). Used for agent-team task tracking — these
+ * are agent-team-level lifecycle events that complement SubagentStart/Stop
+ * with task-level metadata (description, status). When the parent session
+ * is unknown (e.g. team launched outside a tracked Claude Code session),
+ * the row is still recorded but parentSessionId stays null.
+ *
+ * Returns:
+ *   { ok: true,  sessionId, taskId, parentSessionId, agentType, status, description }
+ *   { ok: false, error: string }
+ */
+export function parseTaskEventPayload(data) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  const taskId = (typeof data.task_id === 'string' && data.task_id.length > 0)
+    ? data.task_id
+    : null;
+  if (!taskId) {
+    return { ok: false, error: 'task_id required' };
+  }
+  const parentSessionId = data.parent_session_id || data.parentSessionId || null;
+  const agentType = (typeof data.agent_type === 'string' && data.agent_type.length > 0)
+    ? data.agent_type
+    : null;
+  const status = (typeof data.status === 'string' && data.status.length > 0)
+    ? data.status
+    : null;
+  // Truncate description to 500 chars — task descriptions can be long
+  // (multi-paragraph prompts) and we don't want to bloat token-usage.json.
+  const description = (typeof data.description === 'string' && data.description.length > 0)
+    ? data.description.slice(0, 500)
+    : null;
+  return { ok: true, sessionId, taskId, parentSessionId, agentType, status, description };
+}
+
+/**
+ * Phase E — Validate and normalise a TeammateIdle payload.
+ *
+ * Fires when a Claude Code teammate (in agent-teams mode) goes idle.
+ * Purely informational — doesn't affect token attribution. We log it
+ * to the activity feed so users can correlate idle gaps with token-usage
+ * lulls in the timeline view.
+ *
+ * Returns:
+ *   { ok: true,  sessionId, teammateId }
+ *   { ok: false, error: string }
+ */
+export function parseTeammateIdlePayload(data) {
+  if (!data || typeof data !== 'object') {
+    return { ok: false, error: 'payload must be an object' };
+  }
+  const sessionId = data.session_id;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { ok: false, error: 'session_id required' };
+  }
+  const teammateId = (typeof data.teammate_id === 'string' && data.teammate_id.length > 0)
+    ? data.teammate_id
+    : ((typeof data.team_id === 'string' && data.team_id.length > 0) ? data.team_id : null);
+  return { ok: true, sessionId, teammateId };
+}
+
+/**
+ * Phase E — Aggregate token-usage rows by `tool` field for the Tool
+ * Breakdown UI panel.
+ *
+ * Skips non-usage rows (compact_boundary, etc.) via isUsageRow. Rows
+ * without a `tool` field — which is the common case until perToolAttribution
+ * is enabled — are bucketed under '(no per-tool attribution)' so the totals
+ * still reconcile against the global aggregate (the user can immediately
+ * see "X% of tokens are unattributed because the gate is off").
+ *
+ * MCP tools are bucketed by `mcpServer:tool` so two tools with the same
+ * short name from different MCP servers don't collapse into one bucket.
+ *
+ * Optional second arg `range` filters by ts inclusively on both ends.
+ *
+ * Returns: [{ tool, mcpServer, inputTokens, outputTokens, totalTokens, count }]
+ *          sorted by totalTokens desc.
+ */
+export function aggregateByTool(rows, range = null) {
+  const buckets = new Map();
+  const startMs = (range && typeof range.start === 'number') ? range.start : null;
+  const endMs = (range && typeof range.end === 'number') ? range.end : null;
+  for (const row of rows || []) {
+    if (!isUsageRow(row)) continue;
+    if (startMs !== null && (typeof row.ts !== 'number' || row.ts < startMs)) continue;
+    if (endMs !== null && (typeof row.ts !== 'number' || row.ts > endMs)) continue;
+    const tool = (typeof row.tool === 'string' && row.tool.length > 0)
+      ? row.tool
+      : '(no per-tool attribution)';
+    const mcpServer = (typeof row.mcpServer === 'string' && row.mcpServer.length > 0)
+      ? row.mcpServer
+      : null;
+    const key = mcpServer ? `${mcpServer}:${tool}` : tool;
+    const inputTokens = Number(row.inputTokens) || 0;
+    const outputTokens = Number(row.outputTokens) || 0;
+    const existing = buckets.get(key);
+    if (existing) {
+      existing.inputTokens += inputTokens;
+      existing.outputTokens += outputTokens;
+      existing.totalTokens += inputTokens + outputTokens;
+      existing.count += 1;
+    } else {
+      buckets.set(key, {
+        tool,
+        mcpServer,
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        count: 1,
+      });
+    }
+  }
+  return Array.from(buckets.values()).sort((a, b) => b.totalTokens - a.totalTokens);
+}
