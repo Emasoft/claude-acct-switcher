@@ -456,7 +456,6 @@ import {
   parseSubagentStartPayload,
   parseCwdChangedPayload,
   parsePostToolBatchPayload,
-  inferMcpServerFromToolName,
   isUsageRow,
   buildCompactBoundaryEntry,
   mergeSessionAttribution,

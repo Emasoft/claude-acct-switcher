@@ -58,7 +58,7 @@ claude login    # account B — that's it
 
 ```
 vdm list                    List accounts
-vdm switch [name]           Switch account (interactive if no name)
+vdm switch [name|--auto]    Switch account (interactive if no name; --auto picks next available)
 vdm remove <name>           Remove account
 vdm status                  Current account + settings
 vdm config [key] [on|off]   View/toggle settings
@@ -67,6 +67,14 @@ vdm logs [filter]           Stream live proxy logs
 vdm tokens [options]        Show token usage
 vdm upgrade                 Update to latest version
 ```
+
+### Slash commands
+
+`install.sh` drops user-level slash commands into `~/.claude/commands/` so any Claude Code session can call them directly.
+
+| Command | Effect |
+|---------|--------|
+| `/vdm-switch` | Picks the next available saved profile via the dashboard's current rotation strategy and switches to it. Equivalent to `vdm switch --auto` — bypasses the interactive picker, useful for unattended `--remote-control` sessions. |
 
 ### Dashboard
 
@@ -143,7 +151,9 @@ Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.
                                           '-- Circuit breaker auto-disables on repeated failures
 ```
 
-Credentials live in the macOS Keychain. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. On 429, it writes the next account's credentials to the Keychain and retries — Claude Code picks up the change seamlessly.
+All credentials live in the macOS Keychain. The active account sits at the canonical `Claude Code-credentials` entry that Claude Code itself reads on every request. Saved-but-inactive accounts sit at `vdm-account-<name>` entries (one per profile, encrypted at rest by macOS). On 429, the proxy reads the next saved entry and writes its blob to `Claude Code-credentials` — Claude Code picks up the change on its next API call. The keychain *is* the IPC; there is no separate state to keep in sync.
+
+Earlier versions of vdm stored saved profiles as plaintext `accounts/<name>.json` files. On first run, both the dashboard and `vdm` migrate any leftover JSON files into matching keychain entries (write keychain first, delete file only on success — interrupted migrations re-run cleanly).
 
 ### Proxy Resilience
 
@@ -213,7 +223,7 @@ node --test 'test/*.test.mjs'
 ./uninstall.sh
 ```
 
-Keychain credentials are not touched — Claude Code keeps working normally.
+The uninstaller stops the dashboard, removes the shell config block, deletes the install dir + symlink, and asks whether to **purge** or **keep** your saved `vdm-account-*` Keychain entries (default: keep — a future re-install picks them up automatically). Your active `Claude Code-credentials` entry is never touched, so Claude Code keeps working with whichever account was last active.
 
 ## License
 
