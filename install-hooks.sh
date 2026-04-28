@@ -58,7 +58,12 @@ _install_claude_code_hooks() {
     fi
     sleep 0.1
   done
-  trap 'rmdir "$lock_dir" 2>/dev/null' RETURN
+  # Capture $lock_dir at trap-set time (double quotes), not trap-fire
+  # time (single quotes). With single quotes the variable is read when
+  # the trap fires — which happens during function teardown when the
+  # `local` scope is being collapsed, and `set -u` in the caller turns
+  # the missing reference into an error.
+  trap "rmdir \"$lock_dir\" 2>/dev/null || true" RETURN
 
   # Gate flag for the high-frequency PostToolBatch subscription. The
   # dashboard's settings UI / vdm CLI toggles this flag file. Default:
@@ -311,7 +316,12 @@ _uninstall_claude_code_hooks() {
     fi
     sleep 0.1
   done
-  trap 'rmdir "$lock_dir" 2>/dev/null' RETURN
+  # Capture $lock_dir at trap-set time (double quotes), not trap-fire
+  # time (single quotes). With single quotes the variable is read when
+  # the trap fires — which happens during function teardown when the
+  # `local` scope is being collapsed, and `set -u` in the caller turns
+  # the missing reference into an error.
+  trap "rmdir \"$lock_dir\" 2>/dev/null || true" RETURN
 
   if ! python3 - "$settings_file" "$_VDM_PORT" <<'PYEOF'
 import json, os, sys

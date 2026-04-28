@@ -17,9 +17,75 @@ INSTALL_DIR="$HOME/.claude/account-switcher"
 # blanked mid-script when the accounts/ backup fails — see section 5).
 INSTALL_DIR_ORIG="$INSTALL_DIR"
 
+# ── Flag parsing ──
+# By default the script is interactive (4 prompts: main confirm, keychain
+# purge/keep, backup-file cleanup, LaunchAgent removal). The flags below
+# are the unattended path — useful for CI, scripted re-installs, and
+# "I just want this gone" workflows.
+NON_INTERACTIVE=false
+PURGE_KEYCHAIN=false  # default: keep saved vdm-account-* entries
+PURGE_BACKUPS=false   # default: keep .vdm-backup files
+REMOVE_LAUNCHAGENT=false  # default: keep any vdm-shaped LaunchAgent
+
+usage() {
+  cat <<'EOF'
+Usage: ./uninstall.sh [options]
+
+Options:
+  -y, --yes, --non-interactive
+      Run without prompting. Defaults are conservative — saved keychain
+      entries, backup files, and LaunchAgents are KEPT unless one of the
+      flags below is also set.
+
+  --purge-keychain
+      With --non-interactive, also delete every "vdm-account-*"
+      Keychain entry. Without this flag the entries are preserved so
+      a future re-install picks them up automatically.
+
+  --purge-backups
+      With --non-interactive, also delete the .vdm-backup files left
+      over from prior installs (settings.json.vdm-backup, the per-rc
+      .vdm-backup files, and orphan backups).
+
+  --remove-launchagent
+      With --non-interactive, unload + delete any vdm-shaped LaunchAgent
+      (~/Library/LaunchAgents/*claude*account*switcher*.plist or
+      *vdm*.plist).
+
+  -h, --help
+      Show this message.
+
+Without --non-interactive, the script asks each question on stdin and
+the above flags are ignored.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes|--non-interactive|--quiet)
+      NON_INTERACTIVE=true; shift ;;
+    --purge-keychain)
+      PURGE_KEYCHAIN=true; shift ;;
+    --purge-backups)
+      PURGE_BACKUPS=true; shift ;;
+    --remove-launchagent)
+      REMOVE_LAUNCHAGENT=true; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --) shift; break ;;
+    *)
+      echo "Unknown flag: $1" >&2
+      usage >&2
+      exit 2 ;;
+  esac
+done
+
 echo ""
 echo -e "${BOLD}  Claude Account Switcher  - Uninstaller${NC}"
 echo -e "  ──────────────────────────────────────────"
+if [[ "$NON_INTERACTIVE" == "true" ]]; then
+  echo -e "  ${DIM}(non-interactive mode — purge_keychain=$PURGE_KEYCHAIN, purge_backups=$PURGE_BACKUPS, remove_launchagent=$REMOVE_LAUNCHAGENT)${NC}"
+fi
 echo ""
 
 # ── Show what will be removed ──
@@ -63,12 +129,14 @@ fi
 # `read` in a stand-alone statement under `set -e` exits the script on
 # EOF (Ctrl-D / closed stdin). Wrap in `|| true` and force-cancel so the
 # user gets a friendly message instead of an abrupt errexit.
-confirm=""
-read -rp "  Continue? [y/N] " confirm || { echo ""; echo -e "  ${DIM}Cancelled.${NC}"; exit 0; }
-if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-  echo -e "  ${DIM}Cancelled.${NC}"
-  echo ""
-  exit 0
+if [[ "$NON_INTERACTIVE" != "true" ]]; then
+  confirm=""
+  read -rp "  Continue? [y/N] " confirm || { echo ""; echo -e "  ${DIM}Cancelled.${NC}"; exit 0; }
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo -e "  ${DIM}Cancelled.${NC}"
+    echo ""
+    exit 0
+  fi
 fi
 
 # Second, separate prompt for the saved-profiles question. Default is
@@ -76,22 +144,33 @@ fi
 # any other input (including bare `y`, blank, EOF) keeps them. This is
 # deliberately stricter than the main confirm so an autopilot-y user
 # can't lose all their saved logins by reflexively typing y/Enter.
+# In non-interactive mode the prompt is skipped — preserve_accounts is
+# driven by --purge-keychain instead.
 if [[ "$ACCT_COUNT" -gt 0 ]]; then
-  echo ""
-  echo -e "  ${BOLD}$ACCT_COUNT${NC} saved profile(s) live as ${CYAN}vdm-account-*${NC} entries in the macOS Keychain."
-  echo -e "  ${DIM}They hold OAuth access + refresh tokens. Keychain entries are encrypted at rest${NC}"
-  echo -e "  ${DIM}by macOS, but anything with the user's login keychain unlocked can read them.${NC}"
-  echo ""
-  echo -e "     ${BOLD}purge${NC}  delete the keychain entries (recommended on shared machines)"
-  echo -e "     ${BOLD}keep${NC}   leave them in the Keychain (so a re-install picks them up automatically)"
-  echo ""
-  purge_input=""
-  read -rp "  How should saved profiles be handled? [purge / keep] " purge_input || purge_input=""
-  if [[ "$purge_input" == "purge" ]]; then
-    preserve_accounts=false
-    echo -e "  ${YELLOW}!${NC} Saved keychain entries will be DELETED."
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    if [[ "$PURGE_KEYCHAIN" == "true" ]]; then
+      preserve_accounts=false
+      echo -e "  ${YELLOW}!${NC} Saved keychain entries will be DELETED (--purge-keychain)."
+    else
+      echo -e "  ${GREEN}✓${NC} Saved keychain entries will be kept (no --purge-keychain)."
+    fi
   else
-    echo -e "  ${GREEN}✓${NC} Saved keychain entries will be kept."
+    echo ""
+    echo -e "  ${BOLD}$ACCT_COUNT${NC} saved profile(s) live as ${CYAN}vdm-account-*${NC} entries in the macOS Keychain."
+    echo -e "  ${DIM}They hold OAuth access + refresh tokens. Keychain entries are encrypted at rest${NC}"
+    echo -e "  ${DIM}by macOS, but anything with the user's login keychain unlocked can read them.${NC}"
+    echo ""
+    echo -e "     ${BOLD}purge${NC}  delete the keychain entries (recommended on shared machines)"
+    echo -e "     ${BOLD}keep${NC}   leave them in the Keychain (so a re-install picks them up automatically)"
+    echo ""
+    purge_input=""
+    read -rp "  How should saved profiles be handled? [purge / keep] " purge_input || purge_input=""
+    if [[ "$purge_input" == "purge" ]]; then
+      preserve_accounts=false
+      echo -e "  ${YELLOW}!${NC} Saved keychain entries will be DELETED."
+    else
+      echo -e "  ${GREEN}✓${NC} Saved keychain entries will be kept."
+    fi
   fi
 fi
 
@@ -473,8 +552,12 @@ if (( ${#backup_candidates[@]} > 0 )); then
   for f in "${backup_candidates[@]}"; do echo -e "    ${DIM}$f${NC}"; done
   # Same EOF safety as the main confirm prompt — a closed stdin should
   # not crash the script just before the friendly footer.
-  rm_backups=""
-  read -rp "  Remove these backups? [y/N] " rm_backups || rm_backups=""
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    rm_backups="$([[ "$PURGE_BACKUPS" == "true" ]] && echo y || echo n)"
+  else
+    rm_backups=""
+    read -rp "  Remove these backups? [y/N] " rm_backups || rm_backups=""
+  fi
   if [[ "$rm_backups" == "y" || "$rm_backups" == "Y" ]]; then
     for f in "${backup_candidates[@]}"; do rm -f "$f" 2>/dev/null && echo -e "    ${GREEN}✓${NC} Removed $f" || true; done
   else
@@ -526,8 +609,16 @@ if (( ${#ORPHAN_BACKUPS_DIRS[@]} > 0 )); then
     echo -e "    ${DIM}$_bk${NC} ${DIM}(${_files} profile(s), ${_size})${NC}"
   done
   echo -e "  ${DIM}Each contains plaintext OAuth tokens.${NC}"
-  rm_old_bks=""
-  read -rp "  Delete these older backups too? [y/N] " rm_old_bks || rm_old_bks=""
+  # --purge-backups also deletes the orphan accounts-backup directories
+  # left over from prior interactive uninstalls. Without the flag, the
+  # non-interactive default is to keep them (they're user-data, not
+  # vdm-owned scaffolding).
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    rm_old_bks="$([[ "$PURGE_BACKUPS" == "true" ]] && echo y || echo n)"
+  else
+    rm_old_bks=""
+    read -rp "  Delete these older backups too? [y/N] " rm_old_bks || rm_old_bks=""
+  fi
   if [[ "$rm_old_bks" == "y" || "$rm_old_bks" == "Y" ]]; then
     for _bk in "${ORPHAN_BACKUPS_DIRS[@]}"; do
       rm -rf "$_bk" 2>/dev/null && echo -e "    ${GREEN}✓${NC} Removed $_bk" || true
@@ -543,8 +634,12 @@ if [[ -f "$LAUNCHAGENT_PLIST" ]]; then
   echo ""
   echo -e "  ${YELLOW}LaunchAgent detected:${NC}"
   echo -e "    ${DIM}$LAUNCHAGENT_PLIST${NC}"
-  rm_la=""
-  read -rp "  Unload + remove this LaunchAgent? [y/N] " rm_la || rm_la=""
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    rm_la="$([[ "$REMOVE_LAUNCHAGENT" == "true" ]] && echo y || echo n)"
+  else
+    rm_la=""
+    read -rp "  Unload + remove this LaunchAgent? [y/N] " rm_la || rm_la=""
+  fi
   if [[ "$rm_la" == "y" || "$rm_la" == "Y" ]]; then
     launchctl bootout "gui/$(id -u)" "$LAUNCHAGENT_PLIST" 2>/dev/null || true
     rm -f "$LAUNCHAGENT_PLIST" && echo -e "    ${GREEN}✓${NC} LaunchAgent removed" || true
