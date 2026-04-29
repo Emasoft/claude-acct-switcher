@@ -1851,6 +1851,123 @@ except Exception:
   done
 }
 
+cmd_prefs() {
+  # Per-account preferences (excludeFromAuto, priority).
+  # Usage:
+  #   vdm prefs                     - list all set prefs
+  #   vdm prefs <name>              - show prefs for one account
+  #   vdm prefs <name> exclude on   - set excludeFromAuto=true
+  #   vdm prefs <name> exclude off  - set excludeFromAuto=false
+  local subname="${1:-}"
+  local key="${2:-}"
+  local val="${3:-}"
+
+  # Dashboard must be running — these endpoints don't have a CLI fallback
+  # because the prefs file is owned by the dashboard process to avoid
+  # write conflicts.
+  if ! curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
+    echo -e "${RED}Dashboard is not running. Start it with: vdm dashboard${NC}"
+    return 1
+  fi
+
+  if [[ -z "$subname" ]]; then
+    # List mode
+    local resp
+    resp=$(curl -s --max-time 5 "http://localhost:$DASHBOARD_PORT/api/account-prefs")
+    if [[ -z "$resp" ]]; then
+      echo -e "${RED}Failed to fetch preferences${NC}"
+      return 1
+    fi
+    echo ""
+    echo -e "${BOLD}  Account preferences${NC}"
+    echo -e "  ────────────────────"
+    echo "$resp" | python3 -c '
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  prefs = d.get("prefs", {})
+  if not prefs:
+    print("  (no prefs set — every account participates in auto-switch)")
+  else:
+    for name, p in sorted(prefs.items()):
+      flags = []
+      if p.get("excludeFromAuto") is True: flags.append("excluded from auto-switch")
+      if isinstance(p.get("priority"), (int, float)) and p.get("priority"): flags.append(f"priority={p[\"priority\"]}")
+      print(f"  {name}: {\"; \".join(flags) or \"(empty)\"}")
+except Exception as e:
+  print(f"  (parse error: {e})")
+'
+    echo ""
+    return 0
+  fi
+
+  if [[ -z "$key" ]]; then
+    # Single-account view
+    local resp
+    resp=$(curl -s --max-time 5 "http://localhost:$DASHBOARD_PORT/api/account-prefs")
+    echo "$resp" | python3 -c '
+import sys, json
+name = sys.argv[1]
+try:
+  d = json.load(sys.stdin)
+  p = (d.get("prefs", {}) or {}).get(name) or {}
+  print(f"  {name}:")
+  print(f"    excludeFromAuto: {p.get(\"excludeFromAuto\", False)}")
+  print(f"    priority:        {p.get(\"priority\", 0)}")
+except Exception as e:
+  print(f"  (error: {e})")
+' "$subname"
+    return 0
+  fi
+
+  # Set mode
+  local api_key api_value
+  case "$key" in
+    exclude|excludefromauto)
+      api_key="excludeFromAuto"
+      case "$val" in
+        on|true|1|yes)  api_value="true" ;;
+        off|false|0|no) api_value="false" ;;
+        *) echo -e "${RED}value must be on/off${NC}"; return 1 ;;
+      esac
+      ;;
+    priority)
+      api_key="priority"
+      [[ -z "$val" ]] && { echo -e "${RED}priority requires a numeric value${NC}"; return 1; }
+      # Numeric validation in bash 3.2 — reject anything not a finite number.
+      if ! [[ "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        echo -e "${RED}priority must be a finite number${NC}"
+        return 1
+      fi
+      api_value="$val"
+      ;;
+    *)
+      echo -e "${RED}Unknown key: $key. Use 'exclude' or 'priority'.${NC}"
+      return 1
+      ;;
+  esac
+
+  local payload
+  payload=$(python3 -c "import json,sys; print(json.dumps({'name':sys.argv[1],'key':sys.argv[2],'value':json.loads(sys.argv[3])}))" "$subname" "$api_key" "$api_value" 2>/dev/null)
+  if [[ -z "$payload" ]]; then
+    echo -e "${RED}Failed to encode payload${NC}"
+    return 1
+  fi
+  local resp
+  resp=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -d "$payload" "http://localhost:$DASHBOARD_PORT/api/account-prefs")
+  echo "$resp" | python3 -c '
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  if d.get("ok"):
+    print("  ok")
+  else:
+    print(f"  failed: {d.get(\"error\", \"unknown\")}")
+except Exception:
+  print("  (no response)")
+'
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -1870,6 +1987,9 @@ cmd_help() {
   echo -e "    ${CYAN}logs${NC} [filter]            Stream live proxy logs"
   echo -e "    ${CYAN}tokens${NC} [options]        Show token usage (use --per-commit for"
   echo -e "                            per-branch + per-commit breakdown; --help for options)"
+  echo -e "    ${CYAN}prefs${NC} [name [exclude on|off]]"
+  echo -e "                            Show / set per-account preferences"
+  echo -e "                            (excludeFromAuto opts an account out of auto-switch)"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
@@ -1915,6 +2035,7 @@ case "$command" in
   dashboard) cmd_dashboard "$@" ;;
   logs|log) cmd_logs "$@" ;;
   tokens|tok) cmd_tokens "$@" ;;
+  prefs|pref) cmd_prefs "$@" ;;
   upgrade|update) cmd_upgrade ;;
   help|--help|-h) cmd_help ;;
   *)

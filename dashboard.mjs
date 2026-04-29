@@ -26,6 +26,12 @@ const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
 const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
 const SESSION_HISTORY_FILE = join(__dirname, 'session-history.json');
+// Per-account user preferences. Schema: { "<account-name>": { excludeFromAuto: bool, priority: number } }.
+// Atomic file (tmp + rename) like every other state file. Preferred over
+// per-account sidecar files because (a) prefs change rarely so a single
+// JSON read is cheaper than N stat calls, (b) it's natural to enumerate
+// "all accounts with prefs" without listdir.
+const ACCOUNT_PREFS_FILE = join(__dirname, 'account-prefs.json');
 // Phase C — date-range scrubber persistence. Kept next to the other state
 // files so it shares the same atomic-write contract and per-install scope.
 // Schema: { start: ms_epoch, end: ms_epoch, tierFilter: string[] }.
@@ -716,6 +722,70 @@ try {
   }
 } catch { sessionHistory = []; }
 
+// Per-account preferences.
+//   excludeFromAuto: true  → pickByStrategy / pickBestAccount / pickConserve
+//                            etc. all skip this account when picking the
+//                            next active. The user can still manually
+//                            switch to it via the dashboard or vdm CLI.
+//   priority:        number → reserved for future use; not yet honoured
+//                             by the picker.
+// File is loaded once at startup and held in memory; mutations go through
+// setAccountPref which atomically rewrites the whole map. Account names
+// in the keychain are restricted to [a-zA-Z0-9._@-] so JSON-key safety
+// is automatic.
+let _accountPrefs = {};
+try {
+  if (existsSync(ACCOUNT_PREFS_FILE)) {
+    const raw = JSON.parse(readFileSync(ACCOUNT_PREFS_FILE, 'utf8'));
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) _accountPrefs = raw;
+  }
+} catch { _accountPrefs = {}; }
+
+function getAccountPrefs(name) {
+  if (!name) return { excludeFromAuto: false };
+  const p = _accountPrefs[name] || {};
+  return {
+    excludeFromAuto: p.excludeFromAuto === true,
+    priority: typeof p.priority === 'number' ? p.priority : 0,
+  };
+}
+
+function setAccountPref(name, key, value) {
+  if (!name || typeof name !== 'string') throw new Error('setAccountPref: name required');
+  if (key !== 'excludeFromAuto' && key !== 'priority') {
+    throw new Error('setAccountPref: only excludeFromAuto and priority are settable');
+  }
+  // Validate value shape per key. Reject anything else with a clear
+  // error so callers can't accidentally persist garbage that breaks the
+  // picker filter.
+  if (key === 'excludeFromAuto' && typeof value !== 'boolean') {
+    throw new Error('excludeFromAuto must be a boolean');
+  }
+  if (key === 'priority' && (typeof value !== 'number' || !Number.isFinite(value))) {
+    throw new Error('priority must be a finite number');
+  }
+  if (!_accountPrefs[name]) _accountPrefs[name] = {};
+  _accountPrefs[name][key] = value;
+  // Drop empty prefs objects so the file doesn't accumulate cruft after
+  // a user un-toggles their last flag for a given account.
+  if (
+    (_accountPrefs[name].excludeFromAuto === false || _accountPrefs[name].excludeFromAuto == null) &&
+    (_accountPrefs[name].priority === 0           || _accountPrefs[name].priority           == null)
+  ) {
+    delete _accountPrefs[name];
+  }
+  try {
+    atomicWriteFileSync(ACCOUNT_PREFS_FILE, JSON.stringify(_accountPrefs, null, 2));
+  } catch (e) {
+    log('warn', `Failed to persist account-prefs.json: ${e.message}`);
+    throw e;
+  }
+  // Bust the loadAllAccountTokens cache so the next picker call sees
+  // the new excludeFromAuto flag immediately instead of waiting for
+  // the cache TTL.
+  invalidateAccountsCache();
+}
+
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
 // Per-process mutex for autoDiscoverAccount. Multiple proxy requests
@@ -1352,6 +1422,12 @@ async function handleAPI(req, res) {
       const resetAt7d = (p.rateLimits && p.rateLimits.sevenD && p.rateLimits.sevenD.reset) || 0;
       p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint, resetAt5h);
       p.minutesToLimit7d = weeklyHistory.predictMinutesToLimit(p.fingerprint, resetAt7d);
+      // Per-account preferences. The UI shows an "Exclude from auto" toggle
+      // on each card; the user can opt accounts out of rotation without
+      // removing them entirely.
+      const _prefs = getAccountPrefs(p.name);
+      p.excludeFromAuto = _prefs.excludeFromAuto;
+      p.priority        = _prefs.priority;
     }
     const stats = await loadStats();
     const probeStats = getProbeStats();
@@ -1519,6 +1595,47 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/activity' && req.method === 'GET') {
     json(res, { log: activityLog.slice(0, 100) });
+    return true;
+  }
+
+  // Per-account preferences. GET returns the full prefs map (small JSON,
+  // bounded by account count). POST validates {name, key, value} and
+  // persists. The picker layer reads these via getAccountPrefs() in
+  // loadAllAccountTokens, so a successful POST takes effect on the next
+  // pick (we also bust the accounts cache from setAccountPref).
+  if (url.pathname === '/api/account-prefs' && req.method === 'GET') {
+    json(res, { ok: true, prefs: _accountPrefs });
+    return true;
+  }
+  if (url.pathname === '/api/account-prefs' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      let data;
+      try { data = JSON.parse(body); }
+      catch { json(res, { ok: false, error: 'invalid JSON' }, 400); return true; }
+      const { name, key, value } = data || {};
+      if (!name || typeof name !== 'string') {
+        json(res, { ok: false, error: 'name required' }, 400);
+        return true;
+      }
+      // Same allowed-character set as the keychain service-name validator
+      // (vdmAccountServiceName) so we can't be tricked into mutating
+      // some unrelated key by smuggling slashes / null bytes / etc.
+      if (!/^[a-zA-Z0-9._@-]+$/.test(name) || name === 'index') {
+        json(res, { ok: false, error: 'invalid account name' }, 400);
+        return true;
+      }
+      try {
+        setAccountPref(name, key, value);
+      } catch (e) {
+        json(res, { ok: false, error: e.message }, 400);
+        return true;
+      }
+      logActivity('account-prefs-changed', `${name}: ${key}=${value}`);
+      json(res, { ok: true, prefs: _accountPrefs[name] || null });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
     return true;
   }
 
@@ -1758,7 +1875,11 @@ async function handleAPI(req, res) {
           commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
         } catch { /* not a git repo — keep sentinel `repo` */ }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
-        ensureLocalCommitHook(cwd);
+        // Fire-and-forget — async (file IO under the `_hookedRepoPaths`
+        // gate). Errors are logged inside the function; awaiting would
+        // serialise session-start handling behind disk latency for no
+        // user-visible benefit.
+        ensureLocalCommitHook(cwd).catch(e => log('warn', `ensureLocalCommitHook: ${e.message}`));
         log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);
       } else {
         // Re-read branch on subsequent prompts (handles worktree branch switches)
@@ -4662,6 +4783,38 @@ async function doRefresh(name, e) {
   } catch(e) { showToast('Failed to refresh'); }
 }
 
+// Per-account "Exclude from auto-switch" toggle handler. Posts to
+// /api/account-prefs and triggers an immediate refresh so the card
+// re-renders with the new state. We optimistically toast on success;
+// on failure we surface the server error and let the next refresh()
+// re-set the checkbox to the persisted value.
+async function doToggleExcludeFromAuto(name, checked) {
+  try {
+    const resp = await fetch('/api/account-prefs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, key: 'excludeFromAuto', value: !!checked })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast(checked ? 'Excluded ' + name + ' from auto-switch' : 'Included ' + name + ' in auto-switch');
+      // Bust the per-card cache so renderAccounts picks up the new
+      // class/badge on the next refresh tick instead of skipping the
+      // diff (the hash won't change because the toggle's checked
+      // attribute is part of the inner string — but force a re-render
+      // for instant visual feedback).
+      _renderedCardCache.clear();
+      setTimeout(refresh, 100);
+    } else {
+      showToast('Failed: ' + (data.error || 'unknown'));
+      setTimeout(refresh, 100);
+    }
+  } catch(e) {
+    showToast('Failed to update preferences');
+    setTimeout(refresh, 100);
+  }
+}
+
 function renderProbeStats(ps) {
   const el = document.getElementById('probe-stats');
   if (!ps || !ps.probeCount7d) { el.textContent = ''; return; }
@@ -4868,10 +5021,37 @@ const _sparkCache = {};
 // without us having to think about object-key ordering.
 function quickHash(obj) {
   if (!Array.isArray(obj)) return JSON.stringify(obj);
-  // FNV-1a 32-bit. Two independent accumulators ('low' and 'high') give
-  // a 64-bit-ish hash that's still fast — collisions on a single 32-bit
-  // hash for a 50k-row array would be roughly 1-in-100 by birthday
-  // bound, which is too lossy for "skip render" logic.
+  // Schema detection — quickHash is called on three different array
+  // shapes in this file:
+  //   (a) token-usage rows  — { ts, model, account, repo, branch,
+  //                             inputTokens, outputTokens, ... }
+  //   (b) profile rows      — { name, label, isActive, expiresAt,
+  //                             rateLimits, utilizationHistory, ... }
+  //   (c) activity log rows — { ts, type, account/from/to, ... }
+  // The token-usage fold (below) is much cheaper than JSON.stringify
+  // for a 50k-row array, but folds ZERO discriminating fields for
+  // shape (b) — every profile array would hash to the same value and
+  // renderAccounts would never re-fire. Detect shape from the first
+  // entry: if it has any token-usage marker field, use the fast fold;
+  // otherwise fall back to JSON.stringify which guarantees a unique
+  // canonical form regardless of shape.
+  if (obj.length === 0) return 'L0';
+  var sample = obj[0];
+  var isUsageShape = sample != null && typeof sample === 'object' && (
+    'inputTokens' in sample ||
+    'outputTokens' in sample ||
+    'cacheReadInputTokens' in sample ||
+    'cacheCreationInputTokens' in sample
+  );
+  if (!isUsageShape) {
+    // Profiles / activity log / unknown shape — JSON.stringify is
+    // bounded (small array sizes) and gives perfect change detection.
+    return JSON.stringify(obj);
+  }
+  // FNV-1a 32-bit, dual accumulator for a 64-bit-ish digest. Used for
+  // the token-usage hot path (5s polling on a potentially 50k-row
+  // array) where JSON.stringify allocated multi-MB strings just to
+  // compare against itself.
   var lo = 0x811c9dc5 | 0;
   var hi = 0xcbf29ce4 | 0;
   function fold(s) {
@@ -4892,10 +5072,6 @@ function quickHash(obj) {
       fold(e); fold('|');
       continue;
     }
-    // For row-shaped entries (token-usage / activity-log style) fold a
-    // stable, project-known set of fields. Anything outside the set is
-    // ignored — a per-row latency change in the tool field will not
-    // trigger a re-render but a token-count change WILL.
     fold(e.ts || e.timestamp || 0); fold('|');
     fold(e.model || '');            fold('|');
     fold(e.account || '');          fold('|');
@@ -5005,13 +5181,46 @@ async function refresh() {
   }
 }
 
+// Per-card hash cache for incremental DOM updates. The outer
+// _lastProfilesHash gate prevents calling renderAccounts when nothing
+// changed; THIS map prevents re-writing innerHTML for the unchanged
+// cards within a renderAccounts call when only one account's status
+// actually changed (e.g. one card's 5h utilization ticked from 78% to
+// 79% — the other 4 cards shouldn't get DOM-recreated). Hashing the
+// rendered HTML is the simplest correct check: if the HTML string
+// matches what we last wrote, the DOM doesn't need to change.
+var _renderedCardCache = new Map(); // safeName -> hash
+
+// Tiny string hash (djb2 variant) — sufficient to distinguish two
+// rendered card HTMLs of the same length but different content. Not
+// cryptographic; collision probability across 5-10 cards is negligible.
+function _cardHash(s) {
+  var h = 5381 | 0;
+  for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h.toString(36);
+}
+
+// Bash-safe-ish identifier for the DOM id attribute. The keychain
+// service-name spec already restricts account names to
+// [a-zA-Z0-9._@-], so they're already safe — we just escape for
+// extra defense in depth (the dashboard is local-only but the
+// principle of "never assume your data is HTML-safe" applies).
+function _safeIdForName(name) {
+  return String(name || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function renderAccounts(profiles, animate) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
     el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code  - accounts are auto-discovered.</div>';
+    _renderedCardCache.clear();
     return;
   }
-  el.innerHTML = profiles.map((p, i) => {
+  // Build per-card HTML and per-card hash. We also track the order
+  // so we can detect the cheap "nothing visible changed" case (same
+  // names, same hashes, same order) without rewriting innerHTML.
+  var newHashes = new Map();
+  var cardHtmls = profiles.map((p, i) => {
     const active = p.isActive;
     const displayName = p.label || p.name;
     const eName = p.name.replace(/'/g, "\\\\'");
@@ -5065,7 +5274,22 @@ function renderAccounts(profiles, animate) {
         staleMsg = '<div class="stale-msg">Token expired. Auto-refresh will retry shortly.</div>';
       }
     }
-    var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+    var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '') +
+      (p.excludeFromAuto ? ' excluded-from-auto' : '');
+    // Per-account "Exclude from auto-switch" toggle. Visible on every
+    // card (active OR inactive) because users may want to opt OUT the
+    // currently-active account too — the flag prevents AUTO selection
+    // but doesn't force a rotation now (the active account stays
+    // active until manually switched or rate-limited).
+    var excludedBadge = p.excludeFromAuto
+      ? '<span class="badge" style="background:var(--muted);color:var(--bg);font-size:0.65rem">excluded</span>'
+      : '';
+    var prefsHtml =
+      '<label class="acct-pref-toggle" style="display:flex;align-items:center;gap:0.4rem;font-size:0.75rem;color:var(--muted);margin-top:0.5rem;cursor:pointer">' +
+        '<input type="checkbox" onchange="doToggleExcludeFromAuto(\\''+eName+'\\',this.checked)"' +
+          (p.excludeFromAuto ? ' checked' : '') + ' />' +
+        'Exclude from auto-switch' +
+      '</label>';
     var buttonsHtml = '';
     if (!active) {
       buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
@@ -5073,7 +5297,8 @@ function renderAccounts(profiles, animate) {
         (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
       '</div>';
     }
-    return '<div class="' + cardClass + '"' + animStyle + '>' +
+    var safeId = 'acct-card-' + _safeIdForName(p.name);
+    var inner =
       '<div class="card-top">' +
         '<div class="card-identity">' +
           '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
@@ -5083,13 +5308,48 @@ function renderAccounts(profiles, animate) {
         '<div class="card-badges">' +
           planBadge(p.subscriptionType, p.rateLimitTier) +
           (active ? '<span class="badge badge-active">Active</span>' : '') +
+          excludedBadge +
         '</div>' +
       '</div>' +
       barsHtml +
       staleMsg +
-      buttonsHtml +
+      prefsHtml +
+      buttonsHtml;
+    var h = _cardHash(cardClass + '|' + animStyle + '|' + inner);
+    newHashes.set(p.name, h);
+    return '<div class="' + cardClass + '" id="' + safeId + '" data-card-hash="' + h + '"' + animStyle + '>' +
+      inner +
     '</div>';
-  }).join('');
+  });
+  // Decide between three render strategies:
+  //   (a) full innerHTML when the set/order of accounts changed (add /
+  //       remove / re-order — DOM tree shape changes);
+  //   (b) per-card outerHTML replacement for cards whose hash changed
+  //       (existing children's DOM identity preserved);
+  //   (c) skip everything when every card's hash matches the prior
+  //       render — no DOM mutation at all.
+  var prevNames = Array.from(_renderedCardCache.keys());
+  var sameOrder = prevNames.length === profiles.length &&
+    profiles.every(function(p, i) { return prevNames[i] === p.name; });
+  if (!sameOrder) {
+    el.innerHTML = cardHtmls.join('');
+  } else {
+    var anyChanged = false;
+    for (var pi = 0; pi < profiles.length; pi++) {
+      var pname = profiles[pi].name;
+      if (_renderedCardCache.get(pname) !== newHashes.get(pname)) {
+        anyChanged = true;
+        var cardEl = document.getElementById('acct-card-' + _safeIdForName(pname));
+        if (cardEl) cardEl.outerHTML = cardHtmls[pi];
+        else { // unexpected: fall back to full re-render
+          el.innerHTML = cardHtmls.join('');
+          break;
+        }
+      }
+    }
+    if (!anyChanged) { /* no DOM write needed — fastest path */ }
+  }
+  _renderedCardCache = newHashes;
 }
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -5508,15 +5768,33 @@ function applyTokenModelFilter() {
     if (pass(_tokPrevPeriodData[j])) prevData.push(_tokPrevPeriodData[j]);
   }
   _tokFilteredData = data;
+  // Filters update synchronously — they affect the dropdowns the user
+  // is actively interacting with, so any latency here is visible.
   populateTokenFilters(_tokensRawData);
-  renderTokenStats(data, prevData);
-  renderDailyChart(data);
-  renderCostSavingsChart();
-  renderModelBreakdown(data);
-  renderAccountBreakdown(data);
-  renderRepoBranchBreakdown(data);
-  renderToolBreakdown(data);
+  // Batch the seven chart/list renders into a single rAF callback so
+  // the browser performs ONE layout/paint per frame instead of seven
+  // back-to-back innerHTML reflows. requestAnimationFrame is also a
+  // natural debounce — fast scrubber drags or rapid model-filter
+  // changes coalesce into the next frame instead of redundantly
+  // re-rendering the chart on every change. Cancel any pending frame
+  // first so we don't render stale data/prevData after a faster
+  // re-call has already overwritten them.
+  if (_renderChartsRaf != null) {
+    cancelAnimationFrame(_renderChartsRaf);
+    _renderChartsRaf = null;
+  }
+  _renderChartsRaf = requestAnimationFrame(function() {
+    _renderChartsRaf = null;
+    renderTokenStats(data, prevData);
+    renderDailyChart(data);
+    renderCostSavingsChart();
+    renderModelBreakdown(data);
+    renderAccountBreakdown(data);
+    renderRepoBranchBreakdown(data);
+    renderToolBreakdown(data);
+  });
 }
+var _renderChartsRaf = null;
 
 function populateTokenFilters(data) {
   var repoSel = document.getElementById('tok-repo');
@@ -5533,7 +5811,8 @@ function populateTokenFilters(data) {
   // earlier had nothing to attach to (only the default "All ..." option
   // existed). When prev* are still empty AND we have a saved value, use
   // it; if data shows the saved value still exists in the new dataset
-  // it gets selected below by the `=== prev*` checks.
+  // it gets selected below by the equality checks against the prev*
+  // variables (prevRepo, prevBranch, prevModel, prevAccount).
   try {
     if (!prevRepo)    prevRepo    = localStorage.getItem('vdm.filter.tok-repo')    || '';
     if (!prevBranch)  prevBranch  = localStorage.getItem('vdm.filter.tok-branch')  || '';
@@ -7229,7 +7508,15 @@ function loadAllAccountTokens() {
         let label = '';
         try { label = readFileSync(join(ACCOUNTS_DIR, `${name}.label`), 'utf8').trim(); } catch {}
         const expiresAt = creds.claudeAiOauth?.expiresAt || 0;
-        accounts.push({ name, label, token, creds, expiresAt });
+        // Attach per-account user preferences. The picker layer in
+        // lib.mjs filters by `excludeFromAuto` when present so an
+        // opted-out account never gets selected by the rotation logic.
+        const prefs = getAccountPrefs(name);
+        accounts.push({
+          name, label, token, creds, expiresAt,
+          excludeFromAuto: prefs.excludeFromAuto,
+          priority: prefs.priority,
+        });
       } catch { /* skip corrupt */ }
     }
     _accountsCache = accounts;
@@ -8602,7 +8889,15 @@ setInterval(() => {
 const _hookedRepoPaths = new Set(); // avoid re-checking the same repo
 const _HOOKED_REPO_PATHS_MAX = 200; // hard cap — typical user has < 50 repos
 
-function ensureLocalCommitHook(cwd) {
+// Async because the IO ops (readFile / writeFile / mkdir / rename / chmod)
+// run on EVERY /api/session-start for every freshly-discovered repo. The
+// `_hookedRepoPaths.has` gate makes the work idempotent per resolvedLocal,
+// but the FIRST hit per repo used to block the event loop on
+// readFileSync(globalHookFile) + readFileSync(localHookFile) +
+// writeFileSync(localHookFile) — non-trivial on cold cache or NFS.
+// Caller is fire-and-forget (see line ~1761) so the absence of an `await`
+// doesn't lose any work; the function logs its own outcome via `log()`.
+async function ensureLocalCommitHook(cwd) {
   try {
     if (!settings.commitTokenUsage) return;
     // Check for local core.hooksPath override.
@@ -8653,24 +8948,37 @@ function ensureLocalCommitHook(cwd) {
     // If local == global, no problem
     if (resolvedLocal === globalHooksPath) return;
 
-    // Read the global hook content
+    // Read the global hook content. Async — this runs once per repo but
+    // sync IO on every session-start adds up across many repos.
     const globalHookFile = join(globalHooksPath, 'prepare-commit-msg');
-    if (!existsSync(globalHookFile)) return;
-    const globalHookContent = readFileSync(globalHookFile, 'utf8');
+    let globalHookContent;
+    try {
+      globalHookContent = await readFile(globalHookFile, 'utf8');
+    } catch { return; } // missing global hook is the common path — bail silently
     if (!globalHookContent.includes('vdm-token-usage')) return;
 
     // Check if local hook already has our marker
     const localHookFile = join(resolvedLocal, 'prepare-commit-msg');
-    if (existsSync(localHookFile)) {
-      const existing = readFileSync(localHookFile, 'utf8');
-      if (existing.includes('vdm-token-usage')) return; // already installed
-      // Back up existing hook
+    let existingLocal = null;
+    try { existingLocal = await readFile(localHookFile, 'utf8'); } catch { /* not present — that's fine */ }
+    if (existingLocal != null) {
+      if (existingLocal.includes('vdm-token-usage')) return; // already installed
+      // Back up existing hook (still sync — only fires once per repo)
       try { renameSync(localHookFile, localHookFile + '.vdm-original'); } catch {}
     }
 
-    // Copy global hook to local hooks dir
-    mkdirSync(resolvedLocal, { recursive: true });
-    writeFileSync(localHookFile, globalHookContent);
+    // Copy global hook to local hooks dir.
+    // mkdirSync stays sync — it's a single inode operation, finishes in
+    // microseconds even on slow disks. writeFile is async because the
+    // hook file can be 1-10KB and async lets the proxy keep serving
+    // requests while the write drains.
+    try { mkdirSync(resolvedLocal, { recursive: true }); } catch {}
+    try {
+      await writeFile(localHookFile, globalHookContent);
+    } catch (e) {
+      log('warn', `Failed to write local commit hook ${localHookFile}: ${e.message}`);
+      return;
+    }
     // chmod via execFileSync — argv[] form, no shell, no injection. The
     // previous shell-interpolated form was safe in practice (localHookFile
     // is composed from git config output) but this is defense-in-depth

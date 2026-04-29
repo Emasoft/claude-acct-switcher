@@ -2577,6 +2577,121 @@ describe('pickByStrategy — unknown strategy', () => {
 });
 
 // ─────────────────────────────────────────────────
+// Per-account excludeFromAuto preference — every auto-pick path must
+// honor the flag. Manual switches bypass these helpers entirely so
+// excluded accounts can still be reached via the dashboard / vdm CLI.
+// ─────────────────────────────────────────────────
+describe('pickBestAccount — excludeFromAuto', () => {
+  function _mkExcludedAccount(token, expiresAt = Date.now() + 86400000) {
+    return { name: token, token, expiresAt, excludeFromAuto: true };
+  }
+
+  it('skips accounts with excludeFromAuto=true', () => {
+    // a is the lowest-utilization (would normally win) but excluded.
+    const accounts = [_mkExcludedAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.1 },
+      b: { utilization5h: 0.5 },
+    });
+    const picked = pickBestAccount(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'b', 'a was excluded; should fall back to b');
+  });
+
+  it('returns null when ALL pickable accounts are excluded', () => {
+    const accounts = [_mkExcludedAccount('a'), _mkExcludedAccount('b')];
+    const sm = _mkStateManager({ a: {}, b: {} });
+    const picked = pickBestAccount(accounts, sm);
+    assert.equal(picked, null);
+  });
+
+  it('still respects excludeTokens AND excludeFromAuto together', () => {
+    const accounts = [_mkExcludedAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({ a: {}, b: {}, c: {} });
+    const picked = pickBestAccount(accounts, sm, new Set(['b']));
+    assert.ok(picked);
+    assert.equal(picked.token, 'c', 'a excluded by flag, b excluded by Set, c wins');
+  });
+});
+
+describe('pickConserve — excludeFromAuto', () => {
+  it('skips excluded accounts even if they have the highest 7d utilization', () => {
+    const accounts = [
+      { name: 'warm-but-excluded', token: 'warm', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'cool',              token: 'cool', expiresAt: Date.now() + 86400000 },
+    ];
+    const sm = _mkStateManager({
+      warm: { utilization5h: 0.1, utilization7d: 0.7 },
+      cool: { utilization5h: 0.0, utilization7d: 0.05 },
+    });
+    const picked = pickConserve(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'cool');
+  });
+});
+
+describe('pickDrainFirst — excludeFromAuto', () => {
+  it('skips excluded accounts even if they have the highest 5h utilization', () => {
+    const accounts = [
+      { name: 'drain-target', token: 'drain', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'fresh',        token: 'fresh', expiresAt: Date.now() + 86400000 },
+    ];
+    const sm = _mkStateManager({
+      drain: { utilization5h: 0.9 },
+      fresh: { utilization5h: 0.1 },
+    });
+    const picked = pickDrainFirst(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'fresh');
+  });
+});
+
+describe('pickAnyUntried — excludeFromAuto', () => {
+  it('skips excluded accounts in the last-resort fallback path', () => {
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'b', token: 'b', expiresAt: Date.now() + 86400000 },
+    ];
+    const picked = pickAnyUntried(accounts, new Set());
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('returns null when every untried account is excluded', () => {
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'b', token: 'b', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+    ];
+    assert.equal(pickAnyUntried(accounts, new Set()), null);
+  });
+});
+
+describe('pickByStrategy — excludeFromAuto end-to-end', () => {
+  it('every strategy path honours excludeFromAuto', () => {
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'b', token: 'b', expiresAt: Date.now() + 86400000 },
+    ];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.0, utilization7d: 0.0 },
+      b: { utilization5h: 0.5, utilization7d: 0.5 },
+    });
+    for (const strategy of ['conserve', 'spread', 'drain-first', 'round-robin']) {
+      const r = pickByStrategy({
+        strategy, intervalMin: 0,
+        currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+        now: Date.now() + 60_000_000, // far past any interval
+      });
+      // 'a' is excluded; result must never select 'a'. For strategies
+      // that DO rotate (spread / drain-first / round-robin once interval
+      // elapses), the picked account should be 'b'.
+      if (r.account) assert.notEqual(r.account.token, 'a',
+        `strategy=${strategy} returned excluded account`);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────
 // scoreAccountConserve — weekly dominates 5h tiebreaker (×100 / ×1).
 // Critical: with weekly window already active, conserve should
 // concentrate on it even when its 5h is HIGH (the whole point of
