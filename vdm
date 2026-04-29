@@ -926,6 +926,8 @@ cmd_config() {
     fi
     local delay=$(get_config_string "serializeDelayMs")
     echo -e "  serializeDelayMs:   ${delay:-200}"
+    local maxconc=$(get_config_string "serializeMaxConcurrent")
+    echo -e "  serializeMaxConcurrent: ${maxconc:-1}"
     local commit_tokens=$(get_config_value "commitTokenUsage")
     if [[ "$commit_tokens" == "True" ]]; then
       echo -e "  commitTokenUsage:   ${GREEN}on${NC}"
@@ -959,6 +961,7 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config interval 15|30|60|120${NC}"
     echo -e "  ${DIM}  vdm config serialize on|off${NC}"
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}"
+    echo -e "  ${DIM}  vdm config serialize-max-concurrent <1-16>${NC}"
     echo -e "  ${DIM}  vdm config commit-tokens on|off${NC}"
     echo -e "  ${DIM}  vdm config session-monitor on|off${NC}"
     echo -e "  ${DIM}  vdm config per-tool-attribution on|off${NC}"
@@ -978,6 +981,7 @@ cmd_config() {
     interval|rotationIntervalMin)         key="rotationIntervalMin"; is_bool=false ;;
     serialize|serializeRequests|serialize-requests) key="serializeRequests" ;;
     serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
+    serialize-max-concurrent|serializeMaxConcurrent|serialize-max|max-concurrent) key="serializeMaxConcurrent"; is_bool=false ;;
     commit-tokens|commitTokenUsage|commit-token-usage) key="commitTokenUsage" ;;
     # Phase J/K — keys previously settable only via the dashboard UI.
     session-monitor|sessionMonitor)       key="sessionMonitor" ;;
@@ -988,7 +992,7 @@ cmd_config() {
     activity-max-entries|activityMaxEntries) key="activityMaxEntries"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, commit-tokens, session-monitor, per-tool-attribution, token-usage-max-age, token-usage-max-entries, activity-max-entries"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, serialize-max-concurrent, commit-tokens, session-monitor, per-tool-attribution, token-usage-max-age, token-usage-max-entries, activity-max-entries"
       return 1
       ;;
   esac
@@ -1051,6 +1055,13 @@ cmd_config() {
     esac
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} ms${NC}"
+  elif [[ "$key" == "serializeMaxConcurrent" ]]; then
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 16 ]]; then
+      echo -e "${RED}Invalid value: $value${NC}  (must be an integer between 1 and 16)"
+      return 1
+    fi
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}"
   elif [[ "$key" == "tokenUsageMaxAgeDays" ]]; then
     if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 365 ]]; then
       echo -e "${RED}Invalid value: $value${NC}  (must be an integer between 1 and 365)"

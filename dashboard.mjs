@@ -8426,10 +8426,16 @@ const _serializationQueue = createSerializationQueue({
 
 function getQueueStats() {
   const s = _serializationQueue.getStats();
+  // Only report maxConcurrent when serialization is actually enabled.
+  // When disabled, every request bypasses the cap, so reporting one
+  // would be misleading — the inflight count is uncapped in that mode.
+  const cap = settings.serializeRequests
+    ? Math.max(1, settings.serializeMaxConcurrent | 0 || 1)
+    : null;
   return {
     inflight: s.inflight,
     queued: s.queued,
-    maxConcurrent: Math.max(1, settings.serializeMaxConcurrent | 0 || 1),
+    maxConcurrent: cap,
     accountSlots: getAccountSlotStats(),
   };
 }

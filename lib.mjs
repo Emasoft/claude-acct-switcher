@@ -1739,15 +1739,15 @@ export function parseOtlpMetrics(payload) {
 //
 // What it fixes (the bug that motivated this factory):
 //   The previous module-level implementation in dashboard.mjs had an
-//   `if (_inflightCount === 0) <bypass-queue>` early-return. Under
-//   sustained load (15+ concurrent CC clients), every time the queue's
-//   200ms dispatch timer was waiting to fire, a fresh request whose
-//   _inflightCount was momentarily 0 would bypass the queue entirely.
-//   The queue then dispatched its own pending entry on top, producing
+//   `if (inflight === 0) <bypass-queue>` early-return. Under sustained
+//   load (15+ concurrent CC clients), every time the queue's 200ms
+//   dispatch timer was waiting to fire, a fresh request whose inflight
+//   counter was momentarily 0 would bypass the queue entirely. The
+//   queue then dispatched its own pending entry on top, producing
 //   inflight counts of 18+ even though the user had configured strict
-//   serialization. This factory removes the bypass: when enabled, every
-//   request goes through the queue and inflight is HARD-CAPPED at
-//   getMaxConcurrent().
+//   serialization. This factory removes the bypass: when enabled,
+//   every request goes through the queue and inflight is HARD-CAPPED
+//   at getMaxConcurrent().
 //
 // Semantics:
 //   - getEnabled() === false: every call bypasses the queue (free for all).
@@ -1796,12 +1796,18 @@ export function createSerializationQueue(opts = {}) {
       const entry = queue.shift();
       if (!entry) return;
       clearTimeout(entry.timeoutHandle);
+      entry.dispatched = true;
       inflight++;
       lastDispatchAt = now();
-      Promise.resolve(entry.run()).finally(() => {
-        inflight--;
-        _maybeDispatch();
-      });
+      // Promise.resolve().then(...) wraps the run call so a fn() that
+      // throws synchronously (non-async function) becomes a rejection
+      // instead of an exception propagating out of the timer callback.
+      Promise.resolve()
+        .then(() => entry.run())
+        .finally(() => {
+          inflight--;
+          _maybeDispatch();
+        });
       // If headroom remains (cap > 1) and queue still has work, fire
       // the next one too — but route through _maybeDispatch so the
       // delay between successive dispatches is still honored.
@@ -1822,10 +1828,19 @@ export function createSerializationQueue(opts = {}) {
     }
     return new Promise((resolve, reject) => {
       const entry = {
-        run: () => fn().then(resolve, reject),
+        // Wrap fn in Promise.resolve().then(...) so a synchronous throw
+        // from a non-async fn becomes a rejection routed through the
+        // outer Promise, rather than throwing out of the dispatcher.
+        run: () => Promise.resolve().then(fn).then(resolve, reject),
         timeoutHandle: null,
+        dispatched: false,
       };
       entry.timeoutHandle = setTimeout(() => {
+        // Guard against the dispatcher having shifted+dispatched this
+        // entry between the timer firing and our callback running.
+        // Without this, a queued entry that JUST started executing
+        // could be rejected with queue_timeout while still running.
+        if (entry.dispatched) return;
         const idx = queue.indexOf(entry);
         if (idx !== -1) queue.splice(idx, 1);
         reject(new Error('queue_timeout'));
@@ -1844,12 +1859,15 @@ export function createSerializationQueue(opts = {}) {
     while (queue.length > 0) {
       const entry = queue.shift();
       clearTimeout(entry.timeoutHandle);
+      entry.dispatched = true;
       inflight++;
       lastDispatchAt = now();
-      Promise.resolve(entry.run()).finally(() => {
-        inflight--;
-        _maybeDispatch();
-      });
+      Promise.resolve()
+        .then(() => entry.run())
+        .finally(() => {
+          inflight--;
+          _maybeDispatch();
+        });
     }
   }
 

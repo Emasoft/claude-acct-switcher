@@ -3429,8 +3429,51 @@ describe('createSerializationQueue — getStats', () => {
     assert.equal(stats.queued, 2, 'two should be queued');
     release();
     await Promise.all([a, b, c]);
+    // The dispatcher's .finally (which decrements inflight) runs in a
+    // microtask chain that resolves AFTER the outer Promise the caller
+    // is awaiting. Drain the loop before asserting on inflight.
+    await _flush();
     assert.equal(q.getStats().inflight, 0);
     assert.equal(q.getStats().queued, 0);
+  });
+});
+
+describe('createSerializationQueue — sync-throw safety', () => {
+  it('a fn that throws synchronously becomes a rejection (queued path)', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    // First call occupies the slot so the second one MUST queue.
+    let release;
+    const blocker = new Promise(r => { release = r; });
+    const a = q.acquire(() => blocker);
+    // Second call has a non-async fn that throws synchronously when invoked.
+    const b = q.acquire(() => { throw new Error('boom'); });
+    release();
+    let bErr = null;
+    try { await b; } catch (e) { bErr = e; }
+    assert.ok(bErr && bErr.message === 'boom',
+      `expected the sync throw to surface as rejection, got ${bErr && bErr.message}`);
+    await a;
+    await _flush();
+    assert.equal(q.getStats().inflight, 0, 'sync-throw must still decrement inflight');
+  });
+
+  it('a fn that throws synchronously becomes a rejection (bypass path)', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => false, // bypass
+    });
+    const a = q.acquire(() => { throw new Error('boom'); });
+    let aErr = null;
+    try { await a; } catch (e) { aErr = e; }
+    assert.ok(aErr && aErr.message === 'boom',
+      `expected sync throw via bypass to reject, got ${aErr && aErr.message}`);
+    await _flush();
+    assert.equal(q.getStats().inflight, 0, 'bypass sync-throw must still decrement inflight');
   });
 });
 
