@@ -1428,9 +1428,27 @@ cmd_tokens() {
   # Auto-detect repo from cwd. Match the dashboard's storage key by using
   # `--git-common-dir` (worktree-aware: returns the main repo root) instead
   # of `--show-toplevel` (returns the worktree directory).
+  #
+  # NOTE — pipeline-status bug fix: `git rev-parse … | sed …` returns sed's
+  # exit code, NOT git's. When `git rev-parse` fails (we're not in a git
+  # repo) it exits non-zero AND emits nothing on stdout; sed reads the empty
+  # stream, processes zero lines, exits 0. So the previous one-liner
+  # silently set `repo=""` and the `||` fallback to `--show-toplevel` was
+  # NEVER reached. Worse: `set -o pipefail` is bash-only and not portable
+  # back to stock /bin/sh, so we can't just toggle it. The correct fix is
+  # to capture the raw rev-parse output, branch on its exit code, and only
+  # then do the trailing-`/.git` cleanup with bash parameter expansion.
   if [[ -z "$repo" ]]; then
-    repo=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git/*$||') ||
-      repo=$(git rev-parse --show-toplevel 2>/dev/null) || true
+    local _repo_raw
+    if _repo_raw=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+      # Strip trailing `/.git` (or `/.git/`) — happens when --git-common-dir
+      # points at the .git directory of the main checkout. Use bash regex
+      # match so we don't fork sed unnecessarily on every cmd_tokens call.
+      repo="${_repo_raw%/.git}"
+      repo="${repo%/.git/}"
+    else
+      repo=$(git rev-parse --show-toplevel 2>/dev/null) || repo=""
+    fi
   fi
 
   local since=$(( ($(date +%s) - days * 86400) * 1000 ))
@@ -1784,6 +1802,16 @@ cmd_logs() {
   # so the printer cannot accidentally interpret a `{...}` substring inside
   # `line` as a format-spec on Python builds where future PEP changes
   # alter f-string parsing.
+  #
+  # SIGINT handling — bash propagates Ctrl-C to every member of the
+  # foreground pipeline, so curl + the while-loop subshell + the per-line
+  # python3 child all see the signal simultaneously. The only thing that
+  # WASN'T being cleaned up is the terminal's color state when the user
+  # interrupted mid-line: an in-flight ANSI color code was emitted but
+  # the matching reset never followed. The EXIT trap below ensures the
+  # cursor is back to the default color regardless of how the function
+  # exits (Ctrl-C, dashboard close, EOF on stream).
+  trap 'printf "\033[0m"; trap - EXIT' EXIT
   curl -s -N "http://localhost:$DASHBOARD_PORT/api/logs/stream" 2>/dev/null | while IFS= read -r line; do
     # SSE format: "data: {...}"
     if [[ "$line" == data:* ]]; then

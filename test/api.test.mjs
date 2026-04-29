@@ -544,3 +544,176 @@ describe('PostToolBatch round-trip — gated', () => {
     assert.match(r.error, /session_id/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// OAuth refresh retry-loop integration test.
+//
+// Production code in dashboard.mjs implements callRefreshEndpoint with
+// REFRESH_MAX_RETRIES = 3 + exponential backoff for transient failures
+// (429 / 5xx / network errors), but stops immediately on 4xx (revoked).
+// The pure helpers in lib.mjs don't implement the retry loop themselves,
+// but parseRefreshResponse() returns a `retriable` field that the loop
+// uses to decide whether to back off and try again.
+//
+// This test simulates the full retry-loop pattern against the mock OAuth
+// server, asserting:
+//   1. transient failures trigger retry (429, 500)
+//   2. permanent failures bail immediately (400 invalid_grant)
+//   3. retry budget is respected (max attempts, no infinite loop)
+//   4. successful retry after transient failure produces fresh tokens
+// ─────────────────────────────────────────────────
+describe('OAuth refresh retry-loop simulation', () => {
+  let mockServer, mockUrl;
+  // Per-test counters keyed by refresh-token marker so each scenario
+  // can drive its own attempt sequence without race conditions.
+  let attempts;
+
+  before(async () => {
+    attempts = new Map();
+    const mock = await createMockOAuthServer((req, res) => {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        let payload = {};
+        try { payload = JSON.parse(body); } catch {}
+        const rt = payload.refresh_token || '';
+        const n = (attempts.get(rt) || 0) + 1;
+        attempts.set(rt, n);
+
+        // "transient-then-success-rt": fail twice (500 then 429), succeed
+        // on third attempt. Exercises the full retriable backoff path.
+        if (rt === 'transient-then-success-rt') {
+          if (n === 1) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal Server Error');
+          } else if (n === 2) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'rate_limited' }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              access_token: 'access-after-retry',
+              refresh_token: 'refresh-after-retry',
+              expires_in: 28800,
+            }));
+          }
+          return;
+        }
+
+        // "always-500-rt": exhausts the retry budget — caller must bail
+        // after MAX_RETRIES without crashing or hanging.
+        if (rt === 'always-500-rt') {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Internal Server Error');
+          return;
+        }
+
+        // "revoked-immediately-rt": permanent 400 — the retry loop must
+        // bail on the first attempt, NOT consume the full retry budget.
+        if (rt === 'revoked-immediately-rt') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'invalid_grant',
+            error_description: 'Refresh token has been revoked',
+          }));
+          return;
+        }
+
+        // Catch-all: invalid request
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid_grant' }));
+      });
+    });
+    mockServer = mock.server;
+    mockUrl = mock.url;
+  });
+
+  after(async () => {
+    if (mockServer) await closeServer(mockServer);
+  });
+
+  // Simulator helper — performs the same loop dashboard.mjs's
+  // callRefreshEndpoint does, but as a pure function for testing.
+  // Returns { ok, attempts, parsed, error }.
+  async function simulateRefreshLoop(refreshToken, maxRetries = 3, _backoffMs = (() => 1)) {
+    let lastParsed = null;
+    let lastError = null;
+    let attemptCount = 0;
+    for (let i = 0; i < maxRetries; i++) {
+      attemptCount++;
+      try {
+        const body = buildRefreshRequestBody(refreshToken);
+        const response = await fetch(`${mockUrl}/v1/oauth/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        });
+        const text = await response.text();
+        const parsed = parseRefreshResponse(response.status, text);
+        lastParsed = parsed;
+        if (parsed.ok) return { ok: true, attempts: attemptCount, parsed };
+        if (!parsed.retriable) return { ok: false, attempts: attemptCount, parsed };
+      } catch (e) {
+        lastError = e;
+        // Network errors are retriable — fall through to next iteration.
+      }
+      // Tiny delay so back-to-back fetches don't share a TCP connection
+      // (which would skew the mock server's per-test attempt counters).
+      // The backoff function is injectable so production code can plug
+      // in real exponential backoff while tests stay fast.
+      await new Promise(r => setTimeout(r, _backoffMs(i)));
+    }
+    return { ok: false, attempts: attemptCount, parsed: lastParsed, error: lastError };
+  }
+
+  it('retries transient failures and succeeds when the server recovers', async () => {
+    const result = await simulateRefreshLoop('transient-then-success-rt');
+    assert.equal(result.ok, true);
+    assert.equal(result.attempts, 3, 'should attempt 3 times: 500, 429, 200');
+    assert.equal(result.parsed.accessToken, 'access-after-retry');
+    assert.equal(result.parsed.refreshToken, 'refresh-after-retry');
+    assert.equal(attempts.get('transient-then-success-rt'), 3);
+  });
+
+  it('bails IMMEDIATELY on 400 invalid_grant — does NOT consume retry budget', async () => {
+    const result = await simulateRefreshLoop('revoked-immediately-rt');
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 1, 'invalid_grant must NOT retry');
+    assert.equal(result.parsed.ok, false);
+    assert.equal(result.parsed.retriable, false);
+    // parseRefreshResponse stores the human-readable error in `error`.
+    // For invalid_grant the mock sends error_description, which the
+    // parser surfaces verbatim — assert the string contains "revoked".
+    assert.match(result.parsed.error, /revoked/i);
+    assert.equal(attempts.get('revoked-immediately-rt'), 1);
+  });
+
+  it('exhausts retry budget on always-failing 500 without infinite loop', async () => {
+    const result = await simulateRefreshLoop('always-500-rt');
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 3, 'should attempt exactly maxRetries times');
+    assert.equal(result.parsed.ok, false);
+    assert.equal(result.parsed.retriable, true, '5xx is retriable');
+    assert.equal(attempts.get('always-500-rt'), 3);
+  });
+
+  it('respects custom maxRetries parameter (e.g. caller wants 1 attempt only)', async () => {
+    // Reset counter so the assertion below isn't tainted by previous tests.
+    attempts.set('always-500-rt', 0);
+    const result = await simulateRefreshLoop('always-500-rt', 1);
+    assert.equal(result.attempts, 1);
+    assert.equal(result.ok, false);
+  });
+
+  it('parseRefreshResponse classifies retriable vs non-retriable correctly', () => {
+    // Black-box check that the helper the loop relies on returns the
+    // right `retriable` flag for each status code class.
+    assert.equal(parseRefreshResponse(200, '{"access_token":"a","refresh_token":"b","expires_in":1}').ok, true);
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_grant"}').retriable, false);
+    assert.equal(parseRefreshResponse(401, '{"error":"unauthorized_client"}').retriable, false);
+    assert.equal(parseRefreshResponse(429, '{"error":"rate_limited"}').retriable, true);
+    assert.equal(parseRefreshResponse(500, 'oops').retriable, true);
+    assert.equal(parseRefreshResponse(502, 'oops').retriable, true);
+    assert.equal(parseRefreshResponse(503, 'oops').retriable, true);
+  });
+});

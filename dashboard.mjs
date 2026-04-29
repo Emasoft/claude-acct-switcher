@@ -4005,6 +4005,11 @@ function switchTab(id) {
   const url = new URL(location);
   url.searchParams.set('tab', id);
   history.replaceState(null, '', url);
+  // Persist to localStorage too, so closing & reopening the tab (which
+  // loses the URL query string) still restores the user's last view.
+  // URL param wins on initial load (it is an explicit request); when the
+  // URL has no ?tab= query, we fall back to this stored value.
+  try { localStorage.setItem('vdm.activeTab', id); } catch (e) { /* private mode / quota */ }
 }
 
 // ─────────────────────────────────────────────────
@@ -5357,6 +5362,18 @@ function populateTokenFilters(data) {
   var prevBranch = branchSel.value;
   var prevModel = modelSel.value;
   var prevAccount = accountSel ? accountSel.value : '';
+  // First-load restore from localStorage. The dropdowns are populated
+  // here for the FIRST time after data arrives, so the page-load restore
+  // earlier had nothing to attach to (only the default "All ..." option
+  // existed). When prev* are still empty AND we have a saved value, use
+  // it; if data shows the saved value still exists in the new dataset
+  // it gets selected below by the `=== prev*` checks.
+  try {
+    if (!prevRepo)    prevRepo    = localStorage.getItem('vdm.filter.tok-repo')    || '';
+    if (!prevBranch)  prevBranch  = localStorage.getItem('vdm.filter.tok-branch')  || '';
+    if (!prevModel)   prevModel   = localStorage.getItem('vdm.filter.tok-model')   || '';
+    if (!prevAccount) prevAccount = localStorage.getItem('vdm.filter.tok-account') || '';
+  } catch (e) { /* private mode / quota */ }
   var repoSet = {}, modelSet = {}, accountSet = {};
   for (var i = 0; i < data.length; i++) {
     if (data[i].repo) repoSet[data[i].repo] = 1;
@@ -5971,6 +5988,19 @@ function renderToolBreakdown(data) {
 }
 
 function tokFilterChange(which) {
+  // Persist the new filter value(s) to localStorage so a browser
+  // refresh / reopen retains the user's selection. We persist BEFORE
+  // the refresh/apply so even if the network call below fails, the
+  // next page load picks up the right filter state.
+  try {
+    const _ids = which === 'repo'
+      ? ['tok-repo', 'tok-branch']  // repo also resets branch  - persist both
+      : ['tok-' + which];
+    for (const id of _ids) {
+      const el = document.getElementById(id);
+      if (el) localStorage.setItem('vdm.filter.' + id, el.value || '');
+    }
+  } catch (e) { /* private mode / quota */ }
   if (which === 'repo') {
     var branchEl = document.getElementById('tok-branch');
     if (branchEl) branchEl.value = '';
@@ -6052,9 +6082,38 @@ setInterval(tickCountdowns, 1000);
 // Phase C: poll data-range / tier map every 10 s so the scrubber tracks
 // fresh data points and newly-discovered accounts without a reload.
 setInterval(vsRefreshDataRange, 10000);
-// Restore tab from URL query param
-const _initTab = new URLSearchParams(location.search).get('tab');
+// Restore tab from URL query param, falling back to localStorage so a
+// freshly-opened browser tab (no ?tab= in URL) still lands on the user's
+// last-viewed view. URL wins because users explicitly bookmark + share
+// links with ?tab=NAME and that should take precedence.
+let _initTab = new URLSearchParams(location.search).get('tab');
+if (!_initTab) {
+  try { _initTab = localStorage.getItem('vdm.activeTab'); } catch (e) { _initTab = null; }
+}
 if (_initTab && document.getElementById('tab-' + _initTab)) switchTab(_initTab);
+
+// Restore Token-Usage filters from localStorage on page load. Each
+// filter is stored independently so we can grow this set without
+// versioning. We restore BEFORE the first refreshTokens() so the
+// initial fetch reflects the user's previous filter selection rather
+// than the defaults.
+try {
+  const _tokFilterKeys = ['tok-repo', 'tok-branch', 'tok-model', 'tok-account', 'tok-time'];
+  for (const k of _tokFilterKeys) {
+    const v = localStorage.getItem('vdm.filter.' + k);
+    if (v == null) continue;
+    const el = document.getElementById(k);
+    if (!el) continue;
+    // Only restore if the stored value still corresponds to a real option
+    // — otherwise an old filter (e.g. a deleted repo) would leave the
+    // dropdown stuck on a value that produces an empty result set.
+    let valid = false;
+    for (let i = 0; i < el.options.length; i++) {
+      if (el.options[i].value === v) { valid = true; break; }
+    }
+    if (valid) el.value = v;
+  }
+} catch (e) { /* private mode / quota / DOM not ready */ }
 
 // ── Log stream ──
 let _logES = null;
@@ -8223,6 +8282,36 @@ function updateSessionTimeline(bodyObj, acctName, usage) {
   }, 10000);
 }
 
+// Same debounce pattern used for token-usage.json: don't fsync the entire
+// (potentially N-MB pretty-printed) session-history.json on every session
+// completion. The 30s sweeper bursts can complete dozens of sessions
+// in milliseconds and each unsynced write blocks the event loop. Coalesce
+// into one disk write per ~750 ms.
+let _sessionHistoryDirty = false;
+let _sessionHistoryFlushTimer = null;
+const SESSION_HISTORY_FLUSH_MS = 750;
+
+function _flushSessionHistory() {
+  _sessionHistoryFlushTimer = null;
+  if (!_sessionHistoryDirty) return;
+  _sessionHistoryDirty = false;
+  try {
+    atomicWriteFileSync(SESSION_HISTORY_FILE, JSON.stringify(sessionHistory, null, 2));
+  } catch (e) {
+    log('warn', `Failed to write session-history.json: ${e.message}`);
+    // Re-arm so the next completion retries the write.
+    _sessionHistoryDirty = true;
+  }
+}
+
+function flushSessionHistorySync() {
+  if (_sessionHistoryFlushTimer) {
+    clearTimeout(_sessionHistoryFlushTimer);
+    _sessionHistoryFlushTimer = null;
+  }
+  _flushSessionHistory();
+}
+
 function persistCompletedSession(session) {
   if (!session) return;
   session.status = 'completed';
@@ -8243,7 +8332,13 @@ function persistCompletedSession(session) {
     duration: session.completedAt - session.startedAt,
   });
   if (sessionHistory.length > SESSION_HISTORY_MAX) sessionHistory.length = SESSION_HISTORY_MAX;
-  try { atomicWriteFileSync(SESSION_HISTORY_FILE, JSON.stringify(sessionHistory, null, 2)); } catch {}
+  // Mark dirty + arm the debounce timer. The previous synchronous write
+  // was a 50ms+ event-loop block on every session completion under load.
+  _sessionHistoryDirty = true;
+  if (!_sessionHistoryFlushTimer) {
+    _sessionHistoryFlushTimer = setTimeout(_flushSessionHistory, SESSION_HISTORY_FLUSH_MS);
+    _sessionHistoryFlushTimer.unref?.();
+  }
 }
 
 function getFileConflicts() {
@@ -9950,11 +10045,15 @@ function shutdown(signal) {
   // claims persisted above + any backlog from the last 500 ms make it
   // to disk before we close the listeners.
   try { flushTokenUsageSync(); } catch {}
-  // (2) Persist active monitored sessions.
+  // (2) Persist active monitored sessions. Each call now arms the
+  // debounce timer instead of writing immediately, so we MUST drain
+  // the timer at the end with flushSessionHistorySync — otherwise the
+  // active-session snapshot is lost on shutdown.
   for (const [id, session] of monitoredSessions) {
     try { persistCompletedSession(session); } catch {}
     monitoredSessions.delete(id);
   }
+  try { flushSessionHistorySync(); } catch {}
   // (3) Graceful shutdown: stop accepting new connections, then wait
   // for in-flight SSE subscribers and proxy streams to drain BEFORE
   // we kill the process. Previously we called process.exit(0)
