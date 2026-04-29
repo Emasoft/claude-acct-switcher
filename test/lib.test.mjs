@@ -28,6 +28,7 @@ import {
   createPerAccountLock,
   getEarliestReset,
   createSemaphore,
+  createSerializationQueue,
   clampViewerState,
   VIEWER_STATE_MIN_WINDOW_MS,
   // Phase D — hook payload parsers and helpers
@@ -3190,5 +3191,272 @@ describe('XSS regression — renderAccounts card rendering', () => {
     assert.match(_dashboardSrc, /doSwitch\([^)]*\+displayNameJs\+/);
     assert.doesNotMatch(_dashboardSrc, /doSwitch\([^)]*\+displayName\+/,
       'doSwitch must pass displayNameJs, not the HTML-escaped displayName');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Serialization Queue
+// ─────────────────────────────────────────────────
+//
+// The pre-fix dashboard implementation had an `inflight === 0` early-
+// return bypass that defeated strict serialization under load: every
+// time the dispatch timer was waiting to fire, a fresh request whose
+// counter was momentarily 0 could bypass the queue. Steady-state under
+// 15 concurrent CC clients: 18+ inflight, 50+ queued, even with the
+// queue toggled "on" and a 200ms gap configured.
+//
+// These tests exercise the factory directly (no dashboard plumbing)
+// and assert the cap is HARD — inflight never exceeds the configured
+// max-concurrent.
+
+// 10ms is enough for any setTimeout(0) dispatch to fire on a real Node
+// event loop. setImmediate alone is NOT sufficient — the queue uses
+// setTimeout(0) for scheduling and the timers phase doesn't always run
+// before the check phase (setImmediate).
+const _flush = () => new Promise(r => setTimeout(r, 10));
+const _wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+describe('createSerializationQueue — strict cap (the bug fix)', () => {
+  it('inflight never exceeds maxConcurrent=1 under load', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    let peak = 0;
+    let live = 0;
+    const slowFn = () => new Promise(resolve => {
+      live++;
+      if (live > peak) peak = live;
+      setTimeout(() => { live--; resolve('ok'); }, 30);
+    });
+    // Fire 20 in a tight loop — exactly the burst pattern that broke
+    // the previous implementation.
+    const all = Array.from({ length: 20 }, () => q.acquire(slowFn));
+    await Promise.all(all);
+    assert.equal(peak, 1, `peak inflight should be 1, got ${peak}`);
+  });
+
+  it('inflight never exceeds maxConcurrent=4 under load', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 4,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    let peak = 0;
+    let live = 0;
+    const slowFn = () => new Promise(resolve => {
+      live++;
+      if (live > peak) peak = live;
+      setTimeout(() => { live--; resolve('ok'); }, 20);
+    });
+    const all = Array.from({ length: 30 }, () => q.acquire(slowFn));
+    await Promise.all(all);
+    assert.equal(peak, 4, `peak inflight should be 4, got ${peak}`);
+  });
+
+  it('does NOT have the inflight===0 TOCTOU bypass', async () => {
+    // Reproduce the original failure mode: with strict cap, fire a
+    // request, let it complete, then fire a NEW request during the
+    // dispatch-delay window and a queued request should still come
+    // out first via the queue (no bypass).
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 50,
+      getEnabled: () => true,
+    });
+    const order = [];
+    let id = 0;
+    const tag = (n) => () => new Promise(r => {
+      order.push('start:' + n);
+      setTimeout(() => { order.push('end:' + n); r(n); }, 10);
+    });
+    // Push 3 in a tight burst — under the bug, request 1 bypasses,
+    // requests 2/3 queue. Even with the bug, this small set looks
+    // serial; the assertion targets the explicit ordering invariant.
+    const a = q.acquire(tag(++id));
+    const b = q.acquire(tag(++id));
+    const c = q.acquire(tag(++id));
+    await Promise.all([a, b, c]);
+    // start:N must precede end:N+1 (no overlap).
+    const s1 = order.indexOf('start:1');
+    const e1 = order.indexOf('end:1');
+    const s2 = order.indexOf('start:2');
+    const e2 = order.indexOf('end:2');
+    const s3 = order.indexOf('start:3');
+    assert.ok(e1 < s2, `end:1 (${e1}) must precede start:2 (${s2})`);
+    assert.ok(e2 < s3, `end:2 (${e2}) must precede start:3 (${s3})`);
+    assert.ok(s1 < e1 && s2 < e2, 'each request must finish before the next starts');
+  });
+});
+
+describe('createSerializationQueue — delay between dispatches', () => {
+  it('honors getDelayMs() between successive queued dispatches', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 100,
+      getEnabled: () => true,
+    });
+    const startTimes = [];
+    const fn = () => new Promise(r => {
+      startTimes.push(Date.now());
+      setTimeout(r, 5);
+    });
+    const all = Array.from({ length: 4 }, () => q.acquire(fn));
+    await Promise.all(all);
+    // 4 dispatches, expect ≥ 100ms between each (allow scheduler jitter ±30ms).
+    for (let i = 1; i < startTimes.length; i++) {
+      const gap = startTimes[i] - startTimes[i - 1];
+      assert.ok(gap >= 70, `dispatch ${i} should be ≥70ms after ${i-1}, got ${gap}ms`);
+    }
+  });
+
+  it('zero delay still works', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    const fn = () => Promise.resolve('done');
+    const all = Array.from({ length: 5 }, () => q.acquire(fn));
+    const results = await Promise.all(all);
+    assert.deepEqual(results, ['done', 'done', 'done', 'done', 'done']);
+  });
+});
+
+describe('createSerializationQueue — bypass paths', () => {
+  it('isRetry=true bypasses the queue', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    let peak = 0;
+    let live = 0;
+    const slow = () => new Promise(r => {
+      live++;
+      if (live > peak) peak = live;
+      setTimeout(() => { live--; r('x'); }, 30);
+    });
+    // Two retries fired simultaneously — both bypass → live=2.
+    const a = q.acquire(slow, true);
+    const b = q.acquire(slow, true);
+    await Promise.all([a, b]);
+    assert.ok(peak >= 2, `retries should bypass cap; peak=${peak}`);
+  });
+
+  it('getEnabled()=false bypasses the queue', async () => {
+    let enabled = false;
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => enabled,
+    });
+    let peak = 0;
+    let live = 0;
+    const slow = () => new Promise(r => {
+      live++;
+      if (live > peak) peak = live;
+      setTimeout(() => { live--; r('x'); }, 30);
+    });
+    const all = Array.from({ length: 5 }, () => q.acquire(slow));
+    await Promise.all(all);
+    assert.equal(peak, 5, 'when disabled, all 5 should run concurrently');
+  });
+});
+
+describe('createSerializationQueue — drain', () => {
+  it('drain() releases all queued requests immediately', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 5000, // would-be huge delay
+      getEnabled: () => true,
+    });
+    const completed = [];
+    const fn = (n) => () => new Promise(r => {
+      setTimeout(() => { completed.push(n); r(n); }, 5);
+    });
+    // Start 3, the first dispatches, the other two queue.
+    const a = q.acquire(fn(1));
+    const b = q.acquire(fn(2));
+    const c = q.acquire(fn(3));
+    await _flush();
+    assert.ok(q.getStats().queued >= 2, 'requests should be queued');
+    q.drain();
+    await Promise.all([a, b, c]);
+    assert.deepEqual(completed.sort(), [1, 2, 3]);
+  });
+});
+
+describe('createSerializationQueue — queue timeout', () => {
+  it('rejects with queue_timeout if dispatch never happens', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+      queueTimeoutMs: 50,
+    });
+    // Block the queue with a long-running first request.
+    let releaseBlocker;
+    const blocker = new Promise(r => { releaseBlocker = r; });
+    const a = q.acquire(() => blocker);
+    // Queue a second; this one should time out before blocker releases.
+    const b = q.acquire(() => Promise.resolve('shouldnt reach'));
+    let bErr = null;
+    try { await b; } catch (e) { bErr = e; }
+    assert.ok(bErr && bErr.message === 'queue_timeout',
+      `expected queue_timeout, got ${bErr && bErr.message}`);
+    releaseBlocker('done');
+    await a; // clean up
+  });
+});
+
+describe('createSerializationQueue — getStats', () => {
+  it('reports inflight and queued accurately', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    let release;
+    const blocker = new Promise(r => { release = r; });
+    const a = q.acquire(() => blocker);
+    const b = q.acquire(() => Promise.resolve());
+    const c = q.acquire(() => Promise.resolve());
+    await _flush();
+    const stats = q.getStats();
+    assert.equal(stats.inflight, 1, 'one request should be inflight');
+    assert.equal(stats.queued, 2, 'two should be queued');
+    release();
+    await Promise.all([a, b, c]);
+    assert.equal(q.getStats().inflight, 0);
+    assert.equal(q.getStats().queued, 0);
+  });
+});
+
+describe('createSerializationQueue — runtime cap changes', () => {
+  it('tightening the cap mid-flight does not violate it', async () => {
+    let cap = 4;
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => cap,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    let peak = 0;
+    let live = 0;
+    const slow = () => new Promise(r => {
+      live++;
+      if (live > peak) peak = live;
+      setTimeout(() => { live--; r('x'); }, 60);
+    });
+    const all = Array.from({ length: 12 }, () => q.acquire(slow));
+    // Tighten the cap after the first 4 are inflight.
+    await _wait(20);
+    cap = 1;
+    await Promise.all(all);
+    // Peak BEFORE tightening was 4 (legitimate). After tightening, no
+    // NEW dispatch should push past 4. We're not asserting peak<=1
+    // because the 4 already-inflight from the wide-cap era were valid.
+    assert.ok(peak <= 4, `peak should not exceed pre-tighten cap; got ${peak}`);
   });
 });

@@ -114,6 +114,11 @@ const DEFAULT_SETTINGS = {
   notifications: true,
   serializeRequests: false,
   serializeDelayMs: 200,
+  // Hard cap on concurrent in-flight requests when serialization is on.
+  // Default 1 = strict serialization (the bug-fix-justified default for
+  // users running many CC clients on a single bearer token). Settable
+  // 1..16 via /api/settings — users with many accounts can dial up.
+  serializeMaxConcurrent: 1,
   commitTokenUsage: false,
   sessionMonitor: false,
   // Phase D — gate per-tool attribution behind a setting. When false, the
@@ -533,6 +538,7 @@ import {
   shouldRefreshToken,
   createPerAccountLock,
   createSemaphore,
+  createSerializationQueue,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
   clampViewerState,
@@ -1785,6 +1791,9 @@ async function handleAPI(req, res) {
     }
     if (typeof patch.serializeDelayMs === 'number' && patch.serializeDelayMs >= 0 && patch.serializeDelayMs <= 2000) {
       settings.serializeDelayMs = patch.serializeDelayMs;
+    }
+    if (Number.isFinite(patch.serializeMaxConcurrent) && patch.serializeMaxConcurrent >= 1 && patch.serializeMaxConcurrent <= 16) {
+      settings.serializeMaxConcurrent = Math.floor(patch.serializeMaxConcurrent);
     }
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
@@ -4246,6 +4255,22 @@ function renderHTML() {
             <option value="1000">1000 ms</option>
           </select>
         </div>
+        <div class="config-row" id="serialize-cap-ctrl" style="display:none">
+          <div class="config-info">
+            <div class="config-label">Max concurrent in-flight</div>
+            <div class="config-desc">Hard cap on simultaneous in-flight requests. 1 = strict serialization (recommended for &gt;8 CC clients on a single account). Bump only if you have multiple accounts and want pipelining.</div>
+          </div>
+          <select class="config-select" id="sel-serialize-cap" onchange="changeSerializeMaxConcurrent(Number(this.value))">
+            <option value="1">1 (strict)</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+            <option value="12">12</option>
+            <option value="16">16</option>
+          </select>
+        </div>
         <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
       </div>
 
@@ -5241,7 +5266,8 @@ async function refresh() {
       var qEl = document.getElementById('queue-stats');
       if (queueStats.inflight > 0 || queueStats.queued > 0) {
         qEl.style.display = '';
-        qEl.textContent = 'Queue: ' + queueStats.inflight + ' inflight, ' + queueStats.queued + ' queued';
+        var capPart = queueStats.maxConcurrent ? ' (cap=' + queueStats.maxConcurrent + ')' : '';
+        qEl.textContent = 'Queue: ' + queueStats.inflight + ' inflight, ' + queueStats.queued + ' queued' + capPart;
       } else {
         qEl.style.display = 'none';
       }
@@ -5624,6 +5650,8 @@ async function loadSettingsUI() {
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
     document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
+    document.getElementById('sel-serialize-cap').value = s.serializeMaxConcurrent || 1;
+    document.getElementById('serialize-cap-ctrl').style.display = s.serializeRequests ? '' : 'none';
     // Commit token usage
     document.getElementById('toggle-commit-tokens').checked = !!s.commitTokenUsage;
     // Session monitor
@@ -5669,6 +5697,7 @@ async function toggleSetting(key, value) {
     // Show/hide serialize delay control
     if (key === 'serializeRequests') {
       document.getElementById('serialize-delay-ctrl').style.display = value ? '' : 'none';
+      document.getElementById('serialize-cap-ctrl').style.display = value ? '' : 'none';
     }
   } catch { showToast('Failed to update'); }
 }
@@ -5681,6 +5710,17 @@ async function changeSerializeDelay(value) {
       body: JSON.stringify({ serializeDelayMs: value })
     });
     showToast('Serialize delay: ' + value + ' ms');
+  } catch { showToast('Failed to update'); }
+}
+
+async function changeSerializeMaxConcurrent(value) {
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ serializeMaxConcurrent: value })
+    });
+    showToast('Max concurrent: ' + value);
   } catch { showToast('Failed to update'); }
 }
 
@@ -8370,74 +8410,36 @@ setInterval(async () => {
 // ─────────────────────────────────────────────────
 // Request Serialization Queue
 // ─────────────────────────────────────────────────
+//
+// Backed by createSerializationQueue() in lib.mjs. The previous
+// in-file implementation had an `inflight === 0` early-return bypass
+// that broke strict serialization under sustained load — see lib.mjs
+// for the full bug analysis. The factory removes the bypass and adds
+// a configurable max-concurrent cap (settings.serializeMaxConcurrent,
+// default 1 = strict serialize-everything).
 
-let _inflightCount = 0;
-const _requestQueue = [];
+const _serializationQueue = createSerializationQueue({
+  getEnabled: () => !!settings.serializeRequests,
+  getDelayMs: () => settings.serializeDelayMs | 0,
+  getMaxConcurrent: () => Math.max(1, settings.serializeMaxConcurrent | 0 || 1),
+});
 
 function getQueueStats() {
+  const s = _serializationQueue.getStats();
   return {
-    inflight: _inflightCount,
-    queued: _requestQueue.length,
+    inflight: s.inflight,
+    queued: s.queued,
+    maxConcurrent: Math.max(1, settings.serializeMaxConcurrent | 0 || 1),
     accountSlots: getAccountSlotStats(),
   };
 }
 
 function drainSerializationQueue() {
-  while (_requestQueue.length > 0) {
-    const next = _requestQueue.shift();
-    next.resolve();
-  }
+  _serializationQueue.drain();
 }
 
 function withSerializationQueue(fn, isRetry = false) {
-  // If serialization disabled, retries, or nothing inflight → run immediately
-  if (!settings.serializeRequests || isRetry || _inflightCount === 0) {
-    _inflightCount++;
-    return fn().finally(() => {
-      _inflightCount--;
-      _dispatchNext();
-    });
-  }
-
-  // Queue the request
-  return new Promise((resolve, reject) => {
-    const entry = { fn, resolve: null, reject: null };
-    const timeout = setTimeout(() => {
-      const idx = _requestQueue.indexOf(entry);
-      if (idx !== -1) _requestQueue.splice(idx, 1);
-      reject(new Error('queue_timeout'));
-    }, 120_000);
-
-    entry.resolve = () => {
-      clearTimeout(timeout);
-      _inflightCount++;
-      fn().then(resolve, reject).finally(() => {
-        _inflightCount--;
-        _dispatchNext();
-      });
-    };
-    entry.reject = (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    };
-    _requestQueue.push(entry);
-  });
-}
-
-function _dispatchNext() {
-  if (_requestQueue.length === 0) return;
-  const delay = settings.serializeDelayMs || 0;
-  if (delay > 0) {
-    setTimeout(() => {
-      if (_requestQueue.length > 0) {
-        const next = _requestQueue.shift();
-        next.resolve();
-      }
-    }, delay);
-  } else {
-    const next = _requestQueue.shift();
-    next.resolve();
-  }
+  return _serializationQueue.acquire(fn, isRetry);
 }
 
 // ─────────────────────────────────────────────────

@@ -1726,3 +1726,136 @@ export function parseOtlpMetrics(payload) {
   }
   return out;
 }
+
+// ─────────────────────────────────────────────────
+// Serialization Queue (settings-level, separate from
+// per-account-permit limiter in dashboard.mjs)
+// ─────────────────────────────────────────────────
+//
+// Why this is a factory (not module-level state):
+//   - Unit-testable. Caller injects fake clock + getters and asserts
+//     that inflight never exceeds the configured cap.
+//   - Reusable across more than one queue if needed.
+//
+// What it fixes (the bug that motivated this factory):
+//   The previous module-level implementation in dashboard.mjs had an
+//   `if (_inflightCount === 0) <bypass-queue>` early-return. Under
+//   sustained load (15+ concurrent CC clients), every time the queue's
+//   200ms dispatch timer was waiting to fire, a fresh request whose
+//   _inflightCount was momentarily 0 would bypass the queue entirely.
+//   The queue then dispatched its own pending entry on top, producing
+//   inflight counts of 18+ even though the user had configured strict
+//   serialization. This factory removes the bypass: when enabled, every
+//   request goes through the queue and inflight is HARD-CAPPED at
+//   getMaxConcurrent().
+//
+// Semantics:
+//   - getEnabled() === false: every call bypasses the queue (free for all).
+//   - isRetry === true (per-call flag): bypasses the queue. Retries are
+//     "make progress at any cost" paths from the caller's loop and must
+//     not deadlock against their own queued ancestor.
+//   - Otherwise: pushed onto the queue. The dispatch loop pulls one
+//     entry whenever inflight < cap, waiting at least getDelayMs()
+//     between successive dispatches.
+//   - drain(): release every queued entry immediately (used when the
+//     user toggles serialization OFF — open the floodgates).
+//
+// Re-entrancy: dispatching is gated by a single timer handle so two
+// completion callbacks firing in the same microtask cannot both fire
+// off a fresh dispatch. The timer is cleared and re-scheduled on each
+// state change.
+export function createSerializationQueue(opts = {}) {
+  const getMaxConcurrent = opts.getMaxConcurrent || (() => 1);
+  const getDelayMs = opts.getDelayMs || (() => 0);
+  const getEnabled = opts.getEnabled || (() => true);
+  const queueTimeoutMs = opts.queueTimeoutMs || 120_000;
+  const now = opts.now || (() => Date.now());
+
+  let inflight = 0;
+  let lastDispatchAt = 0;
+  let dispatchTimer = null;
+  const queue = [];
+
+  function _maybeDispatch() {
+    if (dispatchTimer) return; // a dispatch is already pending
+    if (queue.length === 0) return;
+    if (inflight >= Math.max(1, getMaxConcurrent())) return;
+    const delay = Math.max(0, getDelayMs() | 0);
+    const sinceLast = now() - lastDispatchAt;
+    const wait = Math.max(0, delay - sinceLast);
+    dispatchTimer = setTimeout(() => {
+      dispatchTimer = null;
+      // Re-validate at fire time — settings may have changed during the
+      // wait, the queue may have been drained, etc.
+      if (queue.length === 0) return;
+      if (inflight >= Math.max(1, getMaxConcurrent())) {
+        // Cap re-tightened while we waited — back off and let an
+        // inflight completion call us again.
+        return;
+      }
+      const entry = queue.shift();
+      if (!entry) return;
+      clearTimeout(entry.timeoutHandle);
+      inflight++;
+      lastDispatchAt = now();
+      Promise.resolve(entry.run()).finally(() => {
+        inflight--;
+        _maybeDispatch();
+      });
+      // If headroom remains (cap > 1) and queue still has work, fire
+      // the next one too — but route through _maybeDispatch so the
+      // delay between successive dispatches is still honored.
+      _maybeDispatch();
+    }, wait);
+  }
+
+  function acquire(fn, isRetry = false) {
+    if (!getEnabled() || isRetry) {
+      inflight++;
+      lastDispatchAt = now();
+      return Promise.resolve()
+        .then(fn)
+        .finally(() => {
+          inflight--;
+          _maybeDispatch();
+        });
+    }
+    return new Promise((resolve, reject) => {
+      const entry = {
+        run: () => fn().then(resolve, reject),
+        timeoutHandle: null,
+      };
+      entry.timeoutHandle = setTimeout(() => {
+        const idx = queue.indexOf(entry);
+        if (idx !== -1) queue.splice(idx, 1);
+        reject(new Error('queue_timeout'));
+      }, queueTimeoutMs);
+      queue.push(entry);
+      _maybeDispatch();
+    });
+  }
+
+  function drain() {
+    // Cancel any pending dispatch timer — we're going to flush now.
+    if (dispatchTimer) {
+      clearTimeout(dispatchTimer);
+      dispatchTimer = null;
+    }
+    while (queue.length > 0) {
+      const entry = queue.shift();
+      clearTimeout(entry.timeoutHandle);
+      inflight++;
+      lastDispatchAt = now();
+      Promise.resolve(entry.run()).finally(() => {
+        inflight--;
+        _maybeDispatch();
+      });
+    }
+  }
+
+  function getStats() {
+    return { inflight, queued: queue.length };
+  }
+
+  return { acquire, drain, getStats };
+}

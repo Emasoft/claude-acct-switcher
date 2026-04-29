@@ -6,6 +6,7 @@
   "notifications": true,
   "serializeRequests": false,
   "serializeDelayMs": 200,
+  "serializeMaxConcurrent": 1,
   "commitTokenUsage": false,
   "sessionMonitor": false,
   "perToolAttribution": false,
