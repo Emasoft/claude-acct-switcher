@@ -1567,6 +1567,19 @@ async function handleAPI(req, res) {
       // keychain because it carries no secret)
       deleteAccountKeychain(name);
       try { await unlink(join(ACCOUNTS_DIR, `${name}.label`)); } catch {}
+      // Drop any per-account preferences. Without this, removing an
+      // account and later re-creating one with the same name would
+      // silently revive the old excludeFromAuto / priority flags —
+      // surprising behaviour that could lock someone out of their
+      // own newly-created account from the auto-switch pool.
+      if (_accountPrefs[name]) {
+        delete _accountPrefs[name];
+        try {
+          atomicWriteFileSync(ACCOUNT_PREFS_FILE, JSON.stringify(_accountPrefs, null, 2));
+        } catch (e) {
+          log('warn', `Failed to persist account-prefs.json after remove: ${e.message}`);
+        }
+      }
       logActivity('account-removed', { name });
       if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
       json(res, { ok: true });
@@ -5222,7 +5235,18 @@ function renderAccounts(profiles, animate) {
   var newHashes = new Map();
   var cardHtmls = profiles.map((p, i) => {
     const active = p.isActive;
-    const displayName = p.label || p.name;
+    // displayName is user-controlled (label files written by auto-
+    // discover from the Anthropic API's organization_name field, OR
+    // set manually via the vdm-label command). Two derived forms:
+    //   * displayName    HTML-escaped for rendering in innerHTML.
+    //   * displayNameJs  raw value with single-quote-as-JS-string
+    //     escaping ONLY, used inside onclick=doSwitch single-quoted args.
+    // The two MUST stay separate: HTML-escaping the JS-string form
+    // would inject the &amp;#39; entity into the toast message instead
+    // of an apostrophe.
+    const rawDisplayName = p.label || p.name;
+    const displayName = escHtml(rawDisplayName);
+    const displayNameJs = String(rawDisplayName).replace(/'/g, "\\\\'");
     const eName = p.name.replace(/'/g, "\\\\'");
     const tok = tokenStatus(p.expiresAt);
 
@@ -5294,7 +5318,7 @@ function renderAccounts(profiles, animate) {
     if (!active) {
       buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
         '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
-        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
+        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)">Switch to this account</button>') +
       '</div>';
     }
     var safeId = 'acct-card-' + _safeIdForName(p.name);
@@ -5365,20 +5389,32 @@ const evtColors = {
 };
 
 function evtMsg(e) {
+  // Every interpolated field is potentially user-controlled:
+  //   * e.account / e.from / e.to: account NAMES are restricted to
+  //     [a-zA-Z0-9._@-] so they're already HTML-safe, BUT some events
+  //     (account-discovered, account-renamed) carry e.label which is
+  //     arbitrary user input from the vdm-label command or from auto-
+  //     discover's organization_name extraction. e.error from refresh-
+  //     failed is an upstream API string. e.type is set by the dashboard
+  //     code itself so it is safe.
+  // Escape every dynamic field as a uniform discipline. The dashboard
+  // binds to localhost only, so the blast radius is the user's own
+  // host, but defense in depth is cheap.
+  var h = function(s) { return escHtml(s == null ? '?' : String(s)); };
   switch (e.type) {
-    case 'auto-switch': return 'Auto-switched from <b>' + (e.from||'?') + '</b> to <b>' + (e.to||'?') + '</b>';
-    case 'proactive-switch': return 'Proactive switch to <b>' + (e.to||'?') + '</b>';
-    case 'manual-switch': return 'Switched to <b>' + (e.to||'?') + '</b>';
-    case 'rate-limited': return '<b>' + (e.account||'?') + '</b> rate limited' + (e.retryAfter ? ' (' + Math.round(e.retryAfter/60) + ' min)' : '');
-    case 'auth-expired': return '<b>' + (e.account||'?') + '</b> token expired';
+    case 'auto-switch': return 'Auto-switched from <b>' + h(e.from||'?') + '</b> to <b>' + h(e.to||'?') + '</b>';
+    case 'proactive-switch': return 'Proactive switch to <b>' + h(e.to||'?') + '</b>';
+    case 'manual-switch': return 'Switched to <b>' + h(e.to||'?') + '</b>';
+    case 'rate-limited': return '<b>' + h(e.account||'?') + '</b> rate limited' + (e.retryAfter ? ' (' + Math.round(e.retryAfter/60) + ' min)' : '');
+    case 'auth-expired': return '<b>' + h(e.account||'?') + '</b> token expired';
     case 'all-exhausted': return 'All accounts exhausted';
-    case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
-    case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
+    case 'account-discovered': return 'Discovered <b>' + h(e.label||e.name||'?') + '</b>';
+    case 'account-renamed': return 'Renamed <b>' + h(e.name||'?') + '</b> to <b>' + h(e.label||'?') + '</b>';
     case 'settings-changed': return 'Settings updated';
-    case 'upgrade': return 'Upgraded to <b>' + (e.to||'?') + '</b>';
-    case 'refresh-failed': return '<b>' + (e.account||'?') + '</b> refresh failed: ' + (e.error||'unknown');
-    case 'token-refreshed': return '<b>' + (e.account||'?') + '</b> token refreshed';
-    default: return e.type;
+    case 'upgrade': return 'Upgraded to <b>' + h(e.to||'?') + '</b>';
+    case 'refresh-failed': return '<b>' + h(e.account||'?') + '</b> refresh failed: ' + h(e.error||'unknown');
+    case 'token-refreshed': return '<b>' + h(e.account||'?') + '</b> token refreshed';
+    default: return h(e.type);
   }
 }
 
