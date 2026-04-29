@@ -1170,19 +1170,50 @@ cmd_dashboard() {
       fi
 
       echo -e "${BLUE}Starting dashboard on http://localhost:$DASHBOARD_PORT${NC}"
-      node "$SCRIPT_DIR/dashboard.mjs" &
+      # Detach the dashboard from this shell so closing the terminal
+      # (or pressing Ctrl-C during the readiness probe below) does NOT
+      # kill it. nohup ignores SIGHUP, the stdio redirections detach it
+      # from the controlling terminal, and `disown` removes the job from
+      # the shell's job table so the wait-for-exit on shell-close is
+      # bypassed. Logs go to startup.log next to the dashboard so the
+      # user can still find errors after a silent crash.
+      local startup_log="$SCRIPT_DIR/startup.log"
+      ( cd "$SCRIPT_DIR" && nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
       local new_pid=$!
+      disown 2>/dev/null || true
       echo "$new_pid" > "$DASHBOARD_PID_FILE"
 
-      # Wait a moment then open
-      sleep 0.5
+      # Trap SIGINT during the readiness probe so a Ctrl-C doesn't
+      # leave a stale pidfile pointing at a process we just killed.
+      local _start_pid="$new_pid"
+      trap '
+        if [[ -n "$_start_pid" ]] && kill -0 "$_start_pid" 2>/dev/null; then
+          kill "$_start_pid" 2>/dev/null || true
+        fi
+        rm -f "$DASHBOARD_PID_FILE"
+        trap - INT TERM HUP
+        return 130
+      ' INT TERM HUP
+
+      # Wait briefly then probe — the dashboard has to bind two ports
+      # AND read settings from disk, which takes a few hundred ms on
+      # cold cache. 1.0s is conservative without being slow enough that
+      # the user notices.
+      sleep 1.0
+      trap - INT TERM HUP
       if kill -0 "$new_pid" 2>/dev/null; then
         echo -e "${GREEN}✓${NC} Dashboard running (PID $new_pid)"
         echo -e "  Dashboard: ${CYAN}http://localhost:$DASHBOARD_PORT${NC}"
         echo -e "  API Proxy: ${CYAN}http://localhost:$PROXY_PORT${NC}"
+        echo -e "  Logs:      ${DIM}$startup_log${NC}"
         open "http://localhost:$DASHBOARD_PORT" 2>/dev/null || echo -e "  Open http://localhost:$DASHBOARD_PORT in your browser"
       else
-        echo -e "${RED}Dashboard failed to start. Check Node.js is installed.${NC}"
+        echo -e "${RED}Dashboard failed to start. Last lines of $startup_log:${NC}"
+        if [[ -f "$startup_log" ]]; then
+          tail -10 "$startup_log" | sed 's/^/    /'
+        else
+          echo "    (log file not created  - is Node.js installed?)"
+        fi
         rm -f "$DASHBOARD_PID_FILE"
         return 1
       fi
@@ -1407,12 +1438,35 @@ cmd_tokens() {
   # Build URL. Pass `$repo` / `$branch` to python via argv (sys.argv[1]) —
   # interpolating them into a single-quoted python source string broke
   # whenever a path contained an apostrophe (`/Users/foo/O'Brien-project`).
+  # Capture stderr separately so a python3 failure surfaces (the previous
+  # `2>/dev/null` swallowed errors; a broken python install would silently
+  # build a URL with empty `repo`/`branch` and the API would return rows
+  # for the wrong repo / no filter at all).
   local url="http://localhost:$DASHBOARD_PORT/api/token-usage?since=$since"
+  local _enc_err
   if [[ -n "$repo" ]]; then
-    url="${url}&repo=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$repo" 2>/dev/null)"
+    _enc_err=$(mktemp -t vdm-enc.XXXXXX) || _enc_err=""
+    local _enc_repo
+    _enc_repo=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$repo" 2>"${_enc_err:-/dev/null}") || {
+      echo -e "${RED}Could not URL-encode repo (python3 missing or broken):${NC}" >&2
+      [[ -n "$_enc_err" && -s "$_enc_err" ]] && sed 's/^/  /' "$_enc_err" >&2
+      [[ -n "$_enc_err" ]] && rm -f "$_enc_err"
+      return 1
+    }
+    [[ -n "$_enc_err" ]] && rm -f "$_enc_err"
+    url="${url}&repo=${_enc_repo}"
   fi
   if [[ -n "$branch" ]]; then
-    url="${url}&branch=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$branch" 2>/dev/null)"
+    _enc_err=$(mktemp -t vdm-enc.XXXXXX) || _enc_err=""
+    local _enc_branch
+    _enc_branch=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$branch" 2>"${_enc_err:-/dev/null}") || {
+      echo -e "${RED}Could not URL-encode branch (python3 missing or broken):${NC}" >&2
+      [[ -n "$_enc_err" && -s "$_enc_err" ]] && sed 's/^/  /' "$_enc_err" >&2
+      [[ -n "$_enc_err" ]] && rm -f "$_enc_err"
+      return 1
+    }
+    [[ -n "$_enc_err" ]] && rm -f "$_enc_err"
+    url="${url}&branch=${_enc_branch}"
   fi
 
   local usage

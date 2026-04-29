@@ -5,5 +5,11 @@
   "rotationIntervalMin": 60,
   "notifications": true,
   "serializeRequests": false,
-  "serializeDelayMs": 200
+  "serializeDelayMs": 200,
+  "commitTokenUsage": false,
+  "sessionMonitor": false,
+  "perToolAttribution": false,
+  "tokenUsageMaxAgeDays": 90,
+  "tokenUsageMaxEntries": 100000,
+  "activityMaxEntries": 500
 }

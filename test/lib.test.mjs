@@ -11,7 +11,10 @@ import {
   createAccountStateManager,
   isAccountAvailable,
   scoreAccount,
+  scoreAccountConserve,
   pickBestAccount,
+  pickConserve,
+  pickDrainFirst,
   pickAnyUntried,
   pickByStrategy,
   createProbeTracker,
@@ -2569,5 +2572,232 @@ describe('pickByStrategy — unknown strategy', () => {
     });
     assert.equal(r.rotated, false);
     assert.equal(r.account, null);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// scoreAccountConserve — weekly dominates 5h tiebreaker (×100 / ×1).
+// Critical: with weekly window already active, conserve should
+// concentrate on it even when its 5h is HIGH (the whole point of
+// "conserve" is to drain accounts whose windows are open).
+// ─────────────────────────────────────────────────
+describe('scoreAccountConserve', () => {
+  it('returns 0 for unknown token (untouched, preserve)', () => {
+    const sm = _mkStateManager({});
+    assert.equal(scoreAccountConserve('missing', sm), 0);
+  });
+
+  it('returns 0 for known token with no utilization fields', () => {
+    const sm = _mkStateManager({ a: {} });
+    assert.equal(scoreAccountConserve('a', sm), 0);
+  });
+
+  it('weights 7d ×100 over 5h ×1', () => {
+    // 7d=0.5, 5h=0.0  -> 50.0
+    // 7d=0.0, 5h=0.99 -> 0.99
+    // The 7d-active account scores ~50× higher.
+    const sm = _mkStateManager({
+      weekly: { utilization5h: 0.0, utilization7d: 0.5 },
+      hourly: { utilization5h: 0.99, utilization7d: 0.0 },
+    });
+    const sw = scoreAccountConserve('weekly', sm);
+    const sh = scoreAccountConserve('hourly', sm);
+    assert.equal(sw, 50);
+    assert.ok(Math.abs(sh - 0.99) < 1e-9);
+    assert.ok(sw > sh * 25);
+  });
+
+  it('uses 5h as tiebreaker when 7d is equal', () => {
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.1, utilization7d: 0.5 },
+      b: { utilization5h: 0.2, utilization7d: 0.5 },
+    });
+    const sa = scoreAccountConserve('a', sm);
+    const sb = scoreAccountConserve('b', sm);
+    assert.equal(sa, 50.1);
+    assert.equal(sb, 50.2);
+  });
+
+  it('handles missing utilization5h or utilization7d gracefully (treats as 0)', () => {
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.42 },                     // no 7d
+      b: { utilization7d: 0.42 },                     // no 5h
+    });
+    assert.equal(scoreAccountConserve('a', sm), 0.42);
+    assert.equal(scoreAccountConserve('b', sm), 42);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// pickConserve — picks the highest scoreAccountConserve, skipping
+// excluded and unavailable accounts. The default rotation strategy.
+// ─────────────────────────────────────────────────
+describe('pickConserve', () => {
+  it('picks the highest 7d account (drains the warm window)', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.2, utilization7d: 0.1 },  // cold
+      b: { utilization5h: 0.0, utilization7d: 0.5 },  // already-warm 7d
+      c: { utilization5h: 0.0, utilization7d: 0.0 },  // dormant
+    });
+    const picked = pickConserve(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('falls back to next-best when the warmest is excluded', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.0, utilization7d: 0.6 },
+      b: { utilization5h: 0.0, utilization7d: 0.3 },
+    });
+    const picked = pickConserve(accounts, sm, new Set(['a']));
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('skips rate-limited accounts', () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.0, utilization7d: 0.9, limited: true, resetAt: nowSec + 600 },
+      b: { utilization5h: 0.0, utilization7d: 0.1 },
+    });
+    const picked = pickConserve(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('returns null when every account is unavailable', () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { limited: true, resetAt: nowSec + 600 },
+      b: { limited: true, resetAt: nowSec + 600 },
+    });
+    const picked = pickConserve(accounts, sm);
+    assert.equal(picked, null);
+  });
+
+  it('treats fully-untouched accounts (score 0) as last resort', () => {
+    const accounts = [_mkAccount('fresh'), _mkAccount('warm')];
+    const sm = _mkStateManager({
+      fresh: { utilization5h: 0.0, utilization7d: 0.0 },
+      warm:  { utilization5h: 0.1, utilization7d: 0.05 },
+    });
+    const picked = pickConserve(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'warm');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// pickDrainFirst — picks the highest 5h utilization. Used for the
+// "drain-first" strategy: keep using the same account until its 5h
+// window resets, instead of spreading load across accounts.
+// ─────────────────────────────────────────────────
+describe('pickDrainFirst', () => {
+  it('picks the highest 5h account', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.3 },
+      b: { utilization5h: 0.7 },
+      c: { utilization5h: 0.1 },
+    });
+    const picked = pickDrainFirst(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('respects excludeTokens and falls through', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.9 },
+      b: { utilization5h: 0.4 },
+    });
+    const picked = pickDrainFirst(accounts, sm, new Set(['a']));
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('skips rate-limited accounts', () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.95, limited: true, resetAt: nowSec + 600 },
+      b: { utilization5h: 0.05 },
+    });
+    const picked = pickDrainFirst(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('returns null when no candidate is available', () => {
+    const picked = pickDrainFirst([], _mkStateManager({}));
+    assert.equal(picked, null);
+  });
+
+  it('treats unknown accounts as score 0 (lowest priority for drain)', () => {
+    const accounts = [_mkAccount('known'), _mkAccount('unknown')];
+    const sm = _mkStateManager({
+      known: { utilization5h: 0.5 },
+      // 'unknown' deliberately omitted
+    });
+    const picked = pickDrainFirst(accounts, sm);
+    assert.ok(picked);
+    assert.equal(picked.token, 'known');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// getFingerprintFromToken — separate path from getFingerprint(creds);
+// used in dashboard.mjs every time we need to identify a token without
+// reading the keychain blob.
+// ─────────────────────────────────────────────────
+describe('getFingerprintFromToken', () => {
+  // sha256('') = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  const _SHA256_EMPTY_PREFIX_16 = 'e3b0c44298fc1c14';
+
+  it('returns 16-char hex prefix of sha256(token)', () => {
+    const fp = getFingerprintFromToken('sk-ant-oauth-fake-token-aaaa');
+    assert.equal(typeof fp, 'string');
+    assert.match(fp, /^[0-9a-f]{16}$/);
+  });
+
+  it('is deterministic for the same input', () => {
+    const t = 'sk-ant-oauth-fake-token-bbbb';
+    assert.equal(getFingerprintFromToken(t), getFingerprintFromToken(t));
+  });
+
+  it('differs for different tokens', () => {
+    const fpA = getFingerprintFromToken('token-a');
+    const fpB = getFingerprintFromToken('token-b');
+    assert.notEqual(fpA, fpB);
+  });
+
+  it('coerces null/undefined/empty/0/false to the empty-string fingerprint', () => {
+    // `token || ''` collapses every falsy input to the empty string,
+    // which hashes to the well-known `e3b0c4...` prefix. This is the
+    // intended behavior — callers can rely on the function never
+    // throwing on a missing token.
+    assert.equal(getFingerprintFromToken(''), _SHA256_EMPTY_PREFIX_16);
+    assert.equal(getFingerprintFromToken(null), _SHA256_EMPTY_PREFIX_16);
+    assert.equal(getFingerprintFromToken(undefined), _SHA256_EMPTY_PREFIX_16);
+    assert.equal(getFingerprintFromToken(0), _SHA256_EMPTY_PREFIX_16);
+    assert.equal(getFingerprintFromToken(false), _SHA256_EMPTY_PREFIX_16);
+  });
+
+  it('agrees with getFingerprint(creds) when creds.claudeAiOauth.accessToken == token', () => {
+    const token = 'sk-ant-oauth-fake-token-cccc';
+    const creds = { claudeAiOauth: { accessToken: token } };
+    assert.equal(getFingerprintFromToken(token), getFingerprint(creds));
+  });
+
+  it('agrees with getFingerprint({}) on the empty-string fallback', () => {
+    // Both helpers funnel an empty/missing token through `'' ` → sha256('')
+    // → same 16-char prefix. This locks down the contract that lookups
+    // keyed by fingerprint stay consistent across the two entry points.
+    assert.equal(getFingerprintFromToken(''), getFingerprint({}));
+    assert.equal(getFingerprintFromToken(null), getFingerprint(null));
   });
 });
