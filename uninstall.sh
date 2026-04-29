@@ -1,21 +1,67 @@
 #!/usr/bin/env bash
 # Claude Account Switcher  - Uninstaller
 # Safely removes vdm, the dashboard, shell config, and optionally saved accounts.
+#
+# Robustness contract (mirrors install.sh):
+# - Every disk write is atomic via lib-install.sh helpers.
+# - Process kills verify the target's cmdline before SIGKILL — no PID
+#   reuse races. Dashboard gets a graceful SIGTERM + drain window
+#   before the install dir is removed (so half-written state files
+#   never escape to disk).
+# - Cleanup stack runs on EXIT, INT, TERM, HUP via _trap_signals.
+# - Section 9 audit ALWAYS runs, even if earlier sections crashed,
+#   because it's wired into the cleanup stack.
+# - Pre-flight detection (--detect) reports issues without modifying
+#   anything; useful for "what would uninstall do?" inspection.
 
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
 
 INSTALL_DIR="$HOME/.claude/account-switcher"
 # Preserve the original path for the section-9 audit (the variable can be
 # blanked mid-script when the accounts/ backup fails — see section 5).
 INSTALL_DIR_ORIG="$INSTALL_DIR"
+
+# Resolve the dir containing THIS uninstall.sh so we can find the
+# sibling lib-install.sh + commands/ + install-hooks.sh whether the
+# user runs ./uninstall.sh from a checkout, from $INSTALL_DIR after a
+# completed install, or from /usr/local/bin via symlink.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+
+# Source the shared safety primitives. Prefer the installed copy
+# (matches the version that wrote the install) but fall back to the
+# sibling copy in the source repo. If neither exists we run in
+# degraded mode — no atomic helpers, no detectors. Continue rather
+# than abort: a user trying to clean up a broken install needs the
+# uninstaller to keep working even when half the helpers are missing.
+_LIB=""
+if [[ -f "$INSTALL_DIR/lib-install.sh" ]]; then
+  _LIB="$INSTALL_DIR/lib-install.sh"
+elif [[ -f "$SCRIPT_DIR/lib-install.sh" ]]; then
+  _LIB="$SCRIPT_DIR/lib-install.sh"
+fi
+if [[ -n "$_LIB" ]]; then
+  # shellcheck source=/dev/null
+  . "$_LIB"
+  _trap_signals
+else
+  echo -e "${YELLOW}Warning: lib-install.sh not found — running in degraded mode (no atomic helpers).${NC}" >&2
+  # Provide minimal stubs so unconditional calls below don't crash.
+  VDM_CLEANUP_ACTIONS=()
+  _trap_signals() { :; }
+  _register_cleanup() { :; }
+  _safe_kill_pid() { kill "-${3:-TERM}" "$1" 2>/dev/null; }
+  _atomic_remove_block() { return 1; }
+  _atomic_write_string() { printf '%s' "$2" > "$1"; }
+  render_detected_issues() { return 0; }
+fi
 
 # ── Flag parsing ──
 # By default the script is interactive (4 prompts: main confirm, keychain
@@ -52,6 +98,12 @@ Options:
       (~/Library/LaunchAgents/*claude*account*switcher*.plist or
       *vdm*.plist).
 
+  --detect
+      Read-only: run all detectors (orphaned hooks, dangling symlinks,
+      malformed rc, port collisions, partial installs) and exit. Does
+      not modify anything. Useful for "what's vdm's footprint right
+      now?" inspection without committing to an uninstall.
+
   -h, --help
       Show this message.
 
@@ -60,6 +112,7 @@ the above flags are ignored.
 EOF
 }
 
+DETECT_ONLY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -y|--yes|--non-interactive|--quiet)
@@ -70,6 +123,8 @@ while [[ $# -gt 0 ]]; do
       PURGE_BACKUPS=true; shift ;;
     --remove-launchagent)
       REMOVE_LAUNCHAGENT=true; shift ;;
+    --detect)
+      DETECT_ONLY=true; shift ;;
     -h|--help)
       usage; exit 0 ;;
     --) shift; break ;;
@@ -79,6 +134,30 @@ while [[ $# -gt 0 ]]; do
       exit 2 ;;
   esac
 done
+
+# --detect: read-only sweep, then exit. Lets users inspect vdm's
+# footprint without committing to a destructive uninstall.
+if [[ "$DETECT_ONLY" == "true" ]]; then
+  echo ""
+  echo -e "${BOLD}  vdm footprint scan${NC}"
+  echo -e "  ─────────────────────"
+  if [[ -n "$_LIB" ]]; then
+    detect_old_install_remnants "$INSTALL_DIR"
+    detect_orphaned_settings_hooks
+    detect_malformed_rc_blocks
+    detect_dangling_symlinks
+    detect_port_holders "${CSW_PORT:-3333}" "${CSW_PROXY_PORT:-3334}"
+    detect_orphan_keychain_entries "$INSTALL_DIR"
+    detect_truncated_config "$INSTALL_DIR/config.json"
+    set +e
+    render_detected_issues
+    set -e
+  else
+    echo -e "  ${YELLOW}Detectors unavailable (lib-install.sh missing)${NC}"
+  fi
+  echo ""
+  exit 0
+fi
 
 echo ""
 echo -e "${BOLD}  Claude Account Switcher  - Uninstaller${NC}"
@@ -195,36 +274,44 @@ fi
 # Fallback: kill by port. Iterate over ALL listener PIDs (not just the
 # first), because port-sharing or a stuck child can leave more than one
 # process bound. `lsof -t` is one PID per line — read it line-by-line.
-# We send SIGTERM first; the polite exit lets the dashboard atomic-rename
-# any in-flight state writes (account-state.json, utilization-history.json,
+# We use _safe_kill_pid which CONFIRMS the PID's cmdline contains
+# "dashboard.mjs" before signalling — guards against PID reuse on a
+# busy machine where the kernel could recycle the dashboard's PID to
+# an unrelated process between the lsof and the kill.
+# SIGTERM first; the polite exit lets the dashboard atomic-rename any
+# in-flight state writes (account-state.json, utilization-history.json,
 # etc.) before we yank the install dir from under it.
 if [[ "$stopped" != "true" ]]; then
   for port in "$_DASH_PORT" "$_PROXY_PORT"; do
     while IFS= read -r pid; do
       [[ -z "$pid" ]] && continue
-      kill -TERM "$pid" 2>/dev/null && stopped=true || true
+      _safe_kill_pid "$pid" "dashboard.mjs" TERM && stopped=true || true
     done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
   done
 fi
 
 # Fallback: kill by process name. pkill returns 0 when something matched,
 # 1 when nothing did — flip that into the `stopped` flag so we don't lie
-# to the user about whether anything was actually killed.
+# to the user about whether anything was actually killed. The pattern is
+# already tight enough (`account-switcher` AND `dashboard`) that PID
+# reuse won't bite — pkill matches by current cmdline at signal time.
 if [[ "$stopped" != "true" ]]; then
   if pkill -TERM -f "node.*account-switcher.*dashboard" 2>/dev/null; then
     stopped=true
   fi
 fi
 
-# If we sent SIGTERM, give the process up to ~3s to release the listening
+# If we sent SIGTERM, give the process up to ~5s to release the listening
 # socket, then SIGKILL anything still bound. Without this, a stuck Node
 # process (mid-libcurl, deadlocked, blocked on disk IO) survives the
 # polite signal — and then `rm -rf $INSTALL_DIR` below pulls dashboard.mjs
 # out from under a still-running process, which leaks PID and may corrupt
-# state files mid-write. We poll instead of `sleep 3` blindly so the fast
-# path stays fast.
+# state files mid-write. We poll instead of `sleep 5` blindly so the fast
+# path stays fast. Bumped from 3s to 5s because slow disks (Time Machine
+# backup running, Spotlight reindex) can stretch the dashboard's
+# atomic-rename writes past 3s.
 if [[ "$stopped" == "true" ]]; then
-  for _drain in 1 2 3 4 5 6; do
+  for _drain in 1 2 3 4 5 6 7 8 9 10; do
     local_listeners=""
     for port in "$_DASH_PORT" "$_PROXY_PORT"; do
       pids=$(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
@@ -233,12 +320,13 @@ if [[ "$stopped" == "true" ]]; then
     [[ -z "$local_listeners" ]] && break
     sleep 0.5
   done
-  # Anything still bound after ~3s gets the hard kill. -9 cannot be caught
-  # so the listener releases the port even if the process is wedged.
+  # Anything still bound after ~5s gets the hard kill. We still verify
+  # the cmdline before SIGKILL — even at this stage, sniping the wrong
+  # PID is unacceptable.
   for port in "$_DASH_PORT" "$_PROXY_PORT"; do
     while IFS= read -r pid; do
       [[ -z "$pid" ]] && continue
-      kill -KILL "$pid" 2>/dev/null || true
+      _safe_kill_pid "$pid" "dashboard.mjs" KILL || true
     done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
   done
 fi
@@ -307,63 +395,49 @@ clean_one_rc() {
   # possibly with trailing CR from a CRLF file).
   grep -Eq '^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$' "$rc" 2>/dev/null || return 0
 
+  # Backup BEFORE touching anything. cp preserves the original
+  # permissions and content so a failed remove is fully recoverable.
   cp "$rc" "${rc}.vdm-backup"
 
-  # Strip any CRLF line endings in-place so the END marker is reachable.
-  # Same symlink-preservation reason as _sed_in_place: cat-redirect, never mv.
-  if grep -q $'\r' "$rc" 2>/dev/null; then
-    LC_ALL=C tr -d '\r' < "$rc" > "${rc}.vdm-tmp" \
-      && cat "${rc}.vdm-tmp" > "$rc" \
-      && rm -f "${rc}.vdm-tmp"
-  fi
+  # _atomic_remove_block from lib-install.sh:
+  #   - composes the new file in <rc>.tmp.<pid> (tr -d '\r' | sed delete)
+  #   - rename(2)s atomically over the original (no half-written window)
+  #   - returns 0 on success, 1 if no markers, 2 if BEGIN/END mismatch
+  set +e
+  _atomic_remove_block "$rc" \
+    '^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$' \
+    '^[[:space:]]*# END claude-account-switcher[[:space:]]*$'
+  local rc_status=$?
+  set -e
 
-  # Range-delete the entire block, indent-tolerant on both ends.
-  _sed_in_place \
-    '/^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$/,/^[[:space:]]*# END claude-account-switcher[[:space:]]*$/d' \
-    "$rc"
-
-  # Verify the markers are actually gone. Two failure modes here:
-  #   (a) BOTH markers still present — the range delete didn't match (unusual
-  #       indentation or comment fragments inside the block). Safe to strip
-  #       just the marker lines because the body between them was preserved
-  #       intact and the user can decide what to keep.
-  #   (b) ONLY ONE marker present — the file was already malformed before we
-  #       touched it (BEGIN without matching END, or vice-versa). The range
-  #       delete in case (a) above would have been a no-op or run to EOF.
-  #       Stripping just the orphan marker would leave the body code orphaned
-  #       in the rc file, AND silently writing might destroy user content.
-  #       Restore from the backup we made above and tell the user to fix it
-  #       by hand — auto-clean of an undocumented malformed state is data
-  #       corruption waiting to happen.
-  if grep -Eq '# BEGIN claude-account-switcher|# END claude-account-switcher' "$rc" 2>/dev/null; then
-    local has_begin=0 has_end=0
-    grep -Eq '# BEGIN claude-account-switcher' "$rc" 2>/dev/null && has_begin=1
-    grep -Eq '# END claude-account-switcher'   "$rc" 2>/dev/null && has_end=1
-    if [[ "$has_begin" == "1" && "$has_end" == "1" ]]; then
-      _sed_in_place '/# BEGIN claude-account-switcher/d; /# END claude-account-switcher/d' "$rc"
-      echo -e "  ${YELLOW}!${NC} Found indented or non-matching markers in ${CYAN}$rc${NC} — used permissive cleanup"
-    else
-      # Restore the pre-edit state so the user keeps their config intact.
-      cat "${rc}.vdm-backup" > "$rc"
+  case "$rc_status" in
+    0)
+      CLEANED_RC_FILES+=("$rc")
+      echo -e "  ${GREEN}✓${NC} Removed auto-start block from ${CYAN}$rc${NC}"
+      echo -e "    ${DIM}Backup: ${rc}.vdm-backup${NC}"
+      ;;
+    1)
+      # No markers found after backup — implausible but not data-loss
+      # (we backed up first). Drop the redundant backup.
+      rm -f "${rc}.vdm-backup"
+      ;;
+    2)
+      # Malformed: BEGIN without END, or vice versa. _atomic_remove_block
+      # didn't write anything — the original file is unchanged. We restore
+      # from backup as defence-in-depth (in case a future implementation
+      # changes that contract) and surface it.
+      cat "${rc}.vdm-backup" > "$rc" 2>/dev/null || true
       echo -e "  ${RED}!${NC} ${BOLD}${rc}${NC} has an unmatched BEGIN/END marker — refusing to auto-edit."
-      echo -e "    ${DIM}Original restored from ${rc}.vdm-backup. Remove the claude-account-switcher block manually.${NC}"
-      # The backup copy we made above is now redundant (the file content
-      # is identical to what we restored). Track it so section 6 offers to
-      # delete it instead of leaving it orphaned on disk.
+      echo -e "    ${DIM}Original preserved. Remove the claude-account-switcher block manually.${NC}"
       ORPHAN_BACKUPS+=("${rc}.vdm-backup")
-      return 0
-    fi
-  fi
-
-  # Trim a single trailing blank line left behind by the heredoc's
-  # leading `echo "" >>`. Avoids an unbounded loop on weird states.
-  if [[ -s "$rc" ]] && [[ -z "$(tail -1 "$rc")" ]]; then
-    _sed_in_place '$ d' "$rc"
-  fi
-
-  CLEANED_RC_FILES+=("$rc")
-  echo -e "  ${GREEN}✓${NC} Removed auto-start block from ${CYAN}$rc${NC}"
-  echo -e "    ${DIM}Backup: ${rc}.vdm-backup${NC}"
+      ;;
+    *)
+      # Any other status = unexpected; restore + surface.
+      cat "${rc}.vdm-backup" > "$rc" 2>/dev/null || true
+      echo -e "  ${RED}!${NC} Unexpected status $rc_status removing block from $rc — restored from backup"
+      ORPHAN_BACKUPS+=("${rc}.vdm-backup")
+      ;;
+  esac
 }
 
 CHECKED_RCS=()
@@ -474,11 +548,57 @@ fi
 # there is no plaintext-tokens dir to back up. The accounts/ directory
 # may still hold *.label files (just email/display names — no secrets);
 # those go away with the rest of $INSTALL_DIR.
+#
+# Defence-in-depth: refuse to rm -rf unless the path looks vdm-shaped.
+# Three layers:
+#   1. The path must end in `/.claude/account-switcher` (exact suffix).
+#      Catches a corrupted INSTALL_DIR pointing at $HOME or `/`.
+#   2. The path must be under $HOME — never delete a system path.
+#   3. The dir must contain at least one of dashboard.mjs, vdm,
+#      install-hooks.sh — i.e. look like a vdm install. If a previous
+#      uninstall wiped the executables but the dir survived (say,
+#      because of an open file on Finder), we still allow removal —
+#      labels and state files are vdm-owned. So the check is "either
+#      vdm files present, or only vdm-shaped state files present".
 ACCOUNTS_BACKUP=""
 
+_safe_to_rmrf() {
+  local d="$1"
+  [[ -z "$d" ]] && return 1
+  [[ "$d" != *"/.claude/account-switcher" ]] && return 1
+  [[ "$d" != "$HOME"* ]] && return 1
+  [[ ! -d "$d" ]] && return 1
+  # If the dir has vdm executables, it's clearly vdm-owned.
+  if [[ -f "$d/dashboard.mjs" ]] || [[ -f "$d/vdm" ]] \
+     || [[ -f "$d/install-hooks.sh" ]] || [[ -f "$d/lib.mjs" ]]; then
+    return 0
+  fi
+  # Otherwise: every entry must be a vdm-shaped state file or the
+  # accounts/ subdir. Any unrecognised entry → refuse (could be user
+  # data we don't recognise).
+  local entry name
+  for entry in "$d"/* "$d"/.[!.]*; do
+    [[ -e "$entry" ]] || continue
+    name="$(basename "$entry")"
+    case "$name" in
+      accounts|config.json|account-state.json|activity-log.json \
+      |utilization-history.json|probe-log.json|token-usage.json \
+      |.dashboard.pid|.hooks-disabled|.version|startup.log \
+      |per-tool-attribution.flag|*.tmp|*.tmp.*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
 if [[ -n "$INSTALL_DIR" && -d "$INSTALL_DIR" ]]; then
-  rm -rf "$INSTALL_DIR"
-  echo -e "  ${GREEN}✓${NC} Removed ${CYAN}$INSTALL_DIR${NC}"
+  if _safe_to_rmrf "$INSTALL_DIR"; then
+    rm -rf "$INSTALL_DIR"
+    echo -e "  ${GREEN}✓${NC} Removed ${CYAN}$INSTALL_DIR${NC}"
+  else
+    echo -e "  ${RED}!${NC} ${BOLD}$INSTALL_DIR${NC} does not look like a vdm install dir — refusing to rm -rf."
+    echo -e "    ${DIM}If this is correct, remove it manually: rm -rf \"$INSTALL_DIR\"${NC}"
+  fi
 elif [[ -n "$INSTALL_DIR" ]]; then
   echo -e "  ${DIM}$INSTALL_DIR does not exist (already clean)${NC}"
 fi

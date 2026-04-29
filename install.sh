@@ -1,16 +1,78 @@
 #!/usr/bin/env bash
 # Claude Account Switcher  - Installer
 # Installs vdm to ~/.claude/account-switcher/ and configures your shell.
+#
+# Robustness contract:
+# - Every disk write is atomic (tmp + rename) via lib-install.sh helpers.
+#   A SIGKILL / Ctrl-C / power loss never leaves a half-written file.
+# - Pre-flight detection scans the system for stale installs, malformed
+#   rc-file blocks, dangling symlinks, port conflicts, and corrupt
+#   settings.json BEFORE writing anything. Errors block installation;
+#   warnings are surfaced and proceed.
+# - Cleanup stack runs on EXIT, INT, TERM, HUP — locks and temp files
+#   are released even on signal-kill.
+# - Steps register rollback actions so a mid-install failure backs out
+#   the partial state instead of leaving the user broken.
+# - --non-interactive / -y / --quiet runs unattended with safe defaults.
+# - --auto-fix offers to auto-remediate detected issues; without it,
+#   non-error issues are reported and the install proceeds.
 
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# ── Flag parsing ──
+NON_INTERACTIVE=false
+AUTO_FIX=false
+SKIP_DETECT=false
+
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [options]
+
+Options:
+  -y, --yes, --non-interactive, --quiet
+      Run without prompting. Errors detected pre-flight still block
+      installation; warnings proceed silently.
+
+  --auto-fix
+      Attempt to auto-remediate detected issues (orphaned hooks,
+      dangling symlinks, malformed rc blocks, partial prior installs)
+      before installing. Without this flag, blocking issues abort and
+      the user is told how to fix them manually.
+
+  --skip-detect
+      Skip pre-flight detection. Use only if a previous run flagged
+      issues that are intentional / outside vdm's control.
+
+  -h, --help
+      Show this message.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes|--non-interactive|--quiet)
+      NON_INTERACTIVE=true; shift ;;
+    --auto-fix)
+      AUTO_FIX=true; shift ;;
+    --skip-detect)
+      SKIP_DETECT=true; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --) shift; break ;;
+    *)
+      echo "Unknown flag: $1" >&2
+      usage >&2
+      exit 2 ;;
+  esac
+done
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
 
 INSTALL_DIR="$HOME/.claude/account-switcher"
 # POSIX-portable: resolve the directory containing this script. `pwd -P`
@@ -20,38 +82,57 @@ INSTALL_DIR="$HOME/.claude/account-switcher"
 # on stock macOS lacks -f, and `realpath` ships only with newer macOS).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
-# Concurrent-install mutex. Two `install.sh` invocations racing in parallel
-# (rare but possible: two terminals, a shell hook, an editor's "post-clone"
-# action) would both pass the BEGIN-marker check below and both append a
-# block to the rc file — leaving the user with duplicated `if !
-# lsof ... fi` blocks and (more annoying) duplicated `export
-# ANTHROPIC_BASE_URL=...` lines. mkdir is atomic on every POSIX filesystem
-# (the kernel guarantees only one caller wins) — same pattern as
-# install-hooks.sh's settings.json mutex. Stock macOS ships no flock(1),
-# so mkdir is the portable primitive.
+# Source shared safety primitives + detectors. Hard requirement —
+# without lib-install.sh the atomic writers and signal-safe cleanup
+# stack don't exist and the install becomes non-robust.
+if [[ ! -f "$SCRIPT_DIR/lib-install.sh" ]]; then
+  echo -e "${RED}Missing required helper: lib-install.sh next to install.sh${NC}" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lib-install.sh"
+
+# Wire up signal-safe cleanup BEFORE acquiring any lock or writing
+# anything. INT/TERM/HUP/EXIT all flow through _run_cleanup which
+# pops the cleanup stack in LIFO order. Without this, ^C between
+# `mkdir LOCK` and the trap line below would leak the lock dir.
+_trap_signals
+
+# Concurrent-install mutex. Two `install.sh` invocations racing in
+# parallel (rare but possible: two terminals, a shell hook, an editor's
+# "post-clone" action) would both pass the BEGIN-marker check below and
+# both append a block to the rc file — leaving the user with duplicated
+# `if ! lsof ... fi` blocks and (more annoying) duplicated `export
+# ANTHROPIC_BASE_URL=...` lines. mkdir is atomic on every POSIX
+# filesystem; stock macOS ships no flock(1), so mkdir is the portable
+# primitive. Stale-lock reaper: any lock dir older than 60s is treated
+# as orphaned (the previous installer crashed before releasing it) so
+# subsequent installs don't deadlock for the full 60s before bailing.
 INSTALL_LOCK="$HOME/.claude/.vdm-install.lock.d"
 mkdir -p "$HOME/.claude" 2>/dev/null || true
-_we_own_lock=0
 _lock_tries=0
 while ! mkdir "$INSTALL_LOCK" 2>/dev/null; do
+  if [[ -d "$INSTALL_LOCK" ]] \
+     && [[ -z "$(find "$INSTALL_LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]]; then
+    rmdir "$INSTALL_LOCK" 2>/dev/null && continue
+  fi
   _lock_tries=$((_lock_tries + 1))
   if [[ $_lock_tries -ge 600 ]]; then
     echo -e "${RED}Another install.sh appears to be running (lock held > 60s).${NC}"
     echo "  If no install is running, remove the stale lock and retry:"
-    echo "    rm -rf $INSTALL_LOCK"
+    echo "    rmdir \"$INSTALL_LOCK\""
     exit 1
   fi
   sleep 0.1
 done
-_we_own_lock=1
-# Release the lock on every exit path — including ^C and `set -e` aborts.
-# Only release if WE acquired it (the timeout exit above never sets the
-# flag, so we never accidentally rmdir another installer's lock).
-trap '[[ $_we_own_lock -eq 1 ]] && rmdir "$INSTALL_LOCK" 2>/dev/null || true' EXIT
+_register_cleanup "rmdir \"$INSTALL_LOCK\" 2>/dev/null"
 
 echo ""
 echo -e "${BOLD}  Claude Account Switcher  - Installer${NC}"
 echo -e "  ────────────────────────────────────────"
+if [[ "$NON_INTERACTIVE" == "true" ]]; then
+  echo -e "  ${DIM}(non-interactive mode — auto_fix=$AUTO_FIX, skip_detect=$SKIP_DETECT)${NC}"
+fi
 echo ""
 
 # ── Check prerequisites ──
@@ -80,67 +161,149 @@ fi
 echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS, python3)"
 echo ""
 
-# ── Phase G: env-var conflict preflight ──
-# Five env vars silently bypass vdm's keychain rotation. If any of these is
-# set in the user's shell, Claude Code will read it FIRST and never touch
-# the keychain — vdm's whole credential-rotation model becomes a no-op.
-# Four cloud-provider env vars route Claude Code to a different backend
-# entirely (Bedrock / Vertex / Foundry / Mantle), bypassing the proxy.
-# We can't fix any of these — only emit a clear warning so users notice.
-_vdm_warned_envs=()
-for _v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_OAUTH_TOKEN \
-          CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN; do
-  if [[ -n "${!_v:-}" ]]; then
-    _vdm_warned_envs+=("$_v")
+# ── Pre-flight detection ──
+# Run a battery of read-only detectors that surface remnants of prior
+# installs, malformed config, dangling symlinks, port conflicts, and
+# env-var bypasses BEFORE we modify anything on disk. Errors block;
+# warnings proceed.
+_DASH_PORT_DEFAULT="${CSW_PORT:-3333}"
+_PROXY_PORT_DEFAULT="${CSW_PROXY_PORT:-3334}"
+
+if [[ "$SKIP_DETECT" != "true" ]]; then
+  echo -e "  ${BOLD}Running pre-flight checks...${NC}"
+  detect_old_install_remnants "$INSTALL_DIR"
+  detect_orphaned_settings_hooks
+  detect_malformed_rc_blocks
+  detect_dangling_symlinks
+  detect_port_holders "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"
+  detect_orphan_keychain_entries "$INSTALL_DIR"
+  detect_truncated_config "$INSTALL_DIR/config.json"
+  detect_disabling_env_vars
+  detect_managed_settings_restrictions
+
+  set +e
+  render_detected_issues
+  _detect_blocking=$?
+  set -e
+
+  if [[ "$_detect_blocking" -gt 0 ]]; then
+    if [[ "$AUTO_FIX" != "true" ]]; then
+      echo ""
+      echo -e "  ${RED}${BOLD}Pre-flight detected $_detect_blocking blocking issue(s).${NC}"
+      echo -e "  ${DIM}Re-run with --auto-fix to attempt automatic remediation, or fix the issues manually and re-run.${NC}"
+      echo -e "  ${DIM}Bypass with --skip-detect (only if you know the issues are intentional).${NC}"
+      exit 1
+    fi
+    echo ""
+    echo -e "  ${YELLOW}--auto-fix${NC} ${BOLD}— attempting remediation...${NC}"
+    # The detectors that have safe auto-fixes:
+    #   orphaned-hooks → uninstall_hooks (defined by install-hooks.sh)
+    #   dangling-symlink → rm the symlink
+    # Everything else (malformed-rc, settings-corrupt, config-corrupt,
+    # port-conflict) is left to the user — auto-editing those would
+    # risk silent data loss.
+    if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+      # shellcheck source=/dev/null
+      . "$SCRIPT_DIR/install-hooks.sh"
+      uninstall_hooks 2>/dev/null \
+        && echo -e "    ${GREEN}✓${NC} Removed orphaned settings.json hooks" \
+        || echo -e "    ${YELLOW}!${NC} Hook removal returned non-zero — re-check manually after install"
+    fi
+    for _lnk in "$HOME/.local/bin/vdm"     "$HOME/.local/bin/csw" \
+                "/opt/homebrew/bin/vdm"    "/opt/homebrew/bin/csw" \
+                "/usr/local/bin/vdm"       "/usr/local/bin/csw"; do
+      if [[ -L "$_lnk" ]]; then
+        _t="$(readlink "$_lnk" 2>/dev/null || true)"
+        if [[ -z "$_t" ]] || [[ ! -e "$_t" ]]; then
+          rm -f "$_lnk" && echo -e "    ${GREEN}✓${NC} Removed dangling symlink ${DIM}$_lnk${NC}" || true
+        fi
+      fi
+    done
+    # Re-run detection so the user sees what's left.
+    VDM_DETECTED_ISSUES=()
+    detect_old_install_remnants "$INSTALL_DIR"
+    detect_orphaned_settings_hooks
+    detect_malformed_rc_blocks
+    detect_dangling_symlinks
+    detect_port_holders "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"
+    detect_orphan_keychain_entries "$INSTALL_DIR"
+    detect_truncated_config "$INSTALL_DIR/config.json"
+    set +e
+    render_detected_issues
+    _detect_blocking=$?
+    set -e
+    if [[ "$_detect_blocking" -gt 0 ]]; then
+      echo ""
+      echo -e "  ${RED}${BOLD}$_detect_blocking blocking issue(s) remain after auto-fix. Aborting.${NC}"
+      exit 1
+    fi
   fi
-done
-if [[ ${#_vdm_warned_envs[@]} -gt 0 ]]; then
-  echo -e "  ${YELLOW}⚠${NC} ${BOLD}Env vars set that bypass vdm's keychain rotation:${NC}"
-  for _v in "${_vdm_warned_envs[@]}"; do
-    echo -e "      ${YELLOW}$_v${NC} — Claude Code will read this token instead of the keychain"
-  done
-  echo -e "      ${DIM}vdm will still proxy traffic, but credential switching becomes a no-op.${NC}"
-  echo -e "      ${DIM}Unset these to use vdm normally, or accept that the active account is fixed.${NC}"
   echo ""
 fi
 
-_vdm_cloud_envs=()
-for _v in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-          CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE; do
-  if [[ -n "${!_v:-}" ]]; then
-    _vdm_cloud_envs+=("$_v")
-  fi
-done
-if [[ ${#_vdm_cloud_envs[@]} -gt 0 ]]; then
-  echo -e "  ${RED}⚠${NC} ${BOLD}Cloud-provider env vars set:${NC}"
-  for _v in "${_vdm_cloud_envs[@]}"; do
-    echo -e "      ${RED}$_v${NC} — Claude Code routes to a non-Anthropic backend, bypassing vdm entirely"
-  done
-  echo -e "      ${DIM}vdm targets api.anthropic.com only. Unset these to route through vdm.${NC}"
-  echo ""
-fi
-
-# ── Install files ──
+# ── Install files (atomic) ──
+# Every file goes through _atomic_install: copy to tmp, fsync, rename
+# in one syscall. If anything below fails or the user ^C's mid-run, the
+# install dir is left with the OLD versions of every file (or no file
+# at all if this is a first install). Never half-written content.
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/accounts"
 
-cp "$SCRIPT_DIR/dashboard.mjs" "$INSTALL_DIR/dashboard.mjs"
-cp "$SCRIPT_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
-cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
-cp "$SCRIPT_DIR/install-hooks.sh" "$INSTALL_DIR/install-hooks.sh"
-chmod +x "$INSTALL_DIR/vdm"
+# Track every newly-created file so a failure rolls them back.
+_NEW_FILES=()
+_install_atomic() {
+  local src="$1" dst="$2" mode="${3:-644}"
+  local was_present=0
+  [[ -e "$dst" ]] && was_present=1
+  if ! _atomic_install "$src" "$dst" "$mode"; then
+    echo -e "  ${RED}!${NC} Failed to install $dst" >&2
+    return 1
+  fi
+  if [[ $was_present -eq 0 ]]; then
+    _NEW_FILES+=("$dst")
+  fi
+}
 
-# Create default config if it doesn't exist
+# Roll back NEW files (not pre-existing ones) on failure. This means a
+# failed first install leaves NO half-written files behind, while a
+# failed upgrade preserves the old version of any file that already
+# existed. Never destroys user data.
+_rollback_install_files() {
+  local f
+  for f in "${_NEW_FILES[@]}"; do
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+_register_cleanup '
+if [[ "${_INSTALL_OK:-0}" != "1" ]]; then
+  _rollback_install_files
+fi
+'
+
+_install_atomic "$SCRIPT_DIR/dashboard.mjs"      "$INSTALL_DIR/dashboard.mjs"      644 || exit 1
+_install_atomic "$SCRIPT_DIR/lib.mjs"            "$INSTALL_DIR/lib.mjs"            644 || exit 1
+_install_atomic "$SCRIPT_DIR/vdm"                "$INSTALL_DIR/vdm"                755 || exit 1
+_install_atomic "$SCRIPT_DIR/install-hooks.sh"   "$INSTALL_DIR/install-hooks.sh"   644 || exit 1
+_install_atomic "$SCRIPT_DIR/lib-install.sh"     "$INSTALL_DIR/lib-install.sh"     644 || exit 1
+
+# Create default config only if absent (don't clobber user's tuned ports
+# / strategy / settings on a re-install).
 if [[ ! -f "$INSTALL_DIR/config.json" ]]; then
-  cp "$SCRIPT_DIR/config.example.json" "$INSTALL_DIR/config.json"
+  _install_atomic "$SCRIPT_DIR/config.example.json" "$INSTALL_DIR/config.json"     644 || exit 1
 fi
 
-# Write version marker from git if available (prefer semver tag, fall back to hash)
+# Write version marker from git if available (prefer semver tag, fall
+# back to hash). _atomic_write_string ensures a SIGKILL between truncate
+# and the final byte never leaves an empty/partial .version file.
 if command -v git &>/dev/null && git -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null 2>&1; then
   git -C "$SCRIPT_DIR" fetch --tags --quiet 2>/dev/null || true
-  ( git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null \
-    || git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null ) > "$INSTALL_DIR/.version" || true
+  _vdm_version="$( git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null \
+    || git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null \
+    || true )"
+  if [[ -n "$_vdm_version" ]]; then
+    _atomic_write_string "$INSTALL_DIR/.version" "$_vdm_version" || true
+  fi
 fi
 
 echo -e "  ${GREEN}✓${NC} Installed to ${CYAN}$INSTALL_DIR${NC}"
@@ -237,9 +400,19 @@ if [[ -n "$SHELL_RC" ]]; then
     [[ -z "$NODE_BIN" ]] && NODE_BIN="node" # fallback to PATH lookup at run time
     # Pre-quote for safety (in case the path contains spaces)
     NODE_BIN_QUOTED="$(printf '%q' "$NODE_BIN")"
-    echo "" >> "$SHELL_RC"
-    cat >> "$SHELL_RC" <<SHELL_EOF
-# BEGIN claude-account-switcher
+    # Build the snippet body in a tmp file FIRST, then atomically append
+    # to the rc file via _atomic_append_block. This makes the rc-file
+    # edit crash-safe: a SIGKILL / Ctrl-C between the heredoc emitting
+    # the BEGIN line and the END line previously left a half-written
+    # block that the uninstaller could not auto-clean. Now the file
+    # composition happens in a tmp file (no partial state visible to
+    # any reader), then mv-renames in one syscall.
+    _SNIPPET_BODY="$(mktemp -t vdm-snippet.XXXXXX)" || {
+      echo -e "  ${RED}!${NC} mktemp failed — refusing to edit rc file" >&2
+      exit 1
+    }
+    _register_cleanup "rm -f \"$_SNIPPET_BODY\""
+    cat > "$_SNIPPET_BODY" <<SHELL_EOF
 # Resolve dashboard + proxy ports. Priority order:
 #   1. Pre-existing env var (\$CSW_PORT / \$CSW_PROXY_PORT) wins — lets a user
 #      run \`CSW_PORT=4444 CSW_PROXY_PORT=4445 …\` in the SAME shell (or via a
@@ -312,8 +485,15 @@ unset _vdm_lock
 # \$CSW_PROXY_PORT, not a literal 3334, so claude actually hits the proxy
 # on a non-default port instead of bypassing it.
 export ANTHROPIC_BASE_URL="\${ANTHROPIC_BASE_URL:-http://localhost:\$CSW_PROXY_PORT}"
-# END claude-account-switcher
 SHELL_EOF
+    if ! _atomic_append_block "$SHELL_RC" \
+        "# BEGIN claude-account-switcher" \
+        "# END claude-account-switcher" \
+        "$_SNIPPET_BODY"; then
+      echo -e "  ${RED}!${NC} Failed to update $SHELL_RC" >&2
+      exit 1
+    fi
+    rm -f "$_SNIPPET_BODY"
     echo -e "  ${GREEN}✓${NC} Added auto-start to ${CYAN}$SHELL_RC${NC}"
   fi
 else
@@ -354,15 +534,24 @@ else
 fi
 
 # ── Install token tracking hooks ──
-
+# Don't mask install_hooks failures — surface them. install_hooks is
+# itself atomic (settings.json is rewritten via tmp + os.replace), so
+# a failure here means JSON parsing / disk full / permissions, not
+# corruption. Surface so the user knows their tokens won't be tracked.
 if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
-  source "$INSTALL_DIR/install-hooks.sh"
-  install_hooks && echo -e "  ${GREEN}✓${NC} Token tracking hooks installed" || true
+  # shellcheck source=/dev/null
+  . "$INSTALL_DIR/install-hooks.sh"
+  if install_hooks; then
+    echo -e "  ${GREEN}✓${NC} Token tracking hooks installed"
+  else
+    echo -e "  ${YELLOW}!${NC} Hook install returned non-zero — token tracking may be off."
+    echo -e "    ${DIM}Re-run ./install.sh later, or check ${CYAN}~/.claude/settings.json${DIM}.${NC}"
+  fi
 fi
 
 # ── Install user slash commands (~/.claude/commands/) ──
 # Each command is a single .md file with frontmatter + body. Install
-# is idempotent: cp -f overwrites prior copies so an upgrade picks up
+# is atomic per-file (tmp + rename) and idempotent — re-running picks up
 # the new content. Uninstall removes the files we copied here, leaving
 # unrelated commands alone.
 COMMANDS_SRC_DIR="$SCRIPT_DIR/commands"
@@ -371,10 +560,17 @@ if [[ -d "$COMMANDS_SRC_DIR" ]]; then
   mkdir -p "$COMMANDS_DST_DIR"
   for cmd_file in "$COMMANDS_SRC_DIR"/*.md; do
     [[ -f "$cmd_file" ]] || continue
-    cp -f "$cmd_file" "$COMMANDS_DST_DIR/"
-    echo -e "  ${GREEN}✓${NC} Installed slash command ${CYAN}/$(basename "$cmd_file" .md)${NC}"
+    _bn="$(basename "$cmd_file")"
+    if _atomic_install "$cmd_file" "$COMMANDS_DST_DIR/$_bn" 644; then
+      echo -e "  ${GREEN}✓${NC} Installed slash command ${CYAN}/$(basename "$_bn" .md)${NC}"
+    else
+      echo -e "  ${YELLOW}!${NC} Failed to install slash command $_bn"
+    fi
   done
 fi
+
+# Mark the install as successful so the rollback trap is a no-op.
+_INSTALL_OK=1
 
 echo ""
 echo -e "  ${BOLD}${GREEN}Installation complete!${NC}"
