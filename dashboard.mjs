@@ -1012,6 +1012,15 @@ function fetchRateLimits(token) {
       messages: [{ role: 'user', content: '.' }],
     });
 
+    // The Promise-resolution must happen exactly once, even if `error` /
+    // `timeout` / `end` race against each other (which they can — `end`
+    // fires after the body buffer is flushed; `error` can come from the
+    // socket layer slightly later). Without this guard, a quick error +
+    // late `end` produced a "resolve called twice" no-op the first time
+    // and silently dropped the second resolution — the first one wins,
+    // but the bug is real if the order ever flips for the worse.
+    let _settled = false;
+    const settle = (v) => { if (_settled) return; _settled = true; resolve(v); };
     const req = https.request({
       hostname: 'api.anthropic.com',
       path: '/v1/messages',
@@ -1031,11 +1040,11 @@ function fetchRateLimits(token) {
       res.on('end', () => {
         // Read rate limit headers from both 200 and 429 responses
         if (res.statusCode !== 200 && res.statusCode !== 429) {
-          resolve(null);
+          settle(null);
           return;
         }
         const h = res.headers;
-        resolve({
+        settle({
           status: h['anthropic-ratelimit-unified-status'] || (res.statusCode === 429 ? 'limited' : 'unknown'),
           fiveH: {
             status: h['anthropic-ratelimit-unified-5h-status'] || 'unknown',
@@ -1053,9 +1062,15 @@ function fetchRateLimits(token) {
           fetchedAt: Date.now(),
         });
       });
+      // Response-stream errors (socket reset mid-body, malformed chunked
+      // encoding, etc.) fire on `res` not `req`. Without this listener,
+      // an upstream that aborts after headers but before `end` would
+      // hang the Promise until req.timeout (10s) eventually fires —
+      // burning the entire timeout budget on a determined error.
+      res.on('error', () => { try { res.resume(); } catch {} settle(null); });
     });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => settle(null));
+    req.on('timeout', () => { try { req.destroy(); } catch {} settle(null); });
     req.write(body);
     req.end();
   });
@@ -4706,9 +4721,39 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
   }
 
-  // Binary activity area: ON (utilization > 0) vs OFF, with shaded fill
+  // Binary activity area: ON (utilization > 0) vs OFF, with shaded fill.
+  // hist is monotonically non-decreasing in ts (it is appended to in
+  // chronological order by createUtilizationHistory). For a 7-day
+  // sparkline against a 30-day history that's ~80% wasted iterations
+  // when using filter(). Binary-search to find the first index >=
+  // windowStart, then linear scan until ts > windowEnd. O(log n + k)
+  // instead of O(n) per render.
   if (hist && hist.length >= 1) {
-    var pts = hist.filter(function(h) { return h.ts >= windowStart && h.ts <= windowEnd; });
+    var pts;
+    var first = hist[0];
+    var last  = hist[hist.length - 1];
+    if (last.ts < windowStart || first.ts > windowEnd) {
+      pts = [];
+    } else if (first.ts >= windowStart && last.ts <= windowEnd) {
+      // Whole history fits inside the window — no slicing needed.
+      pts = hist;
+    } else {
+      // Binary search: lowest index i with hist[i].ts >= windowStart.
+      var lo = 0, hi = hist.length;
+      while (lo < hi) {
+        var mid = (lo + hi) >>> 1;
+        if (hist[mid].ts < windowStart) lo = mid + 1;
+        else hi = mid;
+      }
+      var startIdx = lo;
+      // Linear scan from startIdx until we exceed windowEnd. Most
+      // sparklines render at most a few hundred points so this loop
+      // is cheap; doing a second binary search for the end index
+      // would only matter for truly enormous histories.
+      var endIdx = startIdx;
+      while (endIdx < hist.length && hist[endIdx].ts <= windowEnd) endIdx++;
+      pts = hist.slice(startIdx, endIdx);
+    }
     // Insert synthetic OFF points when gap between consecutive points > 10 min
     // This prevents the step function from holding ON state across long idle periods
     var GAP_THRESHOLD = 10 * 60 * 1000; // 10 minutes
@@ -6909,25 +6954,49 @@ function saveViewerState(state) {
 // in memory; loadTokenUsage caches the parsed JSON so this is one
 // in-memory linear scan per array — N is bounded by ACTIVITY_MAX_ENTRIES
 // (500) and TOKEN_USAGE_MAX_ENTRIES (50_000).
+// Cache the data range so the 10s `vsRefreshDataRange` poll doesn't
+// re-walk 50k+ token-usage rows on every tick. Invalidation: whenever
+// either the token-usage cache reference changes (atomic replacement
+// in _flushTokenUsage / appendTokenUsage's prune step) OR the activity
+// log length grows. The cached array IDENTITY check is the cheapest
+// reliable signal — `_tokenUsageCache` is reassigned on every prune,
+// not mutated in place after that. Falls back to a recompute every
+// COMPUTE_DATA_RANGE_TTL_MS as a safety net for any path that mutates
+// the array without reassigning the reference.
+let _dataRangeCache = null;        // { oldest, newest, ref, activityLen, ts }
+const COMPUTE_DATA_RANGE_TTL_MS = 5_000;
 function computeDataRange() {
+  const usage = loadTokenUsage();
+  const now = Date.now();
+  const c = _dataRangeCache;
+  if (
+    c &&
+    c.ref === usage &&
+    c.activityLen === activityLog.length &&
+    (now - c.ts) < COMPUTE_DATA_RANGE_TTL_MS
+  ) {
+    if (c.oldest == null) return null;
+    return { oldest: c.oldest, newest: c.newest };
+  }
   let oldest = Infinity;
   let newest = -Infinity;
-  try {
-    const usage = loadTokenUsage();
-    for (let i = 0; i < usage.length; i++) {
-      const ts = Number(usage[i].ts || usage[i].timestamp || 0);
-      if (!Number.isFinite(ts) || ts <= 0) continue;
-      if (ts < oldest) oldest = ts;
-      if (ts > newest) newest = ts;
-    }
-  } catch { /* empty / unreadable */ }
+  for (let i = 0; i < usage.length; i++) {
+    const ts = Number(usage[i].ts || usage[i].timestamp || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts < oldest) oldest = ts;
+    if (ts > newest) newest = ts;
+  }
   for (let i = 0; i < activityLog.length; i++) {
     const ts = Number(activityLog[i].ts || 0);
     if (!Number.isFinite(ts) || ts <= 0) continue;
     if (ts < oldest) oldest = ts;
     if (ts > newest) newest = ts;
   }
-  if (!Number.isFinite(oldest) || !Number.isFinite(newest)) return null;
+  if (!Number.isFinite(oldest) || !Number.isFinite(newest)) {
+    _dataRangeCache = { oldest: null, newest: null, ref: usage, activityLen: activityLog.length, ts: now };
+    return null;
+  }
+  _dataRangeCache = { oldest, newest, ref: usage, activityLen: activityLog.length, ts: now };
   return { oldest, newest };
 }
 
