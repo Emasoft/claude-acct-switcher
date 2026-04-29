@@ -2666,6 +2666,78 @@ describe('pickAnyUntried — excludeFromAuto', () => {
   });
 });
 
+describe('pickByStrategy — excluded-but-available current account stays sticky', () => {
+  it('does NOT auto-rotate away from an excluded current account that is still usable', () => {
+    // User toggled excludeFromAuto on the currently-active account 'a'.
+    // 'a' is healthy (low utilization, not rate-limited). Expected:
+    // strategy keeps 'a' active until it becomes unavailable. Otherwise
+    // every poll would force-rotate-away (because pickConserve filters
+    // 'a' out of candidates) — surprising behaviour for a flag named
+    // "exclude from auto-SWITCH".
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'b', token: 'b', expiresAt: Date.now() + 86400000 },
+    ];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.1, utilization7d: 0.2 },
+      b: { utilization5h: 0.0, utilization7d: 0.0 },
+    });
+    for (const strategy of ['conserve', 'spread', 'drain-first', 'round-robin', 'sticky']) {
+      const r = pickByStrategy({
+        strategy, intervalMin: 0,
+        currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+        now: Date.now() + 60_000_000, // far past any rotation interval
+      });
+      assert.equal(r.rotated, false, `strategy=${strategy} should not rotate away from excluded-but-available current`);
+      assert.equal(r.account, null, `strategy=${strategy} returned non-null account`);
+    }
+  });
+
+  it('rotates away when an excluded current becomes unavailable (rate-limited)', () => {
+    // The exclude flag must NOT block recovery rotation when the
+    // current account is rate-limited — that would strand the user
+    // with a non-functional account. Verify the unavailable branch
+    // wins over the excluded-sticky branch.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+      { name: 'b', token: 'b', expiresAt: Date.now() + 86400000 },
+    ];
+    const sm = _mkStateManager({
+      a: { limited: true, resetAt: nowSec + 600 },
+      b: { utilization5h: 0.0 },
+    });
+    const r = pickByStrategy({
+      strategy: 'conserve', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+      now: Date.now(),
+    });
+    assert.equal(r.rotated, true, 'must rotate away from rate-limited excluded current');
+    assert.ok(r.account);
+    assert.equal(r.account.token, 'b');
+  });
+
+  it('returns null/null when an excluded current is unavailable AND no other candidate exists', () => {
+    // Edge case: only account is excluded AND rate-limited. We can't
+    // recover — but we shouldn't crash either. Expected: account=null,
+    // rotated=false (the proxy will surface the failure to the client).
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: Date.now() + 86400000, excludeFromAuto: true },
+    ];
+    const sm = _mkStateManager({
+      a: { limited: true, resetAt: nowSec + 600 },
+    });
+    const r = pickByStrategy({
+      strategy: 'conserve', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+      now: Date.now(),
+    });
+    assert.equal(r.rotated, false);
+    assert.equal(r.account, null);
+  });
+});
+
 describe('pickByStrategy — excludeFromAuto end-to-end', () => {
   it('every strategy path honours excludeFromAuto', () => {
     const accounts = [
@@ -3001,5 +3073,122 @@ describe('parseRetryAfter', () => {
     // a synthesised value). It should still parse as delta-seconds.
     assert.equal(parseRetryAfter(60), 60);
     assert.equal(parseRetryAfter(0), 0);
+  });
+
+  it('caps absurd upstream values at PARSE_RETRY_AFTER_MAX (24h)', () => {
+    // A misconfigured (or hostile) upstream sending Retry-After: 99999999
+    // should not put us in a multi-year cooldown. Cap at 86400s.
+    assert.equal(parseRetryAfter(99999999), 86400);
+    assert.equal(parseRetryAfter(86401), 86400);
+    assert.equal(parseRetryAfter(86400), 86400); // boundary
+    assert.equal(parseRetryAfter(86399), 86399); // just under
+  });
+
+  it('caps far-future HTTP-date values at PARSE_RETRY_AFTER_MAX', () => {
+    // Date 10 years in the future → cap to 24h.
+    const now = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
+    const farFuture = 'Mon, 01 Jan 2040 12:00:00 GMT';
+    assert.equal(parseRetryAfter(farFuture, now), 86400);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// XSS regression tests for the renderHTML embedded JS.
+//
+// renderHTML returns the dashboard's HTML+JS as a single template
+// literal, so the embedded helpers (escHtml, evtMsg, the card render
+// closure) can't be imported and unit-tested directly. Instead we
+// regression-test the SOURCE: read dashboard.mjs as text and assert
+// that every dynamic-data interpolation goes through an escape helper
+// (`escHtml(...)` / the `h(...)` alias inside evtMsg).
+//
+// These tests are deliberately strict: a future contributor adding a
+// new event type to evtMsg without going through `h()` will see the
+// regression test fail before the change hits the browser.
+// ─────────────────────────────────────────────────
+import { readFileSync as _readFileSync_xss } from 'node:fs';
+
+describe('XSS regression — evtMsg escapes every dynamic field', () => {
+  const _dashboardSrc = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('the local h() helper exists in evtMsg', () => {
+    // evtMsg defines `var h = function(s) { return escHtml(...); };`
+    // Match either `escHtml` or that exact pattern. Without the helper,
+    // every interpolation below would be unsafe.
+    assert.match(_dashboardSrc, /var h = function\(s\) \{ return escHtml\(/);
+  });
+
+  it('no UNESCAPED `+ e.field +` concatenations remain in evtMsg', () => {
+    // The pre-fix XSS pattern had the literal shape `' + e.account` /
+    // `' + e.label` / etc — string-literal concat boundary directly
+    // adjacent to the unsafe field reference. The fix wraps every such
+    // reference in `h(...)`. Search for the dangerous shape directly
+    // and fail on any survivor; this is robust against future event
+    // types being added without going through the helper.
+    //
+    // Allowed exceptions:
+    //   * `e.retryAfter` is numeric and only used in arithmetic
+    //   * `e.type` is set by dashboard code so it's already safe
+    const fnMatch = _dashboardSrc.match(
+      /function evtMsg\(e\) \{[\s\S]*?\n\}/
+    );
+    assert.ok(fnMatch, 'evtMsg function not found');
+    const body = fnMatch[0];
+    // Hunt for the shape `+ e.<field>` where <field> is NOT retryAfter
+    // or type. The shape inside an `h(...)` call would be `(e.field` or
+    // `h(e.field`, NOT `+ e.field`, so this regex distinguishes safe
+    // (wrapped) from unsafe (raw concat) usage.
+    const dangerous = body.match(/\+\s*e\.([a-zA-Z_$][\w$]*)/g) || [];
+    const unsafe = dangerous.filter(m => {
+      const field = m.match(/e\.([a-zA-Z_$][\w$]*)/)[1];
+      return field !== 'retryAfter' && field !== 'type';
+    });
+    assert.deepEqual(unsafe, [],
+      `Unescaped string-concat XSS shape found in evtMsg: ${unsafe.join(', ')}. ` +
+      `Wrap each field in h(...) before concatenating into HTML.`);
+  });
+});
+
+describe('XSS regression — renderAccounts card rendering', () => {
+  const _dashboardSrc = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('displayName is HTML-escaped before innerHTML', () => {
+    // The fix in commit e2f0b35 introduced a separate displayName
+    // (escHtml-wrapped) vs displayNameJs (single-quote-escaped) split.
+    // Ensure both are still present.
+    assert.match(_dashboardSrc, /const displayName = escHtml\(rawDisplayName\);/);
+    assert.match(_dashboardSrc, /const displayNameJs = String\(rawDisplayName\)\.replace/);
+  });
+
+  it('card-name span uses the escaped displayName, not raw', () => {
+    // The span MUST interpolate displayName (already escaped), not
+    // rawDisplayName. A regression here would re-introduce the XSS.
+    const cardNameSnippet = _dashboardSrc.match(
+      /<span class="card-name">.{0,10}\+ ([A-Za-z0-9_]+) \+/
+    );
+    assert.ok(cardNameSnippet, 'card-name span pattern not found');
+    assert.equal(cardNameSnippet[1], 'displayName',
+      'card-name must interpolate displayName (escaped), not ' + cardNameSnippet[1]);
+  });
+
+  it('doSwitch onclick uses displayNameJs, not the escaped form', () => {
+    // The onclick attribute interpolates the JS-string-escaped form so
+    // the toast displays apostrophes correctly. Asserting the right
+    // variable is used here prevents an inverse regression where someone
+    // "simplifies" by reusing displayName everywhere — which would
+    // double-encode and produce &#39; in toasts.
+    // The on-disk pattern looks like:
+    //   onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)"
+    // We just need to confirm displayNameJs (not displayName) is the
+    // value passed in the second slot.
+    assert.match(_dashboardSrc, /doSwitch\([^)]*\+displayNameJs\+/);
+    assert.doesNotMatch(_dashboardSrc, /doSwitch\([^)]*\+displayName\+/,
+      'doSwitch must pass displayNameJs, not the HTML-escaped displayName');
   });
 });

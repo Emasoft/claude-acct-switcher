@@ -450,6 +450,24 @@ function _runGitCached(cwd, args, timeout = 3000) {
   if (typeof cwd !== 'string' || cwd.length === 0) {
     throw new Error('git: cwd must be a non-empty string');
   }
+  // Reject obviously-bogus cwds before they pollute the cache. A
+  // hostile /api/session-start payload could otherwise spam unique
+  // cwd strings to evict every legitimate cache entry (cap is 200
+  // FIFO). Two cheap checks:
+  //   1. Must be an absolute path — git itself rejects relative cwd
+  //      with `fatal: not a git repository`, but only AFTER forking,
+  //      and the cache then stores the error. By rejecting up front
+  //      we save the fork on every poll for the same bad cwd.
+  //   2. Length cap: paths > 4096 chars are pathological on every
+  //      filesystem we support and almost always mean attack input.
+  // We do NOT existsSync(cwd) here — adding a stat call to a hot path
+  // is exactly the kind of thing _runGitCached exists to avoid; the
+  // git fork below will fail cheaply for non-existent paths and the
+  // 5-second error cache absorbs the cost.
+  if (cwd.length > 4096 || !cwd.startsWith('/')) {
+    const e = new Error('git: cwd must be an absolute path under 4096 chars');
+    throw e;
+  }
   const key = cwd + '\0' + args.join('\0');
   const now = Date.now();
   const hit = _runGitCache.get(key);
@@ -997,20 +1015,59 @@ function _isNotifyEnabled(eventType) {
 //   1. macOS              → osascript (JXA) — the project's primary platform
 //   2. Linux + libnotify  → notify-send  (gracefully degrades for WSL2 / dev VMs)
 //   3. anything else      → log-only — at least the activity feed + stderr show it
-function _detectNotifyChannel() {
-  if (process.platform === 'darwin') return 'osascript';
-  if (process.platform === 'linux') {
-    // Probe `notify-send -V` — fast (<10ms), exits 0 if installed.
+// Resolve the absolute path to a binary using the user's PATH at startup,
+// then HARDCODE that path for every subsequent execFile. PATH-hijack
+// defense: a malicious binary named `notify-send` or `osascript` placed
+// earlier in PATH (e.g. ~/.local/bin/) would otherwise receive every
+// notify() call's payload (account labels, error strings) on every
+// rotation event. Resolving once at startup means we'd have to be
+// hijacked AT module-load time, which requires file-system write
+// access the dashboard process never grants to other users.
+//
+// Returns null if the binary isn't on PATH.
+function _resolveBinary(name) {
+  // /usr/bin/which is itself in a fixed system location, so it can't be
+  // hijacked by a user-PATH manipulation. Avoid `command -v` because
+  // that's shell-builtin and execFileSync('command', …) doesn't work.
+  // execFileSync without shell — argv-only, no injection vector.
+  for (const which of ['/usr/bin/which', '/bin/which']) {
     try {
-      execFileSync('notify-send', ['--version'], {
-        timeout: 1500, stdio: ['ignore', 'ignore', 'ignore'],
-      });
-      return 'notify-send';
-    } catch { /* not installed → fall through */ }
+      const out = execFileSync(which, [name], {
+        encoding: 'utf8', timeout: 1500, stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      if (out && out.startsWith('/')) return out;
+    } catch { /* try next which */ }
   }
-  return 'log-only';
+  return null;
 }
-const _NOTIFY_CHANNEL = _detectNotifyChannel();
+
+function _detectNotifyChannel() {
+  if (process.platform === 'darwin') {
+    // osascript ships with macOS in /usr/bin/osascript — hardcoded
+    // path means a malicious ~/.local/bin/osascript can't intercept.
+    // We still verify the canonical path exists in case of a stripped
+    // / sandboxed environment.
+    if (existsSync('/usr/bin/osascript')) return { kind: 'osascript', path: '/usr/bin/osascript' };
+    // Fallback: PATH lookup but pinned at startup. Worst case is a
+    // hijacked ~/.local/bin BEFORE the dashboard starts, which is a
+    // pre-existing supervisor-level compromise, not a notify-channel
+    // problem.
+    const resolved = _resolveBinary('osascript');
+    return resolved ? { kind: 'osascript', path: resolved } : { kind: 'log-only', path: null };
+  }
+  if (process.platform === 'linux') {
+    // Probe notify-send via `which` so we capture an absolute path AND
+    // also confirm it's installed in one go. Skip the previous
+    // `notify-send --version` probe — a hijacked notify-send earlier
+    // in PATH would have answered just to mask itself.
+    const resolved = _resolveBinary('notify-send');
+    if (resolved) return { kind: 'notify-send', path: resolved };
+  }
+  return { kind: 'log-only', path: null };
+}
+const _NOTIFY_CHANNEL_INFO = _detectNotifyChannel();
+const _NOTIFY_CHANNEL = _NOTIFY_CHANNEL_INFO.kind;
+const _NOTIFY_BINARY = _NOTIFY_CHANNEL_INFO.path;
 
 function notify(title, message, eventType = '') {
   if (!_isNotifyEnabled(eventType)) return;
@@ -1027,7 +1084,7 @@ function notify(title, message, eventType = '') {
   // when the GUI channel is unavailable (CI, headless server, etc.).
   try { log('info', `[notify:${eventType || '?'}] ${title} — ${message}`); } catch {}
 
-  if (_NOTIFY_CHANNEL === 'osascript') {
+  if (_NOTIFY_CHANNEL === 'osascript' && _NOTIFY_BINARY) {
     try {
       // JXA (JavaScript for Automation) + JSON.stringify encodes every
       // character — backslash, newline, CR, quote — so account names
@@ -1040,7 +1097,7 @@ function notify(title, message, eventType = '') {
         'app.displayNotification(' + JSON.stringify(String(message)) +
         ', {withTitle: ' + JSON.stringify(String(title)) +
         ', soundName: "Blow"});';
-      execFile('osascript', ['-l', 'JavaScript', '-e', script], { timeout: 3000 }, (err) => {
+      execFile(_NOTIFY_BINARY, ['-l', 'JavaScript', '-e', script], { timeout: 3000 }, (err) => {
         if (err) log('warn', `osascript notify failed: ${err.message}`);
       });
     } catch (e) {
@@ -1049,14 +1106,14 @@ function notify(title, message, eventType = '') {
     return;
   }
 
-  if (_NOTIFY_CHANNEL === 'notify-send') {
+  if (_NOTIFY_CHANNEL === 'notify-send' && _NOTIFY_BINARY) {
     try {
       // notify-send takes positional args: <summary> <body>. Both are
       // passed through argv (no shell), so newlines / quotes / metas
       // in the strings cannot inject. -u low avoids stealing focus on
       // GNOME / KDE.
       execFile(
-        'notify-send',
+        _NOTIFY_BINARY,
         ['-u', 'low', String(title), String(message)],
         { timeout: 3000 },
         (err) => {
@@ -2637,12 +2694,43 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-function readBody(req) {
+// Hard size cap on dashboard control-plane request bodies. Every /api/*
+// handler that accepts a POST body uses readBody, and none of them
+// legitimately need more than ~10KB (settings patch, account-prefs
+// toggle, hook payload). Unbounded Buffer.concat lets a same-origin
+// browser tab DoS the dashboard with a single multi-MB request — the
+// CSRF allow-list rejects mutations from foreign origins, but the user's
+// own tabs CAN reach this surface and a malicious page they navigated
+// to could cost RAM via fetch('/api/account-prefs', { body: '<1GB>' }).
+// 1 MiB is far above any legitimate payload while staying well clear of
+// V8's Buffer.concat fragmentation threshold.
+const READ_BODY_MAX = 1024 * 1024;
+
+function readBody(req, maxBytes = READ_BODY_MAX) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', c => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-    req.on('error', reject);
+    let total = 0;
+    let aborted = false;
+    req.on('data', c => {
+      if (aborted) return;
+      total += c.length;
+      if (total > maxBytes) {
+        aborted = true;
+        // 413 Payload Too Large would be ideal, but at this layer we
+        // only have the raw `req`. Destroying the socket is the cheapest
+        // termination path and lets the server-level error handler emit
+        // a clean 4xx if it can. Reject with an Error the caller can
+        // distinguish from a transport failure.
+        const e = new Error('request body exceeded ' + maxBytes + ' bytes');
+        e.code = 'E_BODY_TOO_LARGE';
+        try { req.destroy(e); } catch {}
+        reject(e);
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => { if (!aborted) resolve(Buffer.concat(chunks).toString()); });
+    req.on('error', e => { if (!aborted) reject(e); });
   });
 }
 

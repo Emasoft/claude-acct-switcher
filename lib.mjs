@@ -315,6 +315,22 @@ export function pickByStrategy(opts) {
     return { account: best, rotated: !!best };
   }
 
+  // Current is still usable. Honor `excludeFromAuto` strictly here:
+  // the flag's literal meaning is "don't auto-PICK this account", but
+  // since the picker functions filter the current account out when it's
+  // flagged, every non-sticky strategy below would AUTO-ROTATE-AWAY on
+  // every poll (because pickConserve/pickBestAccount returns a different
+  // account from current). That violates user intent — they opted out
+  // of auto-switching, not opted into mandatory rotation. Treat an
+  // excluded-but-available current as "sticky for now": no rotation
+  // until either the user manually switches or the account becomes
+  // unavailable (rate-limited / expired), at which point the
+  // unavailable branch above takes over and pickBestAccount returns
+  // the best non-excluded candidate.
+  if (currentAcct && currentAcct.excludeFromAuto) {
+    return { account: null, rotated: false };
+  }
+
   switch (strategy) {
     case 'sticky':
       // Never proactively switch  - keep current
@@ -625,27 +641,44 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
  *
  * Returns a non-negative integer count of seconds. 0 if header is
  * missing/empty/unparseable; for HTTP-date in the past, also 0.
+ * Result is capped at PARSE_RETRY_AFTER_MAX so a hostile or
+ * misconfigured upstream can't talk us into a multi-year cooldown via
+ * `Retry-After: Sat, 01 Jan 2099 00:00:00 GMT`. 24h is well above any
+ * legitimate Anthropic rate-limit window (5h / 7d windows reset, but
+ * the per-request retry-after never exceeds the longer 7d boundary
+ * which is itself ~604800s; we cap LOWER at 86400 because anything
+ * past a day is effectively "give up" from the proxy's perspective
+ * and we'd rather rotate aggressively than honour an absurd value).
  *
  * Pure function — `now` is injectable for unit tests.
  */
+export const PARSE_RETRY_AFTER_MAX = 86_400; // 24h
+
 export function parseRetryAfter(headerValue, now = Date.now()) {
   if (headerValue == null) return 0;
   const trimmed = String(headerValue).trim();
   if (!trimmed) return 0;
+  let raw = 0;
   // Form 1: delta-seconds — purely numeric, non-negative integer.
   // We use a regex test (not parseInt) so "120abc" doesn't masquerade
   // as a valid 120-second delta.
   if (/^\d+$/.test(trimmed)) {
     const n = parseInt(trimmed, 10);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
+    raw = Number.isFinite(n) && n >= 0 ? n : 0;
+  } else {
+    // Form 2: HTTP-date — let Date.parse handle the three RFC-allowed
+    // formats (RFC 1123, RFC 850, asctime). NaN means "unparseable".
+    const targetMs = Date.parse(trimmed);
+    if (!Number.isFinite(targetMs)) return 0;
+    const deltaMs = targetMs - now;
+    if (deltaMs <= 0) return 0;
+    raw = Math.ceil(deltaMs / 1000);
   }
-  // Form 2: HTTP-date — let Date.parse handle the three RFC-allowed
-  // formats (RFC 1123, RFC 850, asctime). NaN means "unparseable".
-  const targetMs = Date.parse(trimmed);
-  if (!Number.isFinite(targetMs)) return 0;
-  const deltaMs = targetMs - now;
-  if (deltaMs <= 0) return 0;
-  return Math.ceil(deltaMs / 1000);
+  // Cap to defend against absurd upstream values (e.g. far-future
+  // HTTP-date or a hostile delta-seconds like 999999999). 0 is left
+  // unchanged because callers use it as the "transient, pass through"
+  // sentinel.
+  return Math.min(raw, PARSE_RETRY_AFTER_MAX);
 }
 
 /**
