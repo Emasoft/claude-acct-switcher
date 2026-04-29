@@ -27,7 +27,7 @@ CSW_PORT=4444 CSW_PROXY_PORT=4445 node dashboard.mjs
 ./uninstall.sh
 
 # CLI (after install, or run `./vdm <cmd>` from the repo)
-vdm list | switch | remove | status | config | dashboard | logs | tokens | upgrade
+vdm list | switch | remove | status | config | dashboard | logs | tokens | prefs | upgrade
 ```
 
 There is **no build step, no bundler, no package.json, no lockfile, no linter**. The whole project is plain Node.js using only built-in modules plus bash. Don't add dependencies — that's a deliberate constraint (see Architecture below).
@@ -38,9 +38,9 @@ Requires Node 18+, macOS (uses Keychain), and `python3` (used by `vdm` and `inst
 
 Three source files do all the work. Understand these and you understand the whole project:
 
-- **`vdm`** (bash, ~1150 lines) — user-facing CLI. Dispatches to `cmd_*` functions; talks to the macOS Keychain via `security(1)` and to the dashboard's HTTP API for anything stateful. The `case` block at the bottom of the file is the command map.
-- **`dashboard.mjs`** (Node, ~4360 lines) — runs **two HTTP servers in one process**: the web dashboard (default port 3333, all the `/api/*` routes plus the embedded HTML in `renderHTML()`) and the API proxy (default port 3334, `handleProxyRequest`). Holds all I/O, timers, and global state. The HTML/CSS/JS for the UI is a single template string returned by `renderHTML()` — there is no separate frontend.
-- **`lib.mjs`** (Node, ~560 lines) — pure functions only, zero side effects. Anything testable lives here: fingerprinting, header rewriting (`buildForwardHeaders`/`stripHopByHopHeaders`), the `createAccountStateManager`/`createUtilizationHistory`/`createProbeTracker`/`createPerAccountLock` factories, rotation-strategy logic (`pickByStrategy` and friends), and OAuth-refresh helpers. **When adding logic that can be expressed as a pure function, put it in `lib.mjs` and unit-test it in `test/lib.test.mjs`** — that's how the existing code is structured.
+- **`vdm`** (bash, ~1900 lines) — user-facing CLI. Dispatches to `cmd_*` functions; talks to the macOS Keychain via `security(1)` and to the dashboard's HTTP API for anything stateful. The `case` block at the bottom of the file is the command map.
+- **`dashboard.mjs`** (Node, ~10,300 lines) — runs **two HTTP servers in one process**: the web dashboard (default port 3333, all the `/api/*` routes plus the embedded HTML in `renderHTML()`) and the API proxy (default port 3334, `handleProxyRequest`). Holds all I/O, timers, and global state. The HTML/CSS/JS for the UI is a single template string returned by `renderHTML()` — there is no separate frontend.
+- **`lib.mjs`** (Node, ~700 lines) — pure functions only, zero side effects. Anything testable lives here: fingerprinting, header rewriting (`buildForwardHeaders`/`stripHopByHopHeaders`), the `createAccountStateManager`/`createUtilizationHistory`/`createProbeTracker`/`createPerAccountLock` factories, rotation-strategy logic (`pickByStrategy` and friends — see **Per-account `excludeFromAuto`** below), OAuth-refresh helpers, and `parseRetryAfter` (RFC 7231 §7.1.3 — handles both delta-seconds and HTTP-date forms; capped at `PARSE_RETRY_AFTER_MAX = 86400s`). **When adding logic that can be expressed as a pure function, put it in `lib.mjs` and unit-test it in `test/lib.test.mjs`** — that's how the existing code is structured.
 
 ### How a Claude Code request flows through this
 
@@ -86,6 +86,8 @@ Active credentials live in **a single macOS Keychain entry**: service `Claude Co
 | `utilization-history.json` | `saveHistoryToDisk()` | 24h + 7d utilization series for trend graphs |
 | `probe-log.json` | `recordProbe()` | rolling 7-day count of HEAD probes (so the cost of probing is itself observable) |
 | `token-usage.json` | `/api/session-start` + `/api/session-stop` hooks | per-session token counters used by the git commit-message trailer |
+| `session-history.json` | `persistCompletedSession` (debounced 750ms) | rolling history of completed monitored sessions; debounced via `_flushSessionHistory` to avoid blocking the event loop on burst completions |
+| `account-prefs.json` | `setAccountPref` | per-account user prefs (`excludeFromAuto`, `priority`); single JSON map, atomic-written on change. The picker layer reads this via `getAccountPrefs(name)` in `loadAllAccountTokens`, so a successful POST to `/api/account-prefs` takes effect on the next pick. **`/api/remove` MUST drop the matching entry** — recreating an account with the same name later otherwise revives stale flags. |
 | `.dashboard.pid` | `vdm dashboard start` | PID file for the foreground-launched dashboard |
 
 Account credentials no longer live as plaintext JSON files — they're keychain entries (see "Credential storage" above). The remaining files in `accounts/` are just `*.label` text files. These all use atomic-rename writes in the helpers; don't write directly with `writeFileSync` from new code — copy the existing pattern.
@@ -97,6 +99,19 @@ Account credentials no longer live as plaintext JSON files — they're keychain 
 ### Rotation strategies
 
 Defined in `lib.mjs` as `ROTATION_STRATEGIES` and implemented by `pickByStrategy()`: `sticky` (only on 429/401), `conserve` (drain already-active windows first, leave dormant accounts dormant — this is the default in `DEFAULT_SETTINGS`), `round-robin` (every N minutes), `spread` (always lowest utilization), `drain-first` (highest 5h utilization first). When you add or change a strategy, update both `ROTATION_STRATEGIES` (the metadata) and `pickByStrategy` (the dispatch) and the UI's strategy dropdown in `renderHTML()`.
+
+#### Per-account `excludeFromAuto`
+
+Every picker function in `lib.mjs` (`pickBestAccount`, `pickConserve`, `pickDrainFirst`, `pickAnyUntried`) routes through the `_isPickable(a, excludeTokens, stateManager)` helper which filters out accounts where `a.excludeFromAuto === true`. The flag flows from `account-prefs.json` → `getAccountPrefs(name)` → `loadAllAccountTokens()` (attaches the field on each account object) → picker layer.
+
+Two important semantics that aren't obvious from the field name:
+
+1. **"Exclude from auto-PICK", not "force-rotate-away"**. `pickByStrategy` has a guard right after the unavailable-fallback branch: if the current account is excluded BUT still available, return `{account: null, rotated: false}` regardless of strategy. Otherwise every poll would force-rotate-away (because the picker filters the current account out of candidates → returns a different account → `rotated: true`). The flag is meant to mean "don't auto-PICK me next time", not "force-rotate me out NOW."
+2. **Recovery rotation still wins.** When the current account is rate-limited or expired, `pickBestAccount(accounts, stateManager, excludeTokens)` is called UNCONDITIONALLY before the excluded-sticky guard. If it returns a non-excluded candidate, we rotate; if every candidate is excluded too, we return null and the proxy surfaces the failure — no force-rotation onto an excluded account ever happens.
+
+Manual switches via `/api/switch` and `vdm switch <name>` bypass these helpers entirely, so excluded accounts can still be reached on demand.
+
+When you add a new picker variant, route it through `_isPickable` (don't reimplement the filter) and add a test that asserts excluded accounts are skipped — `test/lib.test.mjs` has the pattern under `describe('pickXxx — excludeFromAuto', ...)`.
 
 ### Hooks installed into the user's machine
 
@@ -148,6 +163,17 @@ There is currently no integration test that exercises the full proxy server end-
 - **Activity log is a ring buffer** capped at 500 entries / 7 days (`ACTIVITY_MAX_ENTRIES`, `ACTIVITY_MAX_AGE`). Don't log per-request — log state transitions (switch, rate-limit, refresh, settings change). The set of allowed event types is the `case` list in `renderHTML()` around the activity feed renderer.
 - **Hop-by-hop header rules are explicit.** `HOP_BY_HOP` in `lib.mjs` lists the headers that get stripped on forward. `accept-encoding` is stripped intentionally so the proxy can read uncompressed error bodies — don't "fix" that.
 - **The `.janitor/` directory at the repo root is not a project source folder** — it's runtime state for the `ai-maestro-janitor` plugin used in this user's Claude Code setup, unrelated to vdm's own code. Leave it alone.
+- **`_runGitCached` is the hot-path git wrapper** (30s TTL on success, 5s on error, FIFO eviction at 200 entries). Every UserPromptSubmit / SSE response / periodic timer fires through it. Never call `_runGit` directly from a hot path — the cache is what keeps `git rev-parse` from blocking the event loop on every poll. The wrapper rejects non-absolute or `>4096`-char `cwd` values so a hostile `/api/session-start` payload can't churn the cache by spamming unique strings. When mutating worktree state from inside the dashboard, call `_invalidateRunGitCache(cwd)` (or pass `null` for a full clear) so subsequent reads see fresh state — see the `/api/worktree-remove` handler for the pattern.
+- **XSS-escaping discipline inside `renderHTML()`**. The dashboard binds to localhost only, but the `renderHTML` template builds HTML strings via `+` concatenation, and several fields are user-controlled (account labels from `vdm label` or auto-discover's `organization_name`, error strings from refresh-failed events, etc.). Two helpers exist:
+  - `escHtml(s)` — full HTML entity escape for any field rendered with `<span>...` style interpolation.
+  - `displayNameJs` — single-quote-as-JS-string escape, used INSIDE `onclick="doSwitch('...','...')"` so the toast still shows readable apostrophes.
+  - `evtMsg` defines a local `h(...)` alias and routes every dynamic field through it.
+  Source-level regression tests in `test/lib.test.mjs` (`describe('XSS regression — ...')`) read `dashboard.mjs` and grep for the dangerous shape `+ e.<field>` outside an `h(...)` wrap. New event types or new card fields that interpolate user data MUST go through `escHtml` / `h` or those tests fail.
+- **Backtick-in-comment trap inside the `renderHTML` template literal.** `renderHTML()` returns a SINGLE backtick-quoted template string from line ~2446 to ~6500. Any `` ` `` inside that range — even inside a `// JS comment` — terminates the template literal early and produces cascading parse errors. Don't use markdown-style backticks for inline code in comments inside `renderHTML`. Use plain-text wording (`the prev* variables`, `on the API endpoint`) or HTML entities (`&#39;`) instead. There's a regression grep — `awk 'NR>=2446 && NR<=6900 && /\/\/.*\`/'` — that should run zero hits.
+- **`readBody(req, maxBytes = READ_BODY_MAX)` caps every POST body at 1 MiB.** Tracks bytes during `req.on('data')`, destroys the socket with a tagged `Error.code = 'E_BODY_TOO_LARGE'` when exceeded. Without this, a same-origin browser tab could DoS the dashboard by POSTing multi-MB JSON to any `/api/*` endpoint. If you ever need a larger body for a specific endpoint, pass an explicit `maxBytes` — don't bump the global default.
+- **`_resolveBinary(name)` pins absolute paths for `osascript` and `notify-send` at startup** to defend against PATH-hijack (`~/.local/bin/notify-send` could otherwise intercept account labels and error strings on every rotation event). On macOS, `/usr/bin/osascript` is hardcoded first; Linux uses `/usr/bin/which` (or `/bin/which`) to capture the path once. Never re-resolve at notification time, never call `execFile('osascript', ...)` with a bare name.
+- **Per-card hash diffing in `renderAccounts`.** `_renderedCardCache` (a `Map<safeName, hash>`) tracks the previously-rendered card hashes; on each refresh, only cards whose hash changed get rewritten via `outerHTML`. The set of names + their order is also compared — if either changes, full `innerHTML` replacement falls back. The OUTER `quickHash(profiles)` gate (line ~5057 in the refresh loop) skips the entire `renderAccounts` call when nothing visible changed.
+- **`quickHash` schema-detects on the first array entry.** If it has `inputTokens` / `outputTokens` / `cacheReadInputTokens` / `cacheCreationInputTokens` (token-usage row shape), it uses the FNV-1a 32-bit fast path. Otherwise it falls back to `JSON.stringify(obj)` — required for profile arrays whose discriminating fields don't match the usage-row schema. **Never make the FNV-1a path field-set narrower without verifying every caller's data shape**; the previous regression silently broke `_lastProfilesHash` checks because profile fields didn't include any of the FNV folds.
 
 ## What disables vdm (Phase G research findings)
 
@@ -167,3 +193,17 @@ These are external conditions vdm CANNOT override — only detect and warn:
 - **Pricing table covers `claude-opus-4-7`, `claude-sonnet-4-7`, `claude-haiku-4-6`** plus the 4-5/4-6 generations. Cache token rates (`cacheRead`, `cacheCreation`) follow Anthropic's published 1.25x (creation) / 0.10x (read) ratios. Unknown-model hits log to the activity feed on first occurrence so the rate table can be kept current. Verify rates against `https://claude.com/pricing` when bumping versions.
 - **macOS Keychain credential storage is NOT documented in the public spec.** The service name `Claude Code-credentials` is an undocumented implementation detail that has changed before. `detectKeychainService()` (in both `vdm` and `lib.mjs`/`dashboard.mjs`) is the canonical fallback pattern; never hardcode the service name in new code.
 - **Claude Code's keychain-cache TTL is 30 seconds** (raised from 5s in v2.1.86). After `vdm switch`, the new account may not be visible to a running Claude Code session for up to 30s. Document in `vdm switch` output if users hit this.
+
+### `/api/account-prefs` — per-account preferences endpoint
+
+GET returns `{ ok: true, prefs: <map> }` where `<map>` is the full `_accountPrefs` object (small JSON, bounded by account count).
+
+POST accepts `{ name, key, value }` and persists via `setAccountPref(name, key, value)`. Validation rules (enforced in both the handler and the helper):
+
+- `name` must match `/^[a-zA-Z0-9._@-]+$/` and not equal the reserved `"index"` — same allow-list as `vdmAccountServiceName` so we can't be tricked into mutating an unrelated key.
+- `key` must be exactly `excludeFromAuto` (boolean) or `priority` (finite number). Anything else throws.
+- A successful POST calls `invalidateAccountsCache()` so the next picker call sees the new flag without waiting for the cache TTL.
+
+CSRF protection: the global Origin allow-list at `dashboard.mjs:~6960` rejects mutating requests from foreign origins. The endpoint also relies on the `readBody` 1 MiB cap (see `READ_BODY_MAX` above).
+
+The corresponding CLI is `vdm prefs [name [key val]]` — fetches the same endpoint via `curl` and renders a small Python-formatted listing. CLI requires the dashboard to be running because the prefs file is owned by the dashboard process to avoid write conflicts (vdm could in theory read the file directly, but writing it would race the dashboard's atomic-rename pattern).

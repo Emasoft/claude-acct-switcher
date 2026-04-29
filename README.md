@@ -65,6 +65,7 @@ vdm config [key] [on|off]   View/toggle settings
 vdm dashboard [start|stop]  Dashboard control
 vdm logs [filter]           Stream live proxy logs
 vdm tokens [options]        Show token usage
+vdm prefs [name [key val]]  View / set per-account preferences (e.g. exclude on/off)
 vdm upgrade                 Update to latest version
 ```
 
@@ -135,6 +136,23 @@ vdm config commit-tokens on|off  # Token-Usage trailer in commits
 | **Round-robin** | Rotate every N minutes |
 | **Spread** | Always pick lowest utilization |
 | **Drain first** | Use highest 5hr utilization first |
+
+### Per-account preferences
+
+Each saved account can opt out of the auto-switch pool independently of the global rotation strategy. Useful when you want to keep an account around (so it doesn't get auto-discovered again next `claude login`) but never have vdm rotate to it automatically — e.g. a personal account on a work-only laptop, or a low-quota account you want to drain manually.
+
+**Toggle from the dashboard:** every account card has an "Exclude from auto-switch" checkbox. The card gets a grey `excluded` badge when on.
+
+**Toggle from the CLI:**
+
+```bash
+vdm prefs                              # list every account's prefs
+vdm prefs work-account                 # show one account's prefs
+vdm prefs work-account exclude on      # opt out of auto-switch
+vdm prefs work-account exclude off     # opt back in
+```
+
+Excluded accounts are skipped by every auto-pick path (`pickByStrategy`, `pickConserve`, `pickDrainFirst`, `pickAnyUntried`). Manual switches via `vdm switch <name>` or the dashboard's per-card "Switch to this account" button bypass the filter and still work — the flag means "exclude from auto", not "lock out entirely." If the currently-active account is excluded but still healthy, vdm leaves it active (no force-rotate-away); only when it becomes rate-limited or expired does the filter kick in to pick a different account.
 
 ## How It Works
 
