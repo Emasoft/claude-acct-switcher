@@ -92,6 +92,8 @@ Active credentials live in **a single macOS Keychain entry**: service `Claude Co
 
 Account credentials no longer live as plaintext JSON files — they're keychain entries (see "Credential storage" above). The remaining files in `accounts/` are just `*.label` text files. These all use atomic-rename writes in the helpers; don't write directly with `writeFileSync` from new code — copy the existing pattern.
 
+**Gitignore invariant for this table.** Every filename listed above is gitignored in `.gitignore`. When adding a new runtime state file, add it to `.gitignore` in the same commit — historical drift between this table and `.gitignore` (e.g. `session-history.json` and `account-prefs.json` were documented as runtime state but missing from gitignore until commit a867229) is the bug that lets per-install state leak into PRs. A quick `grep -c '<filename>' .gitignore` before merging is enough.
+
 ### OAuth refresh
 
 `OAUTH_TOKEN_URL` defaults to `https://console.anthropic.com/v1/oauth/token` (Anthropic retired the older `platform.claude.com` host during the platform→console migration; the old URL silently 404s and refreshes against it never recover), `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.
