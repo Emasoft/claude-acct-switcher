@@ -423,6 +423,66 @@ function _runGit(cwd, args, timeout = 3000) {
   });
 }
 
+// `git rev-parse` is invoked on every UserPromptSubmit, every CwdChanged,
+// every periodic timer (auto-claim/worktree sweep), and every proxy
+// streaming response that hits updateSessionTimeline. execFileSync forks a
+// child process, blocks the event loop for 5–50 ms, and the answer almost
+// never changes within a 30s window (branch / commit hash / repo root are
+// quasi-static during a Claude turn). Cache by `cwd + args` and re-use.
+//
+// Errors are cached too, but with a SHORTER TTL — a transient `not a git
+// repository` failure (cwd that's been `rm`-ed) should be re-checked sooner
+// than a successful answer that's worth keeping fresh. FIFO eviction at
+// _RUNGIT_CACHE_MAX so a long-running dashboard hitting hundreds of
+// throwaway scratch dirs doesn't accumulate forever.
+const _runGitCache = new Map();
+const _RUNGIT_CACHE_TTL_MS = 30_000;
+const _RUNGIT_ERROR_CACHE_TTL_MS = 5_000;
+const _RUNGIT_CACHE_MAX = 200;
+
+function _runGitCached(cwd, args, timeout = 3000) {
+  if (typeof cwd !== 'string' || cwd.length === 0) {
+    throw new Error('git: cwd must be a non-empty string');
+  }
+  const key = cwd + '\0' + args.join('\0');
+  const now = Date.now();
+  const hit = _runGitCache.get(key);
+  if (hit) {
+    const ttl = hit.error ? _RUNGIT_ERROR_CACHE_TTL_MS : _RUNGIT_CACHE_TTL_MS;
+    if (now - hit.ts < ttl) {
+      if (hit.error) throw hit.error;
+      return hit.value;
+    }
+  }
+  if (_runGitCache.size >= _RUNGIT_CACHE_MAX) {
+    const firstKey = _runGitCache.keys().next().value;
+    if (firstKey !== undefined) _runGitCache.delete(firstKey);
+  }
+  try {
+    const value = _runGit(cwd, args, timeout);
+    _runGitCache.set(key, { value, ts: now });
+    return value;
+  } catch (e) {
+    _runGitCache.set(key, { error: e, ts: now });
+    throw e;
+  }
+}
+
+// Drop cache entries for one cwd (or all cwds when omitted). Call this
+// when the proxy KNOWS git state under that path is now invalid — e.g.
+// after a worktree-removed hook, or when the user explicitly asks for a
+// fresh re-resolution from the UI.
+function _invalidateRunGitCache(cwd) {
+  if (!cwd || typeof cwd !== 'string') {
+    _runGitCache.clear();
+    return;
+  }
+  const prefix = cwd + '\0';
+  for (const k of _runGitCache.keys()) {
+    if (k.startsWith(prefix)) _runGitCache.delete(k);
+  }
+}
+
 import https from 'node:https';
 import { execFile } from 'node:child_process';
 import http from 'node:http';
@@ -481,7 +541,9 @@ import {
 // can't be heuristically distinguished by the upstream.
 function fetchAccountEmail(token) {
   return new Promise((resolve) => {
-    try { recordProbe(); } catch {}
+    try { recordProbe(); } catch (e) {
+      log('warn', `fetchAccountEmail: recordProbe failed: ${e && e.message}`);
+    }
     const req = https.get('https://api.anthropic.com/api/oauth/claude_cli/roles', {
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -490,25 +552,95 @@ function fetchAccountEmail(token) {
       },
       timeout: 3000,
     }, (res) => {
+      // Connect-level deadline: `timeout: 3000` only fires on socket
+      // idle, not on slow connect. Wrap in an outer setTimeout so a
+      // hung TLS handshake doesn't keep the request open past 6s.
+      const _connectDeadline = setTimeout(() => {
+        try { req.destroy(new Error('connect deadline')); } catch {}
+        resolve('');
+      }, 6000);
+      _connectDeadline.unref?.();
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
+        clearTimeout(_connectDeadline);
         try {
           const d = JSON.parse(data);
           const name = d.organization_name || '';
           const match = name.match(/^(.+?)(?:'s Organization| Organization)$/);
           resolve(match ? match[1] : name || '');
-        } catch { resolve(''); }
+        } catch (e) {
+          // Surface JSON parse failures so transient API issues are
+          // not silently masked. The body is redacted (NOT truncated)
+          // so the parser-failure point and structure stay visible
+          // for diagnosis while emails / tokens / UUIDs are scrubbed.
+          // Cap at 4 KiB to bound log volume on a runaway response.
+          const safeBody = _redactForLog((data || '').slice(0, 4096));
+          log('warn', `fetchAccountEmail: JSON parse failed (status=${res.statusCode}, len=${(data || '').length}, body=${safeBody}): ${e.message}`);
+          resolve('');
+        }
       });
+      // Drain the socket on response error so it can be GC'd.
+      res.on('error', () => { try { res.resume(); } catch {} });
     });
-    req.on('error', () => resolve(''));
+    req.on('error', (e) => {
+      log('warn', `fetchAccountEmail: request error: ${e && e.message}`);
+      resolve('');
+    });
     req.on('timeout', () => { req.destroy(); resolve(''); });
   });
 }
 
-// Cache emails so we don't hit the API on every 5s refresh
+// Cache-prune helpers. Several Maps in this file used to grow without
+// bound — token rotation orphans old fingerprint keys, repo discovery
+// adds entries forever, etc. The two helpers below give every cache a
+// shape: either a hard size cap (LRU-ish: drop first key when over)
+// or a TTL prune (walk + delete entries older than X). A periodic
+// timer at startup runs the TTL prune across the caches that need it.
+//
+// Insert helper: cap a Map by inserting AFTER deleting old entries
+// when the size is already at the limit. Insertion order is preserved
+// in JS Map semantics (V8 implementation), so the first key is the
+// oldest. NOT strict-LRU (no on-read move-to-end) but good enough for
+// the access patterns here, where reads are bursty and dominated by
+// fingerprint lifetimes.
+function _capMapInsert(map, key, value, maxSize) {
+  if (map.has(key)) {
+    map.set(key, value);
+    return;
+  }
+  while (map.size >= maxSize) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+// TTL prune: walk a Map and delete entries whose `getTs(entry)` is
+// older than `now - ttlMs`. Returns the count of dropped entries.
+// Safe to call from a setInterval — bounded by map size.
+function _pruneMapByTtl(map, getTs, ttlMs, now = Date.now()) {
+  if (!ttlMs || ttlMs <= 0) return 0;
+  const cutoff = now - ttlMs;
+  let dropped = 0;
+  for (const [k, v] of map) {
+    const ts = getTs(v);
+    if (typeof ts === 'number' && ts < cutoff) {
+      map.delete(k);
+      dropped++;
+    }
+  }
+  return dropped;
+}
+
+// Cache emails so we don't hit the API on every 5s refresh.
+// Capped at 500 fingerprint entries — a single user almost never has
+// more than 10, but token rotation creates new fingerprints for each
+// refresh and the old ones used to leak forever.
 const emailCache = new Map(); // fingerprint -> { email, fetchedAt }
 const EMAIL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const EMAIL_CACHE_MAX = 500;
 
 async function getEmailForToken(token, fp) {
   const cached = emailCache.get(fp);
@@ -516,7 +648,7 @@ async function getEmailForToken(token, fp) {
     return cached.email;
   }
   const email = await fetchAccountEmail(token);
-  if (email) emailCache.set(fp, { email, fetchedAt: Date.now() });
+  if (email) _capMapInsert(emailCache, fp, { email, fetchedAt: Date.now() }, EMAIL_CACHE_MAX);
   return email;
 }
 
@@ -585,6 +717,12 @@ try {
 
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
+// Per-process mutex for autoDiscoverAccount. Multiple proxy requests
+// arriving within the 750ms keychain-write quiescence window could
+// each pass the early returns and race to write the same auto-N
+// keychain entry. Once one is in flight we drop subsequent calls.
+let _autoDiscoverInFlight = false;
+
 async function autoDiscoverAccount() {
   // Skip while ANY refresh is in flight (pre- AND post-keychain-write
   // halves of the race) and for a short window after the most recent
@@ -592,6 +730,16 @@ async function autoDiscoverAccount() {
   // dropping the counter and the keychain becoming "stable").
   if (_refreshesInProgress > 0) return;
   if (Date.now() - _lastKeychainWriteAt < 750) return;
+  if (_autoDiscoverInFlight) return;
+  _autoDiscoverInFlight = true;
+  try {
+    return await _autoDiscoverAccountImpl();
+  } finally {
+    _autoDiscoverInFlight = false;
+  }
+}
+
+async function _autoDiscoverAccountImpl() {
   const creds = readKeychain();
   if (!creds?.claudeAiOauth?.accessToken) return;
   const fp = getFingerprint(creds);
@@ -683,6 +831,7 @@ async function autoDiscoverAccount() {
 // ─────────────────────────────────────────────────
 const rateLimitCache = new Map(); // fingerprint -> { data, fetchedAt }
 const RATE_LIMIT_CACHE_TTL = 5 * 60 * 1000; // 5 min  - proxy state fills the gap between probes
+const RATE_LIMIT_CACHE_MAX = 500;          // cap to prevent fp leak
 
 // ── Probe cost tracking (uses lib.mjs) ──
 const probeTracker = createProbeTracker();
@@ -907,7 +1056,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
   recordProbe();
   const data = await fetchRateLimits(token);
   if (data) {
-    rateLimitCache.set(fp, { data, fetchedAt: Date.now() });
+    _capMapInsert(rateLimitCache, fp, { data, fetchedAt: Date.now() }, RATE_LIMIT_CACHE_MAX);
     // Route probe data through the canonical observation pipeline. The
     // previous code wrote ONLY to persistedState, so the probe path was
     // invisible to utilizationHistory / weeklyHistory and was the root
@@ -1523,13 +1672,16 @@ async function handleAPI(req, res) {
         try {
           // Use --git-common-dir to resolve to main repo root (not worktree directory)
           // so worktree sessions group with the parent repo in the dashboard.
+          // _runGitCached: session-start fires on every UserPromptSubmit, so
+          // without TTL cache these four execFileSync calls would block the
+          // event loop on every prompt.
           try {
-            repo = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
+            repo = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
           } catch {
-            repo = _runGit(cwd, ['rev-parse', '--show-toplevel']).trim();
+            repo = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
           }
-          branch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
-          commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+          branch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
         } catch { /* not a git repo — keep sentinel `repo` */ }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
         ensureLocalCommitHook(cwd);
@@ -1540,11 +1692,14 @@ async function handleAPI(req, res) {
         // Keep cwd up to date so periodic persist and auto-claim use the latest directory
         if (cwd && cwd !== session.cwd) session.cwd = cwd;
         try {
-          const newBranch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          // _runGitCached: 30s TTL means a branch switch within a single 30s
+          // window is detected on the *next* prompt after the cache expires —
+          // accepted trade-off vs. blocking the event loop on every prompt.
+          const newBranch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
           if (newBranch && newBranch !== session.branch) {
             log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
             session.branch = newBranch;
-            session.commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+            session.commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
           }
         } catch { /* ignore */ }
       }
@@ -1626,13 +1781,13 @@ async function handleAPI(req, res) {
       const { sessionId, parentSessionId, agentType, cwd } = parsed;
       // Idempotent: if we've already registered this sub-agent (e.g. the
       // hook fired twice — Claude Code retries on transport failure), just
-      // refresh the branch via _runGit and return success.
+      // refresh the branch via the cached git wrapper and return success.
       if (pendingSessions.has(sessionId)) {
         const existing = pendingSessions.get(sessionId);
         if (cwd && cwd !== existing.cwd) existing.cwd = cwd;
         if (existing.cwd) {
           try {
-            const newBranch = _resolveWorktreeBranch(existing.cwd, _runGit(existing.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+            const newBranch = _resolveWorktreeBranch(existing.cwd, _runGitCached(existing.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
             if (newBranch && newBranch !== existing.branch) existing.branch = newBranch;
           } catch { /* ignore */ }
         }
@@ -1658,12 +1813,12 @@ async function handleAPI(req, res) {
       } else if (cwd) {
         try {
           try {
-            repo = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
+            repo = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
           } catch {
-            repo = _runGit(cwd, ['rev-parse', '--show-toplevel']).trim();
+            repo = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
           }
-          branch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
-          commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+          branch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
         } catch { /* not a git repo — keep sentinel `repo` */ }
       }
       pendingSessions.set(sessionId, {
@@ -1785,11 +1940,16 @@ async function handleAPI(req, res) {
       if (session) {
         session.cwd = cwd;
         try {
-          const newBranch = _resolveWorktreeBranch(cwd, _runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+          // _runGitCached: first call for `cwd` after `cd` is naturally fresh
+          // (no prior cache entry under this key). Subsequent CwdChanged
+          // events for the same cwd within 30s will hit cache — that's fine,
+          // the branch under a stable cwd doesn't change between two
+          // back-to-back hooks.
+          const newBranch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
           if (newBranch && newBranch !== session.branch) {
             log('tokens', `Cwd-changed: session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
             session.branch = newBranch;
-            session.commitHash = _runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+            session.commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
           }
         } catch { /* not a git repo — keep prior branch */ }
       }
@@ -1894,9 +2054,18 @@ async function handleAPI(req, res) {
       const { sessionId, worktreePath, branch } = parsed;
       const session = pendingSessions.get(sessionId);
       let rebranched = false;
+      // Worktree removal invalidates ANY cached git answer for paths under
+      // it — drop them so the re-resolve below + future hot-path calls see
+      // fresh state. Also drop cached entries for the session's own cwd
+      // when it's not the same as worktreePath.
+      _invalidateRunGitCache(worktreePath);
       if (session && session.cwd) {
+        _invalidateRunGitCache(session.cwd);
         // If the session's cwd is INSIDE the removed worktree, _runGit will
         // throw — that's the correct signal that the branch is now invalid.
+        // Use the uncached _runGit here: the cache was just cleared, but we
+        // also explicitly want the freshest possible answer for the rebranch
+        // decision.
         try {
           const newBranch = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
           if (newBranch && newBranch !== session.branch) {
@@ -2155,10 +2324,10 @@ async function handleAPI(req, res) {
         const now = Date.now();
         if (session.cwd) {
           try {
-            const cur = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+            const cur = _resolveWorktreeBranch(session.cwd, _runGitCached(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
             if (cur && cur !== session.branch) {
               session.branch = cur;
-              session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
+              session.commitHash = _runGitCached(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
             }
           } catch { /* ignore */ }
         }
@@ -6249,7 +6418,9 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`Dashboard running at http://localhost:${PORT}`);
   // Discover any existing keychain token on startup so the dashboard
   // shows accounts immediately (don't wait for the first proxy request)
-  autoDiscoverAccount().catch(() => {});
+  autoDiscoverAccount().catch((e) => {
+    log('warn', `Startup autoDiscoverAccount failed: ${e && e.message}`);
+  });
 });
 
 // Without this, a duplicate spawn from the rc-snippet race (two terminals
@@ -6325,6 +6496,54 @@ const _logSubscribers = new Set();
 const _logBuffer = [];
 const LOG_BUFFER_MAX = 2000;
 
+// Redact secrets from a string before it enters the log stream. The
+// SSE subscribers (vdm logs / dashboard activity / startup.log file)
+// have a wider audience than the in-memory state, so anything that
+// might contain credentials should pass through this first.
+//
+// We do PATTERN-BASED REDACTION rather than truncation: truncating
+// hides the response shape and length, which are useful for
+// diagnosing "why didn't the JSON parse" without leaking the body's
+// secret content. Each match is replaced with a typed sentinel so
+// developers can still see WHAT got redacted.
+//
+// Patterns covered (ordered most-specific-first):
+//   - Bearer / Authorization tokens
+//   - sk-* / sk-ant-* / Anthropic API keys
+//   - OAuth refresh / access tokens (long URL-safe-base64 strings)
+//   - UUIDs
+//   - Email addresses (PII, not always secret but worth redacting)
+//   - Long hex runs (≥32 chars) — fingerprints, hashes
+//   - JSON values for keys named "token" / "secret" / "password" /
+//     "apiKey" / "api_key" / "authorization" (covers structured logs)
+function _redactForLog(s) {
+  if (typeof s !== 'string') return s;
+  if (s.length === 0) return s;
+  let out = s;
+  // JSON-shaped key/value pairs first — captures the most context.
+  out = out.replace(
+    /("(?:token|access_token|refresh_token|secret|password|api[_-]?key|authorization)"\s*:\s*)"[^"]*"/gi,
+    '$1"[REDACTED:KV]"'
+  );
+  // Authorization: Bearer / Basic / etc.
+  out = out.replace(/Bearer\s+[A-Za-z0-9._\-/+]+=*/g, 'Bearer [REDACTED:BEARER]');
+  out = out.replace(/Basic\s+[A-Za-z0-9+/=]+/g, 'Basic [REDACTED:BASIC]');
+  // Anthropic API keys
+  out = out.replace(/sk-ant-[A-Za-z0-9_\-]{20,}/g, '[REDACTED:KEY]');
+  out = out.replace(/sk-[A-Za-z0-9_\-]{20,}/g, '[REDACTED:KEY]');
+  // OAuth tokens (URL-safe base64 ≥ 32 chars). Must run BEFORE the
+  // hex pattern because token alphabets overlap.
+  out = out.replace(/[A-Za-z0-9_\-]{32,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}/g, '[REDACTED:JWT]');
+  // UUIDs
+  out = out.replace(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, '[REDACTED:UUID]');
+  // Emails (organisation_name, user labels, etc.)
+  out = out.replace(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g, '[REDACTED:EMAIL]');
+  // Long hex runs (≥ 40 chars — sha-1+ length). Order matters so this
+  // runs after JWT/UUID; both of those have shorter components.
+  out = out.replace(/\b[0-9a-fA-F]{40,}\b/g, '[REDACTED:HEX]');
+  return out;
+}
+
 function log(tag, msg, extra = '') {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
   const line = `[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
@@ -6352,13 +6571,14 @@ function log(tag, msg, extra = '') {
 // doesn't fill up when Claude Code retries against an already-limited account.
 const _eventDedupMap = new Map(); // "type:key" → timestamp
 const EVENT_DEDUP_WINDOW = 5 * 60 * 1000; // 5 min
+const EVENT_DEDUP_MAX = 500;       // hard cap; periodic TTL prune below
 
 function logEvent(type, detail = {}) {
   if (type === 'rate-limited' || type === 'all-exhausted') {
     const dedupKey = type === 'rate-limited' ? `rate-limited:${detail.account || ''}` : 'all-exhausted';
     const lastTs = _eventDedupMap.get(dedupKey);
     if (lastTs && Date.now() - lastTs < EVENT_DEDUP_WINDOW) return;
-    _eventDedupMap.set(dedupKey, Date.now());
+    _capMapInsert(_eventDedupMap, dedupKey, Date.now(), EVENT_DEDUP_MAX);
   }
 
   // Persist to the activity log (the only consumer — UI reads /api/activity-log).
@@ -7274,54 +7494,48 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
     const oldToken = oauth.accessToken;
     const oldFp = getFingerprintFromToken(oldToken);
 
-    // 4. Call OAuth endpoint with retry + exponential backoff
-    let result;
-    for (let attempt = 0; attempt < REFRESH_MAX_RETRIES; attempt++) {
-      result = await callRefreshEndpoint(oauth.refreshToken, oauth.scopes);
-      if (result.ok) break;
-      if (!result.retriable) break;
-      // Exponential backoff: 1s, 2s, 4s
-      const delay = REFRESH_BACKOFF_BASE * Math.pow(2, attempt);
-      log('refresh', `${accountName}: attempt ${attempt + 1} failed (${result.error}), retrying in ${delay}ms...`);
-      await new Promise(r => setTimeout(r, delay));
-    }
-
-    if (!result.ok) {
-      log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
-      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
-      logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
-      // High-impact event: a non-retriable refresh failure silently
-      // disables the account until the user notices in the dashboard.
-      // Push a desktop notification so they see it immediately. The
-      // 'refreshFailed' channel is high-priority and bypasses the
-      // notification throttle (see NOTIFY_HIGH_PRIORITY).
-      if (!result.retriable) {
-        notify(
-          'Token Refresh Failed',
-          `${accountLabel}: ${result.error}. Re-login required.`,
-          'refreshFailed'
-        );
-      }
-      return { ok: false, error: result.error };
-    }
-
-    // 5. Build new credentials and write to the keychain
-    const newExpiresAt = result.expiresIn
-      ? computeExpiresAt(result.expiresIn)
-      : Date.now() + 8 * 60 * 60 * 1000; // fallback: 8 hours
-    const newCreds = buildUpdatedCreds(rawCreds, result.accessToken, result.refreshToken, newExpiresAt);
-
-    // Bracket the per-account-keychain write + (potential) active-keychain
-    // write window with the in-progress counter so a concurrent
-    // autoDiscoverAccount cannot read the OLD keychain creds, match the
-    // just-refreshed entry by email, and overwrite it with stale tokens.
-    // The decrement MUST happen on every exit path — if migrateAccountState
-    // / invalidateAccountsCache / logActivity throws, the counter would
-    // otherwise stay high forever and permanently disable
-    // autoDiscoverAccount. The whole post-increment region is wrapped in
-    // try/finally so the decrement is guaranteed.
+    // Bracket the ENTIRE refresh window — including the OAuth POST —
+    // with `_refreshesInProgress`. Previously the increment happened
+    // AFTER callRefreshEndpoint returned, so a concurrent
+    // autoDiscoverAccount firing DURING the OAuth call would see the
+    // OLD keychain creds, match no saved account by fingerprint, and
+    // create a bogus auto-N entry that gets overwritten the moment
+    // the refresh completes. Moving the increment up closes the race.
+    // Decrement is guaranteed via the outer try/finally.
     _refreshesInProgress++;
     try {
+      // 4. Call OAuth endpoint with retry + exponential backoff
+      let result;
+      for (let attempt = 0; attempt < REFRESH_MAX_RETRIES; attempt++) {
+        result = await callRefreshEndpoint(oauth.refreshToken, oauth.scopes);
+        if (result.ok) break;
+        if (!result.retriable) break;
+        // Exponential backoff: 1s, 2s, 4s
+        const delay = REFRESH_BACKOFF_BASE * Math.pow(2, attempt);
+        log('refresh', `${accountName}: attempt ${attempt + 1} failed (${result.error}), retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+
+      if (!result.ok) {
+        log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
+        refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
+        logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
+        if (!result.retriable) {
+          notify(
+            'Token Refresh Failed',
+            `${accountLabel}: ${result.error}. Re-login required.`,
+            'refreshFailed'
+          );
+        }
+        return { ok: false, error: result.error };
+      }
+
+      // 5. Build new credentials and write to the keychain
+      const newExpiresAt = result.expiresIn
+        ? computeExpiresAt(result.expiresIn)
+        : Date.now() + 8 * 60 * 60 * 1000; // fallback: 8 hours
+      const newCreds = buildUpdatedCreds(rawCreds, result.accessToken, result.refreshToken, newExpiresAt);
+
       try {
         await atomicWriteAccountFile(accountName, newCreds);
       } catch (e) {
@@ -7369,6 +7583,31 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
 
 const REFRESH_FAILURE_TTL = 2 * 60 * 60 * 1000; // 2 hours
 
+// Periodic cache prune. Walks the time-keyed Maps and drops entries
+// whose TTL has elapsed. Each cache also has a hard size cap enforced
+// at insert time (_capMapInsert), so this is a SAFETY NET — without
+// it, low-traffic dashboards would accumulate stale entries forever
+// because nothing else evicts them. Runs every 5 minutes via an
+// unrefed timer (so it doesn't keep the process alive on its own).
+function _pruneCachesPeriodic() {
+  try {
+    const now = Date.now();
+    let dropped = 0;
+    dropped += _pruneMapByTtl(emailCache,     v => v && v.fetchedAt, EMAIL_CACHE_TTL,      now);
+    dropped += _pruneMapByTtl(rateLimitCache, v => v && v.fetchedAt, RATE_LIMIT_CACHE_TTL, now);
+    dropped += _pruneMapByTtl(_eventDedupMap, v => v,                EVENT_DEDUP_WINDOW,   now);
+    // refreshFailures uses .ts. Drop entries past 2× the failure TTL
+    // so a long-stale entry doesn't pin a fingerprint forever.
+    dropped += _pruneMapByTtl(refreshFailures, v => v && v.ts,        REFRESH_FAILURE_TTL * 2, now);
+    if (dropped > 0) log('cache', `pruned ${dropped} stale cache entries`);
+  } catch (e) {
+    log('warn', `cache prune failed: ${e && e.message}`);
+  }
+}
+const _CACHE_PRUNE_INTERVAL = 5 * 60 * 1000;
+const _cachePruneTimer = setInterval(_pruneCachesPeriodic, _CACHE_PRUNE_INTERVAL);
+_cachePruneTimer.unref?.();
+
 async function refreshSweep(label = 'refresh-bg') {
   const accounts = loadAllAccountTokens();
   for (const acct of accounts) {
@@ -7393,22 +7632,31 @@ async function refreshSweep(label = 'refresh-bg') {
 }
 
 // Run immediately on startup (handles expired tokens after sleep/restart)
-refreshSweep('refresh-startup').catch(() => {});
+refreshSweep('refresh-startup').catch((e) => {
+  log('warn', `Startup refreshSweep failed: ${e && e.message}`);
+});
 
-// Detect system wake: if the timer fires much later than expected, the system slept
+// Detect system wake: if the timer fires much later than expected, the
+// system slept. The async callback used to swallow rejections silently
+// because Node's setInterval doesn't await the body — a thrown error
+// inside refreshSweep would be lost. Wrap in try/catch + explicit log.
 let lastRefreshTick = Date.now();
 setInterval(async () => {
-  const now = Date.now();
-  const drift = now - lastRefreshTick - REFRESH_CHECK_INTERVAL;
-  lastRefreshTick = now;
-  if (drift > 30_000) {
-    log('refresh-wake', `System wake detected (drift ${Math.round(drift / 1000)}s), refreshing all tokens...`);
-    // Clear non-retriable failures so all accounts get a fresh chance after sleep
-    for (const [name, entry] of refreshFailures) {
-      if (!entry.retriable) refreshFailures.delete(name);
+  try {
+    const now = Date.now();
+    const drift = now - lastRefreshTick - REFRESH_CHECK_INTERVAL;
+    lastRefreshTick = now;
+    if (drift > 30_000) {
+      log('refresh-wake', `System wake detected (drift ${Math.round(drift / 1000)}s), refreshing all tokens...`);
+      // Clear non-retriable failures so all accounts get a fresh chance after sleep
+      for (const [name, entry] of refreshFailures) {
+        if (!entry.retriable) refreshFailures.delete(name);
+      }
     }
+    await refreshSweep();
+  } catch (e) {
+    log('warn', `Periodic refreshSweep failed: ${e && e.message}`);
   }
-  await refreshSweep();
 }, REFRESH_CHECK_INTERVAL);
 
 // ── Startup: clean orphaned .json.tmp files left over from the
@@ -7583,7 +7831,13 @@ function createUsageExtractor() {
               cacheReadInputTokens = data.usage.cache_read_input_tokens;
             }
           }
-        } catch {}
+        } catch (e) {
+          // Trailing partial line was malformed JSON. Surface it
+          // (debug-level — these can happen legitimately during
+          // upstream cancellation) so we don't silently lose token
+          // counts on every interrupted SSE stream.
+          try { log('debug', `flush: trailing message_delta parse failed: ${e.message}`); } catch {}
+        }
       }
       callback();
     },
@@ -7842,8 +8096,11 @@ function updateSessionTimeline(bodyObj, acctName, usage) {
     // previous regex `/["$`\\]/` blocked only chars that broke out of a
     // shell-interpolated double-quoted form — not enough (newline still
     // worked). This is the correct fix: no shell at all.
+    // _runGitCached: this fires on every proxy SSE response — without the
+    // 30s TTL cache, sustained load made `git rev-parse` the #1 blocker on
+    // the event loop.
     try {
-      branch = _runGit(cwdStr, ['rev-parse', '--abbrev-ref', 'HEAD'], 2000).trim();
+      branch = _runGitCached(cwdStr, ['rev-parse', '--abbrev-ref', 'HEAD'], 2000).trim();
     } catch {}
   }
 
@@ -8027,27 +8284,41 @@ setInterval(() => {
 // ─────────────────────────────────────────────────
 
 const _hookedRepoPaths = new Set(); // avoid re-checking the same repo
+const _HOOKED_REPO_PATHS_MAX = 200; // hard cap — typical user has < 50 repos
 
 function ensureLocalCommitHook(cwd) {
   try {
     if (!settings.commitTokenUsage) return;
-    // Check for local core.hooksPath override
+    // Check for local core.hooksPath override.
+    // _runGitCached: this function is called on every UserPromptSubmit
+    // (session-start). The first git call here used to be ~95% of the
+    // execFileSync cost in steady state — by far the highest-frequency
+    // candidate for caching. Below the `_hookedRepoPaths.has` gate makes
+    // file-IO idempotent per repo; the cache makes the git lookups
+    // idempotent per cwd within 30s.
     let localHooksPath;
     try {
-      localHooksPath = _runGit(cwd, ['config', '--local', 'core.hooksPath']).trim();
+      localHooksPath = _runGitCached(cwd, ['config', '--local', 'core.hooksPath']).trim();
     } catch { return; } // no local override
     if (!localHooksPath) return;
 
     // Resolve relative paths
     let repoRoot;
     try {
-      repoRoot = _runGit(cwd, ['rev-parse', '--show-toplevel']).trim();
+      repoRoot = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
     } catch { return; }
 
     const resolvedLocal = localHooksPath.startsWith('/') ? localHooksPath : join(repoRoot, localHooksPath);
 
     // Skip if already checked this repo
     if (_hookedRepoPaths.has(resolvedLocal)) return;
+    // Cap the set so a long-running dashboard doesn't accumulate
+    // forever (e.g. CI runner that hits hundreds of repos).
+    if (_hookedRepoPaths.size >= _HOOKED_REPO_PATHS_MAX) {
+      // Drop the OLDEST entry (insertion order is preserved in Set).
+      const oldest = _hookedRepoPaths.values().next().value;
+      if (oldest !== undefined) _hookedRepoPaths.delete(oldest);
+    }
     _hookedRepoPaths.add(resolvedLocal);
 
     // Check for global hooks path. This is a `git config --global` call —
@@ -8161,16 +8432,20 @@ function claimUsageInRange(startTs, endTs) {
  */
 function _resolveWorktreeBranch(cwd, detectedBranch) {
   if (!detectedBranch.startsWith('worktree-')) return detectedBranch;
+  // _runGitCached: gitDir/commonDir are quasi-static per cwd (only change
+  // on worktree add/remove). branch--points-at HEAD and the log walk DO
+  // change as the user commits, but for a cwd that's currently checked
+  // into a Claude-Code worktree, the resolved real branch flips at most
+  // a few times per session — 30s TTL is well within the noise floor.
   try {
-    // Confirm we're actually in a worktree (git-dir != git-common-dir)
-    const gitDir = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-dir']).trim();
-    const commonDir = _runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim();
+    const gitDir = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-dir']).trim();
+    const commonDir = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim();
     if (gitDir === commonDir) return detectedBranch;
   } catch { return detectedBranch; }
 
   // Strategy 1: find a non-worktree branch at the exact same commit
   try {
-    const candidates = _runGit(cwd, ['branch', '--points-at', 'HEAD'])
+    const candidates = _runGitCached(cwd, ['branch', '--points-at', 'HEAD'])
       .trim().split('\n')
       .map(b => b.replace(/^[*+]?\s+/, '').trim())
       .filter(b => b && !b.startsWith('worktree-'));
@@ -8180,7 +8455,7 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
 
   // Strategy 2: walk recent commits for the closest decorated non-worktree branch
   try {
-    const lines = _runGit(cwd, ['log', '--format=%D', '--max-count=30']).trim().split('\n');
+    const lines = _runGitCached(cwd, ['log', '--format=%D', '--max-count=30']).trim().split('\n');
     for (const line of lines) {
       if (!line.trim()) continue;
       const refs = line.split(',').map(r => r.trim())
@@ -8339,13 +8614,17 @@ function _claimAndPersistForSession(sessionId, payload, kind /* 'stop' | 'end' *
 
 // Claim and persist usage for a session (used by auto-claim and stale pruning)
 function _autoClaimSession(sessionId, session) {
-  // Re-read branch before persisting (handles worktree branch switches)
+  // Re-read branch before persisting (handles worktree branch switches).
+  // _runGitCached: this runs from the periodic auto-persist timer (every
+  // 2 min) and from the 24h stale-prune sweep — both are background loops
+  // where 30s-stale branch info is acceptable in exchange for not blocking
+  // the event loop on every iteration.
   if (session.cwd) {
     try {
-      const cur = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+      const cur = _resolveWorktreeBranch(session.cwd, _runGitCached(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
       if (cur && cur !== session.branch) {
         session.branch = cur;
-        session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
+        session.commitHash = _runGitCached(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
       }
     } catch { /* ignore */ }
   }
@@ -8378,14 +8657,17 @@ setInterval(() => {
   // Update startedAt so we don't double-count on next interval.
   for (const [id, session] of pendingSessions) {
     const now = Date.now();
-    // Re-read branch before persisting (handles worktree branch switches)
+    // Re-read branch before persisting (handles worktree branch switches).
+    // _runGitCached: 2-minute timer × N active sessions could otherwise
+    // block the event loop for 50ms+ per iteration; with 30s TTL the cost
+    // collapses to one git call per cwd per period.
     if (session.cwd) {
       try {
-        const cur = _resolveWorktreeBranch(session.cwd, _runGit(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+        const cur = _resolveWorktreeBranch(session.cwd, _runGitCached(session.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
         if (cur && cur !== session.branch) {
           log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${session.branch} → ${cur}`);
           session.branch = cur;
-          session.commitHash = _runGit(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
+          session.commitHash = _runGitCached(session.cwd, ['rev-parse', '--short', 'HEAD']).trim();
         }
       } catch { /* ignore */ }
     }
@@ -8831,7 +9113,9 @@ async function handleProxyRequest(clientReq, clientRes) {
   // Check if keychain has a token we haven't saved yet (e.g. user just did /login)
   // Skip during error spirals to avoid creating bogus auto-accounts from stale keychain tokens
   if (_consecutive400s < 3) {
-    await autoDiscoverAccount().catch(() => {});
+    await autoDiscoverAccount().catch((e) => {
+      log('warn', `Per-request autoDiscoverAccount failed: ${e && e.message}`);
+    });
   }
 
   let allAccounts = loadAllAccountTokens();
