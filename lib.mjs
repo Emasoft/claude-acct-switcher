@@ -597,6 +597,44 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
 // ─────────────────────────────────────────────────
 
 /**
+ * Parse a Retry-After HTTP header value into a delta in seconds.
+ *
+ * RFC 7231 §7.1.3 allows two forms:
+ *   1. delta-seconds: `Retry-After: 120`
+ *   2. HTTP-date:     `Retry-After: Fri, 31 Dec 1999 23:59:59 GMT`
+ *
+ * The previous code used `parseInt(header, 10)` which silently returned
+ * 0 for HTTP-date form (and any malformed value). With 0 seconds the
+ * 429 was classified as "transient" and passed through to the client
+ * without rotation — defeating the auto-switch behaviour for the very
+ * case it was designed to handle (long upstream rate-limit window).
+ *
+ * Returns a non-negative integer count of seconds. 0 if header is
+ * missing/empty/unparseable; for HTTP-date in the past, also 0.
+ *
+ * Pure function — `now` is injectable for unit tests.
+ */
+export function parseRetryAfter(headerValue, now = Date.now()) {
+  if (headerValue == null) return 0;
+  const trimmed = String(headerValue).trim();
+  if (!trimmed) return 0;
+  // Form 1: delta-seconds — purely numeric, non-negative integer.
+  // We use a regex test (not parseInt) so "120abc" doesn't masquerade
+  // as a valid 120-second delta.
+  if (/^\d+$/.test(trimmed)) {
+    const n = parseInt(trimmed, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+  // Form 2: HTTP-date — let Date.parse handle the three RFC-allowed
+  // formats (RFC 1123, RFC 850, asctime). NaN means "unparseable".
+  const targetMs = Date.parse(trimmed);
+  if (!Number.isFinite(targetMs)) return 0;
+  const deltaMs = targetMs - now;
+  if (deltaMs <= 0) return 0;
+  return Math.ceil(deltaMs / 1000);
+}
+
+/**
  * Build JSON POST body for the OAuth token refresh endpoint.
  */
 export function buildRefreshRequestBody(refreshToken, clientId, scope) {

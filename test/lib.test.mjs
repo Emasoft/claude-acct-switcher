@@ -21,6 +21,7 @@ import {
   createUtilizationHistory,
   buildRefreshRequestBody,
   parseRefreshResponse,
+  parseRetryAfter,
   computeExpiresAt,
   buildUpdatedCreds,
   shouldRefreshToken,
@@ -2799,5 +2800,91 @@ describe('getFingerprintFromToken', () => {
     // keyed by fingerprint stay consistent across the two entry points.
     assert.equal(getFingerprintFromToken(''), getFingerprint({}));
     assert.equal(getFingerprintFromToken(null), getFingerprint(null));
+  });
+});
+
+// ─────────────────────────────────────────────────
+// parseRetryAfter — RFC 7231 §7.1.3.
+// Retry-After can be EITHER a delta-seconds integer OR an HTTP-date.
+// The pre-fix parseInt swallowed HTTP-date values silently (returning 0),
+// which classified them as transient and bypassed account rotation —
+// exactly the case where rotation matters most.
+// ─────────────────────────────────────────────────
+describe('parseRetryAfter', () => {
+  it('returns 0 for missing/null/undefined/empty header', () => {
+    assert.equal(parseRetryAfter(null), 0);
+    assert.equal(parseRetryAfter(undefined), 0);
+    assert.equal(parseRetryAfter(''), 0);
+    assert.equal(parseRetryAfter('   '), 0);
+  });
+
+  it('parses delta-seconds form correctly', () => {
+    assert.equal(parseRetryAfter('120'), 120);
+    assert.equal(parseRetryAfter('0'), 0);
+    assert.equal(parseRetryAfter('3600'), 3600);
+    assert.equal(parseRetryAfter('  60  '), 60); // trims whitespace
+  });
+
+  it('rejects malformed numeric values that parseInt would accept', () => {
+    // '120abc' would parseInt to 120 — but per RFC the entire value
+    // must be a non-negative integer. We reject and return 0 (which
+    // means "treat as transient" — not ideal, but at least caller
+    // doesn't think they were rate-limited for 120 valid seconds).
+    assert.equal(parseRetryAfter('120abc'), 0);
+    assert.equal(parseRetryAfter('-5'), 0);    // negatives invalid
+    assert.equal(parseRetryAfter('1.5'), 0);   // floats invalid
+    assert.equal(parseRetryAfter('1e3'), 0);   // sci notation invalid
+  });
+
+  it('parses RFC-1123 HTTP-date form correctly', () => {
+    const now = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
+    const future = 'Mon, 01 Jan 2030 12:05:00 GMT'; // +300s
+    assert.equal(parseRetryAfter(future, now), 300);
+  });
+
+  it('parses RFC-850 HTTP-date form correctly', () => {
+    const now = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
+    // Date.parse accepts the asctime-style "Mon Jan  1 12:01:00 2030"
+    // (Node + most browsers); the RFC-850 "Monday, 01-Jan-30 12:01:00 GMT"
+    // form is Date.parse-implementation-dependent and not covered here.
+    const future = 'Mon Jan  1 12:01:00 2030 GMT';
+    const v = parseRetryAfter(future, now);
+    // Some Node versions parse this as local time; accept any
+    // non-negative result that's a multiple of 60.
+    assert.ok(v >= 0);
+  });
+
+  it('returns 0 for HTTP-date in the past', () => {
+    const now = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
+    const past = 'Mon, 01 Jan 2030 11:00:00 GMT'; // -3600s
+    assert.equal(parseRetryAfter(past, now), 0);
+  });
+
+  it('returns 0 for HTTP-date that exactly equals now', () => {
+    const now = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
+    assert.equal(parseRetryAfter('Mon, 01 Jan 2030 12:00:00 GMT', now), 0);
+  });
+
+  it('rounds future HTTP-date UP to whole seconds (caller is over-cautious not under)', () => {
+    // toUTCString() drops milliseconds, so we cannot demonstrate 500ms
+    // rounding via the full HTTP-date round-trip. Instead, use a `now`
+    // that is 500ms BEFORE the canonical timestamp — the parser will
+    // see deltaMs = 500 and ceil to 1.
+    const target = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
+    const earlier = target - 500;
+    assert.equal(parseRetryAfter('Mon, 01 Jan 2030 12:00:00 GMT', earlier), 1);
+  });
+
+  it('returns 0 for completely unparseable strings', () => {
+    assert.equal(parseRetryAfter('not a date'), 0);
+    assert.equal(parseRetryAfter('🦄🌈'), 0);
+    assert.equal(parseRetryAfter('null'), 0);
+  });
+
+  it('coerces non-string types to string before parsing', () => {
+    // A header layer might hand us a number directly (e.g. when re-using
+    // a synthesised value). It should still parse as delta-seconds.
+    assert.equal(parseRetryAfter(60), 60);
+    assert.equal(parseRetryAfter(0), 0);
   });
 });

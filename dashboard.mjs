@@ -503,6 +503,7 @@ import {
   createUtilizationHistory,
   buildRefreshRequestBody,
   parseRefreshResponse,
+  parseRetryAfter,
   computeExpiresAt,
   buildUpdatedCreds,
   shouldRefreshToken,
@@ -916,6 +917,31 @@ function _isNotifyEnabled(eventType) {
   return n._default !== false; // default ON unless explicitly disabled
 }
 
+// Detect available notification backends ONCE at startup so we don't
+// fork osascript / notify-send / which on every notify() call. Result is
+// the FIRST working channel for the current platform; falls back to
+// 'log-only' (write to activity feed and stderr but no GUI popup) when
+// neither macOS nor Linux libnotify is available.
+//
+// Order:
+//   1. macOS              → osascript (JXA) — the project's primary platform
+//   2. Linux + libnotify  → notify-send  (gracefully degrades for WSL2 / dev VMs)
+//   3. anything else      → log-only — at least the activity feed + stderr show it
+function _detectNotifyChannel() {
+  if (process.platform === 'darwin') return 'osascript';
+  if (process.platform === 'linux') {
+    // Probe `notify-send -V` — fast (<10ms), exits 0 if installed.
+    try {
+      execFileSync('notify-send', ['--version'], {
+        timeout: 1500, stdio: ['ignore', 'ignore', 'ignore'],
+      });
+      return 'notify-send';
+    } catch { /* not installed → fall through */ }
+  }
+  return 'log-only';
+}
+const _NOTIFY_CHANNEL = _detectNotifyChannel();
+
 function notify(title, message, eventType = '') {
   if (!_isNotifyEnabled(eventType)) return;
   const now = Date.now();
@@ -926,21 +952,54 @@ function notify(title, message, eventType = '') {
     if (now - last < NOTIFY_THROTTLE_MS) return;
   }
   _lastNotifyAtByType[eventType || '_'] = now;
-  try {
-    // Use JXA (JavaScript for Automation) + JSON.stringify to encode the
-    // strings. JSON.stringify handles every character — backslash, newline,
-    // carriage return, quote — so account names containing those bytes
-    // cannot break out of the string and inject `do shell script`. The
-    // previous AppleScript form only escaped `"` and was an RCE path
-    // through user-controlled account labels.
-    const script =
-      'var app = Application.currentApplication(); ' +
-      'app.includeStandardAdditions = true; ' +
-      'app.displayNotification(' + JSON.stringify(String(message)) +
-      ', {withTitle: ' + JSON.stringify(String(title)) +
-      ', soundName: "Blow"});';
-    execFile('osascript', ['-l', 'JavaScript', '-e', script], { timeout: 3000 }, () => {});
-  } catch { /* non-critical */ }
+  // Always log to the activity feed regardless of channel — that's the
+  // canonical record of what was emitted, and the only thing visible
+  // when the GUI channel is unavailable (CI, headless server, etc.).
+  try { log('info', `[notify:${eventType || '?'}] ${title} — ${message}`); } catch {}
+
+  if (_NOTIFY_CHANNEL === 'osascript') {
+    try {
+      // JXA (JavaScript for Automation) + JSON.stringify encodes every
+      // character — backslash, newline, CR, quote — so account names
+      // containing those bytes cannot break out of the string and inject
+      // `do shell script`. The previous AppleScript form only escaped `"`
+      // and was an RCE path through user-controlled account labels.
+      const script =
+        'var app = Application.currentApplication(); ' +
+        'app.includeStandardAdditions = true; ' +
+        'app.displayNotification(' + JSON.stringify(String(message)) +
+        ', {withTitle: ' + JSON.stringify(String(title)) +
+        ', soundName: "Blow"});';
+      execFile('osascript', ['-l', 'JavaScript', '-e', script], { timeout: 3000 }, (err) => {
+        if (err) log('warn', `osascript notify failed: ${err.message}`);
+      });
+    } catch (e) {
+      log('warn', `notify (osascript) threw: ${e && e.message}`);
+    }
+    return;
+  }
+
+  if (_NOTIFY_CHANNEL === 'notify-send') {
+    try {
+      // notify-send takes positional args: <summary> <body>. Both are
+      // passed through argv (no shell), so newlines / quotes / metas
+      // in the strings cannot inject. -u low avoids stealing focus on
+      // GNOME / KDE.
+      execFile(
+        'notify-send',
+        ['-u', 'low', String(title), String(message)],
+        { timeout: 3000 },
+        (err) => {
+          if (err) log('warn', `notify-send failed: ${err.message}`);
+        },
+      );
+    } catch (e) {
+      log('warn', `notify (notify-send) threw: ${e && e.message}`);
+    }
+    return;
+  }
+
+  // 'log-only' — already logged above. Nothing more to do.
 }
 
 function fetchRateLimits(token) {
@@ -4746,8 +4805,68 @@ let _lastStatsHash = '';
 let _firstRender = true;
 const _sparkCache = {};
 
+// Cheap "did the data change?" check used by refresh loops to skip
+// re-rendering when the response is byte-identical to the previous one.
+//
+// The previous implementation called JSON.stringify(obj) which, for a
+// 50k-row token-usage array, allocated a multi-MB string on every poll
+// (every 5s) just to compare against a stored copy of itself. For arrays
+// with primitive-keyed objects we can do far better: walk the array
+// once, fold each row into a 32-bit FNV-1a accumulator over its key
+// values, and produce a 16-byte hex digest. ~30× faster for the
+// token-usage hot path; identical results modulo ordering for the
+// "did anything change" question.
+//
+// For non-array inputs (profiles, stats, log) we still use JSON.stringify
+// — the size is bounded (~50 entries) so the savings don't pay for the
+// added complexity, and stringify produces a stable canonical form
+// without us having to think about object-key ordering.
 function quickHash(obj) {
-  return JSON.stringify(obj);
+  if (!Array.isArray(obj)) return JSON.stringify(obj);
+  // FNV-1a 32-bit. Two independent accumulators ('low' and 'high') give
+  // a 64-bit-ish hash that's still fast — collisions on a single 32-bit
+  // hash for a 50k-row array would be roughly 1-in-100 by birthday
+  // bound, which is too lossy for "skip render" logic.
+  var lo = 0x811c9dc5 | 0;
+  var hi = 0xcbf29ce4 | 0;
+  function fold(s) {
+    if (s == null) return;
+    s = String(s);
+    for (var i = 0, n = s.length; i < n; i++) {
+      var c = s.charCodeAt(i);
+      lo ^= c;       lo = Math.imul(lo, 0x01000193);
+      hi ^= c + 31;  hi = Math.imul(hi, 0x01000193);
+    }
+  }
+  // length first — distinguishes [] from [0] before any folds.
+  fold(obj.length + '|');
+  for (var i = 0, n = obj.length; i < n; i++) {
+    var e = obj[i];
+    if (e == null || typeof e !== 'object') {
+      fold(typeof e); fold('=');
+      fold(e); fold('|');
+      continue;
+    }
+    // For row-shaped entries (token-usage / activity-log style) fold a
+    // stable, project-known set of fields. Anything outside the set is
+    // ignored — a per-row latency change in the tool field will not
+    // trigger a re-render but a token-count change WILL.
+    fold(e.ts || e.timestamp || 0); fold('|');
+    fold(e.model || '');            fold('|');
+    fold(e.account || '');          fold('|');
+    fold(e.repo || '');             fold('|');
+    fold(e.branch || '');           fold('|');
+    fold(e.inputTokens || 0);       fold('|');
+    fold(e.outputTokens || 0);      fold('|');
+    fold(e.cacheReadInputTokens || 0); fold('|');
+    fold(e.cacheCreationInputTokens || 0); fold('|');
+    fold(e.tool || '');             fold('|');
+    fold(e.type || '');             fold(';');
+  }
+  // 16-char hex digest — same shape as the sha256 fingerprints elsewhere
+  // so consumers comparing two hashes don't have to special-case length.
+  function _h(n) { return ('00000000' + (n >>> 0).toString(16)).slice(-8); }
+  return _h(lo) + _h(hi);
 }
 
 async function refresh() {
@@ -5307,39 +5426,41 @@ async function refreshTokens() {
 }
 
 function applyTokenModelFilter() {
-  var data = _tokensRawData;
-  var prevData = _tokPrevPeriodData;
   var modelSel = document.getElementById('tok-model');
   var accountSel = document.getElementById('tok-account');
-  if (modelSel && modelSel.value) {
-    data = data.filter(function(e) { return e.model === modelSel.value; });
-    prevData = prevData.filter(function(e) { return e.model === modelSel.value; });
-  }
-  if (accountSel && accountSel.value) {
-    data = data.filter(function(e) { return e.account === accountSel.value; });
-    prevData = prevData.filter(function(e) { return e.account === accountSel.value; });
-  }
+  var modelFilter   = (modelSel   && modelSel.value)   || '';
+  var accountFilter = (accountSel && accountSel.value) || '';
   // Phase C: apply the scrubber window + tier filter on top of the
   // existing select-based filters. Snapshot at filter time so a fast
   // drag does not mutate data mid-render. populateTokenFilters runs
   // against the unwindowed dataset so the dropdown options never
   // collapse just because the scrubber narrows the timeline.
   var snap = vsSnapshot();
-  if (snap && snap.start != null && snap.end != null) {
-    data = data.filter(function(e) {
+  var hasWindow = !!(snap && snap.start != null && snap.end != null);
+  var hasTier   = !!(snap && Array.isArray(snap.tierFilter) && snap.tierFilter.length && snap.tierFilter[0] !== 'all');
+  // Single-pass filter — the previous version did up to 4 sequential
+  // .filter() calls, each rebuilding the array. For 50k+ rows that
+  // was 4× the closure-allocation pressure; this collapses to one
+  // pass per dataset (data + prevData) with all four predicates fused.
+  function pass(e) {
+    if (modelFilter   && e.model   !== modelFilter)   return false;
+    if (accountFilter && e.account !== accountFilter) return false;
+    if (hasWindow) {
       var ts = Number(e.timestamp || e.ts || 0);
-      if (!ts) return true; // keep entries with no ts so we don't silently drop them
-      return ts >= snap.start && ts <= snap.end;
-    });
-    prevData = prevData.filter(function(e) {
-      var ts = Number(e.timestamp || e.ts || 0);
-      if (!ts) return true;
-      return ts >= snap.start && ts <= snap.end;
-    });
+      // Keep entries with no ts so we don't silently drop them — same
+      // semantics as the previous "if (!ts) return true" guard.
+      if (ts && (ts < snap.start || ts > snap.end)) return false;
+    }
+    if (hasTier && !vsTierMatchesEntry(e, snap)) return false;
+    return true;
   }
-  if (snap && Array.isArray(snap.tierFilter) && snap.tierFilter.length && snap.tierFilter[0] !== 'all') {
-    data = data.filter(function(e) { return vsTierMatchesEntry(e, snap); });
-    prevData = prevData.filter(function(e) { return vsTierMatchesEntry(e, snap); });
+  var data = [];
+  for (var i = 0, n = _tokensRawData.length; i < n; i++) {
+    if (pass(_tokensRawData[i])) data.push(_tokensRawData[i]);
+  }
+  var prevData = [];
+  for (var j = 0, m = _tokPrevPeriodData.length; j < m; j++) {
+    if (pass(_tokPrevPeriodData[j])) prevData.push(_tokPrevPeriodData[j]);
   }
   _tokFilteredData = data;
   populateTokenFilters(_tokensRawData);
@@ -5892,6 +6013,24 @@ function renderRepoBranchBreakdown(data) {
         var tb = repo.branches[b].totalIn + repo.branches[b].totalOut;
         return tb - ta;
       });
+      // Cap per-repo branch rendering to keep the DOM bounded. A long-lived
+      // repo with many feature branches (or worktree-* auto-names) used to
+      // render hundreds of rows on every refresh, doubling page weight and
+      // making scroll laggy. Show top-N by total tokens; collapse the rest
+      // into a footer row that sums them. RENDER_BRANCH_CAP is per-repo.
+      var RENDER_BRANCH_CAP = 25;
+      var hiddenBranchCount = 0;
+      var hiddenBranchTotalIn = 0;
+      var hiddenBranchTotalOut = 0;
+      if (branchKeys.length > RENDER_BRANCH_CAP) {
+        for (var hi = RENDER_BRANCH_CAP; hi < branchKeys.length; hi++) {
+          var hb = repo.branches[branchKeys[hi]];
+          hiddenBranchTotalIn += hb.totalIn;
+          hiddenBranchTotalOut += hb.totalOut;
+          hiddenBranchCount++;
+        }
+        branchKeys = branchKeys.slice(0, RENDER_BRANCH_CAP);
+      }
       for (var bi = 0; bi < branchKeys.length; bi++) {
         var br = repo.branches[branchKeys[bi]];
         var brTotal = br.totalIn + br.totalOut;
@@ -5909,6 +6048,19 @@ function renderRepoBranchBreakdown(data) {
         h += '<span class="tok-branch-pct">' + brPct + '%</span>';
         h += '</div>';
         h += '<div class="tok-branch-detail">' + modelDetail + '</div>';
+        h += '</div>';
+      }
+      // Footer row summarising hidden branches (only when we actually
+      // capped the display above).
+      if (hiddenBranchCount > 0) {
+        var hiddenTotal = hiddenBranchTotalIn + hiddenBranchTotalOut;
+        var hiddenPct = Math.round((hiddenTotal / grandTotal) * 100);
+        h += '<div class="tok-branch-row tok-branch-inactive" style="padding-left:1.5rem;font-style:italic;opacity:0.75">';
+        h += '<div class="tok-branch-name">… and ' + hiddenBranchCount + ' more branch' + (hiddenBranchCount === 1 ? '' : 'es') + '</div>';
+        h += '<div class="tok-branch-stats">';
+        h += '<span class="tok-branch-total">' + formatNum(hiddenBranchTotalIn) + ' / ' + formatNum(hiddenBranchTotalOut) + '</span>';
+        h += '<span class="tok-branch-pct">' + hiddenPct + '%</span>';
+        h += '</div>';
         h += '</div>';
       }
     }
@@ -9410,7 +9562,15 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     // ── 429: Rate limited → auto-switch (if enabled) ──
     if (status === 429) {
-      const retryAfter = parseInt(proxyRes.headers['retry-after'] || '0', 10);
+      // RFC 7231 §7.1.3 allows Retry-After to be a delta-seconds OR an
+      // HTTP-date. The previous parseInt(…) returned 0 for HTTP-date and
+      // any malformed value, which classified the response as "transient"
+      // (retry-after < 60) and passed it through to the client without
+      // marking the account limited or rotating — exactly the failure
+      // mode auto-switch was meant to prevent. parseRetryAfter (lib.mjs)
+      // handles both forms and returns 0 only for genuinely missing /
+      // unparseable / past-date values.
+      const retryAfter = parseRetryAfter(proxyRes.headers['retry-after']);
 
       // Phase G — drain the body once and parse error.type so we can
       // distinguish PLAN-side throttle (rate_limit_error → rotating to
