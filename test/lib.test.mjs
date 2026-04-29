@@ -3438,6 +3438,27 @@ describe('createSerializationQueue — getStats', () => {
   });
 });
 
+describe('createSerializationQueue — timeout vs dispatch race', () => {
+  it('queue_timeout does NOT reject an entry that has already been dispatched', async () => {
+    // Use a very short queueTimeout to force the timeout to fire AROUND
+    // the same time as the dispatch. Without the dispatched flag guard,
+    // the timeout's reject(queue_timeout) would race with the dispatcher
+    // shifting+running the entry, producing either a wrong rejection or
+    // a double-settle attempt on the outer Promise.
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+      queueTimeoutMs: 5, // very short, intentionally near dispatch time
+    });
+    // Dispatch a quick fn — should resolve normally before queueTimeout.
+    const r = await q.acquire(() => Promise.resolve('done'));
+    assert.equal(r, 'done', 'dispatched entry should not be rejected with queue_timeout');
+    await _flush();
+    assert.equal(q.getStats().inflight, 0);
+  });
+});
+
 describe('createSerializationQueue — sync-throw safety', () => {
   it('a fn that throws synchronously becomes a rejection (queued path)', async () => {
     const q = createSerializationQueue({
