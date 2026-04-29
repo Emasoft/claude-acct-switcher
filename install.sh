@@ -539,6 +539,21 @@ if [ -d "\$_vdm_lock" ]; then
   fi
 fi
 if mkdir "\$_vdm_lock" 2>/dev/null; then
+  # Rotate startup.log before spawn if it's grown past 1 MiB. Without
+  # this the file is append-only and grows indefinitely (every shell
+  # opens a fresh dashboard if no listener exists, every vdm restart
+  # re-opens this stream). Cap at 1 MiB; rotated as .1 (one-deep
+  # ring). On macOS \`stat -f '%z'\` is the BSD form; \`stat -c '%s'\`
+  # works on GNU coreutils. We try both for portability.
+  _vdm_log="\$HOME/.claude/account-switcher/startup.log"
+  if [ -f "\$_vdm_log" ]; then
+    _vdm_log_sz="\$(stat -f '%z' "\$_vdm_log" 2>/dev/null || stat -c '%s' "\$_vdm_log" 2>/dev/null || echo 0)"
+    if [ "\${_vdm_log_sz:-0}" -gt 1048576 ]; then
+      mv -f "\$_vdm_log" "\${_vdm_log}.1" 2>/dev/null || :
+    fi
+    unset _vdm_log_sz
+  fi
+  unset _vdm_log
   # Probe the RESOLVED dashboard port — not a hard-coded 3333. Otherwise a
   # user with \`CSW_PORT=4444\` already running would still get a second
   # dashboard.mjs spawned because lsof looked at the wrong port.

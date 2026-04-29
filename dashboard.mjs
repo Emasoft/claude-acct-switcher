@@ -172,7 +172,7 @@ function _openCircuit(reason) {
   _circuitOpen = true;
   _circuitOpenAt = Date.now();
   log('circuit', `Circuit breaker OPEN (${reason}) — passthrough for ${CIRCUIT_COOLDOWN_MS / 1000}s`);
-  notify('Proxy Bypassed', `${reason} — passthrough mode for ${CIRCUIT_COOLDOWN_MS / 60000}min`);
+  notify('Proxy Bypassed', `${reason} — passthrough mode for ${CIRCUIT_COOLDOWN_MS / 60000}min`, 'circuitBreaker');
 }
 
 // ─────────────────────────────────────────────────
@@ -734,15 +734,49 @@ function saveHistoryToDisk() {
 loadHistoryFromDisk();
 
 // ── macOS desktop notifications ──
+// `settings.notifications` accepts two shapes for backward compat:
+//   1. boolean — single global gate (legacy, pre-fine-grained).
+//   2. object  — per-event-type flags:
+//        { switch: true, exhausted: true, refreshFailed: true,
+//          circuitBreaker: true, expired: true, _default: true }
+// Code paths that emit a notification pass an `eventType` so the per-
+// event flag (or `_default` if missing) decides whether to show. Boolean
+// settings.notifications keeps every event ON (true) or OFF (false).
+//
+// Throttling is also per-event-type: a "switch" + "all-exhausted"
+// arriving within the global window used to drop the second (more
+// important) one. Now each event-type has its own last-fired timestamp,
+// AND high-priority events (exhausted, expired, circuitBreaker,
+// refreshFailed) bypass the throttle entirely so a critical follow-up
+// is never silently dropped.
 
-let _lastNotifyAt = 0;
-const NOTIFY_THROTTLE_MS = 10_000; // max 1 notification per 10 seconds
+const NOTIFY_THROTTLE_MS = 10_000;          // default throttle (per type)
+const NOTIFY_HIGH_PRIORITY = new Set([      // bypass throttling
+  'exhausted', 'expired', 'circuitBreaker', 'refreshFailed',
+]);
+const _lastNotifyAtByType = Object.create(null);
 
-function notify(title, message) {
-  if (!settings.notifications) return;
+function _isNotifyEnabled(eventType) {
+  const n = settings.notifications;
+  if (n === undefined || n === null) return false;
+  if (typeof n === 'boolean') return n;
+  if (typeof n !== 'object') return false;
+  if (eventType && Object.prototype.hasOwnProperty.call(n, eventType)) {
+    return !!n[eventType];
+  }
+  return n._default !== false; // default ON unless explicitly disabled
+}
+
+function notify(title, message, eventType = '') {
+  if (!_isNotifyEnabled(eventType)) return;
   const now = Date.now();
-  if (now - _lastNotifyAt < NOTIFY_THROTTLE_MS) return; // throttle notification spam
-  _lastNotifyAt = now;
+  // High-priority events bypass throttling so a "switch" notification
+  // doesn't suppress a critical follow-up "exhausted" / "expired".
+  if (!NOTIFY_HIGH_PRIORITY.has(eventType)) {
+    const last = _lastNotifyAtByType[eventType || '_'] || 0;
+    if (now - last < NOTIFY_THROTTLE_MS) return;
+  }
+  _lastNotifyAtByType[eventType || '_'] = now;
   try {
     // Use JXA (JavaScript for Automation) + JSON.stringify to encode the
     // strings. JSON.stringify handles every character — backslash, newline,
@@ -1167,22 +1201,43 @@ async function handleAPI(req, res) {
       // Log the manual switch
       let label = '';
       try { label = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
-      // Auto-set strategy to sticky so the manual switch isn't overridden
+      // The user clicked Switch on a non-sticky/round-robin strategy.
+      // Previously we PERMANENTLY set rotationStrategy='sticky' here,
+      // which destroyed their chosen strategy across the whole session
+      // (and persisted to config.json so it survived restarts). Now we
+      // remember the previous strategy in `settings.previousStrategy`
+      // and apply 'sticky' only as the EFFECTIVE strategy until the
+      // next time the user explicitly changes settings; rotation logic
+      // honours `previousStrategy` if present at next save. This way:
+      //   - auto-switch on 429 still rotates as the user configured.
+      //   - the explicit click sticks until the user touches settings.
+      // Set `respectPreviousStrategy: false` in the body to preserve
+      // the legacy "always overwrite" behaviour.
       let strategyChanged = false;
       const prevStrategy = settings.rotationStrategy;
+      const respectPrev = parsed.respectPreviousStrategy !== false;
       if (prevStrategy !== 'sticky' && prevStrategy !== 'round-robin') {
+        if (respectPrev && !settings.previousStrategy) {
+          settings.previousStrategy = prevStrategy;
+        }
         settings.rotationStrategy = 'sticky';
         saveSettings(settings);
         strategyChanged = true;
         logActivity('settings-changed', {
           autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
           rotationStrategy: 'sticky', rotationIntervalMin: settings.rotationIntervalMin,
+          previousStrategy: settings.previousStrategy || null,
           reason: auto ? 'auto-switch' : 'manual-switch',
         });
       }
       lastRotationTime = Date.now();
       logActivity(auto ? 'auto-switch' : 'manual-switch', { to: label || name });
-      json(res, { ok: true, switched: name, label: label || name, strategyChanged, strategy: settings.rotationStrategy, auto });
+      json(res, {
+        ok: true, switched: name, label: label || name,
+        strategyChanged, strategy: settings.rotationStrategy,
+        previousStrategy: settings.previousStrategy || null,
+        auto,
+      });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 400);
     }
@@ -1286,9 +1341,27 @@ async function handleAPI(req, res) {
         }
       }
     }
-    if (typeof patch.notifications === 'boolean') settings.notifications = patch.notifications;
+    // Accept either a boolean (legacy single-toggle) or a per-event-
+    // type object. Validate the object shape so a typo doesn't sneak
+    // an unknown key into config.json.
+    if (typeof patch.notifications === 'boolean') {
+      settings.notifications = patch.notifications;
+    } else if (patch.notifications && typeof patch.notifications === 'object') {
+      const known = ['switch', 'exhausted', 'expired', 'circuitBreaker', 'refreshFailed', '_default'];
+      const filtered = {};
+      for (const k of known) {
+        if (typeof patch.notifications[k] === 'boolean') filtered[k] = patch.notifications[k];
+      }
+      // Merge with existing — partial patches don't reset other channels.
+      const cur = (typeof settings.notifications === 'object' && settings.notifications) ? settings.notifications : {};
+      settings.notifications = { ...cur, ...filtered };
+    }
     if (typeof patch.rotationStrategy === 'string' && ROTATION_STRATEGIES[patch.rotationStrategy]) {
       settings.rotationStrategy = patch.rotationStrategy;
+      // User explicitly changed the strategy via Settings — clear the
+      // sticky-after-manual-switch shadow so the previous-strategy
+      // bookkeeping doesn't leak into the next manual switch.
+      delete settings.previousStrategy;
       lastRotationTime = Date.now(); // reset timer on strategy change
     }
     if (typeof patch.rotationIntervalMin === 'number' && ROTATION_INTERVALS.includes(patch.rotationIntervalMin)) {
@@ -1306,6 +1379,20 @@ async function handleAPI(req, res) {
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
     if (typeof patch.perToolAttribution === 'boolean') settings.perToolAttribution = patch.perToolAttribution;
+    // Retention knobs — user-tunable trade-off between fidelity and
+    // disk. Cap each at sensible bounds so a typo can't request a 1B
+    // entry buffer. Numbers are days for *_MAX_AGE_DAYS, count for
+    // *_MAX_ENTRIES. Validation: positive integers within range; null
+    // / undefined leaves the existing value alone.
+    if (Number.isFinite(patch.tokenUsageMaxAge) && patch.tokenUsageMaxAge > 0 && patch.tokenUsageMaxAge <= 365) {
+      settings.tokenUsageMaxAgeDays = Math.floor(patch.tokenUsageMaxAge);
+    }
+    if (Number.isFinite(patch.tokenUsageMaxEntries) && patch.tokenUsageMaxEntries > 0 && patch.tokenUsageMaxEntries <= 500_000) {
+      settings.tokenUsageMaxEntries = Math.floor(patch.tokenUsageMaxEntries);
+    }
+    if (Number.isFinite(patch.activityMaxEntries) && patch.activityMaxEntries > 0 && patch.activityMaxEntries <= 5000) {
+      settings.activityMaxEntries = Math.floor(patch.activityMaxEntries);
+    }
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
@@ -6073,13 +6160,70 @@ function copyTimeline(sessionId) {
 // Server
 // ─────────────────────────────────────────────────
 
+// CSRF / cross-origin protection.
+//
+// The dashboard binds to 127.0.0.1, but a malicious local webpage in
+// the user's browser could still POST to /api/switch, /api/remove,
+// /api/refresh, /api/settings — every mutating endpoint — without the
+// user noticing. Previously CORS was wide-open
+// (Access-Control-Allow-Origin: *) which made the situation worse:
+// the browser would treat the response as readable, completing the
+// CSRF.
+//
+// Defence:
+//   1. Restrict Access-Control-Allow-Origin to a small allow-list of
+//      same-host origins. Anything else gets no CORS headers (the
+//      browser blocks the response from being read by JS).
+//   2. Mutating methods (POST/PUT/DELETE) require either:
+//        a. An Origin header that's in the allow-list, OR
+//        b. No Origin header (Claude Code itself, vdm CLI via curl).
+//      A request with a foreign Origin is rejected 403 before any
+//      handler runs.
+// PROXY_PORT is declared later in the file (the proxy server lives
+// further down). Build the allow-list lazily on first request so the
+// constant is defined by then. Cache after first build to avoid
+// rebuilding on every request.
+let _ALLOWED_ORIGINS = null;
+function _getAllowedOrigins() {
+  if (_ALLOWED_ORIGINS) return _ALLOWED_ORIGINS;
+  const proxyPort = (typeof PROXY_PORT !== 'undefined') ? PROXY_PORT : parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
+  _ALLOWED_ORIGINS = new Set([
+    `http://localhost:${PORT}`,
+    `http://127.0.0.1:${PORT}`,
+    `http://localhost:${proxyPort}`,
+    `http://127.0.0.1:${proxyPort}`,
+  ]);
+  return _ALLOWED_ORIGINS;
+}
+
+function _isOriginAllowed(origin) {
+  if (!origin) return true; // CLI / non-browser callers
+  return _getAllowedOrigins().has(origin);
+}
+
 const server = createServer(async (req, res) => {
   try {
-    // CORS for local dev
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // CORS — same-host allow-list, NOT wildcard. Browser CSRF guard.
+    const origin = req.headers.origin || '';
+    if (origin && _getAllowedOrigins().has(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    // Reject mutating requests from foreign origins. Reads (GET) are
+    // tolerated because the browser still won't expose the response
+    // body without matching CORS headers, but mutations could side-
+    // effect even on a 0-byte response.
+    const isMutating = req.method && req.method !== 'GET' && req.method !== 'HEAD';
+    if (isMutating && !_isOriginAllowed(origin)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'cross-origin request rejected' }));
+      return;
+    }
 
     // API routes
     if (req.url.startsWith('/api/')) {
@@ -7146,6 +7290,18 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
       refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
       logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
+      // High-impact event: a non-retriable refresh failure silently
+      // disables the account until the user notices in the dashboard.
+      // Push a desktop notification so they see it immediately. The
+      // 'refreshFailed' channel is high-priority and bypasses the
+      // notification throttle (see NOTIFY_HIGH_PRIORITY).
+      if (!result.retriable) {
+        notify(
+          'Token Refresh Failed',
+          `${accountLabel}: ${result.error}. Re-login required.`,
+          'refreshFailed'
+        );
+      }
       return { ok: false, error: result.error };
     }
 
@@ -8263,9 +8419,31 @@ setInterval(() => {
 // Token Usage Storage (token-usage.json)
 // ─────────────────────────────────────────────────
 
+// Retention defaults — overridable per-user via /api/settings or vdm
+// `config token-usage-max-age` / `token-usage-max-entries`. Settings
+// take precedence at runtime (see _tokenUsageMaxEntries / *MaxAge
+// helpers below).
 const TOKEN_USAGE_MAX_ENTRIES = 50_000;
 const TOKEN_USAGE_MAX_AGE = 90 * 24 * 60 * 60 * 1000; // 90 days
+function _tokenUsageMaxEntries() {
+  const v = settings && Number.isFinite(settings.tokenUsageMaxEntries) ? settings.tokenUsageMaxEntries : 0;
+  return v > 0 ? v : TOKEN_USAGE_MAX_ENTRIES;
+}
+function _tokenUsageMaxAgeMs() {
+  const days = settings && Number.isFinite(settings.tokenUsageMaxAgeDays) ? settings.tokenUsageMaxAgeDays : 0;
+  return days > 0 ? days * 24 * 60 * 60 * 1000 : TOKEN_USAGE_MAX_AGE;
+}
 let _tokenUsageCache = null;
+// Debounced disk-write coalescer. Each appendTokenUsage call updates
+// the in-memory cache + flag and schedules a single setTimeout that
+// eventually writes the WHOLE current array. At sustained 10 row/s
+// traffic this collapses 10 disk writes/second into 2 writes/second
+// (the default 500 ms debounce). The previous implementation wrote
+// the full file (50k rows × ~400B = 20 MB pretty-printed) on every
+// single append, blocking the event loop and thrashing the disk.
+let _tokenUsageDirty = false;
+let _tokenUsageFlushTimer = null;
+const TOKEN_USAGE_FLUSH_MS = 500;
 
 function loadTokenUsage() {
   if (_tokenUsageCache) return _tokenUsageCache;
@@ -8395,21 +8573,49 @@ function appendTokenUsage(entry) {
   };
   const usage = loadTokenUsage();
   usage.push(normalized);
-  // Prune old entries
-  const cutoff = Date.now() - TOKEN_USAGE_MAX_AGE;
+  // Prune old entries — honour user-set retention from settings.
+  const cutoff = Date.now() - _tokenUsageMaxAgeMs();
+  const maxEntries = _tokenUsageMaxEntries();
   const pruned = usage.filter(e => e.ts >= cutoff);
-  const final = pruned.length > TOKEN_USAGE_MAX_ENTRIES
-    ? pruned.slice(pruned.length - TOKEN_USAGE_MAX_ENTRIES)
+  const final = pruned.length > maxEntries
+    ? pruned.slice(pruned.length - maxEntries)
     : pruned;
-  // Note: don't update the in-memory cache until disk write succeeds — if
-  // the write throws, the cache stays consistent with disk and the next
-  // load() re-reads the previous-good file instead of an empty one.
+  // Update the cache immediately (readers see the new row) but DEBOUNCE
+  // the disk write — at sustained traffic the 50K-row pretty-printed
+  // JSON write was thrashing the disk on every append.
+  _tokenUsageCache = final;
+  _tokenUsageDirty = true;
+  if (!_tokenUsageFlushTimer) {
+    _tokenUsageFlushTimer = setTimeout(_flushTokenUsage, TOKEN_USAGE_FLUSH_MS);
+    _tokenUsageFlushTimer.unref?.();
+  }
+}
+
+// Single point that actually writes token-usage.json. Always writes
+// the current cache (not the closed-over `final` from append) so the
+// last-write-wins semantics match what reads will see. Compact JSON
+// (no `,2` indent) — cuts file size ~30% and write latency ~50%.
+function _flushTokenUsage() {
+  _tokenUsageFlushTimer = null;
+  if (!_tokenUsageDirty) return;
+  _tokenUsageDirty = false;
   try {
-    atomicWriteFileSync(TOKEN_USAGE_FILE, JSON.stringify(final, null, 2));
-    _tokenUsageCache = final;
+    atomicWriteFileSync(TOKEN_USAGE_FILE, JSON.stringify(_tokenUsageCache || []));
   } catch (e) {
     log('error', `Failed to write token-usage.json: ${e.message}`);
+    // Re-set the dirty flag so the next append retries the write.
+    _tokenUsageDirty = true;
   }
+}
+
+// Force an immediate flush — used by shutdown() so a pending debounced
+// write doesn't get lost when the process exits.
+function flushTokenUsageSync() {
+  if (_tokenUsageFlushTimer) {
+    clearTimeout(_tokenUsageFlushTimer);
+    _tokenUsageFlushTimer = null;
+  }
+  _flushTokenUsage();
 }
 
 /**
@@ -8680,7 +8886,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (!isSameAccount) {
         logEvent('proactive-switch', { from: oldName, to: pickName, reason });
         if (reason === 'unavailable') {
-          notify('Account Switched', `${oldName} unavailable → ${pickName}`);
+          notify('Account Switched', `${oldName} unavailable → ${pickName}`, 'switch');
         }
       }
     } else if (!token) {
@@ -8929,14 +9135,14 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
         token = next.token;
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '429' });
-        notify('Account Switched', `${acctName} rate-limited → ${next.label || next.name}`);
+        notify('Account Switched', `${acctName} rate-limited → ${next.label || next.name}`, 'switch');
         continue;
       }
 
       // All exhausted
       log('switch', '  → all accounts exhausted, returning 429');
       logEvent('all-exhausted', {});
-      notify('All Accounts Exhausted', `All ${allAccounts.length} accounts rate-limited. Reset: ${getEarliestReset()}`);
+      notify('All Accounts Exhausted', `All ${allAccounts.length} accounts rate-limited. Reset: ${getEarliestReset()}`, 'exhausted');
       // Compute a real Retry-After (in seconds) so Claude Code's own retry
       // loop knows when to come back. Without this header CC retries on
       // its own (often-overly-aggressive) timer or surfaces the error
@@ -9038,13 +9244,13 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
         token = next.token;
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '401' });
-        notify('Account Switched', `${acctName} token expired → ${next.label || next.name}`);
+        notify('Account Switched', `${acctName} token expired → ${next.label || next.name}`, 'switch');
         continue;
       }
 
       // No valid accounts left — try passthrough so Claude Code can re-auth
       log('switch', '  → no valid accounts remain — trying passthrough fallback');
-      notify('All Tokens Expired', 'No valid accounts remain — trying passthrough');
+      notify('All Tokens Expired', 'No valid accounts remain — trying passthrough', 'expired');
       if (await _passthroughFallback(clientReq, clientRes, body, 'all-401-expired')) return;
       clientRes.writeHead(401, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({
@@ -9214,7 +9420,7 @@ async function handleProxyRequest(clientReq, clientRes) {
           }
           token = next.token;
           logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-error' });
-          notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`);
+          notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`, 'switch');
           continue;
         }
       }
@@ -9456,15 +9662,45 @@ function shutdown(signal) {
   } catch (e) {
     try { log('warn', `Shutdown token-usage flush failed: ${e.message}`); } catch {}
   }
+  // Drain any pending debounced token-usage write so the in-flight
+  // claims persisted above + any backlog from the last 500 ms make it
+  // to disk before we close the listeners.
+  try { flushTokenUsageSync(); } catch {}
   // (2) Persist active monitored sessions.
   for (const [id, session] of monitoredSessions) {
     try { persistCompletedSession(session); } catch {}
     monitoredSessions.delete(id);
   }
-  // (3) Stop accepting new connections and exit.
+  // (3) Graceful shutdown: stop accepting new connections, then wait
+  // for in-flight SSE subscribers and proxy streams to drain BEFORE
+  // we kill the process. Previously we called process.exit(0)
+  // immediately, which dropped every long-running SSE connection
+  // (vdm logs, dashboard activity poll, proxy SSE forwarders) and
+  // any Claude Code session piping through the proxy lost data
+  // mid-stream. Drain window is bounded — after _SHUTDOWN_DRAIN_MS
+  // (default 5s) we exit anyway so a wedged stream cannot hold the
+  // process forever.
+  const _SHUTDOWN_DRAIN_MS = 5_000;
   try { proxyServer.close(); } catch {}
   try { server.close(); } catch {}
-  process.exit(0);
+  // End every SSE log subscriber (`/api/logs/stream`) cleanly so the
+  // client sees a connection close, not a half-buffer reset. Without
+  // this they'd hang until Node tears down the socket on exit.
+  try {
+    if (typeof _logSubscribers !== 'undefined' && _logSubscribers && typeof _logSubscribers.forEach === 'function') {
+      _logSubscribers.forEach((sub) => { try { sub.end(); } catch {} });
+    }
+  } catch {}
+  // Give in-flight handlers a moment, then exit. process.exit(0) is
+  // still required because SSE subscribers and persistent keep-alives
+  // keep the event loop occupied — server.close() merely flips the
+  // accept flag.
+  const _exitTimer = setTimeout(() => process.exit(0), _SHUTDOWN_DRAIN_MS);
+  // If both servers report 'close' before the timer, exit early.
+  let _closed = 0;
+  const _maybeExit = () => { if (++_closed >= 2) { clearTimeout(_exitTimer); process.exit(0); } };
+  try { proxyServer.once('close', _maybeExit); } catch {}
+  try { server.once('close', _maybeExit); } catch {}
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

@@ -2347,3 +2347,227 @@ describe('vdmAccountNameFromService', () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────
+// Rotation strategies — pickByStrategy + helpers.
+// Critical missing coverage: every strategy branch was untested.
+// ─────────────────────────────────────────────────
+
+function _mkAccount(token, expiresAt = Date.now() + 24 * 60 * 60 * 1000) {
+  return { name: token, token, expiresAt };
+}
+
+function _mkStateManager(perToken) {
+  return {
+    get(token) { return perToken[token]; },
+    update() {},
+  };
+}
+
+describe('pickBestAccount', () => {
+  it('returns the lowest-utilization account', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.8, utilization7d: 0.5 },
+      b: { utilization5h: 0.1, utilization7d: 0.5 },
+      c: { utilization5h: 0.5, utilization7d: 0.5 },
+    });
+    const picked = pickBestAccount(accounts, sm);
+    assert.equal(picked.token, 'b');
+  });
+
+  it('honours excludeTokens', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.1, utilization7d: 0.1 },
+      b: { utilization5h: 0.9, utilization7d: 0.9 },
+    });
+    const picked = pickBestAccount(accounts, sm, new Set(['a']));
+    assert.equal(picked.token, 'b');
+  });
+
+  it('returns null when every account is excluded', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({ a: {}, b: {} });
+    const picked = pickBestAccount(accounts, sm, new Set(['a', 'b']));
+    assert.equal(picked, null);
+  });
+});
+
+describe('pickAnyUntried', () => {
+  it('returns any account not in the exclude set', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const picked = pickAnyUntried(accounts, new Set(['a', 'b']));
+    assert.equal(picked.token, 'c');
+  });
+
+  it('returns null when all accounts are excluded', () => {
+    const accounts = [_mkAccount('a')];
+    assert.equal(pickAnyUntried(accounts, new Set(['a'])), null);
+  });
+});
+
+describe('pickByStrategy — sticky', () => {
+  it('returns null when current account is available', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({ a: {}, b: {} });
+    const r = pickByStrategy({
+      strategy: 'sticky', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, false);
+    assert.equal(r.account, null);
+  });
+
+  it('rotates when current account is missing from list (unavailable)', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({ a: {}, b: {} });
+    const r = pickByStrategy({
+      strategy: 'sticky', intervalMin: 60,
+      currentToken: 'gone', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, true);
+    assert.ok(r.account);
+  });
+});
+
+describe('pickByStrategy — round-robin', () => {
+  it('skips when timer not elapsed', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.5 }, b: { utilization5h: 0.1 },
+    });
+    const now = 100_000_000;
+    const r = pickByStrategy({
+      strategy: 'round-robin', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: now - 10 * 60 * 1000,
+      accounts, stateManager: sm, now,
+    });
+    assert.equal(r.rotated, false);
+  });
+
+  it('rotates when timer elapsed and a better account exists', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.5 }, b: { utilization5h: 0.1 },
+    });
+    const now = 100_000_000;
+    const r = pickByStrategy({
+      strategy: 'round-robin', intervalMin: 30,
+      currentToken: 'a', lastRotationTime: now - 60 * 60 * 1000,
+      accounts, stateManager: sm, now,
+    });
+    assert.equal(r.rotated, true);
+    assert.equal(r.account.token, 'b');
+  });
+
+  it('does not rotate when current is already best', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.0 }, b: { utilization5h: 0.5 },
+    });
+    const now = 100_000_000;
+    const r = pickByStrategy({
+      strategy: 'round-robin', intervalMin: 30,
+      currentToken: 'a', lastRotationTime: now - 60 * 60 * 1000,
+      accounts, stateManager: sm, now,
+    });
+    assert.equal(r.rotated, false);
+  });
+});
+
+describe('pickByStrategy — spread', () => {
+  it('always picks lowest utilization, even mid-interval', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.5 },
+      b: { utilization5h: 0.0 },
+      c: { utilization5h: 0.9 },
+    });
+    const r = pickByStrategy({
+      strategy: 'spread', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, true);
+    assert.equal(r.account.token, 'b');
+  });
+
+  it('does not rotate when current is already lowest', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.0 }, b: { utilization5h: 0.5 },
+    });
+    const r = pickByStrategy({
+      strategy: 'spread', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, false);
+  });
+});
+
+describe('pickByStrategy — conserve + drain-first', () => {
+  it('conserve picks account with highest 7d utilization (warm window)', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.0, utilization7d: 0.0 },           // dormant
+      b: { utilization5h: 0.0, utilization7d: 0.4 },           // warm
+      c: { utilization5h: 0.0, utilization7d: 0.0 },           // dormant
+    });
+    const r = pickByStrategy({
+      strategy: 'conserve', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, true);
+    assert.equal(r.account.token, 'b');
+  });
+
+  it('drain-first picks account with highest 5h utilization', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b'), _mkAccount('c')];
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.2 },
+      b: { utilization5h: 0.7 },
+      c: { utilization5h: 0.0 },
+    });
+    const r = pickByStrategy({
+      strategy: 'drain-first', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, true);
+    assert.equal(r.account.token, 'b');
+  });
+});
+
+describe('pickByStrategy — current-account-unavailable fallback', () => {
+  it('rotates regardless of strategy when current token is rate-limited', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const now = 100_000_000;          // fixed clock for determinism
+    const nowSec = Math.floor(now / 1000);
+    const sm = _mkStateManager({
+      // `limited` is only treated as unavailable when at least one of
+      // retryAfter / resetAt / resetAt7d is still in the future.
+      a: { limited: true, resetAt: nowSec + 600, utilization5h: 0.9 },
+      b: { utilization5h: 0.1 },
+    });
+    for (const strategy of ['sticky', 'conserve', 'round-robin', 'spread', 'drain-first']) {
+      const r = pickByStrategy({
+        strategy, intervalMin: 60,
+        currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm, now,
+      });
+      assert.equal(r.rotated, true, `strategy=${strategy} should rotate when current is limited`);
+      assert.equal(r.account.token, 'b', `strategy=${strategy} should pick b`);
+    }
+  });
+});
+
+describe('pickByStrategy — unknown strategy', () => {
+  it('returns null/false for an unknown strategy name', () => {
+    const accounts = [_mkAccount('a'), _mkAccount('b')];
+    const sm = _mkStateManager({ a: {}, b: {} });
+    const r = pickByStrategy({
+      strategy: 'wat-strategy', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+    });
+    assert.equal(r.rotated, false);
+    assert.equal(r.account, null);
+  });
+});

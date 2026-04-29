@@ -395,8 +395,13 @@ set_config_value() {
   # `$value` for booleans is the literal text "True" or "False" (validated
   # by cmd_config). We pass it as a string and convert it inside python so
   # `$value` can never be interpolated as raw python code.
+  # Atomic write: tmp + os.replace so a SIGKILL/full-disk between
+  # truncate and the final byte never leaves a corrupt config.json.
+  # We DO NOT swallow stderr — a write failure (read-only FS, no
+  # space, permissions) must reach the user, not silently drop their
+  # setting change.
   python3 -c '
-import json, sys
+import json, os, sys
 config_file = sys.argv[1]
 key = sys.argv[2]
 raw = sys.argv[3]
@@ -406,9 +411,11 @@ try:
 except Exception:
     cfg = {"autoSwitch": True, "proxyEnabled": True}
 cfg[key] = (raw == "True")
-with open(config_file, "w") as f:
+tmp = config_file + ".tmp"
+with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
-' "$CONFIG_FILE" "$key" "$value" 2>/dev/null
+os.replace(tmp, config_file)
+' "$CONFIG_FILE" "$key" "$value"
 }
 
 get_config_string() {
@@ -422,8 +429,9 @@ print(json.load(sys.stdin).get(sys.argv[1], ""))
 set_config_string() {
   local key="$1"
   local value="$2"
+  # Atomic + surfaced errors — see set_config_value for the rationale.
   python3 -c '
-import json, sys
+import json, os, sys
 config_file = sys.argv[1]
 key = sys.argv[2]
 value = sys.argv[3]
@@ -433,16 +441,19 @@ try:
 except Exception:
     cfg = {}
 cfg[key] = value
-with open(config_file, "w") as f:
+tmp = config_file + ".tmp"
+with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
-' "$CONFIG_FILE" "$key" "$value" 2>/dev/null
+os.replace(tmp, config_file)
+' "$CONFIG_FILE" "$key" "$value"
 }
 
 set_config_number() {
   local key="$1"
   local value="$2"
+  # Atomic + surfaced errors — see set_config_value.
   python3 -c '
-import json, sys
+import json, os, sys
 config_file = sys.argv[1]
 key = sys.argv[2]
 raw = sys.argv[3]
@@ -455,9 +466,11 @@ except Exception:
 # caller (cmd_config restricts it to a fixed allow-list) but we re-validate
 # here so a future caller cannot smuggle in a non-numeric literal.
 cfg[key] = int(raw)
-with open(config_file, "w") as f:
+tmp = config_file + ".tmp"
+with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
-' "$CONFIG_FILE" "$key" "$value" 2>/dev/null
+os.replace(tmp, config_file)
+' "$CONFIG_FILE" "$key" "$value"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -919,6 +932,24 @@ cmd_config() {
     else
       echo -e "  commitTokenUsage:   ${DIM}off${NC}"
     fi
+    local session_monitor=$(get_config_value "sessionMonitor")
+    if [[ "$session_monitor" == "True" ]]; then
+      echo -e "  sessionMonitor:     ${GREEN}on${NC}"
+    else
+      echo -e "  sessionMonitor:     ${DIM}off${NC}"
+    fi
+    local per_tool=$(get_config_value "perToolAttribution")
+    if [[ "$per_tool" == "True" ]]; then
+      echo -e "  perToolAttribution: ${GREEN}on${NC}"
+    else
+      echo -e "  perToolAttribution: ${DIM}off${NC}"
+    fi
+    local tu_max_age=$(get_config_string "tokenUsageMaxAgeDays")
+    echo -e "  tokenUsageMaxAge:   ${tu_max_age:-90} days"
+    local tu_max_entries=$(get_config_string "tokenUsageMaxEntries")
+    echo -e "  tokenUsageMaxEntries: ${tu_max_entries:-50000}"
+    local act_max=$(get_config_string "activityMaxEntries")
+    echo -e "  activityMaxEntries: ${act_max:-500}"
     echo ""
     echo -e "  ${DIM}Usage: vdm config <key> <value>${NC}"
     echo -e "  ${DIM}  vdm config proxy on${NC}"
@@ -929,6 +960,11 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config serialize on|off${NC}"
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}"
     echo -e "  ${DIM}  vdm config commit-tokens on|off${NC}"
+    echo -e "  ${DIM}  vdm config session-monitor on|off${NC}"
+    echo -e "  ${DIM}  vdm config per-tool-attribution on|off${NC}"
+    echo -e "  ${DIM}  vdm config token-usage-max-age <1-365 days>${NC}"
+    echo -e "  ${DIM}  vdm config token-usage-max-entries <1-500000>${NC}"
+    echo -e "  ${DIM}  vdm config activity-max-entries <1-5000>${NC}"
     return 0
   fi
 
@@ -943,9 +979,16 @@ cmd_config() {
     serialize|serializeRequests|serialize-requests) key="serializeRequests" ;;
     serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
     commit-tokens|commitTokenUsage|commit-token-usage) key="commitTokenUsage" ;;
+    # Phase J/K — keys previously settable only via the dashboard UI.
+    session-monitor|sessionMonitor)       key="sessionMonitor" ;;
+    per-tool-attribution|perToolAttribution|per-tool) key="perToolAttribution" ;;
+    # Retention knobs — let users trade fidelity for disk space.
+    token-usage-max-age|tokenUsageMaxAgeDays|token-usage-max-age-days) key="tokenUsageMaxAgeDays"; is_bool=false ;;
+    token-usage-max-entries|tokenUsageMaxEntries) key="tokenUsageMaxEntries"; is_bool=false ;;
+    activity-max-entries|activityMaxEntries) key="activityMaxEntries"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, commit-tokens"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, commit-tokens, session-monitor, per-tool-attribution, token-usage-max-age, token-usage-max-entries, activity-max-entries"
       return 1
       ;;
   esac
@@ -1008,6 +1051,27 @@ cmd_config() {
     esac
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} ms${NC}"
+  elif [[ "$key" == "tokenUsageMaxAgeDays" ]]; then
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 365 ]]; then
+      echo -e "${RED}Invalid value: $value${NC}  (must be an integer between 1 and 365)"
+      return 1
+    fi
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} days${NC}"
+  elif [[ "$key" == "tokenUsageMaxEntries" ]]; then
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 500000 ]]; then
+      echo -e "${RED}Invalid value: $value${NC}  (must be an integer between 1 and 500000)"
+      return 1
+    fi
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} entries${NC}"
+  elif [[ "$key" == "activityMaxEntries" ]]; then
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 5000 ]]; then
+      echo -e "${RED}Invalid value: $value${NC}  (must be an integer between 1 and 5000)"
+      return 1
+    fi
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} entries${NC}"
   fi
 
   log_activity "settings-changed" "$key=$value"
@@ -1231,18 +1295,45 @@ cmd_upgrade() {
   # (rename(2)). A SIGKILL/^C between cp and mv leaves the original intact
   # so a half-finished upgrade never bricks the install. dashboard.mjs is
   # ~225 KB and the cp window is real on slow disks.
+  #
+  # Signal-safety: if Ctrl-C arrives BETWEEN file replacements (e.g.
+  # vdm + dashboard.mjs already swapped, lib.mjs not yet), we'd leave a
+  # mismatched-version install. Trap INT/TERM/HUP during the critical
+  # block and revert by removing the .new tmps. The mv-renames
+  # themselves are atomic, so once a mv has succeeded that file is OK
+  # — the trap only handles the case where the tmp exists but the mv
+  # hasn't run.
   echo -e "  ${DIM}Updating files…${NC}"
-  cp "$tmpdir/vdm"               "$SCRIPT_DIR/vdm.new"               && mv -f "$SCRIPT_DIR/vdm.new"               "$SCRIPT_DIR/vdm"
-  cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs.new"     && mv -f "$SCRIPT_DIR/dashboard.mjs.new"     "$SCRIPT_DIR/dashboard.mjs"
-  cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs.new"           && mv -f "$SCRIPT_DIR/lib.mjs.new"           "$SCRIPT_DIR/lib.mjs"
-  cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh.new"  && mv -f "$SCRIPT_DIR/install-hooks.sh.new"  "$SCRIPT_DIR/install-hooks.sh"
-  cp "$tmpdir/lib-install.sh"    "$SCRIPT_DIR/lib-install.sh.new"    && mv -f "$SCRIPT_DIR/lib-install.sh.new"    "$SCRIPT_DIR/lib-install.sh"
+  local _upg_files=("vdm" "dashboard.mjs" "lib.mjs" "install-hooks.sh" "lib-install.sh")
+  _upg_cleanup() {
+    local f
+    for f in "${_upg_files[@]}"; do
+      rm -f "$SCRIPT_DIR/${f}.new" 2>/dev/null || true
+    done
+  }
+  trap '_upg_cleanup; echo -e "\n  ${RED}Upgrade interrupted — install is unchanged.${NC}"; exit 130' INT TERM HUP
+  for f in "${_upg_files[@]}"; do
+    if ! cp "$tmpdir/$f" "$SCRIPT_DIR/${f}.new"; then
+      _upg_cleanup
+      trap - INT TERM HUP
+      echo -e "  ${RED}Failed to stage $f — upgrade aborted, install unchanged.${NC}"
+      return 1
+    fi
+    if ! mv -f "$SCRIPT_DIR/${f}.new" "$SCRIPT_DIR/$f"; then
+      _upg_cleanup
+      trap - INT TERM HUP
+      echo -e "  ${RED}Failed to move $f into place — upgrade aborted.${NC}"
+      return 1
+    fi
+  done
+  trap - INT TERM HUP
   chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker — full SHA-1 so future upgrades can compare without
   # ambiguity. Display value remains the tag/short-hash in the user-facing
-  # messages below.
-  echo "$latest_full" > "$SCRIPT_DIR/.version"
+  # messages below. Atomic write.
+  printf '%s' "$latest_full" > "$SCRIPT_DIR/.version.new" \
+    && mv -f "$SCRIPT_DIR/.version.new" "$SCRIPT_DIR/.version"
 
   # Install hooks if not yet present
   if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
