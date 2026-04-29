@@ -35,11 +35,21 @@
 # ─────────────────────────────────────────────────────────
 
 # _atomic_replace <src_or_content_file> <dst>
-# Replace <dst> atomically. Writes <dst>.tmp.<pid>, fsyncs, renames.
-# rename(2) is atomic on the same filesystem — a SIGKILL between truncate
-# and the final byte never leaves a half-written file. Preserves the
-# destination's permissions if it already exists; otherwise the temp file
-# inherits the umask.
+# Replace <dst> atomically. Writes <dst>.tmp.<pid>, fsyncs, then either:
+#   - mv-renames the tmp into place (regular file destination), OR
+#   - if <dst> is a symlink, writes the tmp content THROUGH the symlink
+#     so the underlying target is updated and the symlink stays intact.
+#
+# Why the symlink branch: rc files in dotfile-manager-managed homes
+# (chezmoi, yadm, stow, vcsh) are commonly symlinks pointing into a
+# managed repo. A naive `mv -f tmp $dst` replaces the symlink with a
+# regular file — silently breaking the dotfile manager and stranding
+# every future edit outside the user's repo. The cat-through branch
+# updates the managed file in place. Tradeoff: cat-redirect is NOT
+# atomic at the byte level — a SIGKILL mid-write leaves a truncated
+# managed file. We accept that for symlinked destinations because the
+# alternative (silently breaking the dotfile chain) is worse.
+# Regular-file destinations stay fully atomic via mv.
 _atomic_replace() {
   local src="$1" dst="$2"
   if [[ ! -f "$src" ]]; then
@@ -64,7 +74,19 @@ _atomic_replace() {
   # fsync the temp file so the bytes are on disk before the rename.
   # macOS lacks `dd ... oflag=fsync`; portable form: open + sync.
   python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f); os.close(f)" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$dst"
+  if [[ -L "$dst" ]]; then
+    # Symlink: write through it so the dotfile-manager target stays
+    # the source of truth. NOT atomic at byte level — see above.
+    if cat "$tmp" > "$dst"; then
+      rm -f "$tmp"
+      return 0
+    else
+      rm -f "$tmp"
+      return 1
+    fi
+  else
+    mv -f "$tmp" "$dst"
+  fi
 }
 
 # Portable chmod-match helper. Tries GNU `stat -c '%a'` first (works
@@ -158,7 +180,12 @@ _atomic_append_block() {
       || true
   fi
   python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f); os.close(f)" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$dst"
+  if [[ -L "$dst" ]]; then
+    # Symlink: write through it (see _atomic_replace for the rationale).
+    cat "$tmp" > "$dst" && rm -f "$tmp"
+  else
+    mv -f "$tmp" "$dst"
+  fi
 }
 
 # _atomic_remove_block <dst> <begin_marker_pattern> <end_marker_pattern>
@@ -202,7 +229,12 @@ _atomic_remove_block() {
       || true
   fi
   python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f); os.close(f)" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$dst"
+  if [[ -L "$dst" ]]; then
+    # Symlink: write through it (see _atomic_replace for the rationale).
+    cat "$tmp" > "$dst" && rm -f "$tmp"
+  else
+    mv -f "$tmp" "$dst"
+  fi
 }
 
 # ─────────────────────────────────────────────────────────

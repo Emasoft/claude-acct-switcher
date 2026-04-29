@@ -137,28 +137,94 @@ echo ""
 
 # ── Check prerequisites ──
 
-if ! command -v node &>/dev/null; then
-  echo -e "${RED}Node.js is required but not installed.${NC}"
-  echo "  Install it from https://nodejs.org/ or via: brew install node"
+# macOS-only check first — vdm uses the macOS Keychain, so there's no
+# point in trying to install dependencies on Linux.
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo -e "${RED}This tool requires macOS (uses Keychain for credential storage).${NC}"
   exit 1
 fi
+
+# _ensure_dep <command> <homebrew-formula> <human-friendly-name>
+# Verifies that <command> is on PATH. If missing:
+#   - In interactive mode: detect Homebrew, offer to install via brew.
+#     User declines → print the manual command and exit 1.
+#   - In --non-interactive mode WITH --auto-fix: install via brew
+#     unattended (errors abort).
+#   - In --non-interactive mode WITHOUT --auto-fix: print the manual
+#     install command and exit 1 — never silently install something
+#     under an automation account.
+# We never attempt sudo or non-Homebrew package managers — too
+# environment-specific. Users on Apple Silicon without Homebrew get a
+# clear "install brew first" message rather than a partial install.
+_ensure_dep() {
+  local cmd="$1" formula="$2" name="$3"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo -e "  ${YELLOW}!${NC} Missing dependency: ${BOLD}$name${NC} (${DIM}$cmd${NC})"
+  if ! command -v brew >/dev/null 2>&1; then
+    echo -e "    ${DIM}Homebrew not found — cannot auto-install. Install $name manually:${NC}"
+    echo -e "      ${CYAN}# Install Homebrew first:${NC}"
+    echo -e "      ${DIM}/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"${NC}"
+    echo -e "      ${CYAN}# Then install $name:${NC}"
+    echo -e "      ${DIM}brew install $formula${NC}"
+    return 1
+  fi
+  local _do_install=false
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    if [[ "$AUTO_FIX" == "true" ]]; then
+      _do_install=true
+      echo -e "    ${DIM}--non-interactive --auto-fix → installing via Homebrew...${NC}"
+    else
+      echo -e "    ${DIM}--non-interactive without --auto-fix → not installing automatically.${NC}"
+      echo -e "    ${DIM}Run: ${CYAN}brew install $formula${DIM} OR re-run install.sh with --auto-fix.${NC}"
+      return 1
+    fi
+  else
+    local ans=""
+    read -rp "  Install $name now via Homebrew (brew install $formula)? [Y/n] " ans || ans=""
+    if [[ -z "$ans" ]] || [[ "$ans" == "y" ]] || [[ "$ans" == "Y" ]]; then
+      _do_install=true
+    else
+      echo -e "    ${DIM}Skipped. Re-run install.sh after installing $name manually.${NC}"
+      return 1
+    fi
+  fi
+  if [[ "$_do_install" == "true" ]]; then
+    if brew install "$formula"; then
+      echo -e "    ${GREEN}✓${NC} Installed $name via Homebrew."
+      # Re-check — homebrew installs may need a PATH reload depending
+      # on shell + arch (Apple Silicon installs to /opt/homebrew/bin
+      # which isn't on a vanilla PATH from a shell that pre-dates the
+      # install). Use brew --prefix to find the bin dir and add it
+      # to this script's PATH so the subsequent `node -v` check works.
+      local _brew_bin
+      _brew_bin="$(brew --prefix 2>/dev/null)/bin"
+      if [[ -d "$_brew_bin" ]] && [[ ":$PATH:" != *":$_brew_bin:"* ]]; then
+        export PATH="$_brew_bin:$PATH"
+      fi
+      if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo -e "    ${RED}!${NC} $cmd still not on PATH after install. Restart your shell and re-run install.sh."
+        return 1
+      fi
+      return 0
+    else
+      echo -e "    ${RED}!${NC} brew install $formula failed."
+      return 1
+    fi
+  fi
+  return 1
+}
+
+if ! _ensure_dep node     node    "Node.js"; then exit 1; fi
+if ! _ensure_dep python3  python  "Python 3"; then exit 1; fi
 
 NODE_VERSION=$(node -v | sed 's/v//' | cut -d. -f1)
 if [[ "$NODE_VERSION" -lt 18 ]]; then
   echo -e "${YELLOW}Warning: Node.js v18+ recommended (found v$(node -v))${NC}"
 fi
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  echo -e "${RED}This tool requires macOS (uses Keychain for credential storage).${NC}"
-  exit 1
-fi
-
-if ! command -v python3 &>/dev/null; then
-  echo -e "${RED}python3 is required but not installed.${NC}"
-  exit 1
-fi
-
-echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS, python3)"
+echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS, python3 $(python3 -V 2>&1 | awk '{print $2}'))"
 echo ""
 
 # ── Pre-flight detection ──
@@ -270,10 +336,15 @@ _install_atomic() {
 # failed upgrade preserves the old version of any file that already
 # existed. Never destroys user data.
 _rollback_install_files() {
-  local f
-  for f in "${_NEW_FILES[@]}"; do
-    rm -f "$f" 2>/dev/null || true
-  done
+  # Guard the array expansion under bash 3.2 (stock macOS), which
+  # treats `${empty_arr[@]}` as an unbound variable under `set -u`.
+  # Bash 4.4+ tolerates it; we run on whatever bash the user has.
+  if (( ${#_NEW_FILES[@]} > 0 )); then
+    local f
+    for f in "${_NEW_FILES[@]}"; do
+      rm -f "$f" 2>/dev/null || true
+    done
+  fi
 }
 _register_cleanup '
 if [[ "${_INSTALL_OK:-0}" != "1" ]]; then

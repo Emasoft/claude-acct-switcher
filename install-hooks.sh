@@ -6,6 +6,36 @@
 # Two hooks are installed:
 # 1. Claude Code hooks in ~/.claude/settings.json (UserPromptSubmit + Stop)
 # 2. Global git prepare-commit-msg hook for token usage trailers
+#
+# Atomicity: settings.json is rewritten via the python heredoc's
+# tmp + os.replace (atomic). The git hook is written via lib-install.sh's
+# _atomic_replace (also atomic, with symlink-through-write for users
+# who manage their global hooksPath via chezmoi/yadm/etc).
+
+# Best-effort source of the shared safety helpers. install-hooks.sh is
+# called from at least three places (install.sh, uninstall.sh, vdm) and
+# we want to use _atomic_replace consistently. Find the lib next to this
+# script first (works under both source-repo and installed layouts);
+# fall back to inline stubs so a missing lib never crashes the hook
+# install — degraded mode just loses atomicity, not functionality.
+if ! declare -f _atomic_replace >/dev/null 2>&1; then
+  _IH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || true)"
+  if [[ -n "$_IH_DIR" ]] && [[ -f "$_IH_DIR/lib-install.sh" ]]; then
+    # shellcheck source=/dev/null
+    . "$_IH_DIR/lib-install.sh"
+  fi
+fi
+if ! declare -f _atomic_replace >/dev/null 2>&1; then
+  # Degraded fallback — non-atomic but functional. Logs a warning to
+  # stderr so the user knows their next install isn't crash-safe.
+  echo "install-hooks.sh: lib-install.sh not found, using non-atomic fallback for git hook write" >&2
+  _atomic_replace() {
+    local src="$1" dst="$2"
+    local dst_dir; dst_dir="$(dirname "$dst")"
+    mkdir -p "$dst_dir" 2>/dev/null || true
+    cp "$src" "$dst"
+  }
+fi
 
 # Detect dashboard port (respect CSW_PORT env var)
 _VDM_PORT="${CSW_PORT:-3333}"
@@ -464,8 +494,17 @@ _install_git_hook() {
     mv "$hook_file" "${hook_file}.vdm-original" 2>/dev/null || true
   fi
 
-  # Write our hook
-  cat > "$hook_file" << 'HOOKEOF'
+  # Write our hook ATOMICALLY: compose the body in a tmp file, then
+  # _atomic_replace renames it into place (or writes through the symlink
+  # if the user manages their hooks dir via chezmoi/yadm). The previous
+  # `cat > "$hook_file" << HOOKEOF` was non-atomic — a SIGKILL between
+  # the BEGIN and END of the heredoc left a half-written hook that
+  # would crash every subsequent commit.
+  local _hook_tmp; _hook_tmp="$(mktemp -t vdm-hook.XXXXXX)" || {
+    echo "install-hooks.sh: mktemp failed for git hook write" >&2
+    return 1
+  }
+  cat > "$_hook_tmp" << 'HOOKEOF'
 #!/bin/bash
 # vdm-token-usage
 # Appends token usage trailer to commit messages.
@@ -603,6 +642,12 @@ with open(commit_msg_file, 'w') as f:
 " "$1" "$USAGE" 2>/dev/null || true
 HOOKEOF
 
+  if ! _atomic_replace "$_hook_tmp" "$hook_file"; then
+    echo "install-hooks.sh: failed to install git hook at $hook_file" >&2
+    rm -f "$_hook_tmp"
+    return 1
+  fi
+  rm -f "$_hook_tmp"
   chmod +x "$hook_file" 2>/dev/null || true
 
   # ─────────────────────────────────────────────────
@@ -653,7 +698,13 @@ HOOKEOF
       mv "$_stub" "${_stub}.vdm-original" 2>/dev/null || true
     fi
 
-    cat > "$_stub" << STUBEOF
+    # Atomic stub write — same rationale as the prepare-commit-msg
+    # write above. Compose to a tmp file, _atomic_replace into place.
+    local _stub_tmp; _stub_tmp="$(mktemp -t vdm-stub.XXXXXX)" || {
+      echo "install-hooks.sh: mktemp failed for stub $_evt" >&2
+      continue
+    }
+    cat > "$_stub_tmp" << STUBEOF
 #!/bin/bash
 # vdm-token-usage
 # vdm passthrough stub for: $_evt
@@ -677,7 +728,12 @@ fi
 
 exit 0
 STUBEOF
-    chmod +x "$_stub" 2>/dev/null || true
+    if _atomic_replace "$_stub_tmp" "$_stub"; then
+      chmod +x "$_stub" 2>/dev/null || true
+    else
+      echo "install-hooks.sh: failed to install stub $_stub" >&2
+    fi
+    rm -f "$_stub_tmp"
   done
 }
 

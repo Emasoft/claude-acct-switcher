@@ -368,26 +368,6 @@ CLEANED_RC_FILES=()
 # `*.vdm-backup` files months later.
 ORPHAN_BACKUPS=()
 
-# Portable in-place sed wrapper. The BSD `sed -i ''` form silently fails
-# under GNU sed (which most homebrew-using Mac developers have shadowed
-# `/usr/bin/sed` with): GNU sed's `-i` takes an optional GLUED suffix, so
-# `''` is interpreted as a SEPARATE FILENAME arg, the script slides into
-# what sed thinks is a filename, and the in-place edit silently no-ops.
-# This bug has shipped with the project for its entire lifetime — every
-# macOS user with `brew install gnu-sed` on PATH had a broken uninstall.
-# Writing to .tmp and renaming sidesteps `-i` entirely; works under both
-# BSD and GNU sed unchanged.
-_sed_in_place() {
-  local script="$1" file="$2"
-  local tmp="${file}.vdm-sed-tmp"
-  # NOTE: write tmp content back into the original file via `cat`, NOT `mv`.
-  # `mv` replaces the inode and converts a symlinked rc file (common in dotfile
-  # repos managed by stow/yadm/chezmoi) into a regular file, breaking the link.
-  # `cat tmp > file` preserves the symlink target, the inode, and the file's
-  # original permissions/ownership. Then rm the tmp.
-  sed "$script" "$file" > "$tmp" && cat "$tmp" > "$file" && rm -f "$tmp"
-}
-
 clean_one_rc() {
   local rc="$1"
   [[ -f "$rc" ]] || return 0
@@ -395,9 +375,15 @@ clean_one_rc() {
   # possibly with trailing CR from a CRLF file).
   grep -Eq '^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$' "$rc" 2>/dev/null || return 0
 
-  # Backup BEFORE touching anything. cp preserves the original
-  # permissions and content so a failed remove is fully recoverable.
-  cp "$rc" "${rc}.vdm-backup"
+  # Backup BEFORE touching anything. _atomic_replace performs the
+  # backup as tmp + rename so a Ctrl-C between cp's first byte and
+  # last cannot leave a partial / truncated backup that could later
+  # silently overwrite the original on restore.
+  if ! _atomic_replace "$rc" "${rc}.vdm-backup" 2>/dev/null; then
+    # Fallback to plain cp — the rc file contents are about to be
+    # rewritten anyway, so a partial backup window is acceptable here.
+    cp "$rc" "${rc}.vdm-backup"
+  fi
 
   # _atomic_remove_block from lib-install.sh:
   #   - composes the new file in <rc>.tmp.<pid> (tr -d '\r' | sed delete)
@@ -712,13 +698,19 @@ for _bk in "$HOME/.claude"/vdm-accounts-backup-*; do
   ORPHAN_BACKUPS_DIRS+=("$_bk")
 done
 # Don't list the backup we JUST created in this run as an "orphan".
-if [[ -n "${ACCOUNTS_BACKUP:-}" ]]; then
+# Guard the array expansion under bash 3.2 (stock macOS) which errors
+# on empty-array references under `set -u`.
+if [[ -n "${ACCOUNTS_BACKUP:-}" ]] && (( ${#ORPHAN_BACKUPS_DIRS[@]} > 0 )); then
   _filtered=()
   for _bk in "${ORPHAN_BACKUPS_DIRS[@]}"; do
     [[ "$_bk" == "$ACCOUNTS_BACKUP" ]] && continue
     _filtered+=("$_bk")
   done
-  ORPHAN_BACKUPS_DIRS=("${_filtered[@]}")
+  if (( ${#_filtered[@]} > 0 )); then
+    ORPHAN_BACKUPS_DIRS=("${_filtered[@]}")
+  else
+    ORPHAN_BACKUPS_DIRS=()
+  fi
 fi
 if (( ${#ORPHAN_BACKUPS_DIRS[@]} > 0 )); then
   echo ""

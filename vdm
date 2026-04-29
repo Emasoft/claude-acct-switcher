@@ -1192,7 +1192,7 @@ cmd_upgrade() {
   fi
 
   # Verify the fetched repo has the files we need
-  for f in vdm dashboard.mjs lib.mjs install-hooks.sh; do
+  for f in vdm dashboard.mjs lib.mjs install-hooks.sh lib-install.sh; do
     if [[ ! -f "$tmpdir/$f" ]]; then
       echo -e "  ${RED}Fetched repo is missing $f — aborting.${NC}"
       return 1
@@ -1236,6 +1236,7 @@ cmd_upgrade() {
   cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs.new"     && mv -f "$SCRIPT_DIR/dashboard.mjs.new"     "$SCRIPT_DIR/dashboard.mjs"
   cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs.new"           && mv -f "$SCRIPT_DIR/lib.mjs.new"           "$SCRIPT_DIR/lib.mjs"
   cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh.new"  && mv -f "$SCRIPT_DIR/install-hooks.sh.new"  "$SCRIPT_DIR/install-hooks.sh"
+  cp "$tmpdir/lib-install.sh"    "$SCRIPT_DIR/lib-install.sh.new"    && mv -f "$SCRIPT_DIR/lib-install.sh.new"    "$SCRIPT_DIR/lib-install.sh"
   chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker — full SHA-1 so future upgrades can compare without
