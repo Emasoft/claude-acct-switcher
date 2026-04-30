@@ -3435,6 +3435,34 @@ describe('createSerializationQueue — queue timeout', () => {
     await a;
     await b; // completes once a unblocks
   });
+
+  it('honors explicit queueTimeoutMs: 0 (not silently replaced by default)', async () => {
+    // Regression for the `??` vs `||` operator fix. With `||` the factory
+    // would silently swap a deliberately-set 0 for the 120_000 default; with
+    // `??` an explicit 0 is honored. With queueTimeoutMs=0, both the
+    // dispatch timer and the timeout timer have delay=0, so the dispatch /
+    // timeout race is genuinely unspecified — but at least one of the two
+    // entries below MUST end up rejecting with queue_timeout under the new
+    // semantics. Under the old `||` behavior neither would reject within
+    // the 5ms test window (the default was 120_000ms).
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+      queueTimeoutMs: 0,
+    });
+    let release;
+    const blocker = new Promise(r => { release = r; });
+    let aErr = null, bErr = null;
+    const a = q.acquire(() => blocker).catch(e => { aErr = e; });
+    const b = q.acquire(() => Promise.resolve('ok')).catch(e => { bErr = e; });
+    await new Promise(r => setTimeout(r, 5));
+    const sawTimeout = (aErr && aErr.message === 'queue_timeout')
+                    || (bErr && bErr.message === 'queue_timeout');
+    assert.ok(sawTimeout, 'queueTimeoutMs:0 must produce a queue_timeout rejection within 5ms');
+    release();
+    await Promise.allSettled([a, b]);
+  });
 });
 
 describe('gcAccountSlots — purge idle slots (Phase F audit K1)', () => {

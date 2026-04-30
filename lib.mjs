@@ -1808,7 +1808,10 @@ export function createSerializationQueue(opts = {}) {
   const getMaxConcurrent = opts.getMaxConcurrent || (() => 1);
   const getDelayMs = opts.getDelayMs || (() => 0);
   const getEnabled = opts.getEnabled || (() => true);
-  const queueTimeoutMs = opts.queueTimeoutMs || 120_000;
+  // Phase F audit follow-up — use `??` so an explicit `0` (or any falsy-but-valid
+  // value) is honored as a configured override. The previous `||` form silently
+  // replaced a deliberate `queueTimeoutMs: 0` with the 120s default.
+  const queueTimeoutMs = opts.queueTimeoutMs ?? 120_000;
   const now = opts.now || (() => Date.now());
 
   let inflight = 0;

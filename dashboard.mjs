@@ -7914,6 +7914,12 @@ async function forwardToAnthropic(method, path, headers, body, timeout = PROXY_T
   const fp = tok ? getFingerprintFromToken(tok) : 'unknown';
   await acquireAccountPermit(fp);
   let released = false;
+  // Phase F audit follow-up (F3 — TDZ hardening) — declare `watchdog` BEFORE
+  // `release` so the closure captures an initialized binding (null) rather
+  // than the Temporal Dead Zone. Without this hoist, any future refactor that
+  // calls `release()` before the `setTimeout(...)` line below would throw
+  // ReferenceError instead of silently no-op'ing on the `if (watchdog)` guard.
+  let watchdog = null;
   const release = () => {
     if (released) return;
     released = true;
@@ -7927,7 +7933,7 @@ async function forwardToAnthropic(method, path, headers, body, timeout = PROXY_T
   // the permit pinned. The watchdog fires PROXY_TIMEOUT + 5s after permit
   // acquisition and force-releases. This is a backstop, not the primary
   // mechanism — if it ever fires, that's a bug worth investigating.
-  const watchdog = setTimeout(() => {
+  watchdog = setTimeout(() => {
     if (!released) {
       log('warn', `forwardToAnthropic watchdog: force-releasing permit for fp=${fp.slice(0, 8)} after ${(timeout + 5000) / 1000}s`);
       release();
@@ -8603,6 +8609,38 @@ function createUsageExtractor() {
   let model = '';
   let lineBuffer = '';
   let nextEventType = '';
+  // Phase F audit M2 — trailing-buffer parsing must run on BOTH the success
+  // path (Transform's flush()) AND the abort path (pipeline destroy bypasses
+  // flush). `_finishedParsing` makes finishParsing idempotent so calling it
+  // from both ends is safe.
+  let _finishedParsing = false;
+
+  function _processTrailingLine() {
+    if (_finishedParsing) return;
+    _finishedParsing = true;
+    const trimmed = lineBuffer.trim();
+    lineBuffer = '';
+    if (trimmed.startsWith('data:') && nextEventType === 'message_delta') {
+      try {
+        const data = JSON.parse(trimmed.slice(5).trim());
+        if (data.usage) {
+          outputTokens = data.usage.output_tokens || outputTokens;
+          if (data.usage.cache_creation_input_tokens != null) {
+            cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
+          }
+          if (data.usage.cache_read_input_tokens != null) {
+            cacheReadInputTokens = data.usage.cache_read_input_tokens;
+          }
+        }
+      } catch (e) {
+        // Trailing partial line was malformed JSON. Surface it
+        // (debug-level — these can happen legitimately during
+        // upstream cancellation) so we don't silently lose token
+        // counts on every interrupted SSE stream.
+        try { log('debug', `flush: trailing message_delta parse failed: ${e.message}`); } catch {}
+      }
+    }
+  }
 
   const extractor = new Transform({
     // `_encoding` is required by the Transform API positional signature
@@ -8656,28 +8694,9 @@ function createUsageExtractor() {
     flush(callback) {
       // Try the trailing partial line one last time so the final
       // message_delta isn't lost when upstream closes between newlines.
-      const trimmed = lineBuffer.trim();
-      lineBuffer = '';
-      if (trimmed.startsWith('data:') && nextEventType === 'message_delta') {
-        try {
-          const data = JSON.parse(trimmed.slice(5).trim());
-          if (data.usage) {
-            outputTokens = data.usage.output_tokens || outputTokens;
-            if (data.usage.cache_creation_input_tokens != null) {
-              cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
-            }
-            if (data.usage.cache_read_input_tokens != null) {
-              cacheReadInputTokens = data.usage.cache_read_input_tokens;
-            }
-          }
-        } catch (e) {
-          // Trailing partial line was malformed JSON. Surface it
-          // (debug-level — these can happen legitimately during
-          // upstream cancellation) so we don't silently lose token
-          // counts on every interrupted SSE stream.
-          try { log('debug', `flush: trailing message_delta parse failed: ${e.message}`); } catch {}
-        }
-      }
+      // Delegated to the shared helper so the abort path can run the
+      // exact same logic via finishParsing().
+      _processTrailingLine();
       callback();
     },
   });
@@ -8690,6 +8709,15 @@ function createUsageExtractor() {
     model,
     ts: Date.now(),
   });
+
+  // Phase F audit M2 — explicit idempotent trailing-buffer flush. pipeline()
+  // calls destroy() (not end()) when ANY stream in the chain errors or the
+  // client aborts. destroy() bypasses _flush, so the trailing-line parser
+  // never runs and the final message_delta is silently lost — which manifests
+  // as recordUsage seeing outputTokens=0 on every aborted SSE stream. The
+  // continuation runner calls finishParsing() unconditionally after pipeline
+  // resolves, and the success path is a no-op via _finishedParsing.
+  extractor.finishParsing = _processTrailingLine;
 
   return extractor;
 }
@@ -9846,6 +9874,13 @@ function pipeAndWait(src, dst) {
 // headers were sent, otherwise just logs and ends the socket.
 async function _runStreamingContinuation(cont, clientRes) {
   if (!cont) return;
+  // Phase F audit M1 — defensive cleanup. If anything between the descriptor
+  // arriving and the body pipe being established throws synchronously
+  // (createUsageExtractor, _streamPipeline construction, etc.) the proxyRes
+  // is already an open upstream socket holding kernel buffers. Without this
+  // guard the request hangs until the watchdog timer fires (PROXY_TIMEOUT +
+  // 5s). With this guard, the socket is destroyed immediately on failure.
+  try {
   if (cont.kind === 'sse') {
     const { proxyRes, body, acctName } = cont;
     const extractor = createUsageExtractor();
@@ -9865,6 +9900,14 @@ async function _runStreamingContinuation(cont, clientRes) {
         resolve();
       });
     });
+    // Phase F audit M2 — pipeline() calls destroy() (not end()) on abort/error,
+    // bypassing the extractor's _flush callback and silently losing the final
+    // message_delta. finishParsing() is idempotent: on the success path the
+    // flush already ran and this is a no-op; on the abort path it processes
+    // the trailing-buffer that destroy() would have orphaned.
+    try { extractor.finishParsing(); } catch (e) {
+      try { log('debug', `extractor.finishParsing() failed: ${e.message}`); } catch {}
+    }
     recordUsage(extractor.getUsage(), acctName);
     setImmediate(() => {
       try {
@@ -9882,13 +9925,28 @@ async function _runStreamingContinuation(cont, clientRes) {
         }
         const bodyObj = JSON.parse(body.toString('utf8'));
         updateSessionTimeline(bodyObj, acctName, extractor.getUsage());
-      } catch {}
+      } catch (e) {
+        // Body parse / timeline-update can legitimately fail (malformed JSON,
+        // body too large was handled above, etc.) but a fully-silent catch
+        // hides regressions in updateSessionTimeline. Log at debug-level so
+        // it shows up only when log filtering is loosened.
+        try { log('debug', `session-monitor post-stream update failed: ${e.message}`); } catch {}
+      }
     });
     return;
   }
   if (cont.kind === 'pipe') {
     await pipeAndWait(cont.proxyRes, clientRes);
     return;
+  }
+  } catch (e) {
+    // Synchronous escape on the streaming-continuation handoff. Destroy the
+    // upstream response so the per-account permit (held by forwardToAnthropic
+    // until 'end'|'error'|'close') is released promptly. Re-throw so the
+    // outer proxyServer catch block can decide whether to write a 502.
+    try { if (cont && cont.proxyRes) cont.proxyRes.destroy(e); } catch {}
+    try { log('error', `_runStreamingContinuation handoff threw: ${e.message}`); } catch {}
+    throw e;
   }
 }
 
@@ -10739,8 +10797,12 @@ async function handleProxyRequest(clientReq, clientRes) {
             clientRes.writeHead(retryRes.statusCode, retryRes.headers);
             retryRes.on('error', () => { try { clientRes.end(); } catch {} });
             clientRes.on('close', () => { retryRes.destroy(); });
-            await pipeAndWait(retryRes, clientRes);
-            return;
+            // Phase F audit B1 — return continuation here too. The previous
+            // `await pipeAndWait` inside the queue-protected region held the
+            // serialization permit for the full body lifetime on the cold-path
+            // minimal-header retry, re-introducing the exact regression that
+            // B1 set out to eliminate.
+            return { kind: 'pipe', proxyRes: retryRes };
           }
           // Still 4xx — it's genuinely a bad request or truly dead tokens
           const retryBuf = await drainResponse(retryRes);
@@ -10939,6 +11001,12 @@ function shutdown(signal) {
   const _SHUTDOWN_DRAIN_MS = 5_000;
   try { proxyServer.close(); } catch {}
   try { server.close(); } catch {}
+  // Phase F audit follow-up (F4) — drain the upstream keepAlive socket pool.
+  // Without this, pooled TLS sockets sit in the kernel buffer until the OS
+  // reclaims them on process exit. destroy() unrefs the agent and closes
+  // every idle socket immediately, giving Anthropic a clean FIN per stream
+  // and freeing local file descriptors.
+  try { _upstreamAgent.destroy(); } catch {}
   // End every SSE log subscriber (`/api/logs/stream`) cleanly so the
   // client sees a connection close, not a half-buffer reset. Without
   // this they'd hang until Node tears down the socket on exit.
