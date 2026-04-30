@@ -1208,7 +1208,13 @@ cmd_dashboard() {
       # bypassed. Logs go to startup.log next to the dashboard so the
       # user can still find errors after a silent crash.
       local startup_log="$SCRIPT_DIR/startup.log"
-      ( cd "$SCRIPT_DIR" && nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
+      # H5 fix — `( cd ... ; nohup node ... ) &` captures the SUBSHELL pid via
+      # $!, not node's. The subshell exits immediately after backgrounding
+      # nohup, so the recorded PID is dead within milliseconds and the
+      # readiness probe's `kill -0` reports false-negative "Dashboard failed
+      # to start" even though the dashboard is running fine. `exec` replaces
+      # the subshell with the node process so $! captures node's PID.
+      ( cd "$SCRIPT_DIR" && exec nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
       local new_pid=$!
       disown 2>/dev/null || true
       echo "$new_pid" > "$DASHBOARD_PID_FILE"

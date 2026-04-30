@@ -128,6 +128,15 @@ const DEFAULT_SETTINGS = {
   // `tool` (and `mcpServer` if applicable) — see Refinement 1 in the
   // contract.
   perToolAttribution: false,
+  // Retention defaults — vdm config and /api/settings accept these and the
+  // _tokenUsageMaxEntries / _activityMaxEntries / _tokenUsageMaxAgeMs helpers
+  // read them, but the values were missing from DEFAULT_SETTINGS. On a fresh
+  // install they fell through to 0 (= "unlimited"), while vdm `cmd_config`
+  // displayed defaults like "90 days" / "500 entries" — drift between what
+  // the user was told and what the dashboard actually used.
+  activityMaxEntries: 500,
+  tokenUsageMaxEntries: 50000,
+  tokenUsageMaxAgeDays: 90,
 };
 
 function loadSettings() {
@@ -692,6 +701,15 @@ async function getEmailForToken(token, fp) {
 
 const ACTIVITY_LOG_FILE = join(__dirname, 'activity-log.json');
 const ACTIVITY_MAX_ENTRIES = 500;
+// Resolve the activity-log cap from settings (overrides the const default).
+// Mirrors _tokenUsageMaxEntries — was missing, so vdm config and /api/settings
+// accepted activityMaxEntries but the cap reads ignored it (silent no-op).
+function _activityMaxEntries() {
+  const v = (typeof settings !== 'undefined' && settings && Number.isFinite(settings.activityMaxEntries))
+    ? settings.activityMaxEntries
+    : 0;
+  return v > 0 ? v : ACTIVITY_MAX_ENTRIES;
+}
 const ACTIVITY_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 // Load persisted activity log on startup (prune stale entries)
@@ -700,7 +718,7 @@ try {
   if (existsSync(ACTIVITY_LOG_FILE)) {
     const raw = JSON.parse(readFileSync(ACTIVITY_LOG_FILE, 'utf8'));
     const cutoff = Date.now() - ACTIVITY_MAX_AGE;
-    activityLog = raw.filter(e => e.ts >= cutoff).slice(0, ACTIVITY_MAX_ENTRIES);
+    activityLog = raw.filter(e => e.ts >= cutoff).slice(0, _activityMaxEntries());
   }
 } catch { activityLog = []; }
 
@@ -718,7 +736,8 @@ function logActivity(type, detail = {}) {
   // Prune by age + cap
   const cutoff = Date.now() - ACTIVITY_MAX_AGE;
   while (activityLog.length > 0 && activityLog[activityLog.length - 1].ts < cutoff) activityLog.pop();
-  if (activityLog.length > ACTIVITY_MAX_ENTRIES) activityLog.length = ACTIVITY_MAX_ENTRIES;
+  const cap = _activityMaxEntries();
+  if (activityLog.length > cap) activityLog.length = cap;
   // C5 fix — atomicWriteFileSync replaces the previous temp+rename async
   // write that had no per-file mutex. Two concurrent calls both targeted the
   // same `<file>.tmp`, raced the rename, and could leave partial bytes.
@@ -1753,13 +1772,28 @@ async function handleAPI(req, res) {
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
     });
+    // H8 fix — cap concurrent subscribers and reject 503 beyond cap. Without
+    // this, a malicious tab opening N subscribers turns each log line into N
+    // writes against dead sockets that never get GC'd until the OS sends RST.
+    // 16 subscribers is far more than any legitimate vdm/dashboard workflow.
+    const MAX_LOG_SUBSCRIBERS = 16;
+    if (_logSubscribers.size >= MAX_LOG_SUBSCRIBERS) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'too many log subscribers' }));
+      return true;
+    }
     res.write(`data: ${JSON.stringify({ tag: 'system', msg: 'Connected to log stream', line: '--- Connected to Van Damme-o-Matic log stream ---' })}\n\n`);
     // Replay buffered history so new clients see recent logs immediately
     for (const entry of _logBuffer) {
       res.write(`data: ${JSON.stringify(entry)}\n\n`);
     }
     _logSubscribers.add(res);
+    // H8 fix — also remove on 'error'. The previous close-only listener missed
+    // async errors (ECONNRESET, EPIPE) that fire on the response stream after
+    // the socket dies; without this the entry leaks until something else
+    // triggers the synchronous-throw catch-and-delete in log().
     req.on('close', () => _logSubscribers.delete(res));
+    res.on('error', () => _logSubscribers.delete(res));
     return true;
   }
 
@@ -6837,7 +6871,14 @@ function connectLogStream() {
       const line = document.createElement('div');
       const tag = (data.tag || 'info').toLowerCase();
       const color = LOG_TAG_COLORS[tag] || '#8b949e';
-      line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + tag.toUpperCase() + ']</span> ' + escapeHtml(data.msg || data.line || '');
+      // H7 fix — escape the tag identifier before HTML interpolation.
+      // Currently every log() caller passes a programmer-set string, but a
+      // future regression (or an attacker-controlled tag via OTLP payload
+      // spillover) would execute injected script. Defense-in-depth: escape
+      // uniformly. NB: avoid markdown backticks in comments inside renderHTML
+      // because the whole function body is one big template literal and any
+      // stray backtick terminates it (see CLAUDE.md backtick-in-comment trap).
+      line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + escapeHtml(tag.toUpperCase()) + ']</span> ' + escapeHtml(data.msg || data.line || '');
       // Check scroll position before DOM changes
       const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
       container.appendChild(line);
@@ -8571,7 +8612,7 @@ refreshSweep('refresh-startup').catch((e) => {
 // because Node's setInterval doesn't await the body — a thrown error
 // inside refreshSweep would be lost. Wrap in try/catch + explicit log.
 let lastRefreshTick = Date.now();
-setInterval(async () => {
+const _refreshSweepTimer = setInterval(async () => {
   try {
     const now = Date.now();
     const drift = now - lastRefreshTick - REFRESH_CHECK_INTERVAL;
@@ -8588,6 +8629,9 @@ setInterval(async () => {
     log('warn', `Periodic refreshSweep failed: ${e && e.message}`);
   }
 }, REFRESH_CHECK_INTERVAL);
+// M11 fix — unref so this timer doesn't block clean process exit. The
+// shutdown handler still has its own debounced flush + 5s drain window.
+_refreshSweepTimer.unref?.();
 
 // ── Startup: clean orphaned .json.tmp files left over from the
 // pre-keychain era. Account credentials now live in the keychain via
@@ -9115,7 +9159,7 @@ function getFileConflicts() {
 }
 
 // Session expiry timer — check every 30s
-setInterval(() => {
+const _sessionExpiryTimer = setInterval(() => {
   const now = Date.now();
   for (const [id, session] of monitoredSessions) {
     if (session.status === 'active' && now - session.lastActiveAt > SESSION_INACTIVITY_MS) {
@@ -9124,6 +9168,7 @@ setInterval(() => {
     }
   }
 }, 30000);
+_sessionExpiryTimer.unref?.();
 
 // ─────────────────────────────────────────────────
 // Ensure prepare-commit-msg hook in repos with local core.hooksPath
@@ -9519,7 +9564,7 @@ function _autoClaimSession(sessionId, session) {
 // Periodically auto-persist unclaimed usage so the Tokens tab shows data
 // even for long-running sessions that haven't called session-stop yet.
 const TOKEN_AUTO_PERSIST_INTERVAL = 2 * 60 * 1000; // every 2 minutes
-setInterval(() => {
+const _tokenAutoPersistTimer = setInterval(() => {
   // For each active session, claim any unclaimed entries and persist them.
   // Update startedAt so we don't double-count on next interval.
   for (const [id, session] of pendingSessions) {
@@ -9563,6 +9608,7 @@ setInterval(() => {
   // buffer — they'll be claimed by session-stop, or age out naturally.
   // No (unknown) attribution: better to lose data than misattribute it.
 }, TOKEN_AUTO_PERSIST_INTERVAL);
+_tokenAutoPersistTimer.unref?.();
 
 // ─────────────────────────────────────────────────
 // Token Usage Storage (token-usage.json)
@@ -10944,6 +10990,11 @@ function shutdown(signal) {
   const _SHUTDOWN_DRAIN_MS = 5_000;
   try { proxyServer.close(); } catch {}
   try { server.close(); } catch {}
+  // M12 fix — close the OTLP listener (Phase H, opt-in via CSW_OTEL_ENABLED).
+  // Without this it stays open during the 5s drain and process.exit, leaking
+  // the bound port to the kernel until OS reclaim. Null-safe since OTEL is
+  // off by default and _otlpServer stays null.
+  if (_otlpServer) { try { _otlpServer.close(); } catch {} }
   // End every SSE log subscriber (`/api/logs/stream`) cleanly so the
   // client sees a connection close, not a half-buffer reset. Without
   // this they'd hang until Node tears down the socket on exit.
@@ -11050,6 +11101,9 @@ function _appendOtelMetrics(records) {
   while (_otelMetrics.length > OTEL_BUFFER_MAX) _otelMetrics.shift();
 }
 
+// Module-level handle so the shutdown sequence can close it (M12 fix).
+// Stays null when CSW_OTEL_ENABLED is unset.
+let _otlpServer = null;
 if (OTEL_ENABLED) {
   const otlpServer = createServer(async (req, res) => {
     // Only handle the two endpoints we care about; everything else 404s.
@@ -11119,6 +11173,7 @@ if (OTEL_ENABLED) {
   otlpServer.listen(OTLP_PORT, '127.0.0.1', () => {
     log('info', `OTLP/HTTP/JSON receiver on http://localhost:${OTLP_PORT} (logs at /v1/logs, metrics at /v1/metrics; buffer cap ${OTEL_BUFFER_MAX})`);
   });
+  _otlpServer = otlpServer;
 
   otlpServer.on('error', (e) => {
     if (e && e.code === 'EADDRINUSE') {

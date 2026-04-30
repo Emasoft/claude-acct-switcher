@@ -27,6 +27,11 @@ export function getFingerprintFromToken(token) {
 export const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade',
+  // proxy-connection is not in RFC 7230 but every major proxy implementation
+  // (Apache, NGINX, Squid) treats it as hop-by-hop. Some HTTP clients still
+  // send it without listing it in `Connection: ...`. Strip on forward so we
+  // don't bloat upstream requests with a header api.anthropic.com ignores.
+  'proxy-connection',
   // Not strictly hop-by-hop, but must be recalculated by the proxy:
   'host', 'content-length',
   // Strip accept-encoding: proxy must read/inspect error bodies (400, 401, etc.)
