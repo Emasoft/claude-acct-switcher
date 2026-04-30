@@ -7186,6 +7186,15 @@ const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
 //     this means high-load queueing no longer manufactures false 504s.
 const PROXY_TIMEOUT = parseInt(process.env.CSW_PROXY_TIMEOUT_MS || '900000', 10);          // 15 min
 const REQUEST_DEADLINE_MS = parseInt(process.env.CSW_REQUEST_DEADLINE_MS || '600000', 10); // 10 min
+// Phase F audit B1/G1 — queueTimeoutMs MUST be larger than REQUEST_DEADLINE_MS,
+// otherwise queued requests get rejected with `queue_timeout` (→ 503) before
+// the deadline guard ever fires. Default = REQUEST_DEADLINE_MS + 60s buffer.
+// Was hard-coded to 120s in lib.mjs (un-tunable, smaller than REQUEST_DEADLINE_MS).
+// Tune via CSW_QUEUE_TIMEOUT_MS for sites with very long Opus streams.
+const QUEUE_TIMEOUT_MS = parseInt(
+  process.env.CSW_QUEUE_TIMEOUT_MS || String(REQUEST_DEADLINE_MS + 60_000),
+  10
+);
 
 // Phase H — opt-in OTLP/HTTP/JSON receiver for cross-checking vdm's
 // hook-derived counts against Claude Code's first-party telemetry. Off by
@@ -8438,6 +8447,11 @@ const _serializationQueue = createSerializationQueue({
   getEnabled: () => !!settings.serializeRequests,
   getDelayMs: () => settings.serializeDelayMs | 0,
   getMaxConcurrent: () => Math.max(1, settings.serializeMaxConcurrent | 0 || 1),
+  // Phase F audit G1 — was hard-coded 120s (lib.mjs default), smaller than
+  // REQUEST_DEADLINE_MS (600s). Result: every queued request rejected with
+  // queue_timeout → 503 before the deadline guard could ever fire. Now tunable
+  // via CSW_QUEUE_TIMEOUT_MS, default REQUEST_DEADLINE_MS + 60s buffer.
+  queueTimeoutMs: QUEUE_TIMEOUT_MS,
 });
 
 function getQueueStats() {
@@ -9706,6 +9720,60 @@ function pipeAndWait(src, dst) {
   });
 }
 
+// Phase F audit B1/D1 — Run a streaming continuation that handleProxyRequest
+// returned. This lives OUTSIDE the serialization queue so a single long SSE
+// stream cannot block other queued requests for its full lifetime.
+//
+// Continuation kinds:
+//   - 'sse'  — text/event-stream success path. Pipe through usage extractor,
+//              call recordUsage() when stream ends, fire session-monitor
+//              timeline update.
+//   - 'pipe' — non-SSE success path OR 529 server-overload pass-through.
+//              Plain pipe with end/error/close handlers.
+//
+// Errors during streaming are logged + best-effort socket close. The caller
+// (proxyServer's catch block) sees the rejection and writes a 502 if no
+// headers were sent, otherwise just logs and ends the socket.
+async function _runStreamingContinuation(cont, clientRes) {
+  if (!cont) return;
+  if (cont.kind === 'sse') {
+    const { proxyRes, body, acctName } = cont;
+    const extractor = createUsageExtractor();
+    proxyRes.pipe(extractor).pipe(clientRes);
+    await new Promise(resolve => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      extractor.on('end', finish);
+      extractor.on('error', finish);
+      clientRes.on('close', finish);
+    });
+    recordUsage(extractor.getUsage(), acctName);
+    setImmediate(() => {
+      try {
+        if (!settings.sessionMonitor) return;
+        if (body.length > SESSION_BODY_MAX) {
+          const rawPrefix = body.toString('utf8', 0, Math.min(body.length, 4096));
+          const cwdMatch = rawPrefix.match(/working directory:\s*(.+)/i);
+          if (cwdMatch) {
+            const cwd = cwdMatch[1].trim().split('\\n')[0].trim();
+            const sid = deriveSessionId(cwd, acctName);
+            const s = monitoredSessions.get(sid);
+            if (s) s.lastActiveAt = Date.now();
+          }
+          return;
+        }
+        const bodyObj = JSON.parse(body.toString('utf8'));
+        updateSessionTimeline(bodyObj, acctName, extractor.getUsage());
+      } catch {}
+    });
+    return;
+  }
+  if (cont.kind === 'pipe') {
+    await pipeAndWait(cont.proxyRes, clientRes);
+    return;
+  }
+}
+
 // ── Proxy server ──
 
 const proxyServer = createServer((clientReq, clientRes) => {
@@ -9721,39 +9789,59 @@ const proxyServer = createServer((clientReq, clientRes) => {
     return;
   }
 
-  withSerializationQueue(() => handleProxyRequest(clientReq, clientRes)).catch(err => {
-    if (err.message === 'queue_timeout') {
-      log('warn', 'Request timed out in serialization queue');
+  // Phase F audit B1/D1 — handleProxyRequest may return a "streaming
+  // continuation" descriptor for the success/529 paths. The serialization
+  // queue releases at handleProxyRequest's resolution (decision boundary);
+  // the body pipe then runs OUTSIDE the queue via _runStreamingContinuation.
+  // For non-streaming responses (passthrough, 429-exhausted, 401, etc.)
+  // handleProxyRequest writes the response itself and returns undefined.
+  withSerializationQueue(() => handleProxyRequest(clientReq, clientRes))
+    .then(cont => _runStreamingContinuation(cont, clientRes))
+    .catch(err => {
+      if (err.message === 'queue_timeout') {
+        log('warn', 'Request timed out in serialization queue');
+        if (!clientRes.headersSent) {
+          // Phase F — return 503 + overloaded_error (with explicit "[vdm proxy]"
+          // prefix in message and x-vdm-proxy header) so Claude Code's retry
+          // logic treats this as a transient backpressure event from OUR proxy,
+          // not a timeout from Anthropic. Without this, CC reported the proxy's
+          // own queue-full as "Anthropic unresponsive".
+          clientRes.writeHead(503, {
+            'Content-Type': 'application/json',
+            'Retry-After': '5',
+            'x-vdm-proxy': 'true',
+          });
+          clientRes.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'overloaded_error',
+              message: '[vdm proxy] request queued too long (serialization queue timeout). Anthropic upstream was not contacted.',
+            },
+          }));
+        } else {
+          // Headers already sent (rare with B1's early-release but possible
+          // if the queue rejects mid-streaming-continuation — should be
+          // impossible because the continuation runs after queue release,
+          // but defensively close the socket).
+          try { clientRes.end(); } catch {}
+        }
+        return;
+      }
+      log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
       if (!clientRes.headersSent) {
-        // Phase F — return 503 + overloaded_error (with explicit "[vdm proxy]"
-        // prefix in message and x-vdm-proxy header) so Claude Code's retry
-        // logic treats this as a transient backpressure event from OUR proxy,
-        // not a timeout from Anthropic. Without this, CC reported the proxy's
-        // own queue-full as "Anthropic unresponsive".
-        clientRes.writeHead(503, {
+        clientRes.writeHead(502, {
           'Content-Type': 'application/json',
-          'Retry-After': '5',
           'x-vdm-proxy': 'true',
         });
-        clientRes.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'overloaded_error',
-            message: '[vdm proxy] request queued too long (serialization queue timeout). Anthropic upstream was not contacted.',
-          },
-        }));
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `[vdm proxy] ${err.message}` } }));
+      } else {
+        // Phase F audit I1 — when an error escapes after headers are sent,
+        // the previous code did nothing; the kernel held the socket open
+        // until CC's request timeout fired (looking like ConnectionRefused
+        // to the user). Closing promptly gives CC a clean signal.
+        try { clientRes.end(); } catch {}
       }
-      return;
-    }
-    log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
-    if (!clientRes.headersSent) {
-      clientRes.writeHead(502, {
-        'Content-Type': 'application/json',
-        'x-vdm-proxy': 'true',
-      });
-      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `[vdm proxy] ${err.message}` } }));
-    }
-  });
+    });
 });
 
 async function handleProxyRequest(clientReq, clientRes) {
@@ -10573,8 +10661,12 @@ async function handleProxyRequest(clientReq, clientRes) {
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       clientRes.on('close', () => { proxyRes.destroy(); });
-      await pipeAndWait(proxyRes, clientRes);
-      return;
+      // Phase F audit B1: return a streaming continuation instead of awaiting
+      // here. The serialization-queue permit was held until this await
+      // resolved, blocking every other queued request for the full pipe
+      // duration. Returning a continuation lets the queue release at the
+      // headers boundary; the body pipe runs OUTSIDE the queue.
+      return { kind: 'pipe', proxyRes };
     }
 
     // ── Any other response: success or client error → pipe through ──
@@ -10597,43 +10689,21 @@ async function handleProxyRequest(clientReq, clientRes) {
     proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
     clientRes.on('close', () => { proxyRes.destroy(); });
 
-    // Extract token usage from SSE streaming responses
+    // Phase F audit B1/D1 — return a streaming continuation rather than
+    // awaiting the body pipe in-line. The previous version awaited
+    // `extractor.on('end')` / `pipeAndWait` here, holding the serialization-
+    // queue permit for the full SSE stream lifetime (60-300s for typical
+    // Opus turns). With cap=1, that meant a single stream blocked every
+    // other queued request until queueTimeoutMs (120s) fired and they 503'd —
+    // and because queue rejections never reach forwardToAnthropic, recordUsage
+    // never ran for those rejected requests, silently breaking token tracking
+    // (audit D1). Returning a continuation here lets the queue release at the
+    // headers boundary; the body pipe + recordUsage run OUTSIDE the queue.
     const contentType = proxyRes.headers['content-type'] || '';
     if (contentType.includes('text/event-stream')) {
-      const extractor = createUsageExtractor();
-      proxyRes.pipe(extractor).pipe(clientRes);
-      await new Promise(resolve => {
-        let done = false;
-        const finish = () => { if (!done) { done = true; resolve(); } };
-        extractor.on('end', finish);
-        extractor.on('error', finish);
-        clientRes.on('close', finish);
-      });
-      recordUsage(extractor.getUsage(), acctName);
-      // Session Monitor — extract timeline from completed request
-      setImmediate(() => {
-        try {
-          if (!settings.sessionMonitor) return;
-          if (body.length > SESSION_BODY_MAX) {
-            // For oversized bodies, extract cwd via regex on raw string to keep session alive
-            const rawPrefix = body.toString('utf8', 0, Math.min(body.length, 4096));
-            const cwdMatch = rawPrefix.match(/working directory:\s*(.+)/i);
-            if (cwdMatch) {
-              const cwd = cwdMatch[1].trim().split('\\n')[0].trim();
-              const sid = deriveSessionId(cwd, acctName);
-              const s = monitoredSessions.get(sid);
-              if (s) s.lastActiveAt = Date.now();
-            }
-            return;
-          }
-          const bodyObj = JSON.parse(body.toString('utf8'));
-          updateSessionTimeline(bodyObj, acctName, extractor.getUsage());
-        } catch {}
-      });
-    } else {
-      await pipeAndWait(proxyRes, clientRes);
+      return { kind: 'sse', proxyRes, body, acctName };
     }
-    return;
+    return { kind: 'pipe', proxyRes };
   }
 
   // Should not reach here, but safety net

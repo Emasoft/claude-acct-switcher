@@ -3409,6 +3409,81 @@ describe('createSerializationQueue — queue timeout', () => {
     releaseBlocker('done');
     await a; // clean up
   });
+
+  it('uses default queueTimeoutMs (120_000) when option is unset', async () => {
+    // We can't easily wait 120s in a unit test, but we can verify the API:
+    // acquire returns a Promise that doesn't immediately reject, and the
+    // factory accepts a missing queueTimeoutMs without throwing.
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+      // queueTimeoutMs intentionally omitted — should default
+    });
+    let release;
+    const blocker = new Promise(r => { release = r; });
+    const a = q.acquire(() => blocker);
+    const b = q.acquire(() => Promise.resolve('ok'));
+    // Give the dispatcher a tick; b must still be pending (not rejected).
+    await new Promise(r => setImmediate(r));
+    let bSettled = false;
+    b.then(() => { bSettled = true; }, () => { bSettled = true; });
+    await new Promise(r => setImmediate(r));
+    assert.equal(bSettled, false, 'b should still be queued under default timeout');
+    release();
+    await a;
+    await b; // completes once a unblocks
+  });
+});
+
+describe('createSerializationQueue — continuation pass-through (Phase F audit B1)', () => {
+  // The proxy refactor relies on `acquire(fn)` propagating fn's resolved
+  // value back to the caller. handleProxyRequest now returns a continuation
+  // descriptor `{kind, proxyRes, ...}` for streaming paths; the proxy server
+  // callback awaits the descriptor OUTSIDE the queue. If acquire ever swallowed
+  // the resolution value (e.g. always resolved with undefined), the proxy
+  // would lose every stream descriptor and never start the body pipe.
+  it('acquire(fn) resolves with fn\'s return value', async () => {
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    const descriptor = { kind: 'sse', proxyRes: { id: 'fake' }, acctName: 'x' };
+    const result = await q.acquire(() => Promise.resolve(descriptor));
+    assert.deepEqual(result, descriptor, 'continuation descriptor must escape the queue');
+  });
+
+  it('inflight decrements at fn resolution, not at any post-fn promise chain', async () => {
+    // Concrete failure mode this test prevents: if fn returns a promise that
+    // resolves with another long-lived promise (analog of a streaming
+    // continuation), inflight must decrement when fn's outer promise
+    // resolves, NOT when the inner promise eventually resolves.
+    const q = createSerializationQueue({
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+      getEnabled: () => true,
+    });
+    let releaseInner;
+    const innerLongRunner = new Promise(r => { releaseInner = r; });
+    // First acquire: fn resolves with a descriptor that REFERENCES a long-
+    // running promise but does NOT await it.
+    const a = q.acquire(() => Promise.resolve({ deferred: innerLongRunner }));
+    const aResult = await a;
+    // Yield once so the queue's `.finally(() => inflight--)` runs — it's
+    // microtask-queued AFTER `resolve(value)` settles the outer promise.
+    await new Promise(r => setImmediate(r));
+    // After a resolves + microtask flush, inflight should be 0 — the inner
+    // promise is intentionally NOT awaited inside acquire.
+    assert.equal(q.getStats().inflight, 0, 'inflight must drop to 0 once fn resolves');
+    // A second acquire should dispatch immediately (cap=1 has room now).
+    const b = q.acquire(() => Promise.resolve('immediate'));
+    const bResult = await b;
+    assert.equal(bResult, 'immediate');
+    // Clean up the dangling inner promise.
+    releaseInner();
+    await aResult.deferred;
+  });
 });
 
 describe('createSerializationQueue — getStats', () => {
