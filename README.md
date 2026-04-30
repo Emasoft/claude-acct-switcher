@@ -228,6 +228,7 @@ The proxy queue + timeouts are tunable for different plans and workloads. All de
 | `CSW_MAX_INFLIGHT_PER_ACCOUNT` | 8 | Concurrent streams per bearer token. Now actually enforced for the full SSE lifetime. |
 | `CSW_MIN_INTERVAL_PER_ACCOUNT_MS` | 100 | Minimum gap (ms) between successive dispatches against one bearer (≈ 10 RPS). |
 | `CSW_MAX_PERMIT_WAIT_MS` | 300000 (5 min) | How long a queued request waits for a per-account permit before failing. |
+| `CSW_QUEUE_TIMEOUT_MS` | `CSW_REQUEST_DEADLINE_MS` + 60s (660 s) | How long a request waits in the settings-level serialization queue before being rejected with `queue_timeout` 503. MUST be ≥ `CSW_REQUEST_DEADLINE_MS`, otherwise queued requests are rejected before the deadline guard fires (re-introduces the audit B1/G1 regression — token tracking silently breaks). The dashboard logs a warn at startup if the configured value is below the deadline. Set to 0 for instant rejection (test mode). |
 
 ## Testing
 

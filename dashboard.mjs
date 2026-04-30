@@ -2341,7 +2341,20 @@ async function handleAPI(req, res) {
         // PostToolBatch time, and then when the next appendTokenUsage for
         // that session fires, set tool: lastBatchToolNames.join(',') and
         // mcpServer: <derived>. This avoids 10x row inflation."
-        session.lastBatchToolNames = tools.map(t => t.toolName);
+        // M10 fix — cap to 32 unique tool names. A pathological PostToolBatch
+        // with 1000 entries would otherwise produce a 1000-string array that
+        // gets `join(',')`-stringified and persisted on every appendTokenUsage
+        // row until the next batch arrives. 32 is well above any realistic
+        // single-batch tool count and bounds the per-row payload.
+        const _seen = new Set();
+        const _names = [];
+        for (const t of tools) {
+          if (_names.length >= 32) break;
+          if (!t || typeof t.toolName !== 'string' || _seen.has(t.toolName)) continue;
+          _seen.add(t.toolName);
+          _names.push(t.toolName);
+        }
+        session.lastBatchToolNames = _names;
         recorded = tools.length;
       }
       json(res, { ok: true, recorded });
@@ -9398,6 +9411,24 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
 // touch the new fields) becomes a primary session row with parentSessionId
 // === null on persist.
 const pendingSessions = new Map();
+
+// H11 fix — prune stale pendingSessions periodically. Cleanup was previously
+// only triggered inside /api/session-start (24h-stale prune). A crashed CC
+// session leaks its entry until the NEXT session-start arrives, which on a
+// quiet machine could be hours-to-days later. Runs every 5 minutes; same
+// 24h staleness threshold + same _autoClaimSession-before-delete behavior
+// as the inline prune at /api/session-start.
+function _prunePendingSessions() {
+  const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [id, s] of pendingSessions) {
+    if (s.startedAt < staleThreshold) {
+      try { _autoClaimSession(id, s); } catch { /* best-effort */ }
+      pendingSessions.delete(id);
+    }
+  }
+}
+const _pendingSessionsGcTimer = setInterval(_prunePendingSessions, 5 * 60 * 1000);
+_pendingSessionsGcTimer.unref?.();
 
 // Phase 6 (CL-3): SubagentStop and SessionEnd hooks may fire with a
 // session_id that pendingSessions has never seen — for SubagentStop

@@ -3133,20 +3133,28 @@ describe('parseRetryAfter', () => {
     assert.equal(parseRetryAfter(0), 0);
   });
 
-  it('caps absurd upstream values at PARSE_RETRY_AFTER_MAX (24h)', () => {
+  it('caps absurd upstream values at PARSE_RETRY_AFTER_MAX (7d)', () => {
     // A misconfigured (or hostile) upstream sending Retry-After: 99999999
-    // should not put us in a multi-year cooldown. Cap at 86400s.
-    assert.equal(parseRetryAfter(99999999), 86400);
-    assert.equal(parseRetryAfter(86401), 86400);
-    assert.equal(parseRetryAfter(86400), 86400); // boundary
-    assert.equal(parseRetryAfter(86399), 86399); // just under
+    // should not put us in a multi-year cooldown. M2 raised the cap from
+    // 24h to 7d so legitimate Anthropic 7d-window responses are honored.
+    assert.equal(parseRetryAfter(99999999), 604800);
+    assert.equal(parseRetryAfter(604801), 604800);
+    assert.equal(parseRetryAfter(604800), 604800); // boundary
+    assert.equal(parseRetryAfter(604799), 604799); // just under
   });
 
-  it('caps far-future HTTP-date values at PARSE_RETRY_AFTER_MAX', () => {
-    // Date 10 years in the future → cap to 24h.
+  it('caps far-future HTTP-date values at PARSE_RETRY_AFTER_MAX (7d)', () => {
+    // Date 10 years in the future → cap to 7d (post-M2).
     const now = Date.parse('Mon, 01 Jan 2030 12:00:00 GMT');
     const farFuture = 'Mon, 01 Jan 2040 12:00:00 GMT';
-    assert.equal(parseRetryAfter(farFuture, now), 86400);
+    assert.equal(parseRetryAfter(farFuture, now), 604800);
+  });
+
+  it('honors a legitimate 7-day Retry-After response (M2 regression)', () => {
+    // Pre-M2: Retry-After: 604800 capped to 86400 → proxy gave up after 1d
+    // and started thundering-herd retries against still-rate-limited 7d
+    // window. Post-M2: full 7d honored.
+    assert.equal(parseRetryAfter(604800), 604800);
   });
 });
 

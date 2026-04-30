@@ -649,16 +649,15 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
  * missing/empty/unparseable; for HTTP-date in the past, also 0.
  * Result is capped at PARSE_RETRY_AFTER_MAX so a hostile or
  * misconfigured upstream can't talk us into a multi-year cooldown via
- * `Retry-After: Sat, 01 Jan 2099 00:00:00 GMT`. 24h is well above any
- * legitimate Anthropic rate-limit window (5h / 7d windows reset, but
- * the per-request retry-after never exceeds the longer 7d boundary
- * which is itself ~604800s; we cap LOWER at 86400 because anything
- * past a day is effectively "give up" from the proxy's perspective
- * and we'd rather rotate aggressively than honour an absurd value).
+ * `Retry-After: Sat, 01 Jan 2099 00:00:00 GMT`. M2 fix bumped the cap
+ * from 86400 (1d) to 604800 (7d) so a legitimate Anthropic 7d-window
+ * Retry-After response is honored; the previous 1d cap silently dropped
+ * the lower bits of any 7d-window value, started a thundering-herd retry
+ * mid-window, and burned the upstream rate-limit deeper.
  *
  * Pure function — `now` is injectable for unit tests.
  */
-export const PARSE_RETRY_AFTER_MAX = 86_400; // 24h
+export const PARSE_RETRY_AFTER_MAX = 604_800; // 7d (Anthropic's longest published window)
 
 export function parseRetryAfter(headerValue, now = Date.now()) {
   if (headerValue == null) return 0;
