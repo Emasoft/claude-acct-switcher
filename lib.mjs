@@ -708,11 +708,30 @@ export function parseRefreshResponse(statusCode, bodyStr) {
       const data = JSON.parse(bodyStr);
       const accessToken = data.access_token || data.accessToken;
       const refreshToken = data.refresh_token || data.refreshToken;
-      const expiresIn = data.expires_in || data.expiresIn || 0;
-      if (!accessToken) {
-        return { ok: false, error: 'No access_token in response', retriable: false };
+      const expiresInRaw = data.expires_in != null ? data.expires_in
+                         : data.expiresIn != null ? data.expiresIn
+                         : 0;
+      // M1 fix — type-validate every field. A buggy/hostile upstream sending
+      // {access_token: 12345, expires_in: "huge"} could otherwise produce a
+      // numeric Bearer token or NaN expiresAt (= "never expires"). Reject
+      // with a non-retriable error so the caller falls back to the documented
+      // 8h default in the dashboard wrapper rather than looping the OAuth
+      // endpoint on a malformed response.
+      if (typeof accessToken !== 'string' || accessToken.length === 0) {
+        return { ok: false, error: 'No access_token in response (missing or not a non-empty string)', retriable: false };
       }
-      return { ok: true, accessToken, refreshToken: refreshToken || null, expiresIn };
+      if (refreshToken != null && (typeof refreshToken !== 'string' || refreshToken.length === 0)) {
+        return { ok: false, error: 'refresh_token must be a non-empty string or absent', retriable: false };
+      }
+      // M5 fix — reject expires_in <= 0 and non-finite values. expires_in: 0
+      // would make shouldRefreshToken always return true (immediate-refresh
+      // loop). Negative expires_in produces past expiresAt → token treated
+      // as already-expired → another refresh loop. Non-finite (NaN, "huge")
+      // produces NaN expiresAt → token treated as never-expiring.
+      if (typeof expiresInRaw !== 'number' || !Number.isFinite(expiresInRaw) || expiresInRaw <= 0) {
+        return { ok: false, error: `expires_in must be a positive finite number, got ${typeof expiresInRaw === 'number' ? expiresInRaw : typeof expiresInRaw}`, retriable: false };
+      }
+      return { ok: true, accessToken, refreshToken: refreshToken || null, expiresIn: expiresInRaw };
     } catch (e) {
       return { ok: false, error: `Invalid JSON: ${e.message}`, retriable: false };
     }
@@ -1624,10 +1643,15 @@ export function unwrapOtlpValue(v) {
  * plain object. Last-write-wins on duplicate keys (rare, but possible).
  */
 export function otlpAttrsToObject(attrs) {
+  // M4 fix — explicitly skip reserved keys that could pollute or shadow
+  // Object.prototype methods. The OTLP receiver accepts any attribute keys
+  // from external Claude Code processes (CSW_OTEL_ENABLED=1 is opt-in, but
+  // the receiver's contract is "untrusted external input" regardless).
   const out = {};
   if (!Array.isArray(attrs)) return out;
   for (const a of attrs) {
     if (!a || typeof a !== 'object' || typeof a.key !== 'string') continue;
+    if (a.key === '__proto__' || a.key === 'constructor' || a.key === 'prototype') continue;
     out[a.key] = unwrapOtlpValue(a.value);
   }
   return out;

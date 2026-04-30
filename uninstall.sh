@@ -343,14 +343,19 @@ clean_one_rc() {
       # didn't write anything — the original file is unchanged. We restore
       # from backup as defence-in-depth (in case a future implementation
       # changes that contract) and surface it.
-      cat "${rc}.vdm-backup" > "$rc" 2>/dev/null || true
+      # H13 fix — use _atomic_replace (tmp+rename) instead of cat>file. SIGKILL
+      # mid-cat could leave a truncated rc file on the user's home — high
+      # blast radius (broken zshrc) for low-probability event. Atomic helper
+      # is already loaded by the uninstall preamble.
+      _atomic_replace "${rc}.vdm-backup" "$rc" 2>/dev/null || true
       echo -e "  ${RED}!${NC} ${BOLD}${rc}${NC} has an unmatched BEGIN/END marker — refusing to auto-edit."
       echo -e "    ${DIM}Original preserved. Remove the claude-account-switcher block manually.${NC}"
       ORPHAN_BACKUPS+=("${rc}.vdm-backup")
       ;;
     *)
       # Any other status = unexpected; restore + surface.
-      cat "${rc}.vdm-backup" > "$rc" 2>/dev/null || true
+      # H13 fix — same as above. Atomic restore prevents truncated rc files.
+      _atomic_replace "${rc}.vdm-backup" "$rc" 2>/dev/null || true
       echo -e "  ${RED}!${NC} Unexpected status $rc_status removing block from $rc — restored from backup"
       ORPHAN_BACKUPS+=("${rc}.vdm-backup")
       ;;

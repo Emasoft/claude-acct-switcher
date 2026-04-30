@@ -98,6 +98,10 @@ describe('stripHopByHopHeaders', () => {
       'content-length': '42',
       'accept-encoding': 'gzip, br',
       'x-api-key': 'sk-ant-abc123',
+      // M3 — proxy-connection treated as hop-by-hop by every major proxy
+      // even though RFC 7230 doesn't list it. Some HTTP clients still send
+      // it without listing in `Connection: ...`.
+      'proxy-connection': 'close',
       // These should survive:
       'content-type': 'application/json',
       'authorization': 'Bearer tok',
@@ -107,6 +111,8 @@ describe('stripHopByHopHeaders', () => {
     for (const h of HOP_BY_HOP) {
       assert.ok(!(h in result), `${h} should be stripped`);
     }
+    // Explicit assertion: proxy-connection MUST be stripped.
+    assert.ok(!('proxy-connection' in result), 'proxy-connection must be stripped (M3)');
     assert.equal(result['content-type'], 'application/json');
     assert.equal(result['authorization'], 'Bearer tok');
     assert.equal(result['x-custom'], 'value');
@@ -501,6 +507,55 @@ describe('parseRefreshResponse', () => {
     assert.equal(result.ok, false);
     assert.match(result.error, /Invalid JSON/);
     assert.equal(result.retriable, false);
+  });
+
+  // M1 + M5 regression — type validation against hostile/buggy upstream
+  it('rejects access_token that is a number (not a string)', () => {
+    const body = JSON.stringify({ access_token: 12345, expires_in: 3600 });
+    const result = parseRefreshResponse(200, body);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /access_token/);
+    assert.equal(result.retriable, false);
+  });
+
+  it('rejects refresh_token that is a non-string non-null value when present', () => {
+    // Note: falsy values (0, '', false, null, undefined) collapse via the
+    // `||` chain to the alternative-camelCase field, so the only way to
+    // exercise the validation is with a truthy non-string. An object value
+    // is the canonical hostile-server case (e.g. `refresh_token: {hostile: true}`).
+    const body = JSON.stringify({ access_token: 'ok', refresh_token: { hostile: true }, expires_in: 3600 });
+    const result = parseRefreshResponse(200, body);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /refresh_token/);
+  });
+
+  it('accepts refresh_token absent (optional field)', () => {
+    const body = JSON.stringify({ access_token: 'ok', expires_in: 3600 });
+    const result = parseRefreshResponse(200, body);
+    assert.equal(result.ok, true);
+    assert.equal(result.refreshToken, null);
+  });
+
+  it('rejects expires_in of 0 (would cause immediate-refresh loop)', () => {
+    const body = JSON.stringify({ access_token: 'ok', expires_in: 0 });
+    const result = parseRefreshResponse(200, body);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /expires_in/);
+    assert.equal(result.retriable, false);
+  });
+
+  it('rejects negative expires_in (would create past expiresAt)', () => {
+    const body = JSON.stringify({ access_token: 'ok', expires_in: -100 });
+    const result = parseRefreshResponse(200, body);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /expires_in/);
+  });
+
+  it('rejects non-numeric expires_in (would produce NaN expiresAt)', () => {
+    const body = JSON.stringify({ access_token: 'ok', expires_in: 'huge' });
+    const result = parseRefreshResponse(200, body);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /expires_in/);
   });
 
   it('extracts message from object error fields', () => {

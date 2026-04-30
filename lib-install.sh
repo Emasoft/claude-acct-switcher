@@ -182,7 +182,15 @@ _atomic_append_block() {
   python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f); os.close(f)" "$tmp" 2>/dev/null || true
   if [[ -L "$dst" ]]; then
     # Symlink: write through it (see _atomic_replace for the rationale).
-    cat "$tmp" > "$dst" && rm -f "$tmp"
+    # H14 fix — unconditional rm -f so the tmp doesn't litter when cat fails
+    # (read-only target, EIO, full disk). Previous `cat ... && rm` form
+    # short-circuited the rm on a failed cat, leaving "${dst}.tmp.$$" on disk.
+    if cat "$tmp" > "$dst"; then
+      rm -f "$tmp"
+    else
+      rm -f "$tmp"
+      return 1
+    fi
   else
     mv -f "$tmp" "$dst"
   fi
@@ -231,7 +239,15 @@ _atomic_remove_block() {
   python3 -c "import os,sys; f=os.open(sys.argv[1], os.O_RDONLY); os.fsync(f); os.close(f)" "$tmp" 2>/dev/null || true
   if [[ -L "$dst" ]]; then
     # Symlink: write through it (see _atomic_replace for the rationale).
-    cat "$tmp" > "$dst" && rm -f "$tmp"
+    # H14 fix — unconditional rm -f so the tmp doesn't litter when cat fails
+    # (read-only target, EIO, full disk). Previous `cat ... && rm` form
+    # short-circuited the rm on a failed cat, leaving "${dst}.tmp.$$" on disk.
+    if cat "$tmp" > "$dst"; then
+      rm -f "$tmp"
+    else
+      rm -f "$tmp"
+      return 1
+    fi
   else
     mv -f "$tmp" "$dst"
   fi
@@ -342,7 +358,11 @@ _kill_running_vdm() {
   if pkill -TERM -f '\.claude/account-switcher/dashboard\.mjs' 2>/dev/null; then
     stopped=true
   fi
-  if pkill -TERM -f 'node.*-e.*dashboard\.mjs' 2>/dev/null; then
+  # H12 fix — narrowed from `node.*-e.*dashboard\.mjs` (which would match any
+  # `node -e '...dashboard.mjs...'` invocation, including dev smoke tests in
+  # unrelated projects). Anchored to `account-switcher` so we only catch the
+  # vdm source-repo dev runs (`node ./dashboard.mjs` from the cloned repo).
+  if pkill -TERM -f 'node[^"]*account-switcher[^"]*dashboard\.mjs' 2>/dev/null; then
     stopped=true
   fi
 
