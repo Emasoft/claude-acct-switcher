@@ -374,6 +374,70 @@ fi
 # file (any will do — backups exist for all of them).
 SHELL_RC="${CLEANED_RC_FILES[0]:-}"
 
+# ── 2b. Add defensive `unset ANTHROPIC_BASE_URL` cleanup block ──
+# Removing the install BEGIN/END block stops FUTURE shells from re-setting
+# ANTHROPIC_BASE_URL=http://localhost:<port>, but it does NOT unset values
+# inherited from PARENT processes that were forked while the var was live
+# (login shell, iTerm app, PM2 daemon, ai-maestro). Those parents carry
+# the polluted env in memory until they themselves are restarted (logout +
+# login, reboot, or `pm2 kill && pm2 resurrect`). Until then, every fresh
+# shell descended from a polluted parent silently inherits the dead URL —
+# every `claude` invocation gets ConnectionRefused, every `pm2 save` re-
+# pollutes the dump, every iTerm tab is contaminated.
+#
+# Defensive fix: actively `unset` on every shell start. The cleanup block
+# sits in the rc file independent of vdm being installed; when vdm is
+# re-installed, install.sh strips this block before adding its own (so
+# re-install is idempotent and the snippet's :- default fallback works).
+# Block is self-documenting and safe for the user to delete manually once
+# they have fully logged out + back in or rebooted.
+CLEANUP_TARGET=""
+for _rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+  [[ -f "$_rc" ]] || continue
+  # Skip if this rc already has the cleanup block (idempotent re-uninstall).
+  if grep -Eq '^[[:space:]]*# BEGIN claude-account-switcher-cleanup[[:space:]]*$' "$_rc" 2>/dev/null; then
+    CLEANUP_TARGET="$_rc"
+    echo -e "  ${DIM}Cleanup block already present in $_rc${NC}"
+    break
+  fi
+  # Otherwise pick the first existing rc file as the install target.
+  if [[ -z "$CLEANUP_TARGET" ]]; then
+    CLEANUP_TARGET="$_rc"
+  fi
+done
+
+if [[ -n "$CLEANUP_TARGET" ]] \
+   && ! grep -Eq '^[[:space:]]*# BEGIN claude-account-switcher-cleanup[[:space:]]*$' "$CLEANUP_TARGET" 2>/dev/null; then
+  CLEANUP_BODY="$(mktemp -t vdm-cleanup.XXXXXX 2>/dev/null || echo '')"
+  if [[ -n "$CLEANUP_BODY" ]]; then
+    cat > "$CLEANUP_BODY" <<'CLEANUP_EOF'
+# Defensive cleanup left by claude-account-switcher uninstall.
+# vdm used to export ANTHROPIC_BASE_URL=http://localhost:<port> in this
+# rc file. Removing that export stops future shells from re-setting it,
+# but does NOT unset values inherited from parent processes that were
+# forked while the var was still active (login shell, iTerm app, PM2
+# daemon, ai-maestro). Actively unsetting on every shell start is the
+# only way to keep new shells clean until those parents are themselves
+# restarted (logout/login, reboot, or `pm2 kill && pm2 resurrect`).
+#
+# Safe to delete this block manually once you have fully logged out and
+# back in, or rebooted — after that no parent process can carry the
+# stale URL. A subsequent install of vdm removes this block automatically.
+unset ANTHROPIC_BASE_URL
+CLEANUP_EOF
+    if _atomic_append_block "$CLEANUP_TARGET" \
+        "# BEGIN claude-account-switcher-cleanup" \
+        "# END claude-account-switcher-cleanup" \
+        "$CLEANUP_BODY" 2>/dev/null; then
+      echo -e "  ${GREEN}✓${NC} Added defensive ${CYAN}unset ANTHROPIC_BASE_URL${NC} block to ${CYAN}$CLEANUP_TARGET${NC}"
+      echo -e "    ${DIM}Open new terminals (or run \`exec zsh\` in each tab) so the unset takes effect.${NC}"
+      echo -e "    ${DIM}If PM2 was managing services that inherited the polluted env, run:${NC}"
+      echo -e "    ${DIM}  unset ANTHROPIC_BASE_URL && pm2 kill && pm2 resurrect${NC}"
+    fi
+    rm -f "$CLEANUP_BODY"
+  fi
+fi
+
 # ── 3. Remove vdm symlink (and legacy csw) ──
 
 removed_link=false

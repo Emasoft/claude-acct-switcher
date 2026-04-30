@@ -459,6 +459,27 @@ elif [[ -f "$HOME/.bash_profile" ]]; then
   SHELL_RC="$HOME/.bash_profile"
 fi
 
+# Strip any defensive cleanup block left by a prior uninstall.sh run.
+# That block contains `unset ANTHROPIC_BASE_URL`, which would unset the var
+# every shell start and defeat the install snippet's `${VAR:-default}`
+# logic — depending on rc-file ordering the proxy could end up unbound.
+# Removing the cleanup block here makes re-install idempotent: clean
+# slate, then add the regular BEGIN/END block below. We sweep ALL plausible
+# rc files (not just SHELL_RC) because the cleanup block from uninstall is
+# written to the FIRST rc file that exists, which may differ from the one
+# install.sh chose (e.g. .zprofile on a fresh login-only shell).
+for _rc in "$HOME/.zshrc"        "$HOME/.zprofile"     "$HOME/.zshenv" \
+           "$HOME/.bashrc"       "$HOME/.bash_profile" "$HOME/.profile"; do
+  [[ -f "$_rc" ]] || continue
+  if grep -Eq '^[[:space:]]*# BEGIN claude-account-switcher-cleanup[[:space:]]*$' "$_rc" 2>/dev/null; then
+    if _atomic_remove_block "$_rc" \
+        '^[[:space:]]*# BEGIN claude-account-switcher-cleanup[[:space:]]*$' \
+        '^[[:space:]]*# END claude-account-switcher-cleanup[[:space:]]*$' >/dev/null 2>&1; then
+      echo -e "  ${GREEN}✓${NC} Removed prior uninstall cleanup block from ${CYAN}$_rc${NC}"
+    fi
+  fi
+done
+
 SNIPPET_MARKER="# BEGIN claude-account-switcher"
 
 if [[ -n "$SHELL_RC" ]]; then

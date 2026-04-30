@@ -3957,14 +3957,13 @@ function renderHTML() {
     border-radius: 3px;
     transform: translateY(-50%);
   }
-  .vs-track-fill {
-    position: absolute;
-    top: 0;
-    height: 100%;
-    background: var(--primary);
-    border-radius: 3px;
-    opacity: 0.5;
-  }
+  /* No coloured fill between the thumbs. The previous .vs-track-fill rule
+     painted a translucent blue rectangle the full height of the wrapper,
+     which dominated the row visually and hid surrounding labels. The plain
+     .vs-track + two thumbs convey "selected range" clearly enough on their
+     own; if a fill is ever wanted, restore it as a 4-6px-tall element ON
+     the track (top: 50%; height: 6px; transform: translateY(-50%)), NOT
+     full-height. The element is also no longer rendered in the markup. */
   .vs-thumb {
     position: absolute;
     top: 50%;
@@ -4060,40 +4059,6 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('logs')">Logs</button>
   </div>
 
-  <!-- Phase C: date-range scrubber + tier filter. Hidden until at least one
-       data point exists; visible only on activity/usage tabs (it filters
-       time-series; it is meaningless on accounts/config/logs). -->
-  <div id="vs-bar" class="vs-bar hidden" role="group" aria-label="Date range and tier filter">
-    <div class="vs-bar-row">
-      <div class="vs-presets">
-        <button class="vs-preset-btn" data-preset="1h">Last hour</button>
-        <button class="vs-preset-btn" data-preset="24h">Last 24h</button>
-        <button class="vs-preset-btn" data-preset="7d">Last 7d</button>
-        <button class="vs-preset-btn" data-preset="30d">Last 30d</button>
-        <button class="vs-preset-btn" data-preset="all">All</button>
-      </div>
-      <div class="vs-track-wrap" id="vs-track-wrap">
-        <div class="vs-track"></div>
-        <div class="vs-track-fill" id="vs-track-fill"></div>
-        <div class="vs-thumb" id="vs-thumb-start" tabindex="0" role="slider" aria-label="Range start" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-          <div class="vs-thumb-label" id="vs-label-start"></div>
-        </div>
-        <div class="vs-thumb" id="vs-thumb-end" tabindex="0" role="slider" aria-label="Range end" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
-          <div class="vs-thumb-label" id="vs-label-end"></div>
-        </div>
-      </div>
-      <div class="vs-fallback-inputs">
-        <label style="font-size:0.6875rem;color:var(--muted)">From <input type="datetime-local" class="vs-fallback-input" id="vs-input-start"></label>
-        <label style="font-size:0.6875rem;color:var(--muted)">To <input type="datetime-local" class="vs-fallback-input" id="vs-input-end"></label>
-      </div>
-      <div class="vs-window-info"><b id="vs-window-text">--</b></div>
-    </div>
-    <div class="vs-bar-row">
-      <span class="vs-tier-label">Tier:</span>
-      <div class="vs-tier-chips" id="vs-tier-chips"></div>
-    </div>
-  </div>
-
   <div id="tab-accounts" class="tab-content active">
     <div id="accounts" class="accounts">
       <div class="empty-state">Loading...</div>
@@ -4116,6 +4081,37 @@ function renderHTML() {
           <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--purple)"></span> Tokens</div>
         </div>
         <div id="chart" class="chart-container"></div>
+      </div>
+    </div>
+    <!-- Date-range scrubber. Sits BELOW the All Accounts summary card so the
+         summary stays always-visible and the scrubber narrows the charts that
+         follow. The tier-filter row from the prior version was a duplicate of
+         the per-account selector under the daily chart and has been removed
+         (a single source of truth for "which accounts/tiers count toward this
+         view" — it lives on the per-account dropdown below). -->
+    <div id="vs-bar" class="vs-bar hidden" role="group" aria-label="Date range filter">
+      <div class="vs-bar-row">
+        <div class="vs-presets">
+          <button class="vs-preset-btn" data-preset="1h">Last hour</button>
+          <button class="vs-preset-btn" data-preset="24h">Last 24h</button>
+          <button class="vs-preset-btn" data-preset="7d">Last 7d</button>
+          <button class="vs-preset-btn" data-preset="30d">Last 30d</button>
+          <button class="vs-preset-btn" data-preset="all">All</button>
+        </div>
+        <div class="vs-track-wrap" id="vs-track-wrap">
+          <div class="vs-track"></div>
+          <div class="vs-thumb" id="vs-thumb-start" tabindex="0" role="slider" aria-label="Range start" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div class="vs-thumb-label" id="vs-label-start"></div>
+          </div>
+          <div class="vs-thumb" id="vs-thumb-end" tabindex="0" role="slider" aria-label="Range end" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+            <div class="vs-thumb-label" id="vs-label-end"></div>
+          </div>
+        </div>
+        <div class="vs-fallback-inputs">
+          <label style="font-size:0.6875rem;color:var(--muted)">From <input type="datetime-local" class="vs-fallback-input" id="vs-input-start"></label>
+          <label style="font-size:0.6875rem;color:var(--muted)">To <input type="datetime-local" class="vs-fallback-input" id="vs-input-end"></label>
+        </div>
+        <div class="vs-window-info"><b id="vs-window-text">--</b></div>
       </div>
     </div>
     <div class="tok-filters">
@@ -4456,17 +4452,15 @@ function vsClampLocal(start, end) {
 
 function vsRenderTrack() {
   var wrap = document.getElementById('vs-track-wrap');
-  var fill = document.getElementById('vs-track-fill');
   var ts   = document.getElementById('vs-thumb-start');
   var te   = document.getElementById('vs-thumb-end');
   var ls   = document.getElementById('vs-label-start');
   var le   = document.getElementById('vs-label-end');
   var win  = document.getElementById('vs-window-text');
-  if (!wrap || !fill || !ts || !te) return;
+  if (!wrap || !ts || !te) return;
   if (!_vsDataRange) return;
   var span = _vsDataRange.newest - _vsDataRange.oldest;
   if (span <= 0) {
-    fill.style.left = '0%'; fill.style.width = '0%';
     ts.style.left = '0%'; te.style.left = '100%';
     return;
   }
@@ -4474,8 +4468,6 @@ function vsRenderTrack() {
   var ePct = ((_vsState.end   - _vsDataRange.oldest) / span) * 100;
   sPct = Math.max(0, Math.min(100, sPct));
   ePct = Math.max(0, Math.min(100, ePct));
-  fill.style.left = sPct + '%';
-  fill.style.width = (ePct - sPct) + '%';
   ts.style.left = sPct + '%';
   te.style.left = ePct + '%';
   ts.setAttribute('aria-valuenow', String(Math.round(sPct)));
@@ -4759,6 +4751,14 @@ async function vsBootstrap() {
 // Refresh dataRange + tier map periodically so the scrubber tracks new
 // data points and live tier additions without requiring a page reload.
 async function vsRefreshDataRange() {
+  // Pause auto-refresh visual updates while the user is mid-drag. Without
+  // this, the 10s poll would re-render the track on top of the user's
+  // in-flight drag — the thumb under the cursor jumps to a "fresh" data
+  // range and the user's pointer is no longer over the same time value.
+  // We still skip the network refresh entirely (rather than fetch but
+  // skip render) to avoid serialising the new dataRange into _vsDataRange
+  // mid-drag, which would silently shift the meaning of the user's drag.
+  if (_vsDragging) return;
   try {
     var rs = await fetch('/api/viewer-state');
     var st = await rs.json();
@@ -6072,7 +6072,23 @@ function renderTokenStats(data, prevData) {
   if (savingsEl) {
     var days = tokTimeRange();
     var planSel = document.getElementById('tok-plan');
-    var planKey = planSel ? planSel.value : 'max5x';
+    // Persist the user's plan choice across reloads. localStorage is the
+    // right scope here — the choice is per-user-per-browser, not part of
+    // server-side config (which is shared with vdm CLI). On first render
+    // the dropdown does not exist yet, so read the saved value from storage;
+    // after this render writes savingsEl.innerHTML, the freshly-built
+    // tok-plan select picks up the saved value via the selected attribute
+    // produced by the loop below. (No backticks in this comment — they
+    // would terminate the renderHTML template literal early.)
+    var planKey;
+    if (planSel) {
+      planKey = planSel.value;
+    } else {
+      try { planKey = localStorage.getItem('vdm.tokPlan') || 'max5x'; }
+      catch (_) { planKey = 'max5x'; }
+    }
+    if (!TOK_PLANS[planKey]) planKey = 'max5x';
+    try { localStorage.setItem('vdm.tokPlan', planKey); } catch (_) {}
     var plan = TOK_PLANS[planKey] || TOK_PLANS['max5x'];
     var planDaily = plan.monthly / 30;
     var apiDaily = days > 0 ? totalCost / days : 0;
