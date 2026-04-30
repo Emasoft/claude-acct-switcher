@@ -11152,6 +11152,19 @@ if (OTEL_ENABLED) {
       res.end(JSON.stringify({ error: 'not found' }));
       return;
     }
+    // H9 fix — CSRF protection. The receiver binds to 127.0.0.1 only, but a
+    // malicious browser tab on http://localhost:9999 can still POST OTLP-shaped
+    // JSON into our ring buffers (then surfaced via /api/otel-events). The main
+    // dashboard server has _isOriginAllowed as a mutating-method guard at
+    // line ~7202; reuse it here. Claude Code's OTLP exporter sends no Origin
+    // header (it's a Node process, not a browser), so the absent-Origin path
+    // in _isOriginAllowed correctly accepts it.
+    const origin = req.headers.origin;
+    if (!_isOriginAllowed(origin)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'forbidden origin' }));
+      return;
+    }
     // Buffer the body. OTLP/HTTP/JSON payloads are small — typical CC export
     // is < 50 KB; cap at 8 MB for safety.
     let bytes = 0;

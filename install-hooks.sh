@@ -480,6 +480,12 @@ _install_git_hook() {
     # Expand ~ in path
     hooks_dir="${hooks_dir/#\~/$HOME}"
     mkdir -p "$hooks_dir" 2>/dev/null || true
+    # M16 fix — surface that vdm is writing into a user-controlled hooks dir.
+    # Previously we silently dropped 7 passthrough stub files into whatever
+    # core.hooksPath the user (or a corporate policy) had set, with no notice.
+    # The stubs are uninstall-clean (tagged with $_VDM_HOOKS_MARKER) but the
+    # surprise factor is real.
+    echo "Note: writing vdm passthrough hooks into your existing core.hooksPath: $hooks_dir"
   fi
 
   local hook_file="$hooks_dir/prepare-commit-msg"

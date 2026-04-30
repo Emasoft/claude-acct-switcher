@@ -2069,7 +2069,17 @@ cmd_help() {
 # vdm-account-* keychain entries before any command runs. Safe to
 # call on every invocation — entries already in the keychain are not
 # rewritten, files that fail to migrate are left in place for retry.
-migrate_accounts_to_keychain 2>/dev/null || true
+# M15 fix — redirect stderr to a log file instead of /dev/null. Previous
+# blanket suppression hid every real error (write-failed, locked keychain,
+# missing security tool) — users would see plaintext accounts/*.json files
+# lingering after the function "succeeded" silently. The log lives next to
+# the script so users can find it; we never block on this even if the log
+# write itself fails.
+_vdm_migration_log="$SCRIPT_DIR/migration.log"
+migrate_accounts_to_keychain 2>>"$_vdm_migration_log" || {
+  echo -e "${DIM}[migration] Encountered errors — see $_vdm_migration_log${NC}" >&2
+  true
+}
 
 command="${1:-help}"
 shift 2>/dev/null || true
