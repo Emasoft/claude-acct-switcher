@@ -442,56 +442,6 @@ events = [
 for event_name, url in events:
     remove_hook(event_name, url)
 
-# Broad-sweep fallback. The targeted `events` list above only knows about
-# endpoints THIS version of vdm installs. A future release could add or
-# rename an endpoint, and an install written by that release would survive
-# uninstall by an older version. Catch every entry whose URL points at a
-# vdm-shaped target — host in {localhost, 127.0.0.1, ::1}, port == _VDM_PORT,
-# and path beginning with /api/ — regardless of whether the path string is
-# in the events list. This is the "any part is left, remove it" guarantee.
-from urllib.parse import urlparse
-_VDM_HOSTS = ('localhost', '127.0.0.1', '::1')
-for event_name in list(hooks.keys()):
-    event_hooks = hooks[event_name]
-    if not isinstance(event_hooks, list):
-        continue
-    filtered = []
-    for entry in event_hooks:
-        if not isinstance(entry, dict):
-            filtered.append(entry)
-            continue
-        inner = entry.get('hooks', [])
-        if not isinstance(inner, list):
-            filtered.append(entry)
-            continue
-        new_inner = []
-        for h in inner:
-            if not isinstance(h, dict):
-                new_inner.append(h)
-                continue
-            u_str = h.get('url', '')
-            if not isinstance(u_str, str) or not u_str:
-                new_inner.append(h)
-                continue
-            try:
-                u = urlparse(u_str)
-                if (u.hostname in _VDM_HOSTS
-                        and str(u.port) == port
-                        and u.path.startswith('/api/')):
-                    continue  # drop — unmistakably vdm
-            except Exception:
-                pass
-            new_inner.append(h)
-        if new_inner:
-            new_entry = dict(entry)
-            new_entry['hooks'] = new_inner
-            filtered.append(new_entry)
-        elif not inner:
-            filtered.append(entry)
-    hooks[event_name] = filtered
-    if not hooks[event_name]:
-        del hooks[event_name]
-
 # Clean up empty hooks dict
 if not hooks:
     del settings['hooks']
