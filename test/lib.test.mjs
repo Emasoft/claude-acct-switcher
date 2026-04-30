@@ -857,7 +857,17 @@ describe('getEarliestReset weekday formatting', () => {
   });
 
   it('omits the date when reset is later today', () => {
-    // Pick a time three minutes from now — guaranteed same calendar day.
+    // Pick a time 3 minutes from now — but ONLY if that doesn't cross
+    // midnight. Within 5 min of midnight, the previous test was a flake
+    // (e.g. now=23:58:30 → future=00:01:30 next day → weekday output).
+    // Skip the assertion in that thin window rather than passing fragile.
+    const now = new Date();
+    const minutesUntilMidnight =
+      (24 * 60) - (now.getHours() * 60 + now.getMinutes());
+    if (minutesUntilMidnight <= 5) {
+      // Within 5 min of midnight — skip to avoid flake.
+      return;
+    }
     const future = Math.floor((Date.now() + 3 * 60 * 1000) / 1000);
     const mgr = fakeMgr(new Map([
       ['t', { resetAt: future, resetAt7d: 0 }],
@@ -2822,6 +2832,67 @@ describe('pickByStrategy — excludeFromAuto end-to-end', () => {
 });
 
 // ─────────────────────────────────────────────────
+// H3 regression — pickByStrategy must forward its `now` arg through every
+// fallback callsite. Pre-fix, the unavailable-current branch and each
+// strategy switch arm called pickBestAccount/pickConserve/pickDrainFirst
+// without passing `now`, so candidate availability was checked against
+// the real wall clock — making picker tests silently fragile.
+// ─────────────────────────────────────────────────
+describe('pickByStrategy — injected `now` reaches candidate availability checks', () => {
+  it('treats a candidate as expired only when the injected `now` is honored', () => {
+    // Two synthetic clocks chosen so wall-clock Date.now() is always ≥ both.
+    // 'a' is the current account and is rate-limited so the unavailable
+    // branch fires; 'b' is the only other candidate. Its expiresAt sits
+    // BETWEEN nowEarly and nowLate. Honored `now`:
+    //   - nowEarly (1000): expiresAt(2000) > now → 'b' is pickable
+    //   - nowLate  (3000): expiresAt(2000) < now → 'b' is expired, no pick
+    // If `now` is silently dropped, both calls would hit Date.now()
+    // (≫ 2000), so 'b' would always be expired and the early case fails.
+    const nowEarly = 1000;
+    const nowLate = 3000;
+    const accounts = [
+      { name: 'a', token: 'a', expiresAt: nowEarly + 86400000 },
+      { name: 'b', token: 'b', expiresAt: 2000 },
+    ];
+    // 'a' is rate-limited at both clocks so the unavailable-current
+    // fallback fires (which is the path that previously dropped `now`).
+    const sm = _mkStateManager({
+      a: { limited: true, retryAfter: nowLate + 600_000, utilization5h: 0.9 },
+      b: { utilization5h: 0.1 },
+    });
+
+    const early = pickByStrategy({
+      strategy: 'spread', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+      now: nowEarly,
+    });
+    assert.ok(early.account, 'with nowEarly, b is not yet expired and must be picked');
+    assert.equal(early.account.token, 'b');
+    assert.equal(early.rotated, true);
+
+    const late = pickByStrategy({
+      strategy: 'spread', intervalMin: 60,
+      currentToken: 'a', lastRotationTime: 0, accounts, stateManager: sm,
+      now: nowLate,
+    });
+    assert.equal(late.account, null, 'with nowLate, b is expired — no pickable candidate');
+    assert.equal(late.rotated, false);
+  });
+
+  it('pickBestAccount also honors injected `now` directly', () => {
+    // Direct caller path (not via pickByStrategy). Same logic: expiresAt
+    // sits between two synthetic clocks. If `now` is dropped, Date.now()
+    // (≫ 2000) is used and the account is reported expired regardless.
+    const accounts = [{ name: 'a', token: 'a', expiresAt: 2000 }];
+    const sm = _mkStateManager({ a: { utilization5h: 0.0 } });
+    assert.ok(pickBestAccount(accounts, sm, new Set(), 1000),
+      'pickBestAccount with now=1000 should treat expiresAt=2000 as still valid');
+    assert.equal(pickBestAccount(accounts, sm, new Set(), 3000), null,
+      'pickBestAccount with now=3000 should treat expiresAt=2000 as expired');
+  });
+});
+
+// ─────────────────────────────────────────────────
 // scoreAccountConserve — weekly dominates 5h tiebreaker (×100 / ×1).
 // Critical: with weekly window already active, conserve should
 // concentrate on it even when its 5h is HIGH (the whole point of
@@ -3216,6 +3287,62 @@ describe('XSS regression — evtMsg escapes every dynamic field', () => {
       `Unescaped string-concat XSS shape found in evtMsg: ${unsafe.join(', ')}. ` +
       `Wrap each field in h(...) before concatenating into HTML.`);
   });
+});
+
+// M14 fix — explicit evtMsg cases for Phase D/E/G/H event types
+// (worktree_create, worktree_remove, task_created, task_completed,
+// auth_success, config_change, account-removed, account-prefs-changed).
+// These regression tests assert each new case routes user-controlled
+// fields through h(...) — a future contributor adding another case
+// without h() will trip the unsafe-shape check above, but this block
+// also asserts the cases exist at all so the activity feed has friendly
+// labels instead of raw type names.
+describe('XSS regression — evtMsg Phase D/E/G/H cases', () => {
+  const _dashboardSrc = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // The regex extracts evtMsg's body (the same pattern the existing
+  // `no UNESCAPED ` test uses). We then check each new case label
+  // and assert its body wraps the dynamic field via h(...).
+  const fnMatch = _dashboardSrc.match(/function evtMsg\(e\) \{[\s\S]*?\n\}/);
+  const body = fnMatch ? fnMatch[0] : '';
+
+  const newCases = [
+    'worktree_create',
+    'worktree_remove',
+    'task_created',
+    'task_completed',
+    'auth_success',
+    'config_change',
+    'account-removed',
+    'account-prefs-changed',
+  ];
+
+  for (const caseName of newCases) {
+    it(`case '${caseName}' exists and wraps user-controlled fields in h()`, () => {
+      // Every new case routes its dynamic field via h(...). We grep for
+      // the case label, capture the return expression, and assert it
+      // contains an h(...) call. Cases that hardcode strings (no user
+      // input) would also satisfy this if they don't concat e.<field>;
+      // the existing unsafe-shape test catches missed h() wrappers.
+      const re = new RegExp(`case ['"]${caseName}['"]:\\s*return ([^;]+);`);
+      const m = body.match(re);
+      assert.ok(m, `evtMsg case '${caseName}' not found — add it for friendlier activity feed labels`);
+      const returnExpr = m[1];
+      // Either the expression contains h(...) (user-controlled field
+      // safely escaped) OR it has no e.<field> reference at all (purely
+      // static label). Both are safe.
+      const hasHelper = /\bh\(/.test(returnExpr);
+      const hasUserField = /\be\.\w+/.test(returnExpr);
+      if (hasUserField) {
+        assert.ok(hasHelper,
+          `case '${caseName}' references e.<field> but does not route through h(...). ` +
+          `Wrap the field in h(...) like the original cases do.`);
+      }
+    });
+  }
 });
 
 describe('XSS regression — renderAccounts card rendering', () => {

@@ -220,23 +220,23 @@ export function scoreAccount(token, stateManager) {
 // returned by any auto-pick path. Manual switches (via /api/switch or
 // `vdm switch <name>`) bypass these helpers entirely, so the flag does
 // what its name says: disable AUTO selection only.
-function _isPickable(a, excludeTokens, stateManager) {
+function _isPickable(a, excludeTokens, stateManager, now = Date.now()) {
   return !excludeTokens.has(a.token) &&
     !a.excludeFromAuto &&
-    isAccountAvailable(a.token, a.expiresAt, stateManager);
+    isAccountAvailable(a.token, a.expiresAt, stateManager, now);
 }
 
-export function pickBestAccount(accounts, stateManager, excludeTokens = new Set()) {
+export function pickBestAccount(accounts, stateManager, excludeTokens = new Set(), now = Date.now()) {
   const candidates = accounts
-    .filter(a => _isPickable(a, excludeTokens, stateManager))
+    .filter(a => _isPickable(a, excludeTokens, stateManager, now))
     .map(a => ({ ...a, score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) => a.score - b.score);
   return candidates[0] || null;
 }
 
-export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()) {
+export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set(), now = Date.now()) {
   const candidates = accounts
-    .filter(a => _isPickable(a, excludeTokens, stateManager))
+    .filter(a => _isPickable(a, excludeTokens, stateManager, now))
     .map(a => ({ ...a, score: scoreAccount(a.token, stateManager) }))
     .sort((a, b) => b.score - a.score); // highest utilization first
   return candidates[0] || null;
@@ -258,19 +258,23 @@ export function scoreAccountConserve(token, stateManager) {
   return w7d * 100 + w5h;
 }
 
-export function pickConserve(accounts, stateManager, excludeTokens = new Set()) {
+export function pickConserve(accounts, stateManager, excludeTokens = new Set(), now = Date.now()) {
   const candidates = accounts
-    .filter(a => _isPickable(a, excludeTokens, stateManager))
+    .filter(a => _isPickable(a, excludeTokens, stateManager, now))
     .map(a => ({ ...a, score: scoreAccountConserve(a.token, stateManager) }))
     .sort((a, b) => b.score - a.score); // highest combined utilization first
   return candidates[0] || null;
 }
 
-export function pickAnyUntried(accounts, excludeTokens) {
+export function pickAnyUntried(accounts, excludeTokens, now = Date.now()) {
   // pickAnyUntried is the LAST-RESORT fallback when every other strategy
   // has run out of candidates. Honor `excludeFromAuto` here too — the
   // user explicitly opted that account out of auto selection, so an
   // emergency fallback isn't a good reason to override their choice.
+  // `now` is accepted for parameter-list parity with the other pickers
+  // (so callers like pickByStrategy can forward `now` uniformly); this
+  // function does not check availability so the value is currently unused.
+  void now;
   return accounts.find(a => !excludeTokens.has(a.token) && !a.excludeFromAuto) || null;
 }
 
@@ -317,7 +321,7 @@ export function pickByStrategy(opts) {
 
   if (!currentAvailable) {
     // Must switch  - pick lowest utilization as safe default
-    const best = pickBestAccount(accounts, stateManager, excludeTokens);
+    const best = pickBestAccount(accounts, stateManager, excludeTokens, now);
     return { account: best, rotated: !!best };
   }
 
@@ -345,7 +349,7 @@ export function pickByStrategy(opts) {
     case 'conserve': {
       // Pick account with highest weekly utilization (windows already active)
       // Untouched accounts stay dormant  - their windows don't start
-      const conserved = pickConserve(accounts, stateManager, excludeTokens);
+      const conserved = pickConserve(accounts, stateManager, excludeTokens, now);
       if (conserved && conserved.token !== currentToken) {
         return { account: conserved, rotated: true };
       }
@@ -358,7 +362,7 @@ export function pickByStrategy(opts) {
       if (elapsed < intervalMs) {
         return { account: null, rotated: false }; // timer not elapsed
       }
-      const best = pickBestAccount(accounts, stateManager, excludeTokens);
+      const best = pickBestAccount(accounts, stateManager, excludeTokens, now);
       if (best && best.token !== currentToken) {
         return { account: best, rotated: true };
       }
@@ -367,14 +371,14 @@ export function pickByStrategy(opts) {
 
     case 'spread':
       // Always pick lowest utilization (current behavior)
-      const lowest = pickBestAccount(accounts, stateManager, excludeTokens);
+      const lowest = pickBestAccount(accounts, stateManager, excludeTokens, now);
       if (lowest && lowest.token !== currentToken) {
         return { account: lowest, rotated: true };
       }
       return { account: null, rotated: false };
 
     case 'drain-first': {
-      const drain = pickDrainFirst(accounts, stateManager, excludeTokens);
+      const drain = pickDrainFirst(accounts, stateManager, excludeTokens, now);
       if (drain && drain.token !== currentToken) {
         return { account: drain, rotated: true };
       }

@@ -408,9 +408,80 @@ print(json.load(sys.stdin).get(sys.argv[1], ""))
 ' "$key" 2>/dev/null
 }
 
+# M9 fix — POST a single settings patch to the running dashboard.
+# Without this, `vdm config <key> <val>` and the dashboard's settings
+# UI both write to ~/.claude/account-switcher/config.json from different
+# processes with no shared lock — a simultaneous CLI write and UI save
+# can interleave at the python `json.load` / `os.replace` boundary and
+# clobber one of the two changes (last-writer-wins, no merge).
+#
+# Solution: when the dashboard is reachable, the CLI POSTs to
+# /api/settings and lets the dashboard's own _settings_lock be the
+# canonical writer (atomicWriteFileSync runs through that lock). The
+# dashboard also broadcasts the change to live UI clients in the same
+# trip. Falls through to the local atomic write only when the dashboard
+# is NOT running — that's when the CLI is the de-facto sole writer.
+#
+# Args: <key> <type> <raw_value>
+#   type = bool | string | number
+#   raw_value for bool is the literal text "True" or "False"; for
+#   number is the integer literal; for string is the value directly.
+# Returns: 0 if dashboard accepted the patch (HTTP 2xx), non-zero
+#          otherwise (curl missing, dashboard down, key not accepted,
+#          HTTP error). Caller falls back to the local atomic write on
+#          non-zero so the user's setting still lands somewhere.
+_post_settings_to_dashboard() {
+  local key="$1" type="$2" raw="$3"
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  # Quick reachability check. -m 2 keeps the fall-through fast for an
+  # offline dashboard so the user never feels a "vdm config" hang.
+  if ! curl -s --max-time 2 -o /dev/null \
+       "http://localhost:$DASHBOARD_PORT/health"; then
+    return 1
+  fi
+  # Map the few stored-key → API-key aliases. The API accepts a smaller
+  # set than what the CLI / config.json store. Keep this list in sync with
+  # the `if (typeof patch.<key> ...)` block in dashboard.mjs's
+  # /api/settings POST handler.
+  local api_key="$key"
+  case "$key" in
+    tokenUsageMaxAgeDays) api_key="tokenUsageMaxAge" ;;
+  esac
+  # Build typed JSON via python3 so booleans / numbers / strings serialise
+  # correctly (bash heredoc string concatenation would mangle bools as
+  # "true"/"false" string literals — the API would silently no-op).
+  local payload
+  payload="$(python3 -c '
+import json, sys
+key = sys.argv[1]
+typ = sys.argv[2]
+raw = sys.argv[3]
+if typ == "bool":
+    val = (raw == "True")
+elif typ == "number":
+    val = int(raw)
+else:
+    val = raw
+print(json.dumps({key: val}))
+' "$api_key" "$type" "$raw" 2>/dev/null)" || return 1
+  [[ -z "$payload" ]] && return 1
+  local code
+  code="$(curl -s --max-time 5 \
+      -o /dev/null -w '%{http_code}' \
+      -X POST -H 'Content-Type: application/json' \
+      -d "$payload" \
+      "http://localhost:$DASHBOARD_PORT/api/settings" 2>/dev/null || echo '000')"
+  [[ "$code" =~ ^2[0-9][0-9]$ ]]
+}
+
 set_config_value() {
   local key="$1"
   local value="$2"
+  # M9 fix — prefer dashboard's lock when it's running.
+  if _post_settings_to_dashboard "$key" bool "$value"; then
+    return 0
+  fi
   # `$value` for booleans is the literal text "True" or "False" (validated
   # by cmd_config). We pass it as a string and convert it inside python so
   # `$value` can never be interpolated as raw python code.
@@ -419,6 +490,10 @@ set_config_value() {
   # We DO NOT swallow stderr — a write failure (read-only FS, no
   # space, permissions) must reach the user, not silently drop their
   # setting change.
+  #
+  # NOTE: this local-write path races the dashboard's own writes when both
+  # are running. The dashboard-POST branch above is the canonical writer
+  # when the dashboard is up; this branch is the offline fallback only.
   python3 -c '
 import json, os, sys
 config_file = sys.argv[1]
@@ -448,6 +523,10 @@ print(json.load(sys.stdin).get(sys.argv[1], ""))
 set_config_string() {
   local key="$1"
   local value="$2"
+  # M9 fix — see set_config_value.
+  if _post_settings_to_dashboard "$key" string "$value"; then
+    return 0
+  fi
   # Atomic + surfaced errors — see set_config_value for the rationale.
   python3 -c '
 import json, os, sys
@@ -470,6 +549,10 @@ os.replace(tmp, config_file)
 set_config_number() {
   local key="$1"
   local value="$2"
+  # M9 fix — see set_config_value.
+  if _post_settings_to_dashboard "$key" number "$value"; then
+    return 0
+  fi
   # Atomic + surfaced errors — see set_config_value.
   python3 -c '
 import json, os, sys

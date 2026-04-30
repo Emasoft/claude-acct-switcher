@@ -143,9 +143,26 @@ echo ""
 # under a running process can corrupt half-written state files. Always
 # clear the slate first. Kill is idempotent and cmdline-validated (only
 # signals processes whose argv contains "dashboard.mjs") so it can't
-# snipe an unrelated listener. Honour CSW_PORT / CSW_PROXY_PORT.
-_DASH_PORT_DEFAULT="${CSW_PORT:-3333}"
-_PROXY_PORT_DEFAULT="${CSW_PROXY_PORT:-3334}"
+# snipe an unrelated listener.
+#
+# H6 fix — port resolution priority is config.json > env > default. Without
+# the config.json read here, a user who changed `port` / `proxyPort` via
+# the dashboard UI (which persists into ~/.claude/account-switcher/config.json)
+# but did NOT set CSW_PORT in their shell would fall through to the 3333/3334
+# defaults — _kill_running_vdm would scan the wrong ports and the live
+# dashboard would survive while we rewrite its files underneath. Mirror
+# the order used by the rc-snippet (config → env → default) for parity.
+_resolve_install_ports() {
+  local cfg="$INSTALL_DIR/config.json"
+  local _cfg_dash="" _cfg_proxy=""
+  if [[ -f "$cfg" ]]; then
+    _cfg_dash="$(_json_get_int "$cfg" port 2>/dev/null || true)"
+    _cfg_proxy="$(_json_get_int "$cfg" proxyPort 2>/dev/null || true)"
+  fi
+  _DASH_PORT_DEFAULT="${_cfg_dash:-${CSW_PORT:-3333}}"
+  _PROXY_PORT_DEFAULT="${_cfg_proxy:-${CSW_PROXY_PORT:-3334}}"
+}
+_resolve_install_ports
 if _kill_running_vdm "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"; then
   echo -e "  ${YELLOW}!${NC} Stopped a previously-running vdm dashboard/proxy."
 fi
@@ -247,8 +264,10 @@ echo ""
 # installs, malformed config, dangling symlinks, port conflicts, and
 # env-var bypasses BEFORE we modify anything on disk. Errors block;
 # warnings proceed.
-_DASH_PORT_DEFAULT="${CSW_PORT:-3333}"
-_PROXY_PORT_DEFAULT="${CSW_PROXY_PORT:-3334}"
+# H6 fix — re-resolve via the same config-json-first helper so detection
+# scans the ports the dashboard actually listens on (not the env/default
+# pair) when the user persisted custom ports via the UI.
+_resolve_install_ports
 
 if [[ "$SKIP_DETECT" != "true" ]]; then
   echo -e "  ${BOLD}Running pre-flight checks...${NC}"
@@ -333,10 +352,37 @@ mkdir -p "$INSTALL_DIR/accounts"
 
 # Track every newly-created file so a failure rolls them back.
 _NEW_FILES=()
+# M7 fix — snapshot directory for upgrade rollback. Before EACH
+# _install_atomic on a pre-existing file, we copy the OLD bytes here.
+# A SIGKILL between two _atomic_install calls would otherwise leave a
+# version-mismatched install (e.g. new dashboard.mjs + old lib.mjs)
+# that boots, fails on a missing helper, and looks like vdm corruption.
+# On failure (`_INSTALL_OK != 1`) we restore each snapshotted file via
+# _atomic_replace so the recovered state is itself crash-safe.
+# On success the dir is removed.
+_ROLLBACK_DIR="$INSTALL_DIR/.vdm-rollback"
+_SNAPSHOTTED_FILES=()
+# Tidy any leftover from a previous interrupted run BEFORE we use it.
+rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
 _install_atomic() {
   local src="$1" dst="$2" mode="${3:-644}"
   local was_present=0
   [[ -e "$dst" ]] && was_present=1
+  # M7 fix — snapshot the existing file before overwriting. Use a flat
+  # filename (basename) since every install destination is unique within
+  # $INSTALL_DIR's top level. Snapshot creation ITSELF is best-effort:
+  # if it fails we surface and abort BEFORE writing the new file, so a
+  # disk-full failure leaves the existing install intact.
+  if [[ $was_present -eq 1 ]]; then
+    mkdir -p "$_ROLLBACK_DIR" 2>/dev/null || true
+    local _snap="$_ROLLBACK_DIR/$(basename "$dst")"
+    if cp -p "$dst" "$_snap" 2>/dev/null; then
+      _SNAPSHOTTED_FILES+=("$dst")
+    else
+      echo -e "  ${RED}!${NC} Failed to snapshot $dst for rollback (disk full?). Aborting before overwrite." >&2
+      return 1
+    fi
+  fi
   if ! _atomic_install "$src" "$dst" "$mode"; then
     echo -e "  ${RED}!${NC} Failed to install $dst" >&2
     return 1
@@ -350,7 +396,25 @@ _install_atomic() {
 # failed first install leaves NO half-written files behind, while a
 # failed upgrade preserves the old version of any file that already
 # existed. Never destroys user data.
+#
+# M7 fix — rollback now restores each snapshotted file via _atomic_replace,
+# so the recovered install is itself crash-safe (a SIGKILL during the
+# rollback restores up to the last completed _atomic_replace, never a
+# half-written file). Without snapshots, rolling back was impossible for
+# pre-existing files — leaving a version-mismatched install instead.
 _rollback_install_files() {
+  # Restore snapshotted files first (LIFO so the most recent change
+  # backs out cleanly), THEN remove brand-new files.
+  if (( ${#_SNAPSHOTTED_FILES[@]} > 0 )); then
+    local i
+    for (( i=${#_SNAPSHOTTED_FILES[@]}-1; i>=0; i-- )); do
+      local dst="${_SNAPSHOTTED_FILES[$i]}"
+      local snap="$_ROLLBACK_DIR/$(basename "$dst")"
+      if [[ -f "$snap" ]]; then
+        _atomic_replace "$snap" "$dst" 2>/dev/null || true
+      fi
+    done
+  fi
   # Guard the array expansion under bash 3.2 (stock macOS), which
   # treats `${empty_arr[@]}` as an unbound variable under `set -u`.
   # Bash 4.4+ tolerates it; we run on whatever bash the user has.
@@ -360,10 +424,16 @@ _rollback_install_files() {
       rm -f "$f" 2>/dev/null || true
     done
   fi
+  rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
 }
 _register_cleanup '
 if [[ "${_INSTALL_OK:-0}" != "1" ]]; then
   _rollback_install_files
+else
+  # M7 fix — clean snapshots on success. Done in the same cleanup
+  # registration so we never leak the dir even if the script exits
+  # via a non-error path between the success marker and EXIT trap.
+  rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
 fi
 '
 

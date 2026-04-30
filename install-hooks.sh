@@ -37,8 +37,38 @@ if ! declare -f _atomic_replace >/dev/null 2>&1; then
   }
 fi
 
-# Detect dashboard port (respect CSW_PORT env var)
-_VDM_PORT="${CSW_PORT:-3333}"
+# M8 fix — port resolution priority is config.json > env > default.
+# Reading $CSW_PORT alone is wrong because vdm's self-heal block re-sources
+# this file WITHOUT exporting CSW_PORT, even when the user persisted a
+# custom dashboard port via the UI (which writes to ~/.claude/account-switcher/
+# config.json). The resulting hooks would always point at port 3333, but
+# the live dashboard is listening on whatever port the user picked — every
+# UserPromptSubmit / Stop / etc. would fire ECONNREFUSED into the void.
+# The lookup is best-effort: if python3 is missing or config.json is
+# malformed, fall through to env / default. Match the rc-snippet's order
+# so the keyset of "what controls vdm's port" stays consistent across
+# every entrypoint (rc-snippet → install.sh → install-hooks.sh).
+_resolve_vdm_port() {
+  local cfg="$HOME/.claude/account-switcher/config.json"
+  local from_cfg=""
+  if [[ -z "${CSW_PORT:-}" ]] \
+     && [[ -r "$cfg" ]] \
+     && command -v python3 >/dev/null 2>&1; then
+    # Inline python — _json_get_int from lib-install.sh may not be sourced
+    # yet (this script is also sourced from `vdm` directly without the lib).
+    from_cfg="$(python3 -c '
+import json, sys
+try:
+  d = json.load(open(sys.argv[1]))
+  v = d.get("port")
+  print(v if isinstance(v, int) else "")
+except Exception:
+  pass
+' "$cfg" 2>/dev/null || true)"
+  fi
+  printf '%s' "${from_cfg:-${CSW_PORT:-3333}}"
+}
+_VDM_PORT="$(_resolve_vdm_port)"
 _VDM_HOOKS_MARKER="# vdm-token-usage"
 _VDM_HOOKS_PATH_MARKER=".vdm-set-hooks-path"
 

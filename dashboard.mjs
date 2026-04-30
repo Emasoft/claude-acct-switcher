@@ -4377,6 +4377,23 @@ function renderHTML() {
           <input type="checkbox" class="sw" id="toggle-session-monitor" onchange="toggleSetting('sessionMonitor', this.checked)">
         </div>
       </div>
+
+      <!-- M19 fix — UI toggle for perToolAttribution. CLAUDE.md promised
+           this knob alongside the CLI vdm config per-tool-attribution
+           on/off; the dashboard toggle was never added. Wired to
+           /api/settings POST with key perToolAttribution and a boolean
+           value, mirroring the commit-tokens / session-monitor pattern.
+           Server-side handler already exists at line 1873. -->
+      <div class="config-section">
+        <div class="config-section-title">Per-Tool Attribution <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Track tokens per tool call</div>
+            <div class="config-desc">Attribute token usage to individual tool calls (Read, Edit, Bash, etc.) via the PostToolBatch hook. Off by default because it materially increases the size of token-usage.json.</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-per-tool" onchange="toggleSetting('perToolAttribution', this.checked)">
+        </div>
+      </div>
     </div>
   </div>
 
@@ -5614,6 +5631,20 @@ function evtMsg(e) {
     case 'upgrade': return 'Upgraded to <b>' + h(e.to||'?') + '</b>';
     case 'refresh-failed': return '<b>' + h(e.account||'?') + '</b> refresh failed: ' + h(e.error||'unknown');
     case 'token-refreshed': return '<b>' + h(e.account||'?') + '</b> token refreshed';
+    // M14 fix — explicit cases for Phase D/E/G/H event types added after
+    // the original taxonomy. Without these the default case shows e.msg
+    // (already populated via logActivity string coercion), but a labeled
+    // prefix makes the activity feed scannable. Every dynamic field
+    // routes through h(...) so the existing source-grep XSS regression
+    // (test/lib.test.mjs describe XSS regression evtMsg) keeps passing.
+    case 'worktree_create': return '<b>Worktree</b> ' + h(e.msg || 'created');
+    case 'worktree_remove': return '<b>Worktree</b> ' + h(e.msg || 'removed');
+    case 'task_created': return '<b>Task</b> ' + h(e.msg || 'created');
+    case 'task_completed': return '<b>Task</b> ' + h(e.msg || 'completed');
+    case 'auth_success': return '<b>Auth</b> ' + h(e.msg || 'success');
+    case 'config_change': return '<b>Config</b> ' + h(e.msg || 'changed');
+    case 'account-removed': return 'Removed account <b>' + h(e.name || '?') + '</b>';
+    case 'account-prefs-changed': return '<b>Prefs</b> ' + h(e.msg || 'updated');
     // C4 fallthrough — events whose detail came in as a string get a .msg
     // field via logActivity's coercion. Surface that to the user. If only
     // .type is present (no msg), keep the legacy behavior (h(e.type)).
@@ -5745,6 +5776,9 @@ async function loadSettingsUI() {
     document.getElementById('toggle-commit-tokens').checked = !!s.commitTokenUsage;
     // Session monitor
     document.getElementById('toggle-session-monitor').checked = !!s.sessionMonitor;
+    // M19 fix — Per-tool attribution toggle. Mirrors the toggle-commit-tokens
+    // pattern; the input id is read by document.getElementById('toggle-per-tool').
+    document.getElementById('toggle-per-tool').checked = !!s.perToolAttribution;
   } catch {}
 }
 
@@ -5781,6 +5815,8 @@ async function toggleSetting(key, value) {
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
       serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
       commitTokenUsage: value ? 'Commit token trailer enabled' : 'Commit token trailer disabled',
+      // M19 fix — toast for the new perToolAttribution toggle.
+      perToolAttribution: value ? 'Per-tool attribution enabled' : 'Per-tool attribution disabled',
     };
     showToast(msgs[key] || (key + ' = ' + value));
     // Show/hide serialize delay control
@@ -6918,7 +6954,14 @@ function clearLogs() {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // M13 fix — also escape single and double quotes so the helper is
+  // safe for attribute interpolation, not just text-content. Currently
+  // every call site is in text position, but one attribute use away
+  // from XSS without these two replacements. The redundant cousin
+  // escHtml at line ~5912 already escapes all 5 chars; aligning
+  // escapeHtml with it removes a we-have-two-helpers footgun.
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ── Session Monitor ──
