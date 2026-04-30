@@ -300,6 +300,74 @@ _safe_kill_pid() {
   kill "-$sig" "$pid" 2>/dev/null
 }
 
+# _kill_running_vdm <dash_port> <proxy_port>
+# Idempotent best-effort kill of any vdm dashboard/proxy process. Used by
+# both install.sh (to clear the slate before laying down new files) and
+# uninstall.sh (to stop the dashboard before deleting its install dir).
+#
+# Returns 0 if anything was stopped, 1 if nothing matched.
+#
+# Strategy:
+#   1. Graceful via `vdm dashboard stop` if the canonical CLI is on disk
+#      (uses the PID file when present, atomic-renames any in-flight state
+#      writes before exit).
+#   2. Cmdline-validated SIGTERM to anything bound to the dashboard or
+#      proxy port whose argv contains "dashboard.mjs". _safe_kill_pid
+#      verifies the cmdline BEFORE signalling — guards against PID reuse
+#      on a busy host between the lsof query and the kill.
+#   3. Pattern-based fallback for vdm-shaped processes that are not
+#      currently bound to a port (starting up, retrying after EADDRINUSE,
+#      stuck during teardown). Two pkill patterns:
+#        - the canonical install path
+#        - `node -e ... dashboard.mjs ...` smoke-test invocations from
+#          a source-repo checkout (which lack the install-path string)
+#   4. Drain ≤5s; SIGKILL anything still bound (cmdline-validated even
+#      at SIGKILL stage so a recycled PID can't be sniped).
+_kill_running_vdm() {
+  local dash_port="${1:-3333}"
+  local proxy_port="${2:-3334}"
+  local stopped=false port pid
+
+  if [[ -x "$HOME/.claude/account-switcher/vdm" ]]; then
+    "$HOME/.claude/account-switcher/vdm" dashboard stop 2>/dev/null && stopped=true || true
+  fi
+
+  for port in "$dash_port" "$proxy_port"; do
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      _safe_kill_pid "$pid" "dashboard.mjs" TERM && stopped=true || true
+    done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+  done
+
+  if pkill -TERM -f '\.claude/account-switcher/dashboard\.mjs' 2>/dev/null; then
+    stopped=true
+  fi
+  if pkill -TERM -f 'node.*-e.*dashboard\.mjs' 2>/dev/null; then
+    stopped=true
+  fi
+
+  if [[ "$stopped" == "true" ]]; then
+    local _i listeners pids
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      listeners=""
+      for port in "$dash_port" "$proxy_port"; do
+        pids="$(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)"
+        [[ -n "$pids" ]] && listeners="$listeners $pids"
+      done
+      [[ -z "$listeners" ]] && break
+      sleep 0.5
+    done
+    for port in "$dash_port" "$proxy_port"; do
+      while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        _safe_kill_pid "$pid" "dashboard.mjs" KILL || true
+      done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+    done
+    return 0
+  fi
+  return 1
+}
+
 # ─────────────────────────────────────────────────────────
 # JSON helpers — settings.json validation and surgical edits.
 # ─────────────────────────────────────────────────────────

@@ -135,6 +135,21 @@ if [[ "$NON_INTERACTIVE" == "true" ]]; then
 fi
 echo ""
 
+# ── Stop any previously-running dashboard/proxy ──
+# Re-installing while the old dashboard is still serving on 3333/3334 is
+# the classic "uninstall didn't take" complaint — the file install would
+# succeed but the user keeps seeing the old behaviour because the old
+# Node process holds the port. Worse, ripping dashboard.mjs out from
+# under a running process can corrupt half-written state files. Always
+# clear the slate first. Kill is idempotent and cmdline-validated (only
+# signals processes whose argv contains "dashboard.mjs") so it can't
+# snipe an unrelated listener. Honour CSW_PORT / CSW_PROXY_PORT.
+_DASH_PORT_DEFAULT="${CSW_PORT:-3333}"
+_PROXY_PORT_DEFAULT="${CSW_PROXY_PORT:-3334}"
+if _kill_running_vdm "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"; then
+  echo -e "  ${YELLOW}!${NC} Stopped a previously-running vdm dashboard/proxy."
+fi
+
 # ── Check prerequisites ──
 
 # macOS-only check first — vdm uses the macOS Keychain, so there's no

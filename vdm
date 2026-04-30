@@ -50,7 +50,17 @@ mkdir -p "$ACCOUNTS_DIR"
 # (handles upgrades from versions that didn't ship install-hooks.sh)
 # ─────────────────────────────────────────────────────────
 
-if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+# Self-healing hook re-install ONLY when running from the CANONICAL install
+# location ($HOME/.claude/account-switcher) AND the install dashboard.mjs
+# exists. Without these guards, running `./vdm` directly from a source-repo
+# checkout (during dev, after uninstall, or to test a release tarball) would
+# silently re-add hooks to ~/.claude/settings.json — resurrecting entries
+# the user just deleted via uninstall.sh and producing ECONNREFUSED on every
+# UserPromptSubmit once the dashboard process is gone. Self-heal is wanted
+# ONLY in the context where the install is supposed to be live.
+if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]] \
+   && [[ "$SCRIPT_DIR" == "$HOME/.claude/account-switcher" ]] \
+   && [[ -f "$SCRIPT_DIR/dashboard.mjs" ]]; then
   # Opt-out sentinel: a user who deliberately removed the token-tracking
   # hooks (perhaps because they're noisy or they're testing alternative
   # tracking) can place this file to keep them removed across vdm

@@ -256,85 +256,16 @@ fi
 echo ""
 
 # ── 1. Stop running processes ──
-
-stopped=false
-
 # Honour CSW_PORT / CSW_PROXY_PORT overrides — a user who installed with
 # custom ports also runs with custom ports, so hardcoding 3333/3334 here
 # would silently fail to kill the listeners and leave stale processes.
-# The defaults match install.sh.
+# Defaults match install.sh. The actual kill logic (graceful → port-bound
+# SIGTERM → cmdline pkill → drain → SIGKILL) lives in lib-install.sh's
+# _kill_running_vdm so install.sh and uninstall.sh share one implementation.
 _DASH_PORT="${CSW_PORT:-3333}"
 _PROXY_PORT="${CSW_PROXY_PORT:-3334}"
 
-# Try vdm dashboard stop (graceful — uses the PID file when present)
-if [[ -x "$INSTALL_DIR/vdm" ]]; then
-  "$INSTALL_DIR/vdm" dashboard stop 2>/dev/null && stopped=true || true
-fi
-
-# Fallback: kill by port. Iterate over ALL listener PIDs (not just the
-# first), because port-sharing or a stuck child can leave more than one
-# process bound. `lsof -t` is one PID per line — read it line-by-line.
-# We use _safe_kill_pid which CONFIRMS the PID's cmdline contains
-# "dashboard.mjs" before signalling — guards against PID reuse on a
-# busy machine where the kernel could recycle the dashboard's PID to
-# an unrelated process between the lsof and the kill.
-# SIGTERM first; the polite exit lets the dashboard atomic-rename any
-# in-flight state writes (account-state.json, utilization-history.json,
-# etc.) before we yank the install dir from under it.
-if [[ "$stopped" != "true" ]]; then
-  for port in "$_DASH_PORT" "$_PROXY_PORT"; do
-    while IFS= read -r pid; do
-      [[ -z "$pid" ]] && continue
-      _safe_kill_pid "$pid" "dashboard.mjs" TERM && stopped=true || true
-    done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
-  done
-fi
-
-# Fallback: kill by process name. pkill returns 0 when something matched,
-# 1 when nothing did — flip that into the `stopped` flag so we don't lie
-# to the user about whether anything was actually killed. The pattern is
-# already tight enough (`account-switcher` AND `dashboard`) that PID
-# reuse won't bite — pkill matches by current cmdline at signal time.
-if [[ "$stopped" != "true" ]]; then
-  if pkill -TERM -f "node.*account-switcher.*dashboard" 2>/dev/null; then
-    stopped=true
-  fi
-fi
-
-# If we sent SIGTERM, give the process up to ~5s to release the listening
-# socket, then SIGKILL anything still bound. Without this, a stuck Node
-# process (mid-libcurl, deadlocked, blocked on disk IO) survives the
-# polite signal — and then `rm -rf $INSTALL_DIR` below pulls dashboard.mjs
-# out from under a still-running process, which leaks PID and may corrupt
-# state files mid-write. We poll instead of `sleep 5` blindly so the fast
-# path stays fast. Bumped from 3s to 5s because slow disks (Time Machine
-# backup running, Spotlight reindex) can stretch the dashboard's
-# atomic-rename writes past 3s.
-if [[ "$stopped" == "true" ]]; then
-  for _drain in 1 2 3 4 5 6 7 8 9 10; do
-    local_listeners=""
-    for port in "$_DASH_PORT" "$_PROXY_PORT"; do
-      pids=$(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
-      [[ -n "$pids" ]] && local_listeners="$local_listeners $pids"
-    done
-    [[ -z "$local_listeners" ]] && break
-    sleep 0.5
-  done
-  # Anything still bound after ~5s gets the hard kill. We still verify
-  # the cmdline before SIGKILL — even at this stage, sniping the wrong
-  # PID is unacceptable.
-  for port in "$_DASH_PORT" "$_PROXY_PORT"; do
-    while IFS= read -r pid; do
-      [[ -z "$pid" ]] && continue
-      _safe_kill_pid "$pid" "dashboard.mjs" KILL || true
-    done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
-  done
-fi
-
-# Only claim success if at least one of the methods above actually killed
-# something. Previously this echo printed unconditionally and led users to
-# think the dashboard had been stopped when in fact every fallback no-oped.
-if [[ "$stopped" == "true" ]]; then
+if _kill_running_vdm "$_DASH_PORT" "$_PROXY_PORT"; then
   echo -e "  ${GREEN}✓${NC} Stopped dashboard/proxy"
 else
   echo -e "  ${DIM}No running dashboard/proxy found${NC}"
@@ -741,25 +672,47 @@ if (( ${#ORPHAN_BACKUPS_DIRS[@]} > 0 )); then
 fi
 
 # ── 8. LaunchAgent (auto-cleanup if user agrees) ──
-LAUNCHAGENT_PLIST="$HOME/Library/LaunchAgents/com.loekj.vdm.dashboard.plist"
-if [[ -f "$LAUNCHAGENT_PLIST" ]]; then
+# Scan every plist that matches a vdm-shaped name pattern, not just the
+# canonical com.loekj.vdm.dashboard.plist. Old installs, forks, or
+# user-authored variants may use a different label (com.emasoft.vdm.plist,
+# claude-account-switcher.plist, etc.) and a single hardcoded path would
+# leave them behind on every uninstall. Each candidate is presented for
+# removal individually so the user can keep one and discard another if
+# they have multiple.
+LAUNCHAGENT_CANDIDATES=()
+for _plist in "$HOME/Library/LaunchAgents/"*; do
+  [[ -f "$_plist" ]] || continue
+  _bn="$(basename "$_plist")"
+  case "$_bn" in
+    *vdm*.plist|*claude*account*switcher*.plist|*claude-acct-switcher*.plist)
+      LAUNCHAGENT_CANDIDATES+=("$_plist")
+      ;;
+  esac
+done
+
+if (( ${#LAUNCHAGENT_CANDIDATES[@]} > 0 )); then
   echo ""
-  echo -e "  ${YELLOW}LaunchAgent detected:${NC}"
-  echo -e "    ${DIM}$LAUNCHAGENT_PLIST${NC}"
-  if [[ "$NON_INTERACTIVE" == "true" ]]; then
-    rm_la="$([[ "$REMOVE_LAUNCHAGENT" == "true" ]] && echo y || echo n)"
-  else
-    rm_la=""
-    read -rp "  Unload + remove this LaunchAgent? [y/N] " rm_la || rm_la=""
-  fi
-  if [[ "$rm_la" == "y" || "$rm_la" == "Y" ]]; then
-    launchctl bootout "gui/$(id -u)" "$LAUNCHAGENT_PLIST" 2>/dev/null || true
-    rm -f "$LAUNCHAGENT_PLIST" && echo -e "    ${GREEN}✓${NC} LaunchAgent removed" || true
-  else
-    echo -e "    ${DIM}LaunchAgent kept. Remove later with:${NC}"
-    echo -e "      ${DIM}launchctl bootout gui/\$(id -u) \"$LAUNCHAGENT_PLIST\" 2>/dev/null${NC}"
-    echo -e "      ${DIM}rm -f \"$LAUNCHAGENT_PLIST\"${NC}"
-  fi
+  echo -e "  ${YELLOW}LaunchAgent(s) detected (${#LAUNCHAGENT_CANDIDATES[@]}):${NC}"
+  for _plist in "${LAUNCHAGENT_CANDIDATES[@]}"; do
+    echo -e "    ${DIM}$_plist${NC}"
+  done
+  for _plist in "${LAUNCHAGENT_CANDIDATES[@]}"; do
+    _bn="$(basename "$_plist")"
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      rm_la="$([[ "$REMOVE_LAUNCHAGENT" == "true" ]] && echo y || echo n)"
+    else
+      rm_la=""
+      read -rp "  Unload + remove ${_bn}? [y/N] " rm_la || rm_la=""
+    fi
+    if [[ "$rm_la" == "y" || "$rm_la" == "Y" ]]; then
+      launchctl bootout "gui/$(id -u)" "$_plist" 2>/dev/null || true
+      rm -f "$_plist" && echo -e "    ${GREEN}✓${NC} LaunchAgent removed: ${DIM}$_bn${NC}" || true
+    else
+      echo -e "    ${DIM}LaunchAgent kept: $_plist${NC}"
+      echo -e "      ${DIM}launchctl bootout gui/\$(id -u) \"$_plist\" 2>/dev/null${NC}"
+      echo -e "      ${DIM}rm -f \"$_plist\"${NC}"
+    fi
+  done
 fi
 
 # ── 9. Final verification audit ──
