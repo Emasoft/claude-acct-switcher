@@ -9,7 +9,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
-import { Transform } from 'node:stream';
+import { Transform, pipeline as _streamPipeline } from 'node:stream';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -539,6 +539,7 @@ import {
   createPerAccountLock,
   createSemaphore,
   createSerializationQueue,
+  gcAccountSlots,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
   clampViewerState,
@@ -7744,16 +7745,70 @@ function buildForwardHeaders(originalHeaders, token) {
 
 // ── Forward request with timeout ──
 
+// Phase F audit C2 — custom https.Agent with bounded keepAlive policy.
+// Node's default `https.globalAgent` has unbounded keepAlive pool and no
+// idle timeout. Anthropic's load balancers terminate idle TLS connections
+// after ~60-120s with TCP RST or TLS close-notify; reusing such a stale
+// socket triggers `socket.on('close')` WITHOUT raising `request.on('error')`
+// (Node treats the TLS close-notify as graceful since no app data was lost).
+// Combined with the missing close-event reject sinks below, this used to
+// produce permits that leaked forever. Bounded pool + 60s idle timeout +
+// scheduling:'fifo' makes stale-socket reuse rare AND survivable.
+const _upstreamAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 100,
+  maxFreeSockets: 8,
+  scheduling: 'fifo',
+  timeout: 60_000,   // close idle sockets after 60s
+});
+
 function _forwardToAnthropicRaw(method, path, headers, body, timeout = PROXY_TIMEOUT) {
   return new Promise((resolve, reject) => {
+    // Phase F audit A1 — idempotent settle wrapper. The previous version
+    // wired `error` and `timeout` as the only reject sinks, missing the
+    // `close` events on both the request itself AND the underlying socket.
+    // When a recycled keepAlive socket was torn down by TLS close-notify or
+    // OS keepalive timeout, neither error nor timeout fired — the Promise
+    // hung forever, the per-account permit leaked, and the slot eventually
+    // wedged at inflight=8 (audit K1). Three reject sinks now cover every
+    // termination path; settle() guards against duplicate settle calls
+    // (e.g. error after close).
+    let settled = false;
+    const settle = (fn) => (...args) => {
+      if (settled) return;
+      settled = true;
+      fn(...args);
+    };
+    const _resolve = settle(resolve);
+    const _reject  = settle(reject);
     const req = https.request({
       hostname: 'api.anthropic.com',
       port: 443,
       path, method, headers,
       timeout,
-    }, resolve);
-    req.on('timeout', () => { req.destroy(new Error('upstream timeout')); });
-    req.on('error', reject);
+      agent: _upstreamAgent,
+    }, _resolve);
+    req.on('timeout', () => {
+      req.destroy(new Error('upstream timeout'));
+      _reject(new Error('upstream timeout'));
+    });
+    req.on('error', _reject);
+    // request 'close' fires when the request is fully sent and the response
+    // is fully consumed OR when the request is destroyed. If neither resolve
+    // (response received) nor error fired before close, the socket was torn
+    // down without a response — reject so the caller's permit can release.
+    req.on('close', () => {
+      _reject(new Error('upstream socket closed before response'));
+    });
+    // Belt-and-braces: also reject on the underlying TCP/TLS socket close.
+    // For pooled keepAlive sockets recycled stale, this is the ONLY event
+    // that fires when the peer drops the connection mid-write.
+    req.on('socket', (sock) => {
+      sock.on('close', () => {
+        _reject(new Error('upstream tcp socket closed'));
+      });
+    });
     if (body.length) req.write(body);
     req.end();
   });
@@ -7853,8 +7908,24 @@ async function forwardToAnthropic(method, path, headers, body, timeout = PROXY_T
   const release = () => {
     if (released) return;
     released = true;
+    if (watchdog) clearTimeout(watchdog);
     releaseAccountPermit(fp);
   };
+  // Phase F audit A1 — defensive watchdog. Even with the new close-event
+  // reject sinks in _forwardToAnthropicRaw and the end/error/close listeners
+  // wired below, an exotic stream state (mid-flight server bug, malformed
+  // chunked encoding, kernel TCP weirdness) could still in principle leave
+  // the permit pinned. The watchdog fires PROXY_TIMEOUT + 5s after permit
+  // acquisition and force-releases. This is a backstop, not the primary
+  // mechanism — if it ever fires, that's a bug worth investigating.
+  const watchdog = setTimeout(() => {
+    if (!released) {
+      log('warn', `forwardToAnthropic watchdog: force-releasing permit for fp=${fp.slice(0, 8)} after ${(timeout + 5000) / 1000}s`);
+      release();
+    }
+  }, timeout + 5000);
+  // Don't keep the process alive solely for this timer (e.g. on shutdown).
+  if (typeof watchdog.unref === 'function') watchdog.unref();
   try {
     const res = await _forwardToAnthropicRaw(method, path, headers, body, timeout);
     // Hold the permit until the response stream finishes. The first of
@@ -7863,6 +7934,7 @@ async function forwardToAnthropic(method, path, headers, body, timeout = PROXY_T
     res.once('end', release);
     res.once('error', release);
     res.once('close', release);
+    res.once('aborted', release);  // Phase F audit A4 — pre-Node-13 abort path
     return res;
   } catch (e) {
     // _forwardToAnthropicRaw rejected before headers — release immediately
@@ -7879,6 +7951,22 @@ function getAccountSlotStats() {
   }
   return out;
 }
+
+// Phase F audit K1 — periodic GC sweep of `_accountSlots`. Runs every 5
+// minutes; deletes entries that have been idle for >1 hour. Catches
+// retired fingerprints that migrateAccountState couldn't drop synchronously
+// (because they had in-flight requests at the moment of migration). Keeps
+// the Map size bounded over long uptimes. Pure logic lives in lib.mjs's
+// gcAccountSlots() for unit-testability; this is just the wiring.
+const _accountSlotsGcTimer = setInterval(() => {
+  try {
+    const purged = gcAccountSlots(_accountSlots);
+    if (purged > 0) log('debug', `GC: purged ${purged} idle account slot(s)`);
+  } catch (e) {
+    log('warn', `_accountSlots GC sweep error: ${e.message}`);
+  }
+}, 5 * 60_000);
+if (typeof _accountSlotsGcTimer.unref === 'function') _accountSlotsGcTimer.unref();
 
 // Drain a response and return the body (for error responses).
 // Destroys the stream on timeout to prevent partial-data races.
@@ -8196,6 +8284,19 @@ function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
   if (cachedRate) {
     rateLimitCache.set(newFp, cachedRate);
     rateLimitCache.delete(oldFp);
+  }
+
+  // Phase F audit K1 — explicitly drop the old fingerprint's per-account
+  // limiter slot. Without this, every refresh creates a new fp keyed slot
+  // and the old slot leaks forever. Combined with leaked permits (audit A1),
+  // retired fingerprints accumulated with inflight>0 forever, eventually
+  // wedging the limiter and producing the "works for hours then breaks"
+  // ConnectionRefused symptom. Only safe to delete when inflight is 0 —
+  // if a refresh races with an in-flight request on the OLD token, drop
+  // the slot only when it drains (deferred delete via the GC sweep below).
+  const oldSlot = _accountSlots.get(oldFp);
+  if (oldSlot && oldSlot.inflight === 0 && oldSlot.waiters.length === 0) {
+    _accountSlots.delete(oldFp);
   }
 }
 
@@ -9739,13 +9840,21 @@ async function _runStreamingContinuation(cont, clientRes) {
   if (cont.kind === 'sse') {
     const { proxyRes, body, acctName } = cont;
     const extractor = createUsageExtractor();
-    proxyRes.pipe(extractor).pipe(clientRes);
+    // Phase F audit A2 — use stream.pipeline() for the SSE chain. The previous
+    // `proxyRes.pipe(extractor).pipe(clientRes)` + manual `extractor.on('end')`
+    // await had three race windows where the per-account permit (released
+    // on proxyRes.on('end'|'error'|'close')) could leak when the client
+    // aborted mid-stream. pipeline() guarantees that an error or close in
+    // any of the three streams propagates to the others via destroy(), so
+    // proxyRes is always destroyed when the chain ends — which fires its
+    // 'close' event and reliably releases the permit.
     await new Promise(resolve => {
-      let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
-      extractor.on('end', finish);
-      extractor.on('error', finish);
-      clientRes.on('close', finish);
+      _streamPipeline(proxyRes, extractor, clientRes, () => {
+        // Errors here are expected on client-abort; we don't surface them
+        // because headers were already sent. The permit-release wiring on
+        // proxyRes (in forwardToAnthropic) handles cleanup.
+        resolve();
+      });
     });
     recordUsage(extractor.getUsage(), acctName);
     setImmediate(() => {

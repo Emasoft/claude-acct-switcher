@@ -29,6 +29,7 @@ import {
   getEarliestReset,
   createSemaphore,
   createSerializationQueue,
+  gcAccountSlots,
   clampViewerState,
   VIEWER_STATE_MIN_WINDOW_MS,
   // Phase D — hook payload parsers and helpers
@@ -3433,6 +3434,81 @@ describe('createSerializationQueue — queue timeout', () => {
     release();
     await a;
     await b; // completes once a unblocks
+  });
+});
+
+describe('gcAccountSlots — purge idle slots (Phase F audit K1)', () => {
+  const makeSlot = (inflight = 0, waiters = [], lastDispatchAt = 0) =>
+    ({ inflight, waiters, lastDispatchAt });
+
+  it('returns 0 on empty/invalid map', () => {
+    assert.equal(gcAccountSlots(null), 0);
+    assert.equal(gcAccountSlots(undefined), 0);
+    assert.equal(gcAccountSlots(new Map()), 0);
+  });
+
+  it('purges slot with inflight=0, no waiters, idle past threshold', () => {
+    const m = new Map();
+    m.set('fp_old', makeSlot(0, [], 1000)); // dispatched at 1000
+    m.set('fp_new', makeSlot(1, [], 2000)); // still in-flight, must keep
+    const now = 1000 + 3600_001; // just past 1 hour
+    const purged = gcAccountSlots(m, now);
+    assert.equal(purged, 1);
+    assert.ok(!m.has('fp_old'), 'old slot must be deleted');
+    assert.ok(m.has('fp_new'), 'in-flight slot must be preserved');
+  });
+
+  it('keeps slots with active waiters even if inflight=0', () => {
+    const m = new Map();
+    m.set('fp_blocked', makeSlot(0, [() => {}], 1000));
+    const now = 1000 + 3600_001;
+    assert.equal(gcAccountSlots(m, now), 0);
+    assert.ok(m.has('fp_blocked'), 'slot with waiters must be preserved');
+  });
+
+  it('respects custom idleMs threshold', () => {
+    const m = new Map();
+    m.set('fp_recent', makeSlot(0, [], 1000));
+    // now=2000, idleMs=500 → idle 1000ms > threshold, purge
+    assert.equal(gcAccountSlots(m, 2000, 500), 1);
+    assert.ok(!m.has('fp_recent'));
+  });
+
+  it('does not purge slot whose lastDispatchAt is still within idle window', () => {
+    const m = new Map();
+    m.set('fp_active', makeSlot(0, [], 1000));
+    // now=1500, idleMs=1000 → idle 500ms < threshold, keep
+    assert.equal(gcAccountSlots(m, 1500, 1000), 0);
+    assert.ok(m.has('fp_active'));
+  });
+
+  it('mixed: purges only the eligible entries', () => {
+    const m = new Map();
+    m.set('fp_idle1', makeSlot(0, [], 0));
+    m.set('fp_idle2', makeSlot(0, [], 100));
+    m.set('fp_active', makeSlot(2, [], 0));      // inflight pinned
+    m.set('fp_recent', makeSlot(0, [], 999_999)); // recently used
+    const now = 1_000_000;
+    const idleMs = 100_000;
+    const purged = gcAccountSlots(m, now, idleMs);
+    assert.equal(purged, 2);
+    assert.ok(!m.has('fp_idle1'));
+    assert.ok(!m.has('fp_idle2'));
+    assert.ok(m.has('fp_active'));
+    assert.ok(m.has('fp_recent'));
+  });
+
+  it('skips malformed entries (defensive — no throws)', () => {
+    const m = new Map();
+    m.set('bad1', null);
+    m.set('bad2', { /* missing fields */ });
+    m.set('bad3', { inflight: 0, waiters: 'not-array', lastDispatchAt: 0 });
+    m.set('bad4', { inflight: 0, waiters: [], lastDispatchAt: 'wrong-type' });
+    const now = Date.now();
+    // No throw; nothing eligible.
+    assert.equal(gcAccountSlots(m, now), 0);
+    // Map still contains all entries (we only delete eligible ones).
+    assert.equal(m.size, 4);
   });
 });
 

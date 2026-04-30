@@ -1764,6 +1764,46 @@ export function parseOtlpMetrics(payload) {
 // completion callbacks firing in the same microtask cannot both fire
 // off a fresh dispatch. The timer is cleared and re-scheduled on each
 // state change.
+/**
+ * Garbage-collect idle account-slot Map entries.
+ *
+ * Phase F audit K1 — the per-account limiter slots Map (in dashboard.mjs)
+ * grows monotonically: every refresh creates a new fingerprint and the old
+ * fingerprint's slot is never deleted by the limiter itself. Combined with
+ * permit leaks (audit A1), retired fingerprints accumulate with inflight>0
+ * forever, eventually wedging the limiter and causing the "works for hours
+ * then breaks" ConnectionRefused symptom.
+ *
+ * `gcAccountSlots` is a pure sweep over the Map: for every entry where
+ *   inflight === 0 && waiters.length === 0 && (now - lastDispatchAt) > idleMs
+ * the entry is deleted. Returns the count of purged entries.
+ *
+ * Pure for testability — no side effects beyond mutating the passed-in Map.
+ *
+ * @param {Map<string, {inflight:number,waiters:Array,lastDispatchAt:number}>} slotsMap
+ * @param {number} [now=Date.now()]   - clock injection for tests
+ * @param {number} [idleMs=3600000]   - idle-eligible threshold (default 1h)
+ * @returns {number} count of purged entries
+ */
+export function gcAccountSlots(slotsMap, now = Date.now(), idleMs = 3600_000) {
+  if (!slotsMap || typeof slotsMap.entries !== 'function') return 0;
+  let purged = 0;
+  for (const [fp, s] of slotsMap) {
+    if (
+      s &&
+      s.inflight === 0 &&
+      Array.isArray(s.waiters) &&
+      s.waiters.length === 0 &&
+      typeof s.lastDispatchAt === 'number' &&
+      (now - s.lastDispatchAt) > idleMs
+    ) {
+      slotsMap.delete(fp);
+      purged++;
+    }
+  }
+  return purged;
+}
+
 export function createSerializationQueue(opts = {}) {
   const getMaxConcurrent = opts.getMaxConcurrent || (() => 1);
   const getDelayMs = opts.getDelayMs || (() => 0);
