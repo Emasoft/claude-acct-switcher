@@ -7804,10 +7804,19 @@ function _forwardToAnthropicRaw(method, path, headers, body, timeout = PROXY_TIM
     // Belt-and-braces: also reject on the underlying TCP/TLS socket close.
     // For pooled keepAlive sockets recycled stale, this is the ONLY event
     // that fires when the peer drops the connection mid-write.
+    //
+    // CRITICAL: with keepAlive=true the socket is reused across many
+    // requests; if we just `sock.on('close', ...)` and never remove the
+    // listener, every reused request leaves one closure attached to the
+    // socket forever. After ~11 reuses Node fires MaxListenersExceeded,
+    // and each closure pins this request's _reject + the entire scope
+    // (memory leak proportional to total requests * pool size). Fix:
+    // remove the listener when the request itself closes (which fires
+    // for both success and failure paths per Node's HTTP contract).
     req.on('socket', (sock) => {
-      sock.on('close', () => {
-        _reject(new Error('upstream tcp socket closed'));
-      });
+      const onSockClose = () => _reject(new Error('upstream tcp socket closed'));
+      sock.on('close', onSockClose);
+      req.once('close', () => sock.removeListener('close', onSockClose));
     });
     if (body.length) req.write(body);
     req.end();
