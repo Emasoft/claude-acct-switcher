@@ -3,6 +3,7 @@
 // Zero dependencies, uses Node.js built-in modules only.
 
 import { createHash } from 'node:crypto';
+import { Transform } from 'node:stream';
 
 // ─────────────────────────────────────────────────
 // Fingerprinting
@@ -1919,4 +1920,152 @@ export function createSerializationQueue(opts = {}) {
   }
 
   return { acquire, drain, getStats };
+}
+
+// ─────────────────────────────────────────────────
+// SSE Token-Usage Extractor
+// ─────────────────────────────────────────────────
+
+// Extracted to lib.mjs (FG4 follow-up) so the abort-path token-rescue
+// behavior of finishParsing() can be unit-tested. Pre-extraction the
+// extractor lived in dashboard.mjs as a private factory and the M2 fix
+// (idempotent finishParsing for pipeline-destroy bypass) had zero direct
+// test coverage — a regression in the Anthropic SSE format would have
+// silently dropped output_tokens on every aborted stream.
+//
+// Pure factory: depends only on `Transform` from `node:stream`. The
+// optional `logger` parameter mirrors dashboard.mjs's `log()` shape
+// (`(level, message) => void`) so debug events bubble through the
+// dashboard's normal log pipeline without coupling lib.mjs to it.
+//
+// Usage shape:
+//   const extractor = createUsageExtractor({ logger: log });
+//   pipeline(srcRes, extractor, clientRes, callback);
+//   // After pipeline resolves (success OR error/abort):
+//   extractor.finishParsing();          // idempotent
+//   const usage = extractor.getUsage(); // { inputTokens, outputTokens, ... }
+export function createUsageExtractor({ logger = null } = {}) {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  // Cache tokens are billed separately by Anthropic; the original extractor
+  // ignored them entirely, so any response whose only "delta" was cache
+  // creation/read showed up as 0/0 and got dropped by recordUsage.
+  let cacheCreationInputTokens = 0;
+  let cacheReadInputTokens = 0;
+  let model = '';
+  let lineBuffer = '';
+  let nextEventType = '';
+  // Phase F audit M2 — trailing-buffer parsing must run on BOTH the success
+  // path (Transform's flush()) AND the abort path (pipeline destroy bypasses
+  // flush). `_finishedParsing` makes finishParsing idempotent so calling it
+  // from both ends is safe.
+  let _finishedParsing = false;
+
+  function _processTrailingLine() {
+    if (_finishedParsing) return;
+    _finishedParsing = true;
+    const trimmed = lineBuffer.trim();
+    lineBuffer = '';
+    if (trimmed.startsWith('data:') && nextEventType === 'message_delta') {
+      try {
+        const data = JSON.parse(trimmed.slice(5).trim());
+        if (data.usage) {
+          outputTokens = data.usage.output_tokens || outputTokens;
+          if (data.usage.cache_creation_input_tokens != null) {
+            cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
+          }
+          if (data.usage.cache_read_input_tokens != null) {
+            cacheReadInputTokens = data.usage.cache_read_input_tokens;
+          }
+        }
+      } catch (e) {
+        // Trailing partial line was malformed JSON. Surface it
+        // (debug-level — these can happen legitimately during
+        // upstream cancellation) so we don't silently lose token
+        // counts on every interrupted SSE stream.
+        if (logger) {
+          try { logger('debug', `flush: trailing message_delta parse failed: ${e.message}`); } catch {}
+        }
+      }
+    }
+  }
+
+  const extractor = new Transform({
+    // `_encoding` is required by the Transform API positional signature
+    // (transform(chunk, encoding, callback)) but unused — chunks are always
+    // Buffers here because the upstream is an http.IncomingMessage.
+    transform(chunk, _encoding, callback) {
+      // Pass through bytes unchanged
+      this.push(chunk);
+
+      // Scan for usage data in SSE events
+      const text = chunk.toString('utf8');
+      lineBuffer += text;
+
+      const lines = lineBuffer.split('\n');
+      // Keep the last (potentially incomplete) line in the buffer
+      lineBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('event:')) {
+          nextEventType = trimmed.slice(6).trim();
+        } else if (trimmed.startsWith('data:') && nextEventType) {
+          try {
+            const data = JSON.parse(trimmed.slice(5).trim());
+            if (nextEventType === 'message_start' && data.message) {
+              if (data.message.usage) {
+                inputTokens = data.message.usage.input_tokens || 0;
+                cacheCreationInputTokens = data.message.usage.cache_creation_input_tokens || 0;
+                cacheReadInputTokens = data.message.usage.cache_read_input_tokens || 0;
+              }
+              if (data.message.model) {
+                model = data.message.model;
+              }
+            } else if (nextEventType === 'message_delta' && data.usage) {
+              outputTokens = data.usage.output_tokens || 0;
+              // message_delta usage may also carry final cache totals.
+              if (data.usage.cache_creation_input_tokens != null) {
+                cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
+              }
+              if (data.usage.cache_read_input_tokens != null) {
+                cacheReadInputTokens = data.usage.cache_read_input_tokens;
+              }
+            }
+          } catch { /* not JSON or malformed — skip */ }
+          nextEventType = '';
+        }
+      }
+
+      callback();
+    },
+    flush(callback) {
+      // Try the trailing partial line one last time so the final
+      // message_delta isn't lost when upstream closes between newlines.
+      // Delegated to the shared helper so the abort path can run the
+      // exact same logic via finishParsing().
+      _processTrailingLine();
+      callback();
+    },
+  });
+
+  extractor.getUsage = () => ({
+    inputTokens,
+    outputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    model,
+    ts: Date.now(),
+  });
+
+  // Phase F audit M2 — explicit idempotent trailing-buffer flush. pipeline()
+  // calls destroy() (not end()) when ANY stream in the chain errors or the
+  // client aborts. destroy() bypasses _flush, so the trailing-line parser
+  // never runs and the final message_delta is silently lost — which manifests
+  // as recordUsage seeing outputTokens=0 on every aborted SSE stream. The
+  // continuation runner calls finishParsing() unconditionally after pipeline
+  // resolves, and the success path is a no-op via _finishedParsing.
+  extractor.finishParsing = _processTrailingLine;
+
+  return extractor;
 }

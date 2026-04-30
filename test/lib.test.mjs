@@ -30,6 +30,7 @@ import {
   createSemaphore,
   createSerializationQueue,
   gcAccountSlots,
+  createUsageExtractor,
   clampViewerState,
   VIEWER_STATE_MIN_WINDOW_MS,
   // Phase D — hook payload parsers and helpers
@@ -3701,5 +3702,151 @@ describe('createSerializationQueue — runtime cap changes', () => {
     // NEW dispatch should push past 4. We're not asserting peak<=1
     // because the 4 already-inflight from the wide-cap era were valid.
     assert.ok(peak <= 4, `peak should not exceed pre-tighten cap; got ${peak}`);
+  });
+});
+
+// ───────────────────────────────────────────────────────────
+// createUsageExtractor — SSE Token Usage Extractor
+// (FG4 follow-up — extracted from dashboard.mjs so the M2 abort-path
+//  rescue contract has unit-test coverage)
+// ───────────────────────────────────────────────────────────
+
+describe('createUsageExtractor — happy path (Transform _flush)', () => {
+  it('parses input/output tokens from a complete SSE stream', async () => {
+    const extractor = createUsageExtractor();
+    // Drain pass-through bytes so backpressure doesn't stall write().
+    extractor.on('data', () => {});
+    const sse =
+      'event: message_start\n' +
+      'data: {"message":{"usage":{"input_tokens":120,"cache_read_input_tokens":40},"model":"claude-opus-4-7"}}\n' +
+      '\n' +
+      'event: content_block_delta\n' +
+      'data: {"delta":{"text":"hello"}}\n' +
+      '\n' +
+      'event: message_delta\n' +
+      'data: {"usage":{"output_tokens":250}}\n' +
+      '\n';
+    extractor.write(Buffer.from(sse, 'utf8'));
+    extractor.end();
+    await new Promise(r => extractor.on('end', r));
+    const u = extractor.getUsage();
+    assert.equal(u.inputTokens, 120);
+    assert.equal(u.outputTokens, 250);
+    assert.equal(u.cacheReadInputTokens, 40);
+    assert.equal(u.model, 'claude-opus-4-7');
+  });
+});
+
+describe('createUsageExtractor — abort-path rescue (audit M2)', () => {
+  it('finishParsing() recovers a trailing message_delta NOT terminated by newline', () => {
+    // This simulates: pipeline() destroys the extractor mid-event because
+    // the client aborted. The trailing `data:` line never got the
+    // newline-terminator that triggers in-`transform` parse, AND _flush
+    // never ran because destroy() bypasses it. Without finishParsing, the
+    // 999 output_tokens would be silently lost.
+    const extractor = createUsageExtractor();
+    extractor.on('data', () => {});
+    extractor.write(Buffer.from(
+      'event: message_start\n' +
+      'data: {"message":{"usage":{"input_tokens":50}}}\n' +
+      '\n' +
+      'event: message_delta\n' +
+      'data: {"usage":{"output_tokens":999}}',  // ← NO trailing newline
+      'utf8'
+    ));
+    // Simulate pipeline() destroy bypassing flush — explicitly call
+    // finishParsing() to rescue the trailing buffer.
+    extractor.finishParsing();
+    const u = extractor.getUsage();
+    assert.equal(u.inputTokens, 50);
+    assert.equal(u.outputTokens, 999, 'finishParsing must rescue the trailing message_delta');
+  });
+
+  it('finishParsing() is idempotent (no double-parse, safe to call twice)', () => {
+    const extractor = createUsageExtractor();
+    extractor.on('data', () => {});
+    extractor.write(Buffer.from(
+      'event: message_delta\n' +
+      'data: {"usage":{"output_tokens":42}}',
+      'utf8'
+    ));
+    extractor.finishParsing();
+    extractor.finishParsing();   // second call must be a no-op
+    extractor.finishParsing();   // third too
+    assert.equal(extractor.getUsage().outputTokens, 42);
+  });
+
+  it('flush() then finishParsing() is also idempotent (success path order)', async () => {
+    // On normal stream end, pipeline() calls extractor.end() → triggers
+    // _flush() → sets _finishedParsing=true. The continuation runner then
+    // calls finishParsing() unconditionally; it must be a no-op here.
+    const extractor = createUsageExtractor();
+    extractor.on('data', () => {});
+    extractor.write(Buffer.from(
+      'event: message_delta\n' +
+      'data: {"usage":{"output_tokens":7}}',
+      'utf8'
+    ));
+    extractor.end();
+    await new Promise(r => extractor.on('end', r));
+    // _flush has already parsed. Calling finishParsing() now is the
+    // double-call exercise.
+    extractor.finishParsing();
+    assert.equal(extractor.getUsage().outputTokens, 7);
+  });
+
+  it('finishParsing() with malformed trailing JSON does not throw, surfaces via logger', () => {
+    let captured = null;
+    const logger = (level, msg) => { captured = { level, msg }; };
+    const extractor = createUsageExtractor({ logger });
+    extractor.on('data', () => {});
+    extractor.write(Buffer.from(
+      'event: message_delta\n' +
+      'data: {"usage":{"output_to',  // ← truncated mid-key
+      'utf8'
+    ));
+    // Must not throw.
+    extractor.finishParsing();
+    // outputTokens should remain at its initial value (0, not whatever
+    // partial parse might have set).
+    assert.equal(extractor.getUsage().outputTokens, 0);
+    // The logger must have been called with debug-level message.
+    assert.ok(captured, 'logger should have been invoked on parse failure');
+    assert.equal(captured.level, 'debug');
+    assert.match(captured.msg, /trailing message_delta parse failed/);
+  });
+
+  it('finishParsing() with no trailing data is a no-op (no logger calls)', () => {
+    let loggerCalls = 0;
+    const logger = () => { loggerCalls++; };
+    const extractor = createUsageExtractor({ logger });
+    extractor.on('data', () => {});
+    extractor.write(Buffer.from(
+      'event: message_delta\n' +
+      'data: {"usage":{"output_tokens":11}}\n',  // ← properly terminated
+      'utf8'
+    ));
+    // Don't end the stream — explicit finishParsing should still process
+    // any remaining buffer (which is empty after the newline split).
+    extractor.finishParsing();
+    assert.equal(extractor.getUsage().outputTokens, 11);
+    assert.equal(loggerCalls, 0, 'logger should not be called when there is no malformed trailing line');
+  });
+});
+
+describe('createUsageExtractor — pass-through correctness', () => {
+  it('passes bytes through unchanged (Transform pipe semantics)', async () => {
+    const extractor = createUsageExtractor();
+    const chunks = [];
+    extractor.on('data', c => chunks.push(c));
+    const payload =
+      'event: message_start\n' +
+      'data: {"message":{"usage":{"input_tokens":1}}}\n' +
+      '\n';
+    extractor.write(Buffer.from(payload, 'utf8'));
+    extractor.end();
+    await new Promise(r => extractor.on('end', r));
+    const passed = Buffer.concat(chunks).toString('utf8');
+    assert.equal(passed, payload, 'extractor must not mutate the byte stream');
   });
 });

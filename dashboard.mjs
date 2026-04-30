@@ -9,7 +9,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
-import { Transform, pipeline as _streamPipeline } from 'node:stream';
+import { pipeline as _streamPipeline } from 'node:stream';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -540,6 +540,7 @@ import {
   createSemaphore,
   createSerializationQueue,
   gcAccountSlots,
+  createUsageExtractor as _createUsageExtractor,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
   clampViewerState,
@@ -7192,10 +7193,27 @@ const REQUEST_DEADLINE_MS = parseInt(process.env.CSW_REQUEST_DEADLINE_MS || '600
 // the deadline guard ever fires. Default = REQUEST_DEADLINE_MS + 60s buffer.
 // Was hard-coded to 120s in lib.mjs (un-tunable, smaller than REQUEST_DEADLINE_MS).
 // Tune via CSW_QUEUE_TIMEOUT_MS for sites with very long Opus streams.
-const QUEUE_TIMEOUT_MS = parseInt(
+// FG4 follow-up — validate the parsed env-var. With the lib.mjs `??`
+// change, an explicit `0` propagates all the way through the queue and
+// rejects every queued request immediately. That's a useful test mode
+// but a footgun in production. Warn loudly when the value looks
+// pathological, but don't override — the operator is in charge.
+const _rawQueueTimeoutMs = parseInt(
   process.env.CSW_QUEUE_TIMEOUT_MS || String(REQUEST_DEADLINE_MS + 60_000),
   10
 );
+const QUEUE_TIMEOUT_MS = Number.isFinite(_rawQueueTimeoutMs) && _rawQueueTimeoutMs >= 0
+  ? _rawQueueTimeoutMs
+  : (REQUEST_DEADLINE_MS + 60_000);
+if (process.env.CSW_QUEUE_TIMEOUT_MS && QUEUE_TIMEOUT_MS < REQUEST_DEADLINE_MS) {
+  // setLog() hasn't been wired yet at module load — defer the warning
+  // to next tick so the log() function exists by the time it fires.
+  setImmediate(() => {
+    try {
+      log('warn', `CSW_QUEUE_TIMEOUT_MS=${QUEUE_TIMEOUT_MS}ms is less than REQUEST_DEADLINE_MS=${REQUEST_DEADLINE_MS}ms — queued requests will be rejected with queue_timeout before the deadline guard fires (re-introduces the audit B1/G1 regression). Set ≥ REQUEST_DEADLINE_MS or omit to use the default.`);
+    } catch {}
+  });
+}
 
 // Phase H — opt-in OTLP/HTTP/JSON receiver for cross-checking vdm's
 // hook-derived counts against Claude Code's first-party telemetry. Off by
@@ -8598,128 +8616,13 @@ function withSerializationQueue(fn, isRetry = false) {
 // Token Usage Extractor (SSE Transform Stream)
 // ─────────────────────────────────────────────────
 
+// FG4 follow-up — the extractor itself lives in lib.mjs so its
+// `finishParsing()` idempotency contract (audit M2 — abort-path token
+// rescue) can be unit-tested. This thin wrapper just injects the
+// dashboard's `log()` function so debug events from malformed trailing
+// lines bubble through the existing log pipeline.
 function createUsageExtractor() {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  // Cache tokens are billed separately by Anthropic; the original extractor
-  // ignored them entirely, so any response whose only "delta" was cache
-  // creation/read showed up as 0/0 and got dropped by recordUsage.
-  let cacheCreationInputTokens = 0;
-  let cacheReadInputTokens = 0;
-  let model = '';
-  let lineBuffer = '';
-  let nextEventType = '';
-  // Phase F audit M2 — trailing-buffer parsing must run on BOTH the success
-  // path (Transform's flush()) AND the abort path (pipeline destroy bypasses
-  // flush). `_finishedParsing` makes finishParsing idempotent so calling it
-  // from both ends is safe.
-  let _finishedParsing = false;
-
-  function _processTrailingLine() {
-    if (_finishedParsing) return;
-    _finishedParsing = true;
-    const trimmed = lineBuffer.trim();
-    lineBuffer = '';
-    if (trimmed.startsWith('data:') && nextEventType === 'message_delta') {
-      try {
-        const data = JSON.parse(trimmed.slice(5).trim());
-        if (data.usage) {
-          outputTokens = data.usage.output_tokens || outputTokens;
-          if (data.usage.cache_creation_input_tokens != null) {
-            cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
-          }
-          if (data.usage.cache_read_input_tokens != null) {
-            cacheReadInputTokens = data.usage.cache_read_input_tokens;
-          }
-        }
-      } catch (e) {
-        // Trailing partial line was malformed JSON. Surface it
-        // (debug-level — these can happen legitimately during
-        // upstream cancellation) so we don't silently lose token
-        // counts on every interrupted SSE stream.
-        try { log('debug', `flush: trailing message_delta parse failed: ${e.message}`); } catch {}
-      }
-    }
-  }
-
-  const extractor = new Transform({
-    // `_encoding` is required by the Transform API positional signature
-    // (transform(chunk, encoding, callback)) but unused — chunks are always
-    // Buffers here because the upstream is an http.IncomingMessage.
-    transform(chunk, _encoding, callback) {
-      // Pass through bytes unchanged
-      this.push(chunk);
-
-      // Scan for usage data in SSE events
-      const text = chunk.toString('utf8');
-      lineBuffer += text;
-
-      const lines = lineBuffer.split('\n');
-      // Keep the last (potentially incomplete) line in the buffer
-      lineBuffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('event:')) {
-          nextEventType = trimmed.slice(6).trim();
-        } else if (trimmed.startsWith('data:') && nextEventType) {
-          try {
-            const data = JSON.parse(trimmed.slice(5).trim());
-            if (nextEventType === 'message_start' && data.message) {
-              if (data.message.usage) {
-                inputTokens = data.message.usage.input_tokens || 0;
-                cacheCreationInputTokens = data.message.usage.cache_creation_input_tokens || 0;
-                cacheReadInputTokens = data.message.usage.cache_read_input_tokens || 0;
-              }
-              if (data.message.model) {
-                model = data.message.model;
-              }
-            } else if (nextEventType === 'message_delta' && data.usage) {
-              outputTokens = data.usage.output_tokens || 0;
-              // message_delta usage may also carry final cache totals.
-              if (data.usage.cache_creation_input_tokens != null) {
-                cacheCreationInputTokens = data.usage.cache_creation_input_tokens;
-              }
-              if (data.usage.cache_read_input_tokens != null) {
-                cacheReadInputTokens = data.usage.cache_read_input_tokens;
-              }
-            }
-          } catch { /* not JSON or malformed — skip */ }
-          nextEventType = '';
-        }
-      }
-
-      callback();
-    },
-    flush(callback) {
-      // Try the trailing partial line one last time so the final
-      // message_delta isn't lost when upstream closes between newlines.
-      // Delegated to the shared helper so the abort path can run the
-      // exact same logic via finishParsing().
-      _processTrailingLine();
-      callback();
-    },
-  });
-
-  extractor.getUsage = () => ({
-    inputTokens,
-    outputTokens,
-    cacheCreationInputTokens,
-    cacheReadInputTokens,
-    model,
-    ts: Date.now(),
-  });
-
-  // Phase F audit M2 — explicit idempotent trailing-buffer flush. pipeline()
-  // calls destroy() (not end()) when ANY stream in the chain errors or the
-  // client aborts. destroy() bypasses _flush, so the trailing-line parser
-  // never runs and the final message_delta is silently lost — which manifests
-  // as recordUsage seeing outputTokens=0 on every aborted SSE stream. The
-  // continuation runner calls finishParsing() unconditionally after pipeline
-  // resolves, and the success path is a no-op via _finishedParsing.
-  extractor.finishParsing = _processTrailingLine;
-
-  return extractor;
+  return _createUsageExtractor({ logger: log });
 }
 
 // ─────────────────────────────────────────────────
@@ -11001,12 +10904,6 @@ function shutdown(signal) {
   const _SHUTDOWN_DRAIN_MS = 5_000;
   try { proxyServer.close(); } catch {}
   try { server.close(); } catch {}
-  // Phase F audit follow-up (F4) — drain the upstream keepAlive socket pool.
-  // Without this, pooled TLS sockets sit in the kernel buffer until the OS
-  // reclaims them on process exit. destroy() unrefs the agent and closes
-  // every idle socket immediately, giving Anthropic a clean FIN per stream
-  // and freeing local file descriptors.
-  try { _upstreamAgent.destroy(); } catch {}
   // End every SSE log subscriber (`/api/logs/stream`) cleanly so the
   // client sees a connection close, not a half-buffer reset. Without
   // this they'd hang until Node tears down the socket on exit.
@@ -11018,11 +10915,29 @@ function shutdown(signal) {
   // Give in-flight handlers a moment, then exit. process.exit(0) is
   // still required because SSE subscribers and persistent keep-alives
   // keep the event loop occupied — server.close() merely flips the
-  // accept flag.
-  const _exitTimer = setTimeout(() => process.exit(0), _SHUTDOWN_DRAIN_MS);
+  // accept flag. The keepAlive agent is destroyed RIGHT BEFORE exit
+  // (FG4 follow-up): https.Agent.destroy() iterates BOTH freeSockets
+  // AND in-use sockets, so calling it before the drain window would
+  // rip in-flight upstream requests mid-stream — directly contradicting
+  // the drain window's purpose. Running it inside the exit timer means
+  // it fires after legitimate streams have either completed or been
+  // abandoned, then we exit. Same goal (clean FIN, free FDs) without
+  // the regression.
+  const _exitTimer = setTimeout(() => {
+    try { _upstreamAgent.destroy(); } catch {}
+    process.exit(0);
+  }, _SHUTDOWN_DRAIN_MS);
   // If both servers report 'close' before the timer, exit early.
   let _closed = 0;
-  const _maybeExit = () => { if (++_closed >= 2) { clearTimeout(_exitTimer); process.exit(0); } };
+  const _maybeExit = () => {
+    if (++_closed >= 2) {
+      clearTimeout(_exitTimer);
+      // Same FG4 invariant — destroy the agent at the very last moment,
+      // never before in-flight streams have had a chance to drain.
+      try { _upstreamAgent.destroy(); } catch {}
+      process.exit(0);
+    }
+  };
   try { proxyServer.once('close', _maybeExit); } catch {}
   try { server.once('close', _maybeExit); } catch {}
 }
