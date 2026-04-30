@@ -11,6 +11,7 @@ probe-log.json
 token-usage.json
 session-history.json
 account-prefs.json
+viewer-state.json
 .dashboard.pid
 
 # Logs

@@ -92,25 +92,29 @@ fi
 # ─────────────────────────────────────────────────────────
 
 detect_keychain_service() {
-  # Mirror dashboard.mjs::detectKeychainService byte-for-byte: try the
-  # canonical name "Claude Code-credentials" first, then fall back to
-  # `security dump-keychain` and pick the first "Claude*" entry. The bash and
-  # Node sides MUST agree; otherwise vdm and the dashboard read different
+  # Mirror dashboard.mjs::detectKeychainService byte-for-byte: try a stable
+  # ordered list of known names FIRST, then fall back to `security dump-keychain`
+  # with `LC_ALL=C sort -u | head -1` for determinism across machines. The bash
+  # and Node sides MUST agree; otherwise vdm and the dashboard read different
   # keychain entries on the same machine, the active token diverges, and
   # rotation logic loses the ground truth.
-  if security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "Claude Code-credentials" -w &>/dev/null; then
-    echo "Claude Code-credentials"
-    return
-  fi
-  # Broader search — same `head -1` as dashboard.mjs (intentionally NOT sorted
-  # so both sides return the same arbitrary-but-equal first match). NB: the
-  # determinism fix should be applied symmetrically to both sides; tracked as
-  # NEEDS_DESIGN in the audit report.
+  local candidate
+  for candidate in "Claude Code-credentials" "Claude-Code-credentials" "claude.ai-credentials"; do
+    if security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$candidate" -w &>/dev/null; then
+      echo "$candidate"
+      return
+    fi
+  done
+  # Deterministic dump-keychain fallback: LC_ALL=C sort -u | head -1 ensures
+  # multiple Claude entries (e.g. dev + stable installs) always resolve to
+  # the same service, instead of whichever the keychain happened to list
+  # first this boot. Mirrors dashboard.mjs:94-95 byte-for-byte.
   local svc
   svc=$(security dump-keychain 2>/dev/null \
     | grep -A4 '"svce"' \
     | grep -i claude \
     | sed -n 's/.*"svce"<blob>="\([^"]*\)".*/\1/p' \
+    | LC_ALL=C sort -u \
     | head -1) || true
   if [[ -n "$svc" ]]; then
     echo "$svc"
@@ -154,7 +158,12 @@ sanitize_profile_name() {
 }
 
 read_keychain() {
-  security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null
+  # Pass -a "$KEYCHAIN_ACCOUNT" so multi-account keychains (e.g. after
+  # `claude logout`/`login` cycles, or import from another machine) return
+  # the entry that belongs to THIS user, not whichever the keychain happened
+  # to list first. Every other security call already passes -a; this one
+  # was the lone holdout and could desync vdm from write_keychain.
+  security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null
 }
 
 write_keychain() {
@@ -1989,6 +1998,20 @@ except Exception:
 '
 }
 
+cmd_hooks() {
+  # Reinstall the Claude Code + git hooks. Idempotent — safe to run any time.
+  # README references this command; without it, "vdm hooks" used to dispatch
+  # to the unknown-command arm and exit 1.
+  if [[ ! -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+    echo -e "${RED}Error: install-hooks.sh not found at $SCRIPT_DIR${NC}"
+    echo "Reinstall vdm via install.sh from the source repo."
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/install-hooks.sh"
+  install_hooks
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -2057,6 +2080,7 @@ case "$command" in
   logs|log) cmd_logs "$@" ;;
   tokens|tok) cmd_tokens "$@" ;;
   prefs|pref) cmd_prefs "$@" ;;
+  hooks|install-hooks) cmd_hooks ;;
   upgrade|update) cmd_upgrade ;;
   help|--help|-h) cmd_help ;;
   *)

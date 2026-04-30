@@ -3,7 +3,7 @@
 // Zero dependencies, uses Node.js built-in modules only.
 
 import { createServer } from 'node:http';
-import { readFile, writeFile, unlink, rename } from 'node:fs/promises';
+import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -705,18 +705,29 @@ try {
 } catch { activityLog = []; }
 
 function logActivity(type, detail = {}) {
+  // C4 fix — coerce string `detail` to {msg: detail}. Eleven call sites in
+  // earlier code passed a string here; the previous `{ ts, type, ...detail }`
+  // spread on a string spreads each character into numeric-keyed properties,
+  // ballooning activity-log.json with garbage like {"0":"W","1":"o",...} and
+  // hiding the actual message. evtMsg's `default: h(e.msg||e.type)` fallthrough
+  // now picks up the rescued .msg field.
+  if (typeof detail === 'string') detail = { msg: detail };
+  else if (!detail || typeof detail !== 'object' || Array.isArray(detail)) detail = {};
   const entry = { ts: Date.now(), type, ...detail };
   activityLog.unshift(entry);
   // Prune by age + cap
   const cutoff = Date.now() - ACTIVITY_MAX_AGE;
   while (activityLog.length > 0 && activityLog[activityLog.length - 1].ts < cutoff) activityLog.pop();
   if (activityLog.length > ACTIVITY_MAX_ENTRIES) activityLog.length = ACTIVITY_MAX_ENTRIES;
-  // Persist async, atomic via temp+rename. Fire-and-forget; the activity
-  // log is best-effort and we don't want logActivity() to block hot paths.
-  const tmp = ACTIVITY_LOG_FILE + '.tmp';
-  writeFile(tmp, JSON.stringify(activityLog))
-    .then(() => rename(tmp, ACTIVITY_LOG_FILE))
-    .catch(() => {});
+  // C5 fix — atomicWriteFileSync replaces the previous temp+rename async
+  // write that had no per-file mutex. Two concurrent calls both targeted the
+  // same `<file>.tmp`, raced the rename, and could leave partial bytes.
+  // The activity log is small (capped at ACTIVITY_MAX_ENTRIES) so the sync
+  // cost is negligible. atomicWriteFileSync is the canonical helper used
+  // for every other state file.
+  try {
+    atomicWriteFileSync(ACTIVITY_LOG_FILE, JSON.stringify(activityLog));
+  } catch { /* persistence is best-effort */ }
 }
 
 // ─────────────────────────────────────────────────
@@ -1610,7 +1621,16 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/remove' && req.method === 'POST') {
     const body = await readBody(req);
-    const { name } = JSON.parse(body);
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      json(res, { ok: false, error: 'invalid JSON' }, 400);
+      return true;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      json(res, { ok: false, error: 'body must be a JSON object' }, 400);
+      return true;
+    }
+    const { name } = parsed;
     if (!name) {
       json(res, { ok: false, error: 'name required' }, 400);
       return true;
@@ -1656,7 +1676,16 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/refresh' && req.method === 'POST') {
     const body = await readBody(req);
-    const { name } = JSON.parse(body);
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      json(res, { ok: false, error: 'invalid JSON' }, 400);
+      return true;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      json(res, { ok: false, error: 'body must be a JSON object' }, 400);
+      return true;
+    }
+    const { name } = parsed;
     if (!name) {
       json(res, { ok: false, error: 'name required' }, 400);
       return true;
@@ -1741,7 +1770,15 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/settings' && req.method === 'POST') {
     const body = await readBody(req);
-    const patch = JSON.parse(body);
+    let patch;
+    try { patch = JSON.parse(body); } catch {
+      json(res, { ok: false, error: 'invalid JSON' }, 400);
+      return true;
+    }
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      json(res, { ok: false, error: 'body must be a JSON object' }, 400);
+      return true;
+    }
     if (typeof patch.autoSwitch === 'boolean') settings.autoSwitch = patch.autoSwitch;
     if (typeof patch.proxyEnabled === 'boolean') {
       const wasEnabled = settings.proxyEnabled;
@@ -5530,7 +5567,10 @@ function evtMsg(e) {
     case 'upgrade': return 'Upgraded to <b>' + h(e.to||'?') + '</b>';
     case 'refresh-failed': return '<b>' + h(e.account||'?') + '</b> refresh failed: ' + h(e.error||'unknown');
     case 'token-refreshed': return '<b>' + h(e.account||'?') + '</b> token refreshed';
-    default: return h(e.type);
+    // C4 fallthrough — events whose detail came in as a string get a .msg
+    // field via logActivity's coercion. Surface that to the user. If only
+    // .type is present (no msg), keep the legacy behavior (h(e.type)).
+    default: return h(e.msg || e.type);
   }
 }
 
