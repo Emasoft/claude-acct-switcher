@@ -649,7 +649,7 @@ _install_git_hook() {
 #!/bin/bash
 # vdm-token-usage
 # Appends token usage trailer to commit messages.
-# Part of claude-acct-switcher (https://github.com/loekj/claude-acct-switcher)
+# Part of claude-acct-switcher (https://github.com/Emasoft/claude-acct-switcher)
 
 # IMPORTANT: even on merge/squash/amend we still run any chained hooks
 # (Husky, git-lfs, project-local) — they are not specific to vdm and the

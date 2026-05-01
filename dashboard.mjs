@@ -7292,7 +7292,7 @@ function copyTimeline(sessionId) {
 </script>
 <footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:#9ca3af;line-height:1.8">
   <div>🤙 Vibe coded with love by LJ &middot; ${PROJECT_VERSION}</div>
-  <a href="https://github.com/loekj/claude-acct-switcher" target="_blank" rel="noopener" style="color:#9ca3af;text-decoration:none">github.com/loekj/claude-acct-switcher</a>
+  <a href="https://github.com/Emasoft/claude-acct-switcher" target="_blank" rel="noopener" style="color:#9ca3af;text-decoration:none">github.com/Emasoft/claude-acct-switcher</a>
 </footer>
 </body>
 </html>`;
