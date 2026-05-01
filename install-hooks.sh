@@ -284,9 +284,12 @@ def _build_hook_command(url):
     # Tradeoff: each event spawns sh+curl (~20-50ms vs ~1-5ms HTTP).
     # Acceptable: hooks are not on the request hot path.
     # `--connect-timeout 1` keeps the failure path snappy when down;
-    # `--max-time 3` caps total time so a hung dashboard cannot stall CC.
+    # `--max-time 5` matches CC's hook timeout (5s) so curl gives up
+    # at the same boundary CC would. Was 3s — too tight when 50
+    # sub-agents fire SubagentStart simultaneously and the dashboard
+    # processes them serially. HOOKS-1 audit fix.
     return (
-        f"curl -sS --connect-timeout 1 --max-time 3 "
+        f"curl -sS --connect-timeout 1 --max-time 5 "
         f"-X POST -H 'Content-Type: application/json' "
         f"--data-binary @- {url} "
         f">/dev/null 2>&1 || true  # {VDM_HOOK_SENTINEL}"
