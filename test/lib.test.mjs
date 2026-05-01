@@ -4862,3 +4862,33 @@ describe('Phase I+ — A11y / dashboard polish (UX-D batch)', () => {
     assert.match(_dashboardSrc_a11y, /data-account-name="' \+ escNameAttr/);
   });
 });
+
+describe('Phase I+ — vdm CLI _levenshtein + did-you-mean (UX-E3)', () => {
+  const _vdmSrc_e3 = _readFileSync_xss(
+    new URL('../vdm', import.meta.url),
+    'utf8',
+  );
+
+  it('vdm defines _levenshtein', () => {
+    assert.match(_vdmSrc_e3, /^_levenshtein\(\) \{/m);
+  });
+
+  it('cmd_switch suggests "Did you mean…" on profile-not-found', () => {
+    // The suggestion is the closest profile by Levenshtein distance ≤ 2.
+    assert.match(_vdmSrc_e3, /Did you mean: \$\{BOLD\}\$_suggestion\$\{NC\}/);
+    assert.match(_vdmSrc_e3, /_d=\$\(_levenshtein "\$name" "\$_p"\)/);
+  });
+});
+
+describe('Phase I+ — slash commands (UX-G2)', () => {
+  it('every commands/*.md has the right frontmatter shape', () => {
+    const cmdsDir = new URL('../commands/', import.meta.url).pathname;
+    const cmds = ['vdm-switch', 'vdm-status', 'vdm-list', 'vdm-tokens'];
+    for (const c of cmds) {
+      const body = _readFileSync_xss(`${cmdsDir}${c}.md`, 'utf8');
+      assert.match(body, /^---/, `${c}: must start with frontmatter`);
+      assert.match(body, /^description:/m, `${c}: must have a description`);
+      assert.match(body, /^allowed-tools: Bash\(vdm /m, `${c}: must restrict to vdm subcommand`);
+    }
+  });
+});

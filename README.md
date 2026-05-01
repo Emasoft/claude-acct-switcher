@@ -83,7 +83,10 @@ vdm upgrade                 Update to latest version
 
 | Command | Effect |
 |---------|--------|
-| `/vdm-switch` | Picks the next available saved profile via the dashboard's current rotation strategy and switches to it. Equivalent to `vdm switch --auto` — bypasses the interactive picker, useful for unattended sessions. |
+| `/vdm-switch` | Picks the next available saved profile via the dashboard's current rotation strategy and switches to it. Equivalent to `vdm switch --auto`. |
+| `/vdm-status` | Show the active account, rate-limit state, current rotation strategy, and saved profiles. Read-only. |
+| `/vdm-list`   | List every saved profile (vdm-account-* keychain entries) with label, tier, and utilization. Read-only. |
+| `/vdm-tokens` | Print recent token usage broken down by account, model, repo, and branch. Read-only. Requires the dashboard to be running. |
 
 ### Dashboard
 

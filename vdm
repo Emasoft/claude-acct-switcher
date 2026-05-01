@@ -157,6 +157,38 @@ sanitize_profile_name() {
   printf '%s' "$name"
 }
 
+# UX-E3: pure-bash Levenshtein distance for "did you mean…" suggestions.
+# Stays in-process (no python / awk subshell on every CLI invocation).
+# Bounded by string length — vdm names are typically <30 chars so the
+# O(m*n) cost is trivial.
+_levenshtein() {
+  local s="$1" t="$2"
+  local m=${#s} n=${#t}
+  if (( m == 0 )); then printf '%d' "$n"; return; fi
+  if (( n == 0 )); then printf '%d' "$m"; return; fi
+  local -a prev curr
+  local i j a b c min
+  for (( j=0; j<=n; j++ )); do prev[j]=$j; done
+  for (( i=1; i<=m; i++ )); do
+    curr[0]=$i
+    for (( j=1; j<=n; j++ )); do
+      a=$(( prev[j] + 1 ))
+      b=$(( curr[j-1] + 1 ))
+      if [[ "${s:i-1:1}" == "${t:j-1:1}" ]]; then
+        c=${prev[j-1]}
+      else
+        c=$(( prev[j-1] + 1 ))
+      fi
+      min=$a
+      (( b < min )) && min=$b
+      (( c < min )) && min=$c
+      curr[j]=$min
+    done
+    for (( j=0; j<=n; j++ )); do prev[j]=${curr[j]}; done
+  done
+  printf '%d' "${prev[n]}"
+}
+
 read_keychain() {
   # Pass -a "$KEYCHAIN_ACCOUNT" so multi-account keychains (e.g. after
   # `claude logout`/`login` cycles, or import from another machine) return
@@ -873,6 +905,20 @@ except Exception:
   local creds
   if ! creds=$(read_account_keychain "$name"); then
     echo -e "${RED}Profile '$name' not found.${NC}"
+    # UX-E3: suggest the closest match by pure-bash Levenshtein
+    # distance (no awk / python — keep CLI startup fast). Limit to
+    # distance ≤ 2 so we don't suggest unrelated typos.
+    local _suggestion="" _best_d=999 _d _p
+    for _p in "${names[@]}"; do
+      _d=$(_levenshtein "$name" "$_p")
+      if (( _d < _best_d )); then
+        _best_d=$_d
+        _suggestion="$_p"
+      fi
+    done
+    if [[ -n "$_suggestion" ]] && (( _best_d <= 2 )); then
+      echo -e "  Did you mean: ${BOLD}$_suggestion${NC}? (vdm switch $_suggestion)"
+    fi
     echo "Available profiles:"
     local _profile
     for _profile in "${names[@]}"; do

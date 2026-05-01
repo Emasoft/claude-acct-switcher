@@ -380,12 +380,14 @@ _print_env_cleanup_instructions() {
         echo -e "     ${CYAN}echo \"\$ANTHROPIC_BASE_URL\"   # MUST print empty${NC}"
         echo -e "     ${CYAN}pm2 kill                       # flushes the daemon's polluted in-memory env${NC}"
         echo -e "     ${CYAN}pm2 resurrect                  # fresh daemon, inherits clean shell, loads dump${NC}"
-        echo -e "     ${CYAN}# verify every PM2 process is clean before re-saving:${NC}"
+        echo -e "     ${DIM}# verify every PM2 process is clean before re-saving — REQUIRES \`jq\` (brew install jq):${NC}"
         echo -e "     ${CYAN}for pid in \$(pm2 jlist | jq -r '.[].pid'); do${NC}"
         echo -e "     ${CYAN}  ps eww -p \"\$pid\" 2>/dev/null | tr ' ' '\\n' | grep '^ANTHROPIC_BASE_URL' \\${NC}"
         echo -e "     ${CYAN}    || echo \"PID \$pid clean\"${NC}"
         echo -e "     ${CYAN}done${NC}"
-        echo -e "     ${CYAN}pm2 save                       # only after verification — otherwise re-pollutes dump${NC}"
+        echo -e "     ${RED}# DO NOT run \`pm2 save\` until every PID prints clean —${NC}"
+        echo -e "     ${RED}# otherwise the dump file gets re-poisoned with the stale env.${NC}"
+        echo -e "     ${CYAN}pm2 save                       # only after EVERY PID printed clean${NC}"
         echo ""
         n=$((n+1))
         ;;
@@ -560,26 +562,13 @@ echo ""
 
 # ── Show what will be removed ──
 
-echo -e "  ${BOLD}This will:${NC}"
-echo -e "    1. Stop the running dashboard/proxy"
-echo -e "    2. Remove the shell config block from your shell rc file"
-echo -e "    3. Remove the ${CYAN}vdm${NC} symlink from PATH"
-echo -e "    4. Remove ${CYAN}$INSTALL_DIR${NC}"
-echo -e "    5. Optionally delete saved ${CYAN}vdm-account-*${NC} Keychain entries"
-echo -e "    6. Remove vdm-installed slash commands from ${CYAN}~/.claude/commands/${NC}"
-echo ""
-
-# Track whether the user explicitly chose to KEEP saved account profiles.
-# Saved accounts live in the macOS Keychain as `vdm-account-*` entries
-# (no longer plaintext files). Default to preserve — these are user data,
-# not vdm-owned scaffolding. The keychain cleanup step at section 5b
-# honours this flag.
+# Count saved keychain entries FIRST so we can elide the "Optionally
+# delete keychain entries" step from the overview when there are zero.
+# `security dump-keychain` lists every generic-password entry in the
+# user's login keychain; we filter by the vdm-account- prefix and count
+# distinct names.
 preserve_accounts=true
 ACCT_COUNT=0
-
-# Count saved keychain entries. `security dump-keychain` lists every
-# generic-password entry in the user's login keychain; we filter by the
-# vdm-account- prefix and count distinct names.
 _VDM_ACCOUNT_NAMES_RAW="$(security dump-keychain 2>/dev/null \
   | grep -E '"svce"<blob>="vdm-account-' \
   | sed -E 's/.*"svce"<blob>="vdm-account-([^"]+)".*/\1/' \
@@ -588,6 +577,26 @@ _VDM_ACCOUNT_NAMES_RAW="$(security dump-keychain 2>/dev/null \
 if [[ -n "$_VDM_ACCOUNT_NAMES_RAW" ]]; then
   ACCT_COUNT=$(printf '%s\n' "$_VDM_ACCOUNT_NAMES_RAW" | wc -l | tr -d ' ')
 fi
+
+echo -e "  ${BOLD}This will:${NC}"
+echo -e "    1. Stop the running dashboard/proxy"
+echo -e "    2. Remove the shell config block from your shell rc file"
+echo -e "    3. Remove the ${CYAN}vdm${NC} symlink from PATH"
+echo -e "    4. Remove ${CYAN}$INSTALL_DIR${NC}"
+# UX-B3: only mention the optional-delete step when there's something to delete.
+_step_n=5
+if [[ "$ACCT_COUNT" -gt 0 ]]; then
+  echo -e "    ${_step_n}. Optionally delete saved ${CYAN}vdm-account-*${NC} Keychain entries (${ACCT_COUNT} present)"
+  _step_n=$((_step_n + 1))
+fi
+echo -e "    ${_step_n}. Remove vdm-installed slash commands from ${CYAN}~/.claude/commands/${NC}"
+echo ""
+
+# Track whether the user explicitly chose to KEEP saved account profiles.
+# Saved accounts live in the macOS Keychain as `vdm-account-*` entries
+# (no longer plaintext files). Default to preserve — these are user data,
+# not vdm-owned scaffolding. The keychain cleanup step at section 5b
+# honours this flag.
 
 if [[ "$ACCT_COUNT" -gt 0 ]]; then
   echo -e "  ${YELLOW}Note:${NC} You have ${BOLD}$ACCT_COUNT saved account profile(s)${NC} in the macOS Keychain"
