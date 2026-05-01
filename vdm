@@ -661,7 +661,27 @@ cmd_label() {
     return 1
   fi
 
-  echo "$label" > "$ACCOUNTS_DIR/${name}.label"
+  # SECURITY (audit SEC-12): label is read by the dashboard and the CLI
+  # and rendered in HTML / notifications. Reject control characters,
+  # nulls, and embedded newlines so a label cannot break a single-line
+  # reader, smuggle ANSI escapes, or sit in the file as a multiline
+  # blob that confuses downstream parsers. Allow only printable ASCII
+  # (0x20-0x7E) plus common Latin-1 / UTF-8 letters; cap at 200 chars.
+  if [[ ${#label} -gt 200 ]]; then
+    echo -e "${RED}Label too long (${#label} > 200 chars).${NC}"
+    return 1
+  fi
+  # Reject if label contains any control char (0x00-0x1F or 0x7F)
+  # printf %q would escape them, but we want to refuse outright so
+  # the on-disk file stays clean.
+  if printf '%s' "$label" | LC_ALL=C grep -qE '[[:cntrl:]]'; then
+    echo -e "${RED}Label contains control characters (newline / tab / null / etc).${NC}"
+    echo "  Use plain text only — labels are rendered in HTML and notifications."
+    return 1
+  fi
+
+  printf '%s' "$label" > "$ACCOUNTS_DIR/${name}.label"
+  chmod 600 "$ACCOUNTS_DIR/${name}.label" 2>/dev/null || true
   echo -e "${GREEN}✓${NC} Labeled ${BOLD}$name${NC} as ${CYAN}$label${NC}"
 
   log_activity "account-renamed" "name=$name" "label=$label"

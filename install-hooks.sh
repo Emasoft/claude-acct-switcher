@@ -37,6 +37,20 @@ if ! declare -f _atomic_replace >/dev/null 2>&1; then
   }
 fi
 
+# UX-A4 fix — install-hooks.sh is sourced from at least 5 places, and
+# only 2 of those (install.sh, uninstall.sh) define the ANSI escape vars
+# at the top. When sourced from `vdm` or run directly for debugging, the
+# `${YELLOW:-}Warning…${NC:-}` fallback pattern collapses to literal
+# `Warning…` with NO surrounding context — looks like the script broke.
+# Define defaults locally if the parent didn't.
+: "${RED:=$'\033[0;31m'}"
+: "${GREEN:=$'\033[0;32m'}"
+: "${YELLOW:=$'\033[0;33m'}"
+: "${CYAN:=$'\033[0;36m'}"
+: "${BOLD:=$'\033[1m'}"
+: "${DIM:=$'\033[2m'}"
+: "${NC:=$'\033[0m'}"
+
 # M8 fix — port resolution priority is config.json > env > default.
 # Reading $CSW_PORT alone is wrong because vdm's self-heal block re-sources
 # this file WITHOUT exporting CSW_PORT, even when the user persisted a

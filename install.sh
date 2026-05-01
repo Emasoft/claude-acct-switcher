@@ -616,7 +616,18 @@ if [[ -n "$SHELL_RC" ]]; then
     # the wrong arch under Rosetta — silently bypassing the proxy
     # because $ANTHROPIC_BASE_URL would never get exported either.
     NODE_BIN="$(command -v node || true)"
-    [[ -z "$NODE_BIN" ]] && NODE_BIN="node" # fallback to PATH lookup at run time
+    if [[ -z "$NODE_BIN" ]]; then
+      # SECURITY (audit SEC-13): if node isn't on PATH at install time,
+      # the rc snippet falling back to bare `node` is a PATH-hijack
+      # vector — a later-installed `~/.local/bin/node` (any node version
+      # manager creates one) would execute on every shell startup with
+      # full read access to ~/.claude/account-switcher/. Refuse the
+      # install instead.
+      echo -e "  ${RED}!${NC} node not found on PATH. Install Node 18+ first," >&2
+      echo -e "      then re-run ./install.sh. Refusing to write a bare-name" >&2
+      echo -e "      \`node\` reference into your rc file (PATH-hijack vector)." >&2
+      exit 1
+    fi
     # Pre-quote for safety (in case the path contains spaces)
     NODE_BIN_QUOTED="$(printf '%q' "$NODE_BIN")"
     # Build the snippet body in a tmp file FIRST, then atomically append
@@ -868,12 +879,21 @@ else
   # rollback-snapshotted copy if the user needs to dig.
   : > "$INSTALL_DIR/startup.log"
   echo -ne "  ${YELLOW}…${NC} Starting dashboard+proxy on ports ${CYAN}${_DASH_HEALTH_PORT}/${_PROXY_HEALTH_PORT}${NC} "
-  # Pass the resolved ports into the child env so the dashboard binds
-  # to exactly what we poll. dashboard.mjs reads CSW_PORT / CSW_PROXY_PORT
-  # via parseInt (line 22 / 7415) so even if these were somehow malicious
-  # they could not become RCE on the dashboard side — but we already
-  # passed them through _validate_port, so they are clean.
-  CSW_PORT="$_DASH_HEALTH_PORT" CSW_PROXY_PORT="$_PROXY_HEALTH_PORT" \
+  # SECURITY (audit SEC-9): spawn dashboard with a MINIMAL env. The
+  # parent install shell may carry the user's AWS_SESSION_TOKEN,
+  # OPENAI_API_KEY, SLACK_TOKEN etc. via .env / direnv loading. Those
+  # land in the dashboard's process.env, are visible to any local user
+  # via `ps eww -p $pid`, and persist for the dashboard's entire
+  # lifetime. The dashboard only needs CSW_*, OAUTH_*, NODE_*, plus
+  # the basics (HOME, USER, PATH, TMPDIR, LANG, TZ). `env -i` resets
+  # to empty, then we re-export the allow-list. CSW_PORT/CSW_PROXY_PORT
+  # come from the resolved ports so the child binds where we poll.
+  env -i \
+    HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+    LANG="${LANG:-}" TZ="${TZ:-}" \
+    CSW_PORT="$_DASH_HEALTH_PORT" CSW_PROXY_PORT="$_PROXY_HEALTH_PORT" \
+    OAUTH_TOKEN_URL="${OAUTH_TOKEN_URL:-}" OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID:-}" \
+    LM_API_TOKEN="${LM_API_TOKEN:-}" \
     nohup "$_NODE_BIN" "$INSTALL_DIR/dashboard.mjs" \
     >>"$INSTALL_DIR/startup.log" 2>&1 &
   _NEW_DASH_PID=$!

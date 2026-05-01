@@ -429,9 +429,26 @@ function migrateAccountsToKeychain() {
       unlinkSync(filePath);
       migrated++;
     } catch (e) {
-      // Keychain has the data; file delete failed (permissions?). Log loud
-      // so the user notices: the file still holds plaintext tokens.
-      log('error', `Migration partial for ${name}: keychain OK but ${filePath} unlink failed: ${e.message}. DELETE THIS FILE MANUALLY — it contains plaintext OAuth tokens.`);
+      // Keychain has the data; file delete failed (permissions?). The
+      // file still holds plaintext tokens.
+      // SEC-10: previously this log line included the absolute filePath,
+      // which then landed in mode-644 startup.log + the in-memory
+      // _logBuffer (visible to /api/logs/stream). That was a roadmap
+      // for any local attacker reading startup.log to find the
+      // plaintext token. Now we (a) print to stderr only — bypasses
+      // log() entirely, so no SSE / disk leak — AND (b) stamp a
+      // sticky activity event so the dashboard UI surfaces it.
+      // The activity event uses ONLY the account name, never the path.
+      try {
+        process.stderr.write(`[vdm migration WARNING] Account "${name}": keychain write OK but plaintext-file delete failed (${e.code || e.message}). The file still contains plaintext OAuth tokens. Open the dashboard for the recovery command.\n`);
+      } catch {}
+      try {
+        // Activity-log entry carries only the account name + reason —
+        // the dashboard's UI can resolve the path back from
+        // _accountNameToPlaintextFile() at render time without ever
+        // putting the path into the persisted log.
+        logActivity('keychain-migration-partial-failure', { account: name, reason: e.code || 'unlink-failed' });
+      } catch {}
     }
   }
   if (migrated > 0) {
@@ -871,8 +888,18 @@ function setAccountPref(name, key, value) {
   if (key === 'excludeFromAuto' && typeof value !== 'boolean') {
     throw new Error('excludeFromAuto must be a boolean');
   }
-  if (key === 'priority' && (typeof value !== 'number' || !Number.isFinite(value))) {
-    throw new Error('priority must be a finite number');
+  if (key === 'priority') {
+    // SEC-17: clamp priority to [-100, 100]. The field is unused TODAY
+    // (picker doesn't honour it) but the validation contract IS the
+    // persistence contract — a future picker change that multiplies or
+    // compares priorities is one PR away from a Number.MAX_VALUE
+    // overflow / Infinity / NaN bug. Lock the range now.
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new Error('priority must be a finite number');
+    }
+    if (value < -100 || value > 100) {
+      throw new Error('priority must be between -100 and 100 (inclusive)');
+    }
   }
   if (!_accountPrefs[name]) _accountPrefs[name] = {};
   _accountPrefs[name][key] = value;
@@ -2899,32 +2926,71 @@ function json(res, data, status = 200) {
 // 1 MiB is far above any legitimate payload while staying well clear of
 // V8's Buffer.concat fragmentation threshold.
 const READ_BODY_MAX = 1024 * 1024;
+// SEC-11: per-request cap is necessary but not sufficient. Without a
+// global cap, an attacker (or a confused local script) opening 200
+// concurrent POSTs to /api/* with 1 MiB each accumulates 200 MiB
+// across `chunks[]` arrays + per-handler scope, OOM-killing the
+// dashboard. The proxy server already has `_bufferedBytes` /
+// `MAX_GLOBAL_BUFFERED`; mirror that for the dashboard server.
+const READ_BODY_GLOBAL_MAX = 64 * 1024 * 1024; // 64 MiB across ALL in-flight /api requests
+let _apiBufferedBytes = 0;
 
 function readBody(req, maxBytes = READ_BODY_MAX) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
     let aborted = false;
+    let countedTotal = 0; // bytes already added to _apiBufferedBytes
+    const _refundAndCleanup = () => {
+      _apiBufferedBytes = Math.max(0, _apiBufferedBytes - countedTotal);
+      countedTotal = 0;
+      // Detach data listener so any chunk that arrives in the
+      // socket-destroy window cannot re-increment _apiBufferedBytes
+      // (PROXY-7 in the reliability audit).
+      try { req.removeAllListeners('data'); } catch {}
+    };
     req.on('data', c => {
       if (aborted) return;
       total += c.length;
       if (total > maxBytes) {
         aborted = true;
-        // 413 Payload Too Large would be ideal, but at this layer we
-        // only have the raw `req`. Destroying the socket is the cheapest
-        // termination path and lets the server-level error handler emit
-        // a clean 4xx if it can. Reject with an Error the caller can
-        // distinguish from a transport failure.
         const e = new Error('request body exceeded ' + maxBytes + ' bytes');
         e.code = 'E_BODY_TOO_LARGE';
+        _refundAndCleanup();
         try { req.destroy(e); } catch {}
         reject(e);
         return;
       }
+      if (_apiBufferedBytes + c.length > READ_BODY_GLOBAL_MAX) {
+        aborted = true;
+        const e = new Error('global API body buffer exceeded ' + READ_BODY_GLOBAL_MAX + ' bytes');
+        e.code = 'E_GLOBAL_BUFFER_FULL';
+        _refundAndCleanup();
+        try { req.destroy(e); } catch {}
+        reject(e);
+        return;
+      }
+      _apiBufferedBytes += c.length;
+      countedTotal += c.length;
       chunks.push(c);
     });
-    req.on('end', () => { if (!aborted) resolve(Buffer.concat(chunks).toString()); });
-    req.on('error', e => { if (!aborted) reject(e); });
+    req.on('end', () => {
+      if (aborted) return;
+      const result = Buffer.concat(chunks).toString();
+      _refundAndCleanup();
+      resolve(result);
+    });
+    req.on('error', e => {
+      if (aborted) return;
+      _refundAndCleanup();
+      reject(e);
+    });
+    req.on('close', () => {
+      // Catches the case where the client closes the socket before
+      // 'end' or 'error' fires. Without this, _apiBufferedBytes leaks
+      // on dropped connections.
+      if (countedTotal > 0) _refundAndCleanup();
+    });
   });
 }
 

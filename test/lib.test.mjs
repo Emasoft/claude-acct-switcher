@@ -4346,10 +4346,15 @@ describe('Phase I — install.sh atomic block uses validated ports', () => {
   it('install.sh exports validated ports into the dashboard child env', () => {
     // H1 fix: dashboard.mjs reads CSW_PORT/CSW_PROXY_PORT from env.
     // Forcing the env on the child guarantees it binds to what we polled.
-    assert.match(
-      _installSrc,
-      /CSW_PORT="\$_DASH_HEALTH_PORT" CSW_PROXY_PORT="\$_PROXY_HEALTH_PORT"[\s\S]{0,80}nohup/,
-    );
+    // Phase I+ (SEC-9): now wrapped in `env -i ...` to drop unrelated
+    // secrets from the parent shell. Both vars must be in the env-i
+    // block, with nohup invocation following within the same scope.
+    const sliceFromEnvI = _installSrc.indexOf('env -i');
+    assert.notEqual(sliceFromEnvI, -1, 'install.sh must use env -i to spawn dashboard with a minimal env');
+    const childSpawn = _installSrc.slice(sliceFromEnvI, sliceFromEnvI + 800);
+    assert.match(childSpawn, /CSW_PORT="\$_DASH_HEALTH_PORT"/);
+    assert.match(childSpawn, /CSW_PROXY_PORT="\$_PROXY_HEALTH_PORT"/);
+    assert.match(childSpawn, /nohup "\$_NODE_BIN" "\$INSTALL_DIR\/dashboard\.mjs"/);
   });
 
   it('install.sh polls BOTH dashboard AND proxy /health', () => {
@@ -4589,5 +4594,99 @@ describe('Phase I+ — reliability fixes', () => {
       _dashboardSrc_rel.indexOf('async function refreshSweep') + 1500,
     );
     assert.match(sweepBlock, /Promise\.allSettled\(/);
+  });
+});
+
+describe('Phase I+ — defense-in-depth (SEC-9..17, UX-A4)', () => {
+  const _dashboardSrc_dd = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+  const _installSrc_dd = _readFileSync_xss(
+    new URL('../install.sh', import.meta.url),
+    'utf8',
+  );
+  const _vdmSrc_dd = _readFileSync_xss(
+    new URL('../vdm', import.meta.url),
+    'utf8',
+  );
+  const _ihSrc_dd = _readFileSync_xss(
+    new URL('../install-hooks.sh', import.meta.url),
+    'utf8',
+  );
+
+  it('SEC-9: install.sh spawns dashboard with `env -i` (filtered env)', () => {
+    // Without env -i, the parent shell's full env (AWS_SESSION_TOKEN,
+    // OPENAI_API_KEY, ...) is inherited by the dashboard process and
+    // visible via `ps eww`.
+    const idx = _installSrc_dd.indexOf('env -i');
+    assert.notEqual(idx, -1, 'install.sh must use `env -i` for dashboard spawn');
+    const block = _installSrc_dd.slice(idx, idx + 600);
+    // Must explicitly forward HOME/USER/PATH for the dashboard to function.
+    assert.match(block, /HOME="\$HOME"/);
+    assert.match(block, /USER="\$USER"/);
+    assert.match(block, /PATH="\$PATH"/);
+  });
+
+  it('SEC-13: install.sh refuses to install if `node` is not on PATH', () => {
+    // The previous fallback `NODE_BIN="node"` would write a bare-name
+    // `node` reference into the rc file — PATH-hijack vector.
+    assert.match(
+      _installSrc_dd,
+      /node not found on PATH[\s\S]{0,200}PATH-hijack vector/,
+    );
+  });
+
+  it('SEC-10: plaintext-token migration error does NOT log the path via log()', () => {
+    // The previous log line passed the absolute filePath through log()
+    // → in-memory _logBuffer + SSE feed + mode-644 startup.log. Now we
+    // print to stderr only and stamp an activity event with just the
+    // account name.
+    const migBlock = _dashboardSrc_dd.slice(
+      _dashboardSrc_dd.indexOf('// Keychain has the data; file delete failed'),
+      _dashboardSrc_dd.indexOf('// Keychain has the data; file delete failed') + 1500,
+    );
+    assert.ok(migBlock.length > 0, 'migration error block must exist');
+    assert.equal(
+      /log\('error'.*filePath/.test(migBlock), false,
+      'plaintext-token error path must not log filePath via log()',
+    );
+    assert.match(migBlock, /process\.stderr\.write/);
+    assert.match(migBlock, /logActivity\('keychain-migration-partial-failure'/);
+  });
+
+  it('SEC-11: readBody enforces a global body buffer cap', () => {
+    // Per-request 1 MiB cap is necessary but not sufficient — 200 concurrent
+    // 1 MiB POSTs would OOM the dashboard without a global accumulator.
+    assert.match(_dashboardSrc_dd, /READ_BODY_GLOBAL_MAX/);
+    assert.match(_dashboardSrc_dd, /_apiBufferedBytes \+ c\.length > READ_BODY_GLOBAL_MAX/);
+    // Refund + cleanup on every termination path (end / error / close).
+    assert.match(_dashboardSrc_dd, /req\.on\('close'/);
+  });
+
+  it('SEC-12: vdm label rejects control characters and over-200-char inputs', () => {
+    assert.match(_vdmSrc_dd, /Label too long/);
+    assert.match(_vdmSrc_dd, /Label contains control characters/);
+    assert.match(_vdmSrc_dd, /grep -qE '\[\[:cntrl:\]\]'/);
+  });
+
+  it('SEC-12: vdm label chmod 600s the .label file', () => {
+    // Labels often contain emails (PII). Mode 600 keeps them out of
+    // other-user reads on multi-user macOS.
+    assert.match(_vdmSrc_dd, /chmod 600 "\$ACCOUNTS_DIR\/\$\{name\}\.label"/);
+  });
+
+  it('SEC-17: priority field is clamped to [-100, 100]', () => {
+    // Field is unused today (picker doesn't honour it) but the
+    // validation contract IS the persistence contract.
+    assert.match(_dashboardSrc_dd, /priority must be between -100 and 100/);
+  });
+
+  it('UX-A4: install-hooks.sh defines its own ANSI defaults', () => {
+    // Was using ${YELLOW:-}Warning…${NC:-} which collapses to literal
+    // "Warning…" when sourced from contexts that don't pre-define
+    // YELLOW/NC (e.g. `vdm` self-heal block, manual debugging).
+    assert.match(_ihSrc_dd, /: "\$\{YELLOW:=/);
+    assert.match(_ihSrc_dd, /: "\$\{NC:=/);
   });
 });
