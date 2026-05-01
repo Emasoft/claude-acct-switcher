@@ -143,6 +143,14 @@ const DEFAULT_SETTINGS = {
   // (set this to false) if they prefer to debug failures manually
   // without serialize getting flipped under them.
   serializeAutoDisableEnabled: true,
+  // Safeguard D — auto-ENABLE serialize when a single account hits
+  // 3+ rate-limits within 30s. Avoids the "burst payload bombards
+  // every account in turn → all banned" failure mode by switching to
+  // queue mode + small inter-request delay BEFORE rotating to the next
+  // account. Auto-reverts to non-serialize after 30 min of no 429s.
+  // Default ON. Set false to disable JUST this safeguard while still
+  // keeping the auto-disable safeguards above active.
+  serializeAutoEnableEnabled: true,
   // Breaker A — N queue_timeout 503s within window → auto-disable.
   // Defaults: 5 trips within 10 min. Conservative — a healthy serialize
   // run won't hit any queue_timeout 503 (the queue timeout default of
@@ -6152,6 +6160,8 @@ function evtMsg(e) {
     // queue-depth alert). Fields routed through h(...) keep the source-grep
     // XSS regression test passing.
     case 'serialize-auto-disabled': return '<b>Serialize auto-disabled</b>: ' + h(e.reason || '?') + (e.count ? ' (count=' + h(String(e.count)) + ')' : '') + (e.accountCount ? ' (' + h(String(e.accountCount)) + ' accounts)' : '');
+    case 'serialize-auto-enabled': return '<b>Serialize auto-enabled</b>: ' + h(e.reason || '?') + (e.account ? ' (' + h(e.account) + ')' : '') + (e.revert_after_quiet_min ? ' — auto-revert after ' + h(String(e.revert_after_quiet_min)) + 'min quiet' : '');
+    case 'serialize-auto-reverted': return '<b>Serialize auto-reverted</b>: ' + h(String(e.quiet_min || '?')) + 'min of no rate-limits';
     case 'queue-depth-alert': return '<b>Queue depth alert</b>: ' + h(String(e.queued || '?')) + ' queued (≥' + h(String(e.threshold || '?')) + ') for ' + h(String(e.sustainedSeconds || '?')) + 's';
     // C4 fallthrough — events whose detail came in as a string get a .msg
     // field via logActivity's coercion. Surface that to the user. If only
@@ -9522,6 +9532,38 @@ let _queueDepthAlertEmittedAt = 0;     // ms of last alert (debounce — once pe
 let _lastSerializeAutoDisableAt = 0;
 const _SERIALIZE_AUTO_DISABLE_DEBOUNCE_MS = 30_000; // 30s — enough for the user to see + react
 
+// ─────────────────────────────────────────────────
+// Safeguard D — burst rate-limit detector → AUTO-ENABLE serialize
+// ─────────────────────────────────────────────────
+//
+// User-reported scenario (Phase I+):
+//   "If multiple Claude Code instances just got rate limited because
+//    they sent requests with too big payloads at the same time, do not
+//    immediately switch to another oauth, because that will surely
+//    cause the new oauth to be banned too. Instead switch automatically
+//    to queue mode, and with the new oauth send the requests serially
+//    with a delay between them, and only in that case switch back to
+//    non-queue mode (unless the user is already in queue mode)."
+//
+// Detection heuristic:
+//   - 3+ 429s on the SAME account within 30s, AND
+//   - serializeRequests is currently OFF, AND
+//   - serializeAutoEnableEnabled is true (default ON)
+//   → enable serializeRequests=true with a small delay (250ms) +
+//     concurrent=1, log forensic event, fire a notification
+//
+// Auto-revert: 30 minutes with NO new 429 from any account → set
+// settings.serializeRequests back to whatever was before, IF we were
+// the ones who enabled it (track via _serializeAutoEnabledAt). If
+// the user was already in serialize mode, do nothing on detection
+// AND nothing on revert.
+const _BURST_429_WINDOW_MS = 30_000;   // 30s sliding window
+const _BURST_429_THRESHOLD = 3;        // 3 429s within window
+const _SERIALIZE_AUTO_REVERT_MS = 30 * 60 * 1000; // 30 min of quiet → revert
+let _serializeAutoEnabledAt = 0;       // 0 = user-controlled; >0 = WE enabled it
+let _last429AnyAccountAt = 0;          // for the auto-revert quiet window
+const _burst429ByFingerprint = new Map(); // fp → SlidingWindowCounter
+
 // Auto-disable serialize mode + emit activity event explaining why.
 // Idempotent; safe to call from any safeguard's trip path.
 function _autoDisableSerialize(reason, detail = {}) {
@@ -9550,6 +9592,106 @@ function _autoDisableSerialize(reason, detail = {}) {
     'circuitBreaker',
   );
 }
+
+// Safeguard D — auto-ENABLE serialize on burst 429 from a single
+// account. Mirrors _autoDisableSerialize's contract: best-effort,
+// debounced, only acts when the user hasn't opted out via settings.
+// Also tracks _serializeAutoEnabledAt so the auto-revert timer knows
+// whether vdm or the user owns the current serialize state.
+function _autoEnableSerializeOnBurst(account_fp, account_name) {
+  // User-disabled the auto-safeguards entirely → respect that.
+  if (!settings.serializeAutoDisableEnabled) return;
+  // Already in serialize mode (whoever enabled it) → no-op.
+  if (settings.serializeRequests) return;
+  // Auto-enable was turned off by the user via settings → respect.
+  if (settings.serializeAutoEnableEnabled === false) return;
+
+  // Make sure we have a per-account counter, then record this 429.
+  let counter = _burst429ByFingerprint.get(account_fp);
+  if (!counter) {
+    counter = createSlidingWindowCounter({
+      windowMs: _BURST_429_WINDOW_MS,
+      threshold: _BURST_429_THRESHOLD,
+    });
+    _burst429ByFingerprint.set(account_fp, counter);
+  }
+  counter.record();
+  if (!counter.tripped()) return;
+
+  // Threshold crossed — enable serialize mode + a small inter-request
+  // delay so the next account doesn't get bombarded by the same
+  // parallel-payload burst.
+  settings.serializeRequests = true;
+  settings.serializeMaxConcurrent = Math.max(1, settings.serializeMaxConcurrent || 1);
+  if (!settings.serializeDelayMs || settings.serializeDelayMs < 250) {
+    settings.serializeDelayMs = 250;
+  }
+  _serializeAutoEnabledAt = Date.now();
+
+  try { saveSettings(settings); } catch (e) {
+    log('warn', `auto-enable serialize: saveSettings failed: ${e.message}`);
+  }
+  // Forensic event — captures everything you'd need to investigate why
+  // serialize flipped on by itself. Includes the account that triggered
+  // the trip + the 429 burst count.
+  try {
+    logForensicEvent('serialize_auto_enabled', {
+      reason: 'burst-429-on-single-account',
+      account_fp,
+      account_name,
+      window_ms: _BURST_429_WINDOW_MS,
+      threshold: _BURST_429_THRESHOLD,
+      serialize_max_concurrent: settings.serializeMaxConcurrent,
+      serialize_delay_ms: settings.serializeDelayMs,
+    });
+  } catch {}
+  log('warn', `serialize auto-ENABLED: ${account_name} burst-429 (${_BURST_429_THRESHOLD} in ${_BURST_429_WINDOW_MS / 1000}s) — switching to queue mode to avoid bombarding the next account`);
+  logActivity('serialize-auto-enabled', {
+    reason: 'burst-429',
+    account: account_name,
+    revert_after_quiet_min: Math.round(_SERIALIZE_AUTO_REVERT_MS / 60000),
+  });
+  notify(
+    'vdm: Serialize mode auto-enabled',
+    `${account_name} hit ${_BURST_429_THRESHOLD} rate-limits in ${_BURST_429_WINDOW_MS / 1000}s. Queueing requests to avoid burning the next account. Will revert after 30min quiet.`,
+    'circuitBreaker',
+  );
+}
+
+// Periodic check (every 60s): if WE auto-enabled serialize and there
+// has been NO 429 from any account for _SERIALIZE_AUTO_REVERT_MS,
+// disable serialize and clear the auto-enable marker. If the user
+// turned serialize on themselves (_serializeAutoEnabledAt === 0), the
+// auto-revert is a no-op — only vdm-owned auto-enable cleans itself
+// up.
+function _maybeAutoRevertSerialize() {
+  if (_serializeAutoEnabledAt === 0) return;     // user owns the state
+  if (!settings.serializeRequests) {
+    // Someone else turned it off (user, _autoDisableSerialize, etc.)
+    // Clear our marker so we don't fight them.
+    _serializeAutoEnabledAt = 0;
+    return;
+  }
+  const quietMs = Date.now() - _last429AnyAccountAt;
+  if (quietMs < _SERIALIZE_AUTO_REVERT_MS) return;
+
+  settings.serializeRequests = false;
+  _serializeAutoEnabledAt = 0;
+  _burst429ByFingerprint.clear();
+  try { saveSettings(settings); } catch {}
+  try { drainSerializationQueue(); } catch {}
+  try {
+    logForensicEvent('serialize_auto_reverted', {
+      reason: 'quiet-window-elapsed',
+      quiet_ms: quietMs,
+    });
+  } catch {}
+  log('info', `serialize auto-reverted: ${Math.round(quietMs / 60000)}min of no 429s`);
+  logActivity('serialize-auto-reverted', { quiet_min: Math.round(quietMs / 60000) });
+  // No notification on revert — it's good news, no user action needed.
+}
+const _serializeAutoRevertTimer = setInterval(_maybeAutoRevertSerialize, 60_000);
+if (_serializeAutoRevertTimer.unref) _serializeAutoRevertTimer.unref();
 
 // Called from the proxy queue_timeout 503 catch handler. Records the
 // event, then trips the breaker if the count crosses threshold AND
@@ -11437,6 +11579,15 @@ async function handleProxyRequest(clientReq, clientRes) {
       // No-op if serialize is off.
       try { _record429ForAccount(getFingerprintFromToken(token)); } catch (e) {
         log('warn', `_record429ForAccount failed: ${e.message}`);
+      }
+      // Safeguard D — burst-429 detector. If we hit 3+ 429s on the
+      // SAME account within 30s, auto-enable serialize so the next
+      // account doesn't get bombarded by the same parallel-payload
+      // burst. The 429 timestamp also feeds the auto-revert quiet
+      // window (no 429 from anyone for 30 min → revert).
+      _last429AnyAccountAt = Date.now();
+      try { _autoEnableSerializeOnBurst(getFingerprintFromToken(token), acctName); } catch (e) {
+        log('warn', `_autoEnableSerializeOnBurst failed: ${e.message}`);
       }
       // RFC 7231 §7.1.3 allows Retry-After to be a delta-seconds OR an
       // HTTP-date. The previous parseInt(…) returned 0 for HTTP-date and

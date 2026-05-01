@@ -4972,3 +4972,198 @@ describe('Phase I+ — forensic event log + rotation (batch 9)', () => {
     assert.match(_src_f, /'anthropic-ratelimit-unified-5h-utilization'/);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — Safeguard D: burst-429 from a single account
+// auto-enables serialize mode (queue requests) instead of
+// rotating to the next account, which would just bombard it
+// too. Auto-reverts after a quiet window so the user doesn't
+// stay queued forever.
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — Safeguard D: burst-429 → auto-enable serialize (batch 10)', () => {
+  const _src_d = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('declares the Safeguard D constants with sane defaults', () => {
+    // 30s window / 3 events / 30min quiet revert. If anyone tunes these
+    // numbers down, they need to think about it loud enough to update
+    // this regression test — accidentally setting threshold to 1 turns
+    // every isolated 429 into a serialize trip.
+    assert.match(_src_d, /_BURST_429_WINDOW_MS\s*=\s*30_000/);
+    assert.match(_src_d, /_BURST_429_THRESHOLD\s*=\s*3/);
+    assert.match(_src_d, /_SERIALIZE_AUTO_REVERT_MS\s*=\s*30 \* 60 \* 1000/);
+  });
+
+  it('exposes serializeAutoEnableEnabled in DEFAULT_SETTINGS (default ON)', () => {
+    // The user-facing kill-switch. Default ON because the worst case if
+    // it doesn't fire is the original "all accounts get banned" failure.
+    assert.match(_src_d, /serializeAutoEnableEnabled:\s*true/);
+  });
+
+  it('_autoEnableSerializeOnBurst respects all three opt-out paths', () => {
+    // (a) master switch off → no-op
+    // (b) already in serialize mode → no-op (don't fight whoever turned
+    //     it on, esp. the user)
+    // (c) the specific Safeguard-D toggle off → no-op
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _autoEnableSerializeOnBurst'),
+      _src_d.indexOf('function _autoEnableSerializeOnBurst') + 4000,
+    );
+    assert.ok(fn.length > 100, 'function body must exist');
+    assert.match(fn, /if \(!settings\.serializeAutoDisableEnabled\) return/);
+    assert.match(fn, /if \(settings\.serializeRequests\) return/);
+    assert.match(fn, /if \(settings\.serializeAutoEnableEnabled === false\) return/);
+  });
+
+  it('_autoEnableSerializeOnBurst counts per fingerprint, not per name', () => {
+    // Per-fingerprint tracking is what makes the breaker survive a
+    // mid-incident vdm rename. Counter map lookup MUST be by the
+    // fingerprint argument, never by name.
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _autoEnableSerializeOnBurst'),
+      _src_d.indexOf('function _autoEnableSerializeOnBurst') + 4000,
+    );
+    assert.match(fn, /_burst429ByFingerprint\.get\(account_fp\)/);
+    assert.match(fn, /_burst429ByFingerprint\.set\(account_fp/);
+  });
+
+  it('_autoEnableSerializeOnBurst sets a 250ms+ delay AND clamps concurrent ≥1', () => {
+    // The whole point is to throttle outbound burst. If we leave delay=0
+    // and concurrent=8 (typical defaults pre-incident) the queue does
+    // nothing useful. Defensive clamp of concurrent ≥1 also guards
+    // against a user-set 0 freezing the queue forever.
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _autoEnableSerializeOnBurst'),
+      _src_d.indexOf('function _autoEnableSerializeOnBurst') + 4000,
+    );
+    assert.match(fn, /settings\.serializeRequests = true/);
+    assert.match(fn, /serializeMaxConcurrent = Math\.max\(1,/);
+    assert.match(fn, /serializeDelayMs < 250/);
+    assert.match(fn, /settings\.serializeDelayMs = 250/);
+  });
+
+  it('_autoEnableSerializeOnBurst emits forensic + activity + notify', () => {
+    // Three independent surfaces — forensic JSONL for post-mortem,
+    // activity feed for the dashboard, OS notification because vdm
+    // changed a user-visible setting and the user needs to know.
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _autoEnableSerializeOnBurst'),
+      _src_d.indexOf('function _autoEnableSerializeOnBurst') + 4000,
+    );
+    assert.match(fn, /logForensicEvent\('serialize_auto_enabled'/);
+    assert.match(fn, /logActivity\('serialize-auto-enabled'/);
+    assert.match(fn, /notify\(/);
+    // Notify category MUST be 'circuitBreaker' so it bypasses the
+    // 10s throttle (NOTIFY_HIGH_PRIORITY).
+    assert.match(fn, /'circuitBreaker'/);
+  });
+
+  it('_maybeAutoRevertSerialize respects user ownership of the flag', () => {
+    // _serializeAutoEnabledAt === 0 means EITHER the user turned it on
+    // themselves OR vdm never enabled it → in both cases the auto-revert
+    // must do nothing. Touching the flag in the user-owned case would be
+    // a UX disaster ("I set serialize=on; vdm turned it off without
+    // telling me").
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _maybeAutoRevertSerialize'),
+      _src_d.indexOf('function _maybeAutoRevertSerialize') + 1500,
+    );
+    assert.ok(fn.length > 100, 'function body must exist');
+    assert.match(fn, /if \(_serializeAutoEnabledAt === 0\) return/);
+  });
+
+  it('_maybeAutoRevertSerialize gives up its claim if someone else flipped serialize off', () => {
+    // If _autoDisableSerialize (Breakers A/C) ran while we owned the
+    // serialize state, the marker becomes stale. Clear it so we don't
+    // re-flip the next time burst-429 fires.
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _maybeAutoRevertSerialize'),
+      _src_d.indexOf('function _maybeAutoRevertSerialize') + 1500,
+    );
+    assert.match(fn, /if \(!settings\.serializeRequests\)/);
+    assert.match(fn, /_serializeAutoEnabledAt = 0/);
+  });
+
+  it('_maybeAutoRevertSerialize uses _last429AnyAccountAt as the quiet-window anchor', () => {
+    // The quiet window is across ALL accounts, not just the original
+    // tripping account. If a different account is still being rate-
+    // limited mid-window we should NOT revert.
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _maybeAutoRevertSerialize'),
+      _src_d.indexOf('function _maybeAutoRevertSerialize') + 1500,
+    );
+    assert.match(fn, /Date\.now\(\) - _last429AnyAccountAt/);
+    assert.match(fn, /quietMs < _SERIALIZE_AUTO_REVERT_MS/);
+  });
+
+  it('_maybeAutoRevertSerialize clears _burst429ByFingerprint on revert', () => {
+    // Otherwise an old burst could trip immediately after revert.
+    const fn = _src_d.slice(
+      _src_d.indexOf('function _maybeAutoRevertSerialize'),
+      _src_d.indexOf('function _maybeAutoRevertSerialize') + 1500,
+    );
+    assert.match(fn, /_burst429ByFingerprint\.clear\(\)/);
+  });
+
+  it('auto-revert timer runs every 60s and is unref()d', () => {
+    // unref() so a process that's otherwise idle can still exit.
+    assert.match(_src_d, /_serializeAutoRevertTimer = setInterval\(_maybeAutoRevertSerialize, 60_000\)/);
+    assert.match(_src_d, /_serializeAutoRevertTimer\.unref/);
+  });
+
+  it('proxy 429 handler stamps _last429AnyAccountAt and calls Safeguard D', () => {
+    // The wiring at the 429 site is what turns the safeguard from a
+    // dead function into an active circuit breaker. If somebody refactors
+    // the 429 path and forgets to re-wire these two lines, the breaker
+    // silently stops working.
+    assert.match(_src_d, /_last429AnyAccountAt = Date\.now\(\)/);
+    assert.match(_src_d, /_autoEnableSerializeOnBurst\(getFingerprintFromToken\(token\), acctName\)/);
+  });
+
+  it('activity-feed renderer cases route every dynamic field through h(...)', () => {
+    // XSS regression — the renderHTML cases for the new event types
+    // MUST escape every account/reason field. If somebody adds a new
+    // field via raw `+ e.field +` concatenation, the source-grep XSS
+    // test (further down) catches it.
+    const enabled = _src_d.slice(
+      _src_d.indexOf("case 'serialize-auto-enabled'"),
+      _src_d.indexOf("case 'serialize-auto-enabled'") + 400,
+    );
+    assert.ok(enabled.length > 50, 'serialize-auto-enabled case must exist');
+    assert.match(enabled, /h\(e\.reason/);
+    assert.match(enabled, /h\(e\.account/);
+    assert.match(enabled, /h\(String\(e\.revert_after_quiet_min/);
+
+    const reverted = _src_d.slice(
+      _src_d.indexOf("case 'serialize-auto-reverted'"),
+      _src_d.indexOf("case 'serialize-auto-reverted'") + 300,
+    );
+    assert.ok(reverted.length > 50, 'serialize-auto-reverted case must exist');
+    assert.match(reverted, /h\(String\(e\.quiet_min/);
+  });
+
+  it('createSlidingWindowCounter (the breaker primitive) handles the actual Safeguard-D scenario', () => {
+    // Behavioral test (not just source-grep): three 429s spaced 5s apart
+    // within a 30s window MUST trip; one 429 every 60s must NOT trip.
+    const burstWindowMs = 30_000;
+    const burstThreshold = 3;
+    const cb = createSlidingWindowCounter({ windowMs: burstWindowMs, threshold: burstThreshold });
+
+    // Burst case — 3 events in 10s
+    cb.record(0);
+    cb.record(5_000);
+    cb.record(10_000);
+    assert.equal(cb.tripped(10_000), true, 'three 429s within burst window must trip');
+
+    // Spaced case — 3 events spaced 60s apart, only the most recent
+    // is in the 30s window at any given read time → never trips.
+    const cb2 = createSlidingWindowCounter({ windowMs: burstWindowMs, threshold: burstThreshold });
+    cb2.record(0);
+    cb2.record(60_000);
+    cb2.record(120_000);
+    assert.equal(cb2.tripped(120_000), false, 'spaced 429s must NOT trip the burst breaker');
+  });
+});
