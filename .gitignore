@@ -25,3 +25,26 @@ Thumbs.db
 node_modules/
 /reports/
 /reports_dev/
+
+# Dev-only scratch (per global rule 0.2 — counterparts of published dirs)
+/docs_dev/
+/scripts_dev/
+/samples_dev/
+/examples_dev/
+/tests_dev/
+/downloads_dev/
+/libs_dev/
+/builds_dev/
+
+# Internal review artifacts (contain absolute paths, internal analysis)
+/reviews/
+
+# Claude Code per-session / per-user state
+/.claude/chat_history/
+/.claude/scheduled_tasks.json
+/.claude/scheduled_tasks.lock
+/.claude/settings.local.json
+
+# Janitor / rechecker plugin runtime state
+/.janitor/
+/.rechecker/
