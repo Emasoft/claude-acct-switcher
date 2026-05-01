@@ -57,6 +57,7 @@ import {
   parseOtlpMetrics,
   // Phase I+ — bypass mode (all-accounts-revoked detection)
   isOAuthRevocationError,
+  isPostRefreshTrulyExpired,
   areAllAccountsTerminallyDead,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
@@ -5771,5 +5772,101 @@ describe('Phase I+ — anthropic-beta header forwarding (regression for CC gatew
       oauthBetaPatches >= 3,
       `expected ≥3 inline oauth-2025-04-20 patches (proxy-disabled, circuit-breaker, oauth-bypass); found ${oauthBetaPatches}`,
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — isPostRefreshTrulyExpired (CC-style heuristic
+// from bridge/initReplBridge.ts:203-240). After refresh
+// completes with !ok, if expiresAt is STILL in the past →
+// truly dead refresh token.
+// ─────────────────────────────────────────────────────────
+
+describe('isPostRefreshTrulyExpired — CC-style hard-revocation signal', () => {
+  it('returns true for past expiresAt (the actual dead-token signal)', () => {
+    const now = 5_000_000_000;
+    assert.equal(isPostRefreshTrulyExpired(now - 1, now),                    true);
+    assert.equal(isPostRefreshTrulyExpired(now - 60_000, now),               true);
+    assert.equal(isPostRefreshTrulyExpired(now - 24 * 60 * 60_000, now),     true);
+    assert.equal(isPostRefreshTrulyExpired(now, now),                        true, '== now is "expired" too — sub-millisecond expiry');
+  });
+
+  it('returns false for future expiresAt (token still has time left)', () => {
+    const now = 5_000_000_000;
+    assert.equal(isPostRefreshTrulyExpired(now + 1, now),                    false);
+    assert.equal(isPostRefreshTrulyExpired(now + 60_000, now),               false);
+    assert.equal(isPostRefreshTrulyExpired(now + 8 * 60 * 60_000, now),      false);
+  });
+
+  it('NEVER trips for null / undefined / non-numeric expiresAt', () => {
+    // Per CC source: env-var and FD tokens carry expiresAt=null and must
+    // never trip this — they're inference-only tokens whose "expiry"
+    // tracking is the responsibility of whatever produced the env var.
+    assert.equal(isPostRefreshTrulyExpired(null),                            false);
+    assert.equal(isPostRefreshTrulyExpired(undefined),                       false);
+    assert.equal(isPostRefreshTrulyExpired(0),                               false, 'falsy 0 = unknown, not "expired in 1970"');
+    assert.equal(isPostRefreshTrulyExpired(NaN),                             false);
+    assert.equal(isPostRefreshTrulyExpired(Infinity),                        false);
+    assert.equal(isPostRefreshTrulyExpired('1234567890'),                    false, 'string forms must not be auto-coerced — that would be a class of upstream-parsing bug we want to surface, not paper over');
+  });
+
+  it('does NOT use a buffer (unlike shouldRefreshToken)', () => {
+    // The whole point: a token with 3 minutes left + transient OAuth-server
+    // blip would falsely classify as dead under the buffered heuristic. This
+    // function uses ACTUAL expiry, no buffer.
+    const now = 5_000_000_000;
+    assert.equal(isPostRefreshTrulyExpired(now + 3 * 60_000, now), false, '3 min left = NOT truly dead');
+    assert.equal(shouldRefreshToken(now + 3 * 60_000, 5 * 60_000, now), true, 'shouldRefreshToken WOULD trip with 5min buffer (proves the difference)');
+  });
+});
+
+describe('Phase I+ — refreshAccountToken wires isPostRefreshTrulyExpired', () => {
+  const _src_pe = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports isPostRefreshTrulyExpired from lib.mjs', () => {
+    assert.match(_src_pe, /isPostRefreshTrulyExpired,/);
+  });
+
+  it('refresh-failed path checks oauth.expiresAt and force-marks if truly expired', () => {
+    // Anchor on the unique log message; the slice covers the whole branch.
+    const idx = _src_pe.indexOf('post-refresh truly expired');
+    assert.notEqual(idx, -1, 'post-refresh-expired branch must exist');
+    const block = _src_pe.slice(idx - 1500, idx + 1500);
+    assert.match(block, /isPostRefreshTrulyExpired\(oauth\.expiresAt\)/);
+    assert.match(block, /forceMarkPermanentlyRevoked\(\s*oldToken, accountName, 'post-refresh-truly-expired'/);
+    assert.match(block, /logActivity\('account-post-refresh-expired'/);
+  });
+
+  it('post-refresh-expired calls _evaluateBypassMode after force-marking', () => {
+    // Without the eval, marking the LAST account dead wouldn't engage
+    // bypass mode until the next request. We want immediate engagement.
+    const idx = _src_pe.indexOf('post-refresh-truly-expired');
+    const block = _src_pe.slice(idx, idx + 1500);
+    assert.match(block, /_evaluateBypassMode\(\)/);
+  });
+
+  it('activity-feed renderer escapes account name', () => {
+    const slice = _src_pe.slice(
+      _src_pe.indexOf("case 'account-post-refresh-expired'"),
+      _src_pe.indexOf("case 'account-post-refresh-expired'") + 400,
+    );
+    assert.ok(slice.length > 50, 'renderer case must exist');
+    assert.match(slice, /h\(e\.account/);
+  });
+
+  it('detection happens IN ADDITION to isOAuthRevocationError, not replacing it', () => {
+    // Both signals are valid; they catch different failure modes:
+    //   - isOAuthRevocationError: the OAuth server returned a known
+    //     RFC 6749 revocation error code
+    //   - isPostRefreshTrulyExpired: the OAuth server returned ANY
+    //     error AND the token is past its expiresAt
+    // The second catches non-RFC-conformant error responses (custom
+    // error formats, HTML error pages, network timeouts that exhausted
+    // the retry budget). Both must be present in the source.
+    assert.match(_src_pe, /isOAuthRevocationError\(result\.error\)/);
+    assert.match(_src_pe, /isPostRefreshTrulyExpired\(oauth\.expiresAt\)/);
   });
 });

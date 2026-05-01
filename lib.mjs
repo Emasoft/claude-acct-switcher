@@ -996,6 +996,38 @@ export function shouldRefreshToken(expiresAt, bufferMs = 60 * 60 * 1000, now = D
 }
 
 /**
+ * Stronger "this refresh token is dead" detector than `shouldRefreshToken`.
+ * Returns true ONLY when `expiresAt` is in the ACTUAL past (no buffer). The
+ * 5-minute / 1-hour proactive-refresh buffer that `shouldRefreshToken` uses
+ * is the right heuristic for "should refresh soon" but the WRONG one for
+ * "provably unusable" — a token with 3 minutes left plus a transient OAuth-
+ * server blip (5xx, timeout, wifi reconnect) would falsely classify as dead
+ * even though the still-valid token would connect fine.
+ *
+ * Per the Claude Code source (bridge/initReplBridge.ts:203-240, v2.1.89):
+ *   "Check actual expiry instead: past-expiry AND refresh-failed → truly dead."
+ *
+ * The vdm refresh wrapper retries up to REFRESH_MAX_RETRIES with exponential
+ * backoff, so by the time it returns !ok the OAuth endpoint has been given
+ * multiple chances. If `expiresAt < now()` STILL holds at that point, no
+ * future refresh attempt will succeed without user re-auth — the refresh
+ * grant has been revoked at the IdP.
+ *
+ * Returns false for unknown/falsy expiresAt (env-var / FD tokens carry
+ * `expiresAt: null` and must never trip this check).
+ *
+ * @param {number|null|undefined} expiresAt — epoch ms or null
+ * @param {number} [now] — current time (for testing)
+ * @returns {boolean}
+ */
+export function isPostRefreshTrulyExpired(expiresAt, now = Date.now()) {
+  if (!expiresAt) return false;          // null = unknown → don't speculate
+  if (typeof expiresAt !== 'number') return false;
+  if (!Number.isFinite(expiresAt)) return false;
+  return expiresAt <= now;
+}
+
+/**
  * Promise-chain mutex keyed by account name.
  * Ensures only one refresh runs per account at a time.
  *

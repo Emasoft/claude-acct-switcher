@@ -839,6 +839,7 @@ import {
   VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
   // Phase I+ — bypass mode (all accounts revoked → transparent forward)
   isOAuthRevocationError,
+  isPostRefreshTrulyExpired,
   areAllAccountsTerminallyDead,
 } from './lib.mjs';
 
@@ -6181,6 +6182,7 @@ function evtMsg(e) {
     case 'oauth-bypass-enabled': return '<b>OAuth bypass mode</b>: ' + h(e.reason || 'all accounts revoked') + ' — proxy now passes requests transparently. Run <code>claude login</code> to recover.';
     case 'oauth-bypass-disabled': return '<b>OAuth bypass exited</b>: ' + h(e.reason || 'recovery') + (e.duration_min ? ' (was in bypass for ' + h(String(e.duration_min)) + 'min)' : '');
     case 'account-organization-disabled': return '<b>Account terminated</b>: ' + h(e.account || '?') + ' — Anthropic returned <code>organization has been disabled</code>. Marked permanently revoked.';
+    case 'account-post-refresh-expired': return '<b>Refresh token dead</b>: ' + h(e.account || '?') + ' — refresh failed and <code>expiresAt</code> is still in the past. Marked permanently revoked.';
     case 'queue-depth-alert': return '<b>Queue depth alert</b>: ' + h(String(e.queued || '?')) + ' queued (≥' + h(String(e.threshold || '?')) + ') for ' + h(String(e.sustainedSeconds || '?')) + 's';
     // C4 fallthrough — events whose detail came in as a string get a .msg
     // field via logActivity's coercion. Surface that to the user. If only
@@ -9305,6 +9307,26 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
           try { _evaluateBypassMode(); } catch (e) {
             log('warn', `_evaluateBypassMode failed: ${e.message}`);
           }
+        }
+        // CC-style "post-refresh truly expired" hard-revocation signal
+        // (per github.com/chauncygu/.../bridge/initReplBridge.ts:203-240
+        // in CC v2.1.89): if the refresh chain completed with !ok AND
+        // the token's expiresAt is STILL in the past, no future refresh
+        // attempt will succeed without user re-auth. Force-mark
+        // immediately rather than waiting for 3 strikes over 1 hour.
+        // Catches refresh failures with non-standard error formats that
+        // isOAuthRevocationError doesn't recognize.
+        if (isPostRefreshTrulyExpired(oauth.expiresAt)) {
+          try {
+            accountState.forceMarkPermanentlyRevoked(
+              oldToken, accountName, 'post-refresh-truly-expired',
+            );
+            log('warn', `${accountName}: post-refresh truly expired (expiresAt ${new Date(oauth.expiresAt).toISOString()}) — force-marked permanently revoked`);
+            logActivity('account-post-refresh-expired', { account: accountLabel });
+          } catch (e) {
+            log('warn', `forceMarkPermanentlyRevoked failed: ${e.message}`);
+          }
+          try { _evaluateBypassMode(); } catch {}
         }
         if (!result.retriable) {
           notify(
