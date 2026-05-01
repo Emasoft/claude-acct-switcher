@@ -515,6 +515,15 @@ function _invalidateRunGitCache(cwd) {
     _runGitCache.clear();
     return;
   }
+  // The boundary between cwd and args in the cache key is `\0` (NUL byte
+  // — see _runGitCached `key = cwd + '\0' + args.join('\0')`). Including
+  // the NUL in the prefix is what makes startsWith path-segment-safe:
+  // invalidating `/tmp/foo` MUST NOT also evict `/tmp/foobar` keys, and
+  // it does not because no valid filesystem path contains `\0`. If the
+  // key construction in _runGitCached ever changes to a different
+  // separator (e.g. `/`), this prefix check would silently turn into a
+  // path-prefix bug — the regression test in lib.test.mjs pins both
+  // sides of the contract.
   const prefix = cwd + '\0';
   for (const k of _runGitCache.keys()) {
     if (k.startsWith(prefix)) _runGitCache.delete(k);
@@ -1010,14 +1019,22 @@ function saveHistoryToDisk() {
 loadHistoryFromDisk();
 
 // ── macOS desktop notifications ──
-// `settings.notifications` accepts two shapes for backward compat:
-//   1. boolean — single global gate (legacy, pre-fine-grained).
-//   2. object  — per-event-type flags:
+// `settings.notifications` is intentionally polymorphic — both shapes
+// are first-class public APIs, NOT legacy:
+//   1. boolean — what the dashboard's UI checkbox writes
+//      (toggleSetting('notifications', true|false)). The whole UI is one
+//      single global gate by design; per-event toggles would clutter it
+//      for the 99% of users who just want "on/off".
+//   2. object  — per-event-type flags written by the CLI / API for the
+//      power-user case ("turn off the switch beep but keep the rate-
+//      limit alarm"):
 //        { switch: true, exhausted: true, refreshFailed: true,
 //          circuitBreaker: true, expired: true, _default: true }
 // Code paths that emit a notification pass an `eventType` so the per-
-// event flag (or `_default` if missing) decides whether to show. Boolean
-// settings.notifications keeps every event ON (true) or OFF (false).
+// event flag (or `_default` if missing) decides whether to show. When
+// settings.notifications is a boolean, every event evaluates to that
+// boolean. The dual shape is what lets the UI stay simple while the
+// API stays granular — keep both.
 //
 // Throttling is also per-event-type: a "switch" + "all-exhausted"
 // arriving within the global window used to drop the second (more
@@ -1830,9 +1847,12 @@ async function handleAPI(req, res) {
         }
       }
     }
-    // Accept either a boolean (legacy single-toggle) or a per-event-
-    // type object. Validate the object shape so a typo doesn't sneak
-    // an unknown key into config.json.
+    // L7 — settings.notifications is intentionally polymorphic: the
+    // dashboard UI writes a boolean (one global gate), the CLI / API
+    // writes a per-event-type object (granular control). NOT a legacy
+    // shim — see the comment above _isNotifyEnabled. Validate the
+    // object shape so a typo can't sneak an unknown key into
+    // config.json.
     if (typeof patch.notifications === 'boolean') {
       settings.notifications = patch.notifications;
     } else if (patch.notifications && typeof patch.notifications === 'object') {
@@ -1876,8 +1896,16 @@ async function handleAPI(req, res) {
     // entry buffer. Numbers are days for *_MAX_AGE_DAYS, count for
     // *_MAX_ENTRIES. Validation: positive integers within range; null
     // / undefined leaves the existing value alone.
-    if (Number.isFinite(patch.tokenUsageMaxAge) && patch.tokenUsageMaxAge > 0 && patch.tokenUsageMaxAge <= 365) {
-      settings.tokenUsageMaxAgeDays = Math.floor(patch.tokenUsageMaxAge);
+    // L6 — single canonical name across CLI, API, config.json, and
+    // DEFAULT_SETTINGS: tokenUsageMaxAgeDays. The API previously
+    // accepted `tokenUsageMaxAge` (without the Days suffix) and mapped
+    // it to `tokenUsageMaxAgeDays` on disk — that asymmetry made the
+    // CLI need a custom alias and the field appeared under two names
+    // in user-facing output. Per CLAUDE.md "no backward compatibility
+    // code", the short name is removed; vdm config now sends the full
+    // name.
+    if (Number.isFinite(patch.tokenUsageMaxAgeDays) && patch.tokenUsageMaxAgeDays > 0 && patch.tokenUsageMaxAgeDays <= 365) {
+      settings.tokenUsageMaxAgeDays = Math.floor(patch.tokenUsageMaxAgeDays);
     }
     if (Number.isFinite(patch.tokenUsageMaxEntries) && patch.tokenUsageMaxEntries > 0 && patch.tokenUsageMaxEntries <= 500_000) {
       settings.tokenUsageMaxEntries = Math.floor(patch.tokenUsageMaxEntries);
@@ -5590,6 +5618,13 @@ function renderAccounts(profiles, animate) {
     }
     if (!anyChanged) { /* no DOM write needed — fastest path */ }
   }
+  // L5 — wholesale replacement (NOT cache.set on each pname). The
+  // newHashes map only contains keys for the CURRENT profiles, so any
+  // account that was removed since the last render naturally drops out
+  // of the cache here. If a future refactor switches this to per-key
+  // updates (e.g. for-of over newHashes calling cache.set), removed
+  // accounts would leak hash entries forever — the _renderedCardCache
+  // wholesale-replacement regression test pins this invariant.
   _renderedCardCache = newHashes;
 }
 
@@ -5921,8 +5956,13 @@ function estimateCost(model, inTok, outTok, cacheReadTok, cacheCreationTok) {
       catch { /* logActivity may not be defined in browser context — ignore */ }
     }
   }
-  // Cache rates default to 0 for backward compat with existing rows that lack
-  // cache token fields. New rows from Phase G+ will populate them.
+  // L10 — defensive default for price-table entries that haven't set
+  // cacheRead / cacheCreation yet. NOT a backward-compat shim: every
+  // current model in the price table sets both rates explicitly. The
+  // fallback exists so a future model addition that forgets the cache
+  // rates produces $0 cache cost (visibly wrong) rather than NaN
+  // (silently propagated everywhere downstream). Numeric type-check
+  // also rejects accidental string rates that would coerce to NaN.
   var cacheRead = (typeof p.cacheRead === 'number') ? p.cacheRead : 0;
   var cacheCreation = (typeof p.cacheCreation === 'number') ? p.cacheCreation : 0;
   var crTok = Number(cacheReadTok) || 0;
@@ -5945,8 +5985,19 @@ function toggleRepoCollapse(repoKey) {
   renderRepoBranchBreakdown(_tokFilteredData || []);
 }
 
+// L3 — single canonical HTML-escape helper for the browser bundle.
+// Both escapeHtml and escHtml used to live here; the duplicate was
+// removed in favour of escHtml (shorter, more call sites) and the
+// null-check uses s == null rather than the falsy-check so numeric 0
+// and boolean false round-trip as their string form instead of becoming
+// the empty string. Escapes all 5 characters so the helper is safe for
+// both text-content AND attribute interpolation.
+//
+// CLAUDE.md backtick-in-comment trap: this comment is INSIDE
+// renderHTML()'s template literal (line ~2446 to ~6500). Any backtick
+// here ends the template early. Plain-text wording only.
 function escHtml(s) {
-  if (!s) return '';
+  if (s == null) return '';
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
@@ -6927,7 +6978,7 @@ function connectLogStream() {
       // uniformly. NB: avoid markdown backticks in comments inside renderHTML
       // because the whole function body is one big template literal and any
       // stray backtick terminates it (see CLAUDE.md backtick-in-comment trap).
-      line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + escapeHtml(tag.toUpperCase()) + ']</span> ' + escapeHtml(data.msg || data.line || '');
+      line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + escHtml(tag.toUpperCase()) + ']</span> ' + escHtml(data.msg || data.line || '');
       // Check scroll position before DOM changes
       const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
       container.appendChild(line);
@@ -6951,17 +7002,6 @@ function connectLogStream() {
 function clearLogs() {
   const container = document.getElementById('log-container');
   container.innerHTML = '';
-}
-
-function escapeHtml(s) {
-  // M13 fix — also escape single and double quotes so the helper is
-  // safe for attribute interpolation, not just text-content. Currently
-  // every call site is in text position, but one attribute use away
-  // from XSS without these two replacements. The redundant cousin
-  // escHtml at line ~5912 already escapes all 5 chars; aligning
-  // escapeHtml with it removes a we-have-two-helpers footgun.
-  if (s == null) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ── Session Monitor ──
@@ -7037,7 +7077,7 @@ function renderSessions(data) {
   if (data.conflicts && data.conflicts.length) {
     html += '<div class="session-conflicts">';
     data.conflicts.forEach(function(c) {
-      html += '<div>\\u26A0 ' + c.count + ' sessions editing ' + escapeHtml(c.file) + '</div>';
+      html += '<div>\\u26A0 ' + c.count + ' sessions editing ' + escHtml(c.file) + '</div>';
     });
     html += '</div>';
   }
@@ -7056,7 +7096,7 @@ function renderSessions(data) {
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
       html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
-      html += '<span class="session-header-left"><b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(proj) + '</span>';
+      html += '<span class="session-header-left"><b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
       html += '<span class="session-header-right"><span>' + dur + '</span>';
       if (state === 'awaiting') {
         html += '<span class="session-awaiting">\\u23F8 input ' + idle + '</span>';
@@ -7066,18 +7106,18 @@ function renderSessions(data) {
       // Collapsed activity summary (visible only when collapsed)
       if (s.currentActivity) {
         var brailleC = state === 'processing' ? 'braille-spin' : 'braille-static';
-        html += '<div class="session-collapsed-activity"><span class="' + brailleC + '"></span>' + escapeHtml(s.currentActivity) + '</div>';
+        html += '<div class="session-collapsed-activity"><span class="' + brailleC + '"></span>' + escHtml(s.currentActivity) + '</div>';
       }
       // Timeline
       html += '<div class="session-timeline">';
       s.timeline.forEach(function(e) {
-        if (e.type === 'input') html += '<div class="tl-input">' + escapeHtml(e.text) + '</div>';
-        else html += '<div class="tl-action">' + escapeHtml(e.text) + '</div>';
+        if (e.type === 'input') html += '<div class="tl-input">' + escHtml(e.text) + '</div>';
+        else html += '<div class="tl-action">' + escHtml(e.text) + '</div>';
       });
       // Current activity
       if (s.currentActivity) {
         var brailleClass = state === 'processing' ? 'braille-spin' : 'braille-static';
-        html += '<div class="tl-current"><span class="' + brailleClass + '"></span>' + escapeHtml(s.currentActivity) + '</div>';
+        html += '<div class="tl-current"><span class="' + brailleClass + '"></span>' + escHtml(s.currentActivity) + '</div>';
       }
       html += '</div>';
       // Meta
@@ -7102,13 +7142,13 @@ function renderSessions(data) {
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
       html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
-      html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(proj) + '</span>';
+      html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
       html += '<span class="session-header-right"><span>' + dur + ' \\u00b7 ~$' + cost + '</span></span>';
       html += '</div>';
       html += '<div class="session-timeline">';
       (s.timeline || []).forEach(function(e) {
-        if (e.type === 'input') html += '<div class="tl-input">' + escapeHtml(e.text) + '</div>';
-        else html += '<div class="tl-action">' + escapeHtml(e.text) + '</div>';
+        if (e.type === 'input') html += '<div class="tl-input">' + escHtml(e.text) + '</div>';
+        else html += '<div class="tl-action">' + escHtml(e.text) + '</div>';
       });
       html += '</div>';
       html += '<div class="session-meta">';
@@ -7425,10 +7465,19 @@ function _redactForLog(s) {
 }
 
 function log(tag, msg, extra = '') {
-  const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
-  const line = `[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
+  // L4 — store entry.ts as Date.now() (epoch ms) instead of the
+  // pre-formatted en-GB locale string. Storing the raw epoch lets SSE
+  // consumers re-format in their own locale (or filter by time window
+  // numerically). The pre-formatted display string moves to
+  // entry.tsDisplay so the inline `line` field — and any downstream
+  // consumer that wants the on-the-wire human form — keep working
+  // unchanged. The console / SSE `line` text continues to embed the
+  // formatted display so existing renderers don't change.
+  const tsEpoch = Date.now();
+  const tsDisplay = new Date(tsEpoch).toLocaleTimeString('en-GB', { hour12: false });
+  const line = `[${tsDisplay}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
   try { console.log(line); } catch { /* stdout broken (EIO/EPIPE) — ignore */ }
-  const entry = { ts, tag, msg: msg + (extra ? ' ' + extra : ''), line };
+  const entry = { ts: tsEpoch, tsDisplay, tag, msg: msg + (extra ? ' ' + extra : ''), line };
   // Buffer for replay to new SSE clients
   _logBuffer.push(entry);
   if (_logBuffer.length > LOG_BUFFER_MAX) _logBuffer.shift();
@@ -9716,14 +9765,44 @@ const TOKEN_USAGE_FLUSH_MS = 500;
 
 function loadTokenUsage() {
   if (_tokenUsageCache) return _tokenUsageCache;
+  // L9 — distinguish three distinct disk states so a real disk error
+  // doesn't silently masquerade as "missing file = empty start":
+  //   (a) file does not exist → start with an empty array (expected on
+  //       fresh installs).
+  //   (b) file exists but content is malformed JSON OR the parsed value
+  //       isn't an array → log a warn, then start empty so the dashboard
+  //       boots. If we crashed here, the dashboard would be unbootable
+  //       on a single corrupt file.
+  //   (c) file exists, JSON is well-formed, but readFileSync threw a
+  //       real I/O error (EACCES, EIO, EBUSY) → log a warn so the
+  //       operator sees the failure rather than silently treating it as
+  //       case (b).
+  if (!existsSync(TOKEN_USAGE_FILE)) {
+    _tokenUsageCache = [];
+    return _tokenUsageCache;
+  }
+  let raw;
   try {
-    if (existsSync(TOKEN_USAGE_FILE)) {
-      const raw = readFileSync(TOKEN_USAGE_FILE, 'utf8');
-      _tokenUsageCache = JSON.parse(raw);
-      return _tokenUsageCache;
-    }
-  } catch { /* corrupt file */ }
-  _tokenUsageCache = [];
+    raw = readFileSync(TOKEN_USAGE_FILE, 'utf8');
+  } catch (e) {
+    log('warn', `loadTokenUsage: read failed (${e.code || 'EUNKNOWN'}): ${e.message}`);
+    _tokenUsageCache = [];
+    return _tokenUsageCache;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    log('warn', `loadTokenUsage: JSON parse failed (${e.message}); starting empty`);
+    _tokenUsageCache = [];
+    return _tokenUsageCache;
+  }
+  if (!Array.isArray(parsed)) {
+    log('warn', `loadTokenUsage: top-level JSON must be an array, got ${typeof parsed}; starting empty`);
+    _tokenUsageCache = [];
+    return _tokenUsageCache;
+  }
+  _tokenUsageCache = parsed;
   return _tokenUsageCache;
 }
 

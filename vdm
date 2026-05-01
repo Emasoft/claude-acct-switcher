@@ -440,14 +440,14 @@ _post_settings_to_dashboard() {
        "http://localhost:$DASHBOARD_PORT/health"; then
     return 1
   fi
-  # Map the few stored-key → API-key aliases. The API accepts a smaller
-  # set than what the CLI / config.json store. Keep this list in sync with
-  # the `if (typeof patch.<key> ...)` block in dashboard.mjs's
-  # /api/settings POST handler.
+  # L6 — the API now uses the same name as config.json
+  # (tokenUsageMaxAgeDays); no alias mapping is needed. Kept this
+  # branch as a no-op pass-through plus comment so future settings
+  # whose API name diverges from the disk name have an obvious place
+  # to land. Always cross-check with the `if (typeof patch.<key> ...)`
+  # block in dashboard.mjs's /api/settings POST handler when adding
+  # new settings.
   local api_key="$key"
-  case "$key" in
-    tokenUsageMaxAgeDays) api_key="tokenUsageMaxAge" ;;
-  esac
   # Build typed JSON via python3 so booleans / numbers / strings serialise
   # correctly (bash heredoc string concatenation would mangle bools as
   # "true"/"false" string literals — the API would silently no-op).
@@ -1049,7 +1049,7 @@ cmd_config() {
       echo -e "  perToolAttribution: ${DIM}off${NC}"
     fi
     local tu_max_age=$(get_config_string "tokenUsageMaxAgeDays")
-    echo -e "  tokenUsageMaxAge:   ${tu_max_age:-90} days"
+    echo -e "  tokenUsageMaxAgeDays:   ${tu_max_age:-90}"
     local tu_max_entries=$(get_config_string "tokenUsageMaxEntries")
     echo -e "  tokenUsageMaxEntries: ${tu_max_entries:-50000}"
     local act_max=$(get_config_string "activityMaxEntries")
@@ -1469,6 +1469,19 @@ cmd_upgrade() {
       echo -e "  ${RED}Failed to stage $f — upgrade aborted, install unchanged.${NC}"
       return 1
     fi
+    # chmod the .new file BEFORE mv-rename. Doing it after the rename
+    # leaves a SIGKILL/^C window in which the new vdm is in place but
+    # not executable, bricking the install until the user runs `chmod +x`
+    # by hand. The mv-rename is the only atomic step; the chmod must
+    # piggyback on the source side of the rename.
+    if [[ "$f" == "vdm" ]]; then
+      if ! chmod +x "$SCRIPT_DIR/${f}.new"; then
+        _upg_cleanup
+        trap - INT TERM HUP
+        echo -e "  ${RED}Failed to chmod ${f}.new — upgrade aborted.${NC}"
+        return 1
+      fi
+    fi
     if ! mv -f "$SCRIPT_DIR/${f}.new" "$SCRIPT_DIR/$f"; then
       _upg_cleanup
       trap - INT TERM HUP
@@ -1477,7 +1490,6 @@ cmd_upgrade() {
     fi
   done
   trap - INT TERM HUP
-  chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker — full SHA-1 so future upgrades can compare without
   # ambiguity. Display value remains the tag/short-hash in the user-facing

@@ -85,7 +85,15 @@ _atomic_replace() {
       return 1
     fi
   else
-    mv -f "$tmp" "$dst"
+    # L8 sibling — make sure $tmp is removed on the failure path of
+    # `mv -f` too (cross-FS rename, EACCES, full disk). The success
+    # case consumes $tmp via rename(2), so no cleanup is needed there.
+    if mv -f "$tmp" "$dst"; then
+      return 0
+    else
+      rm -f "$tmp"
+      return 1
+    fi
   fi
 }
 

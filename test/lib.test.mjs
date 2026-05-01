@@ -4040,3 +4040,68 @@ describe('createUsageExtractor — pass-through correctness', () => {
     assert.equal(passed, payload, 'extractor must not mutate the byte stream');
   });
 });
+
+// ─────────────────────────────────────────────────
+// L2 source-level regression — _runGitCache key + invalidate prefix
+// must use \0 separator (NUL byte is the only path-segment-safe boundary)
+// ─────────────────────────────────────────────────
+describe('L2 — _runGitCache uses NUL-byte separator for path-segment safety', () => {
+  const _dashboardSrc_l2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('cache key construction uses \\0 between cwd and args', () => {
+    // _runGitCached MUST build the key as `cwd + '\0' + args.join('\0')`.
+    // If a future refactor switches to '/' or ':' separator, the
+    // _invalidateRunGitCache prefix check below silently turns into a
+    // path-prefix bug — invalidating /tmp/foo would also evict
+    // /tmp/foobar entries.
+    assert.match(
+      _dashboardSrc_l2,
+      /const key = cwd \+ '\\0' \+ args\.join\('\\0'\)/,
+      'cache key must use NUL-byte separator',
+    );
+  });
+
+  it('_invalidateRunGitCache prefix uses \\0 to enforce path-segment boundary', () => {
+    assert.match(
+      _dashboardSrc_l2,
+      /const prefix = cwd \+ '\\0';/,
+      '_invalidateRunGitCache must use NUL-byte boundary for prefix match',
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────
+// L5 source-level regression — _renderedCardCache wholesale replacement
+// ─────────────────────────────────────────────────
+describe('L5 — _renderedCardCache replaced wholesale per render (no add+remove leak)', () => {
+  const _dashboardSrc_l5 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('renderAccounts assigns _renderedCardCache = newHashes (not per-key set)', () => {
+    // Wholesale replacement is what guarantees removed accounts drop out
+    // of the cache. If a future refactor turns this into a for-of that
+    // calls cache.set(name, hash) per profile, removed-account entries
+    // would leak forever — every account that ever existed would pin a
+    // hash entry until process restart.
+    assert.match(
+      _dashboardSrc_l5,
+      /_renderedCardCache = newHashes;/,
+      'renderAccounts must replace the cache wholesale, not per-key',
+    );
+  });
+
+  it('renderAccounts has no remaining .set( call against _renderedCardCache', () => {
+    // Belt-and-braces: if anyone ever adds _renderedCardCache.set(...)
+    // INSIDE renderAccounts the wholesale-replacement guarantee is gone.
+    // The .clear() call in the empty-profiles early return is fine.
+    assert.equal(
+      /_renderedCardCache\.set\(/.test(_dashboardSrc_l5), false,
+      '_renderedCardCache.set(...) must not exist; replace wholesale only',
+    );
+  });
+});
