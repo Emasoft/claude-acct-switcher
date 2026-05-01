@@ -73,6 +73,22 @@ _VDM_HOOKS_MARKER="# vdm-token-usage"
 _VDM_HOOKS_PATH_MARKER=".vdm-set-hooks-path"
 
 install_hooks() {
+  # Uninstall-aware guard. install-hooks.sh can be sourced from at least
+  # five places (install.sh, uninstall.sh, vdm self-heal, `vdm hooks`,
+  # `vdm upgrade`). The vdm self-heal block already gates on dashboard.mjs
+  # existing in the canonical install dir before sourcing this file, but
+  # any other caller — including a stray script the user wrote, an old
+  # checkout left over from a prior install, or this file getting sourced
+  # by hand for debugging — would otherwise re-install hooks pointing at
+  # a port nothing is listening on (every CC turn would fire ECONNREFUSED).
+  # Refusing here closes the "old script resurrects hooks after uninstall"
+  # vector without affecting legitimate callers (install.sh copies
+  # dashboard.mjs BEFORE sourcing this file, so the guard always passes
+  # during a real install).
+  if [ ! -x "$HOME/.claude/account-switcher/dashboard.mjs" ]; then
+    echo "install-hooks.sh: $HOME/.claude/account-switcher/dashboard.mjs not found — refusing to install hooks against a missing dashboard. Run install.sh from the source repo to (re)install vdm." >&2
+    return 1
+  fi
   _install_claude_code_hooks
   _install_git_hook
 }

@@ -590,93 +590,109 @@ if [[ -n "$SHELL_RC" ]]; then
     }
     _register_cleanup "rm -f \"$_SNIPPET_BODY\""
     cat > "$_SNIPPET_BODY" <<SHELL_EOF
-# Resolve dashboard + proxy ports. Priority order:
-#   1. Pre-existing env var (\$CSW_PORT / \$CSW_PROXY_PORT) wins — lets a user
-#      run \`CSW_PORT=4444 CSW_PROXY_PORT=4445 …\` in the SAME shell (or via a
-#      launchd plist that already exported the value) without this snippet
-#      stomping it back to 3333/3334.
-#   2. Else, parse ~/.claude/account-switcher/config.json for "port" /
-#      "proxyPort" — that's where the dashboard persists user-configured
-#      ports via the settings UI, so a setting saved last week is still
-#      honoured by every fresh shell this week.
-#   3. Else, fall back to the project defaults 3333 / 3334.
-# All python3 calls short-circuit silently on ANY failure (missing python3,
-# missing config.json, malformed JSON, missing key) — the \`|| true\` swallows
-# parse errors and the \`command -v python3\` guard handles a missing
-# interpreter, so the snippet stays inert on a broken-environment shell
-# instead of polluting stderr at every prompt.
-if [ -z "\${CSW_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
-  CSW_PORT="\$(python3 -c 'import json,sys
+# Uninstall-aware self-disable check. If dashboard.mjs is missing
+# (vdm uninstalled, partial removal, manual rm of the install dir), the
+# snippet must NOT export ANTHROPIC_BASE_URL — doing so would point every
+# new shell at a port nothing is listening on, producing ConnectionRefused
+# on every \`claude\` invocation. Defensively also strip any inherited
+# ANTHROPIC_BASE_URL=http://localhost:* / 127.0.0.1:* (e.g. carried over
+# from a parent process started while vdm WAS installed) so the new shell
+# falls back to Anthropic's default endpoint.
+if [ ! -x "\$HOME/.claude/account-switcher/dashboard.mjs" ]; then
+  case "\${ANTHROPIC_BASE_URL:-}" in
+    http*://localhost:*|http*://127.0.0.1:*)
+      unset ANTHROPIC_BASE_URL
+      ;;
+  esac
+else
+  # Resolve dashboard + proxy ports. Priority order:
+  #   1. Pre-existing env var (\$CSW_PORT / \$CSW_PROXY_PORT) wins — lets a user
+  #      run \`CSW_PORT=4444 CSW_PROXY_PORT=4445 …\` in the SAME shell (or via a
+  #      launchd plist that already exported the value) without this snippet
+  #      stomping it back to 3333/3334.
+  #   2. Else, parse ~/.claude/account-switcher/config.json for "port" /
+  #      "proxyPort" — that's where the dashboard persists user-configured
+  #      ports via the settings UI, so a setting saved last week is still
+  #      honoured by every fresh shell this week.
+  #   3. Else, fall back to the project defaults 3333 / 3334.
+  # All python3 calls short-circuit silently on ANY failure (missing python3,
+  # missing config.json, malformed JSON, missing key) — the \`|| true\` swallows
+  # parse errors and the \`command -v python3\` guard handles a missing
+  # interpreter, so the snippet stays inert on a broken-environment shell
+  # instead of polluting stderr at every prompt.
+  if [ -z "\${CSW_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    CSW_PORT="\$(python3 -c 'import json,sys
 try:
   d=json.load(open(sys.argv[1]))
   v=d.get("port","")
   print(v if isinstance(v,int) else "")
 except Exception:
   pass' "\$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"
-fi
-if [ -z "\${CSW_PROXY_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
-  CSW_PROXY_PORT="\$(python3 -c 'import json,sys
+  fi
+  if [ -z "\${CSW_PROXY_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    CSW_PROXY_PORT="\$(python3 -c 'import json,sys
 try:
   d=json.load(open(sys.argv[1]))
   v=d.get("proxyPort","")
   print(v if isinstance(v,int) else "")
 except Exception:
   pass' "\$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"
-fi
-# Numeric default fallback runs unconditionally — covers the case where
-# python3 ran but returned an empty string (key missing / non-int value).
-CSW_PORT="\${CSW_PORT:-3333}"
-CSW_PROXY_PORT="\${CSW_PROXY_PORT:-3334}"
-export CSW_PORT CSW_PROXY_PORT
-# Auto-start the dashboard at most once per machine. Two terminals opened
-# the same instant would both pass an \`lsof\` check before either had
-# bound the port, so we use a mkdir-based mutex (atomic on every POSIX
-# filesystem) as the race-free "I'm starting it" guard. The dashboard
-# itself also handles EADDRINUSE cleanly (exits 0), so this is
-# defence-in-depth — the lock just avoids the wasted spawn + log noise.
-# Stale-lock cleanup: if the lock dir is older than 60s, the previous
-# starter must have crashed before releasing it; reclaim it.
-_vdm_lock="\${TMPDIR:-/tmp}/vdm-autostart-\$(id -u).lock.d"
-if [ -d "\$_vdm_lock" ]; then
-  # -mmin +1 is portable across BSD (macOS) and GNU find. The -maxdepth 0
-  # is needed so find tests the lock dir itself, not its (empty) contents.
-  if find "\$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then
+  fi
+  # Numeric default fallback runs unconditionally — covers the case where
+  # python3 ran but returned an empty string (key missing / non-int value).
+  CSW_PORT="\${CSW_PORT:-3333}"
+  CSW_PROXY_PORT="\${CSW_PROXY_PORT:-3334}"
+  export CSW_PORT CSW_PROXY_PORT
+  # Auto-start the dashboard at most once per machine. Two terminals opened
+  # the same instant would both pass an \`lsof\` check before either had
+  # bound the port, so we use a mkdir-based mutex (atomic on every POSIX
+  # filesystem) as the race-free "I'm starting it" guard. The dashboard
+  # itself also handles EADDRINUSE cleanly (exits 0), so this is
+  # defence-in-depth — the lock just avoids the wasted spawn + log noise.
+  # Stale-lock cleanup: if the lock dir is older than 60s, the previous
+  # starter must have crashed before releasing it; reclaim it.
+  _vdm_lock="\${TMPDIR:-/tmp}/vdm-autostart-\$(id -u).lock.d"
+  if [ -d "\$_vdm_lock" ]; then
+    # -mmin +1 is portable across BSD (macOS) and GNU find. The -maxdepth 0
+    # is needed so find tests the lock dir itself, not its (empty) contents.
+    if find "\$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then
+      rmdir "\$_vdm_lock" 2>/dev/null
+    fi
+  fi
+  if mkdir "\$_vdm_lock" 2>/dev/null; then
+    # Rotate startup.log before spawn if it's grown past 1 MiB. Without
+    # this the file is append-only and grows indefinitely (every shell
+    # opens a fresh dashboard if no listener exists, every vdm restart
+    # re-opens this stream). Cap at 1 MiB; rotated as .1 (one-deep
+    # ring). On macOS \`stat -f '%z'\` is the BSD form; \`stat -c '%s'\`
+    # works on GNU coreutils. We try both for portability.
+    _vdm_log="\$HOME/.claude/account-switcher/startup.log"
+    if [ -f "\$_vdm_log" ]; then
+      _vdm_log_sz="\$(stat -f '%z' "\$_vdm_log" 2>/dev/null || stat -c '%s' "\$_vdm_log" 2>/dev/null || echo 0)"
+      if [ "\${_vdm_log_sz:-0}" -gt 1048576 ]; then
+        mv -f "\$_vdm_log" "\${_vdm_log}.1" 2>/dev/null || :
+      fi
+      unset _vdm_log_sz
+    fi
+    unset _vdm_log
+    # Probe the RESOLVED dashboard port — not a hard-coded 3333. Otherwise a
+    # user with \`CSW_PORT=4444\` already running would still get a second
+    # dashboard.mjs spawned because lsof looked at the wrong port.
+    if ! lsof -iTCP:"\$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      nohup ${NODE_BIN_QUOTED} ~/.claude/account-switcher/dashboard.mjs \\
+        >>~/.claude/account-switcher/startup.log 2>&1 &
+      disown
+    fi
     rmdir "\$_vdm_lock" 2>/dev/null
   fi
+  unset _vdm_lock
+  # Use \`:-\` so a user-set ANTHROPIC_BASE_URL exported earlier in the rc
+  # file (or inherited from the parent process) is preserved. Only set the
+  # vdm proxy URL when nothing else is configured. Use the resolved
+  # \$CSW_PROXY_PORT, not a literal 3334, so claude actually hits the proxy
+  # on a non-default port instead of bypassing it.
+  export ANTHROPIC_BASE_URL="\${ANTHROPIC_BASE_URL:-http://localhost:\$CSW_PROXY_PORT}"
 fi
-if mkdir "\$_vdm_lock" 2>/dev/null; then
-  # Rotate startup.log before spawn if it's grown past 1 MiB. Without
-  # this the file is append-only and grows indefinitely (every shell
-  # opens a fresh dashboard if no listener exists, every vdm restart
-  # re-opens this stream). Cap at 1 MiB; rotated as .1 (one-deep
-  # ring). On macOS \`stat -f '%z'\` is the BSD form; \`stat -c '%s'\`
-  # works on GNU coreutils. We try both for portability.
-  _vdm_log="\$HOME/.claude/account-switcher/startup.log"
-  if [ -f "\$_vdm_log" ]; then
-    _vdm_log_sz="\$(stat -f '%z' "\$_vdm_log" 2>/dev/null || stat -c '%s' "\$_vdm_log" 2>/dev/null || echo 0)"
-    if [ "\${_vdm_log_sz:-0}" -gt 1048576 ]; then
-      mv -f "\$_vdm_log" "\${_vdm_log}.1" 2>/dev/null || :
-    fi
-    unset _vdm_log_sz
-  fi
-  unset _vdm_log
-  # Probe the RESOLVED dashboard port — not a hard-coded 3333. Otherwise a
-  # user with \`CSW_PORT=4444\` already running would still get a second
-  # dashboard.mjs spawned because lsof looked at the wrong port.
-  if ! lsof -iTCP:"\$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
-    nohup ${NODE_BIN_QUOTED} ~/.claude/account-switcher/dashboard.mjs \\
-      >>~/.claude/account-switcher/startup.log 2>&1 &
-    disown
-  fi
-  rmdir "\$_vdm_lock" 2>/dev/null
-fi
-unset _vdm_lock
-# Use \`:-\` so a user-set ANTHROPIC_BASE_URL exported earlier in the rc
-# file (or inherited from the parent process) is preserved. Only set the
-# vdm proxy URL when nothing else is configured. Use the resolved
-# \$CSW_PROXY_PORT, not a literal 3334, so claude actually hits the proxy
-# on a non-default port instead of bypassing it.
-export ANTHROPIC_BASE_URL="\${ANTHROPIC_BASE_URL:-http://localhost:\$CSW_PROXY_PORT}"
 SHELL_EOF
     if ! _atomic_append_block "$SHELL_RC" \
         "# BEGIN claude-account-switcher" \
@@ -693,35 +709,42 @@ else
   echo "  Add this to your shell profile manually:"
   echo ""
   echo '    # BEGIN claude-account-switcher'
-  echo '    if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
-  echo '      CSW_PORT="$(python3 -c '"'"'import json,sys'
+  echo '    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone.'
+  echo '    if [ ! -x "$HOME/.claude/account-switcher/dashboard.mjs" ]; then'
+  echo '      case "${ANTHROPIC_BASE_URL:-}" in'
+  echo '        http*://localhost:*|http*://127.0.0.1:*) unset ANTHROPIC_BASE_URL ;;'
+  echo '      esac'
+  echo '    else'
+  echo '      if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
+  echo '        CSW_PORT="$(python3 -c '"'"'import json,sys'
   echo 'try:'
   echo '  d=json.load(open(sys.argv[1])); v=d.get("port",""); print(v if isinstance(v,int) else "")'
   echo 'except Exception: pass'"'"' "$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"'
-  echo '    fi'
-  echo '    if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
-  echo '      CSW_PROXY_PORT="$(python3 -c '"'"'import json,sys'
+  echo '      fi'
+  echo '      if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
+  echo '        CSW_PROXY_PORT="$(python3 -c '"'"'import json,sys'
   echo 'try:'
   echo '  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) else "")'
   echo 'except Exception: pass'"'"' "$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"'
-  echo '    fi'
-  echo '    CSW_PORT="${CSW_PORT:-3333}"'
-  echo '    CSW_PROXY_PORT="${CSW_PROXY_PORT:-3334}"'
-  echo '    export CSW_PORT CSW_PROXY_PORT'
-  echo '    _vdm_lock="${TMPDIR:-/tmp}/vdm-autostart-$(id -u).lock.d"'
-  echo '    if [ -d "$_vdm_lock" ] && find "$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then'
-  echo '      rmdir "$_vdm_lock" 2>/dev/null'
-  echo '    fi'
-  echo '    if mkdir "$_vdm_lock" 2>/dev/null; then'
-  echo '      if ! lsof -iTCP:"$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then'
-  echo "        nohup $(command -v node) ~/.claude/account-switcher/dashboard.mjs \\"
-  echo '          >>~/.claude/account-switcher/startup.log 2>&1 &'
-  echo '        disown'
   echo '      fi'
-  echo '      rmdir "$_vdm_lock" 2>/dev/null'
+  echo '      CSW_PORT="${CSW_PORT:-3333}"'
+  echo '      CSW_PROXY_PORT="${CSW_PROXY_PORT:-3334}"'
+  echo '      export CSW_PORT CSW_PROXY_PORT'
+  echo '      _vdm_lock="${TMPDIR:-/tmp}/vdm-autostart-$(id -u).lock.d"'
+  echo '      if [ -d "$_vdm_lock" ] && find "$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then'
+  echo '        rmdir "$_vdm_lock" 2>/dev/null'
+  echo '      fi'
+  echo '      if mkdir "$_vdm_lock" 2>/dev/null; then'
+  echo '        if ! lsof -iTCP:"$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then'
+  echo "          nohup $(command -v node) ~/.claude/account-switcher/dashboard.mjs \\"
+  echo '            >>~/.claude/account-switcher/startup.log 2>&1 &'
+  echo '          disown'
+  echo '        fi'
+  echo '        rmdir "$_vdm_lock" 2>/dev/null'
+  echo '      fi'
+  echo '      unset _vdm_lock'
+  echo '      export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:$CSW_PROXY_PORT}"'
   echo '    fi'
-  echo '    unset _vdm_lock'
-  echo '    export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:$CSW_PROXY_PORT}"'
   echo '    # END claude-account-switcher'
 fi
 
