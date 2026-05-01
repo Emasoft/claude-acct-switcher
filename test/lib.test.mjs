@@ -29,6 +29,7 @@ import {
   getEarliestReset,
   createSemaphore,
   createSerializationQueue,
+  createSlidingWindowCounter,
   gcAccountSlots,
   createUsageExtractor,
   clampViewerState,
@@ -4076,6 +4077,114 @@ describe('L2 — _runGitCache uses NUL-byte separator for path-segment safety', 
 // ─────────────────────────────────────────────────
 // L5 source-level regression — _renderedCardCache wholesale replacement
 // ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────
+// createSlidingWindowCounter — circuit-breaker primitive used by the
+// serialize-mode auto-safeguards in dashboard.mjs (queue_timeout
+// breaker, all-accounts-429 breaker). Pure function with explicit-time
+// API so tests don't need to wait for wall clock.
+// ─────────────────────────────────────────────────
+
+describe('createSlidingWindowCounter', () => {
+  it('rejects non-positive windowMs at construction', () => {
+    assert.throws(() => createSlidingWindowCounter({ windowMs: 0,    threshold: 1 }), /windowMs/);
+    assert.throws(() => createSlidingWindowCounter({ windowMs: -1,   threshold: 1 }), /windowMs/);
+    assert.throws(() => createSlidingWindowCounter({ windowMs: NaN,  threshold: 1 }), /windowMs/);
+    assert.throws(() => createSlidingWindowCounter({ windowMs: null, threshold: 1 }), /windowMs/);
+  });
+
+  it('rejects non-positive-integer threshold at construction', () => {
+    assert.throws(() => createSlidingWindowCounter({ windowMs: 1000, threshold: 0   }), /threshold/);
+    assert.throws(() => createSlidingWindowCounter({ windowMs: 1000, threshold: -1  }), /threshold/);
+    assert.throws(() => createSlidingWindowCounter({ windowMs: 1000, threshold: 1.5 }), /threshold/);
+    assert.throws(() => createSlidingWindowCounter({ windowMs: 1000, threshold: '5' }), /threshold/);
+  });
+
+  it('counts only events within the sliding window', () => {
+    const cb = createSlidingWindowCounter({ windowMs: 100, threshold: 3 });
+    cb.record(1000);
+    cb.record(1050);
+    cb.record(1099);
+    assert.equal(cb.count(1100), 3, 'all three within window ending at 1100');
+    assert.equal(cb.count(1101), 2, 'event at 1000 falls out (window = 1001..1101)');
+    assert.equal(cb.count(1200), 0, 'all events outside window');
+  });
+
+  it('tripped() is true at and above threshold, false below', () => {
+    const cb = createSlidingWindowCounter({ windowMs: 1000, threshold: 3 });
+    cb.record(0);
+    cb.record(500);
+    assert.equal(cb.tripped(900),  false, '2 events < threshold 3 → not tripped');
+    cb.record(800);
+    assert.equal(cb.tripped(900),  true,  '3 events >= threshold 3 → tripped');
+    assert.equal(cb.tripped(2000), false, 'all events fell out of window → not tripped');
+  });
+
+  it('reset() clears all events', () => {
+    const cb = createSlidingWindowCounter({ windowMs: 1000, threshold: 1 });
+    cb.record(0);
+    cb.record(500);
+    assert.equal(cb._size(), 2);
+    cb.reset();
+    assert.equal(cb._size(), 0);
+    assert.equal(cb.count(900), 0);
+    assert.equal(cb.tripped(900), false);
+  });
+
+  it('prunes lazily on read — no insert-time pruning', () => {
+    const cb = createSlidingWindowCounter({ windowMs: 100, threshold: 1 });
+    // Fill with 100 events all at t=0
+    for (let i = 0; i < 100; i++) cb.record(0);
+    assert.equal(cb._size(), 100, 'no prune until read');
+    // Reading at t=200 prunes everything (cutoff = 100, all events at 0)
+    assert.equal(cb.count(200), 0);
+    assert.equal(cb._size(), 0, 'prune dropped every event');
+  });
+
+  it('handles a clock that jumps backwards (NTP correction) without crashing', () => {
+    // record(1000), then record(500) — the new event has a smaller
+    // timestamp than the prior one. Must not throw, must still count
+    // events that fall within the window from the read time.
+    const cb = createSlidingWindowCounter({ windowMs: 1000, threshold: 1 });
+    cb.record(1000);
+    cb.record(500);   // backwards
+    cb.record(700);
+    // At t=1500 the window is [501, 1500]. Events at 1000 + 700 are in,
+    // event at 500 is out. The prune step is "find first in-window
+    // entry"; if the array isn't perfectly sorted the prune may keep
+    // an extra out-of-window event, but tripped() / count() still
+    // return a meaningful number for the breaker.
+    const c = cb.count(1500);
+    assert.ok(c >= 2 && c <= 3, `expected 2–3 events, got ${c}`);
+  });
+
+  it('default record() and tripped() arguments use Date.now()', () => {
+    // Smoke test that the default-argument paths work. Use a tiny
+    // window so a real wall-clock gap doesn't affect the assertion.
+    const cb = createSlidingWindowCounter({ windowMs: 60_000, threshold: 1 });
+    cb.record();
+    assert.equal(cb.tripped(), true);
+  });
+
+  it('count() called repeatedly is idempotent for the same now', () => {
+    const cb = createSlidingWindowCounter({ windowMs: 100, threshold: 1 });
+    cb.record(0);
+    cb.record(50);
+    assert.equal(cb.count(100), 2);
+    assert.equal(cb.count(100), 2);
+    assert.equal(cb.count(100), 2);
+  });
+
+  it('high-volume insert + read does not retain events past window', () => {
+    // 10 000 events spaced 1 ms apart over a 1-second window → after
+    // the burst, reading 10 s later prunes everything.
+    const cb = createSlidingWindowCounter({ windowMs: 1000, threshold: 1 });
+    for (let i = 0; i < 10_000; i++) cb.record(i);
+    assert.equal(cb._size(), 10_000);
+    cb.count(20_000);
+    assert.equal(cb._size(), 0);
+  });
+});
+
 describe('L5 — _renderedCardCache replaced wholesale per render (no add+remove leak)', () => {
   const _dashboardSrc_l5 = _readFileSync_xss(
     new URL('../dashboard.mjs', import.meta.url),

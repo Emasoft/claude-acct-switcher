@@ -137,6 +137,34 @@ const DEFAULT_SETTINGS = {
   activityMaxEntries: 500,
   tokenUsageMaxEntries: 50000,
   tokenUsageMaxAgeDays: 90,
+  // ── Serialize-mode auto-safeguards ──
+  // Master switch for the breakers + alerts that auto-disable serialize
+  // when it's making things worse. The user can disable the auto-toggle
+  // (set this to false) if they prefer to debug failures manually
+  // without serialize getting flipped under them.
+  serializeAutoDisableEnabled: true,
+  // Breaker A — N queue_timeout 503s within window → auto-disable.
+  // Defaults: 5 trips within 10 min. Conservative — a healthy serialize
+  // run won't hit any queue_timeout 503 (the queue timeout default of
+  // REQUEST_DEADLINE_MS + 60s = 660s is well above any normal request).
+  // 5 in 10 min means something is genuinely sustained-broken.
+  queueTimeoutBreakerThreshold: 5,
+  queueTimeoutBreakerWindowMs: 600000,
+  // Alert B — sustained queue depth above threshold for sustainMs.
+  // Informational only — emits an activity event and a log warn but
+  // does NOT auto-disable, because a transient burst of legitimate
+  // traffic can produce a deep queue without indicating a problem.
+  // Defaults: 50 queued for 60s straight.
+  queueDepthAlertThreshold: 50,
+  queueDepthAlertSustainMs: 60000,
+  // Breaker C — every account hit 429 within window AND serialize is on.
+  // The original symptom that motivated this work: serialize made every
+  // request line up behind the slowest account, so when one account
+  // started returning 429 the whole queue piled up and OTHER accounts
+  // also exhausted. Auto-disabling serialize lets the queue drain in
+  // parallel and the rotation logic find a healthy account again.
+  // Defaults: every-account-429 within 60s.
+  all429BreakerWindowMs: 60000,
 };
 
 function loadSettings() {
@@ -557,6 +585,7 @@ import {
   createPerAccountLock,
   createSemaphore,
   createSerializationQueue,
+  createSlidingWindowCounter,
   gcAccountSlots,
   createUsageExtractor as _createUsageExtractor,
   ROTATION_STRATEGIES,
@@ -1887,6 +1916,28 @@ async function handleAPI(req, res) {
     }
     if (Number.isFinite(patch.serializeMaxConcurrent) && patch.serializeMaxConcurrent >= 1 && patch.serializeMaxConcurrent <= 16) {
       settings.serializeMaxConcurrent = Math.floor(patch.serializeMaxConcurrent);
+    }
+    // Serialize-mode auto-safeguard tunables. All three breakers respect
+    // serializeAutoDisableEnabled at trip time; setting that to false
+    // turns off the auto-toggle without removing the safeguards (alerts
+    // still log + emit activity events).
+    if (typeof patch.serializeAutoDisableEnabled === 'boolean') {
+      settings.serializeAutoDisableEnabled = patch.serializeAutoDisableEnabled;
+    }
+    if (Number.isFinite(patch.queueTimeoutBreakerThreshold) && patch.queueTimeoutBreakerThreshold >= 1 && patch.queueTimeoutBreakerThreshold <= 1000) {
+      settings.queueTimeoutBreakerThreshold = Math.floor(patch.queueTimeoutBreakerThreshold);
+    }
+    if (Number.isFinite(patch.queueTimeoutBreakerWindowMs) && patch.queueTimeoutBreakerWindowMs >= 1000 && patch.queueTimeoutBreakerWindowMs <= 86_400_000) {
+      settings.queueTimeoutBreakerWindowMs = Math.floor(patch.queueTimeoutBreakerWindowMs);
+    }
+    if (Number.isFinite(patch.queueDepthAlertThreshold) && patch.queueDepthAlertThreshold >= 1 && patch.queueDepthAlertThreshold <= 100_000) {
+      settings.queueDepthAlertThreshold = Math.floor(patch.queueDepthAlertThreshold);
+    }
+    if (Number.isFinite(patch.queueDepthAlertSustainMs) && patch.queueDepthAlertSustainMs >= 1000 && patch.queueDepthAlertSustainMs <= 86_400_000) {
+      settings.queueDepthAlertSustainMs = Math.floor(patch.queueDepthAlertSustainMs);
+    }
+    if (Number.isFinite(patch.all429BreakerWindowMs) && patch.all429BreakerWindowMs >= 1000 && patch.all429BreakerWindowMs <= 86_400_000) {
+      settings.all429BreakerWindowMs = Math.floor(patch.all429BreakerWindowMs);
     }
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
@@ -5680,6 +5731,11 @@ function evtMsg(e) {
     case 'config_change': return '<b>Config</b> ' + h(e.msg || 'changed');
     case 'account-removed': return 'Removed account <b>' + h(e.name || '?') + '</b>';
     case 'account-prefs-changed': return '<b>Prefs</b> ' + h(e.msg || 'updated');
+    // Serialize-mode auto-safeguards (queue_timeout breaker, all-429 breaker,
+    // queue-depth alert). Fields routed through h(...) keep the source-grep
+    // XSS regression test passing.
+    case 'serialize-auto-disabled': return '<b>Serialize auto-disabled</b>: ' + h(e.reason || '?') + (e.count ? ' (count=' + h(String(e.count)) + ')' : '') + (e.accountCount ? ' (' + h(String(e.accountCount)) + ' accounts)' : '');
+    case 'queue-depth-alert': return '<b>Queue depth alert</b>: ' + h(String(e.queued || '?')) + ' queued (≥' + h(String(e.threshold || '?')) + ') for ' + h(String(e.sustainedSeconds || '?')) + 's';
     // C4 fallthrough — events whose detail came in as a string get a .msg
     // field via logActivity's coercion. Surface that to the user. If only
     // .type is present (no msg), keep the legacy behavior (h(e.type)).
@@ -8684,6 +8740,20 @@ const _CACHE_PRUNE_INTERVAL = 5 * 60 * 1000;
 const _cachePruneTimer = setInterval(_pruneCachesPeriodic, _CACHE_PRUNE_INTERVAL);
 _cachePruneTimer.unref?.();
 
+// Safeguard B — periodic poll of the serialization queue depth. 5-second
+// interval is short enough to detect a sustained backup well within the
+// 60-second sustainMs default, long enough to avoid measurable CPU
+// overhead. Runs even when serialize is OFF so a user toggling it on
+// during heavy load gets the alert at the next sample.
+const _QUEUE_DEPTH_POLL_INTERVAL = 5_000;
+const _queueDepthPollTimer = setInterval(() => {
+  try { _checkQueueDepthAlert(); } catch (e) {
+    // Don't let a transient log/save error kill the timer.
+    try { log('warn', `_checkQueueDepthAlert poll failed: ${e.message}`); } catch {}
+  }
+}, _QUEUE_DEPTH_POLL_INTERVAL);
+_queueDepthPollTimer.unref?.();
+
 async function refreshSweep(label = 'refresh-bg') {
   const accounts = loadAllAccountTokens();
   for (const acct of accounts) {
@@ -8799,6 +8869,185 @@ function drainSerializationQueue() {
 
 function withSerializationQueue(fn, isRetry = false) {
   return _serializationQueue.acquire(fn, isRetry);
+}
+
+// ─────────────────────────────────────────────────
+// Serialize-mode auto-safeguards (queue_timeout / depth / 429-burst)
+// ─────────────────────────────────────────────────
+//
+// Three independent safeguards watch for the failure modes serialize mode
+// can produce in production:
+//
+//   A. queue_timeout breaker — counts 503 queue_timeout responses in a
+//      sliding window. Above threshold → auto-disable serialize. These
+//      503s mean the serialization queue is so backed up that requests
+//      time out before reaching forwardToAnthropic — turning serialize
+//      off lets the backlog drain in parallel and unblocks the user.
+//
+//   B. queue depth alert — informational only. If the in-queue depth
+//      stays above the threshold for sustainMs, log + emit activity
+//      event so the user sees the warning sign before the breaker
+//      trips. Doesn't auto-disable because legitimate burst traffic
+//      can produce a deep queue without indicating a problem.
+//
+//   C. all-accounts-429 breaker — tracks every 429 received from
+//      Anthropic. If the set of accounts that hit 429 within
+//      all429BreakerWindowMs covers EVERY known account AND serialize
+//      is on, auto-disable serialize. The original symptom: with
+//      strict serialize the queue lined up behind the slowest
+//      account, so when one account started 429-ing the whole queue
+//      piled up against it and other accounts also got rate-limited
+//      because the rotation logic couldn't switch between them in
+//      parallel. Disabling serialize lets the rotation work in
+//      parallel and the queue drains.
+//
+// All three safeguards check settings.serializeAutoDisableEnabled at
+// trip time — a user who explicitly wants serialize on through hell
+// or high water can set that to false.
+
+const _queueTimeoutCounter = createSlidingWindowCounter({
+  windowMs: DEFAULT_SETTINGS.queueTimeoutBreakerWindowMs,
+  threshold: DEFAULT_SETTINGS.queueTimeoutBreakerThreshold,
+});
+
+// Map<accountFingerprint, lastSeen429AtMs> — used by safeguard C to
+// answer "have all known accounts been seen 429-ing within window".
+// Key by FINGERPRINT not name so a rename mid-incident doesn't cause
+// a false-positive trip from "the renamed account hasn't 429'd yet".
+const _all429ByFingerprint = new Map();
+
+// State for safeguard B (sustained queue depth).
+let _queueDepthHighSince = null;       // ms when depth first exceeded threshold
+let _queueDepthAlertEmittedAt = 0;     // ms of last alert (debounce — once per sustain window)
+
+// Last time we auto-disabled serialize. Debounce so two rapid trips
+// (queue_timeout + all-429) don't double-emit the same alert.
+let _lastSerializeAutoDisableAt = 0;
+const _SERIALIZE_AUTO_DISABLE_DEBOUNCE_MS = 30_000; // 30s — enough for the user to see + react
+
+// Auto-disable serialize mode + emit activity event explaining why.
+// Idempotent; safe to call from any safeguard's trip path.
+function _autoDisableSerialize(reason, detail = {}) {
+  if (!settings.serializeAutoDisableEnabled) return;
+  if (!settings.serializeRequests) return; // already off
+  const now = Date.now();
+  if (now - _lastSerializeAutoDisableAt < _SERIALIZE_AUTO_DISABLE_DEBOUNCE_MS) return;
+  _lastSerializeAutoDisableAt = now;
+
+  settings.serializeRequests = false;
+  try { saveSettings(settings); } catch (e) {
+    log('warn', `auto-disable: saveSettings failed: ${e.message}`);
+  }
+  try { drainSerializationQueue(); } catch {}
+  // Reset the breakers so the user can re-enable without an immediate
+  // re-trip from the same recorded events.
+  _queueTimeoutCounter.reset();
+  _all429ByFingerprint.clear();
+  _queueDepthHighSince = null;
+
+  log('warn', `serialize auto-disabled: ${reason}`);
+  logActivity('serialize-auto-disabled', { reason, ...detail });
+  notify(
+    'vdm: Serialize mode auto-disabled',
+    `Reason: ${reason}. Re-enable from Settings if intentional.`,
+    'circuitBreaker',
+  );
+}
+
+// Called from the proxy queue_timeout 503 catch handler. Records the
+// event, then trips the breaker if the count crosses threshold AND
+// serialize is on. The window/threshold are read from live settings on
+// each trip-check so a user tuning them via the API doesn't need a
+// dashboard restart.
+function _recordQueueTimeout() {
+  _queueTimeoutCounter.record();
+  if (!settings.serializeRequests) return;
+  if (!settings.serializeAutoDisableEnabled) return;
+  const threshold = Math.max(1, settings.queueTimeoutBreakerThreshold | 0 || 5);
+  // Re-check against the live threshold (the counter was instantiated
+  // with the DEFAULT but the user may have tuned it). The window is
+  // fixed at counter-creation time; tuning windowMs at runtime would
+  // require recreating the counter, which is a future enhancement.
+  if (_queueTimeoutCounter.count() >= threshold) {
+    _autoDisableSerialize('queue_timeout breaker tripped', {
+      count: _queueTimeoutCounter.count(),
+      windowMs: settings.queueTimeoutBreakerWindowMs,
+    });
+  }
+}
+
+// Called from forwardToAnthropic when a 429 is received from Anthropic.
+// Records by account FINGERPRINT so a rename between record + check
+// doesn't desync. Trips when EVERY known account has been seen 429-ing
+// within window AND serialize is on.
+function _record429ForAccount(fingerprint) {
+  if (!fingerprint) return;
+  const now = Date.now();
+  _all429ByFingerprint.set(fingerprint, now);
+  if (!settings.serializeRequests) return;
+  if (!settings.serializeAutoDisableEnabled) return;
+  const windowMs = Math.max(1000, settings.all429BreakerWindowMs | 0 || 60000);
+  // Prune entries outside the window. Doing it here keeps the map
+  // bounded by account count + window-fresh entries.
+  for (const [fp, ts] of _all429ByFingerprint) {
+    if (now - ts > windowMs) _all429ByFingerprint.delete(fp);
+  }
+  // Check if every known account fingerprint is in the recent-429 set.
+  // loadAllAccountTokens reads from the keychain (sync) — we already do
+  // this on the proxy hot path so it's cached. Skip the trip if
+  // accounts can't be read (degraded mode — better to leave serialize
+  // on than auto-disable on a transient keychain error).
+  let knownFps;
+  try {
+    knownFps = loadAllAccountTokens()
+      .map(a => getFingerprintFromToken(a.accessToken))
+      .filter(Boolean);
+  } catch {
+    return;
+  }
+  if (knownFps.length === 0) return;          // no accounts → nothing to compare
+  if (knownFps.length < 2) return;            // single-account installs can't trip this — that's just "the only account is rate-limited", not a serialize symptom
+  for (const fp of knownFps) {
+    if (!_all429ByFingerprint.has(fp)) return; // at least one healthy account → no trip
+  }
+  _autoDisableSerialize('all-accounts-429 burst', {
+    accountCount: knownFps.length,
+    windowMs,
+  });
+}
+
+// Called from the periodic queue-stats poll. Tracks the queued count;
+// if it stays above threshold for sustainMs, emits an alert. Does NOT
+// auto-disable — bursts of legitimate traffic can produce deep queues.
+function _checkQueueDepthAlert() {
+  if (!settings.serializeRequests) {
+    _queueDepthHighSince = null;
+    return;
+  }
+  const stats = _serializationQueue.getStats();
+  const threshold = Math.max(1, settings.queueDepthAlertThreshold | 0 || 50);
+  const sustainMs = Math.max(1000, settings.queueDepthAlertSustainMs | 0 || 60000);
+  const now = Date.now();
+  if (stats.queued < threshold) {
+    _queueDepthHighSince = null;
+    return;
+  }
+  if (_queueDepthHighSince == null) {
+    _queueDepthHighSince = now;
+    return;
+  }
+  // Debounce: only emit once per sustain window so a 5-min sustained
+  // backup doesn't spam the activity log every poll-interval.
+  if (now - _queueDepthHighSince >= sustainMs &&
+      now - _queueDepthAlertEmittedAt >= sustainMs) {
+    _queueDepthAlertEmittedAt = now;
+    log('warn', `serialize queue depth alert: queued=${stats.queued} (threshold=${threshold}) sustained ${Math.round((now - _queueDepthHighSince) / 1000)}s`);
+    logActivity('queue-depth-alert', {
+      queued: stats.queued,
+      threshold,
+      sustainedSeconds: Math.round((now - _queueDepthHighSince) / 1000),
+    });
+  }
 }
 
 // ─────────────────────────────────────────────────
@@ -10118,6 +10367,11 @@ const proxyServer = createServer((clientReq, clientRes) => {
     .catch(err => {
       if (err.message === 'queue_timeout') {
         log('warn', 'Request timed out in serialization queue');
+        // Safeguard A — feed the breaker. Trip + auto-disable serialize
+        // when the count crosses threshold within window.
+        try { _recordQueueTimeout(); } catch (e) {
+          log('warn', `_recordQueueTimeout failed: ${e.message}`);
+        }
         if (!clientRes.headersSent) {
           // Phase F — return 503 + overloaded_error (with explicit "[vdm proxy]"
           // prefix in message and x-vdm-proxy header) so Claude Code's retry
@@ -10493,6 +10747,12 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     // ── 429: Rate limited → auto-switch (if enabled) ──
     if (status === 429) {
+      // Safeguard C — feed the all-accounts-429 breaker. Records by
+      // FINGERPRINT (not name) so a rename mid-incident doesn't desync.
+      // No-op if serialize is off.
+      try { _record429ForAccount(getFingerprintFromToken(token)); } catch (e) {
+        log('warn', `_record429ForAccount failed: ${e.message}`);
+      }
       // RFC 7231 §7.1.3 allows Retry-After to be a delta-seconds OR an
       // HTTP-date. The previous parseInt(…) returned 0 for HTTP-date and
       // any malformed value, which classified the response as "transient"

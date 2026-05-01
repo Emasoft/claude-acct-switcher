@@ -896,6 +896,85 @@ export function createSemaphore(maxConcurrent) {
 }
 
 // ─────────────────────────────────────────────────
+// Sliding-window event counter (circuit-breaker primitive)
+// ─────────────────────────────────────────────────
+
+/**
+ * Bounded sliding-window counter for "N events within last X ms" checks.
+ *
+ * Designed for the serialize-mode safeguards: count queue_timeout 503s
+ * over the last 10 minutes, count all-accounts-429 events over the last
+ * 60 seconds, etc. The pattern shows up everywhere a rate-of-failure
+ * threshold needs to trip a circuit breaker without leaking unbounded
+ * timestamp history.
+ *
+ * Contract:
+ *   const cb = createSlidingWindowCounter({ windowMs: 600_000, threshold: 5 });
+ *   cb.record();              // record an event at "now"
+ *   cb.record(t);             // record at explicit timestamp
+ *   cb.count();               // events within window ending now
+ *   cb.tripped();             // count() >= threshold
+ *   cb.reset();               // clear all events (e.g. after auto-disable fires)
+ *   cb._size();               // diagnostic — internal array length
+ *
+ * Memory bound: array length is bounded by the natural arrival rate
+ * within `windowMs` because every read prunes events older than the
+ * window. There's no separate cap — pathological insert-without-read
+ * traffic would grow unbounded, but the only call sites here always
+ * read after recording (record → count/tripped pair).
+ */
+export function createSlidingWindowCounter({ windowMs, threshold } = {}) {
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new Error(`createSlidingWindowCounter: windowMs must be a positive number, got ${windowMs}`);
+  }
+  if (!Number.isInteger(threshold) || threshold < 1) {
+    throw new Error(`createSlidingWindowCounter: threshold must be a positive integer, got ${threshold}`);
+  }
+
+  // Sorted ascending by insertion (which is monotonic by Date.now()
+  // unless the system clock jumps — see below). The prune step uses
+  // this ordering so it can stop at the first in-window entry.
+  let events = [];
+
+  function _prune(now) {
+    const cutoff = now - windowMs;
+    // Find first index whose timestamp is within the window. Linear
+    // scan from front because the array is sorted ascending. For the
+    // expected sizes (handful of events per window) this is faster
+    // than a binary-search overhead.
+    let i = 0;
+    while (i < events.length && events[i] < cutoff) i++;
+    if (i > 0) events = events.slice(i);
+  }
+
+  function record(ts = Date.now()) {
+    // System-clock jump backwards: an NTP correction could insert a
+    // timestamp older than the previous one. Treat that as a one-off
+    // — the new event still belongs in the window. The prune step is
+    // tolerant; the array order is "best effort sorted", and the
+    // count() loop scans every element anyway.
+    events.push(ts);
+  }
+
+  function count(now = Date.now()) {
+    _prune(now);
+    return events.length;
+  }
+
+  function tripped(now = Date.now()) {
+    return count(now) >= threshold;
+  }
+
+  function reset() {
+    events = [];
+  }
+
+  function _size() { return events.length; }
+
+  return { record, count, tripped, reset, _size };
+}
+
+// ─────────────────────────────────────────────────
 // Viewer-state helpers (Phase C — date-range scrubber)
 // ─────────────────────────────────────────────────
 
