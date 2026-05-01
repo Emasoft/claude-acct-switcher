@@ -2391,6 +2391,11 @@ export function createUsageExtractor({ logger = null } = {}) {
   let cacheCreationInputTokens = 0;
   let cacheReadInputTokens = 0;
   let model = '';
+  // Anthropic's `message_start` event carries a `message.id` (the assistant
+  // turn UUID, e.g. "msg_01ABC…"). Capturing it lets appendTokenUsage dedup
+  // by (sessionId, messageId) so a hook re-fire (dashboard restart mid-turn,
+  // duplicate-delivery, etc.) doesn't double-count the same turn.
+  let messageId = '';
   let lineBuffer = '';
   let nextEventType = '';
   // Phase F audit M2 — trailing-buffer parsing must run on BOTH the success
@@ -2460,6 +2465,9 @@ export function createUsageExtractor({ logger = null } = {}) {
               if (data.message.model) {
                 model = data.message.model;
               }
+              if (typeof data.message.id === 'string' && data.message.id) {
+                messageId = data.message.id;
+              }
             } else if (nextEventType === 'message_delta' && data.usage) {
               outputTokens = data.usage.output_tokens || 0;
               // message_delta usage may also carry final cache totals.
@@ -2493,6 +2501,7 @@ export function createUsageExtractor({ logger = null } = {}) {
     cacheCreationInputTokens,
     cacheReadInputTokens,
     model,
+    messageId: messageId || null,
     ts: Date.now(),
   });
 

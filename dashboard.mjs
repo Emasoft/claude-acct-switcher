@@ -3108,6 +3108,7 @@ async function handleAPI(req, res) {
             inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
             cacheReadInputTokens: entry.cacheReadInputTokens || 0,
             cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
+            messageId: entry.messageId ?? null,
             account: entry.account,
           }));
         }
@@ -10678,6 +10679,11 @@ function recordUsage(usage, account) {
     cacheCreationInputTokens: usage.cacheCreationInputTokens || 0,
     cacheReadInputTokens: usage.cacheReadInputTokens || 0,
     model: usage.model,
+    // Anthropic message UUID — surfaced via createUsageExtractor in lib.mjs.
+    // Threaded through claimUsageInRange → appendTokenUsage so the
+    // (sessionId, messageId) dedup can reject hook re-fires that would
+    // otherwise double-count the same assistant turn.
+    messageId: usage.messageId || null,
     account,
     claimed: false,
   });
@@ -10873,6 +10879,7 @@ function _claimAndPersistForSession(sessionId, payload, kind /* 'stop' | 'end' *
         outputTokens: entry.outputTokens,
         cacheReadInputTokens: entry.cacheReadInputTokens || 0,
         cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
+        messageId: entry.messageId ?? null,
         account: entry.account,
       });
     } else {
@@ -10891,6 +10898,7 @@ function _claimAndPersistForSession(sessionId, payload, kind /* 'stop' | 'end' *
         outputTokens: entry.outputTokens,
         cacheReadInputTokens: entry.cacheReadInputTokens || 0,
         cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
+        messageId: entry.messageId ?? null,
         account: entry.account,
       });
       row = { ...baseEntry, parentSessionId: resolvedId, agentType: null };
@@ -10940,6 +10948,7 @@ function _autoClaimSession(sessionId, session) {
       outputTokens: entry.outputTokens,
       cacheReadInputTokens: entry.cacheReadInputTokens || 0,
       cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
+      messageId: entry.messageId ?? null,
       account: entry.account,
     }));
   }
@@ -10989,6 +10998,7 @@ const _tokenAutoPersistTimer = setInterval(() => {
         outputTokens: entry.outputTokens,
         cacheReadInputTokens: entry.cacheReadInputTokens || 0,
         cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
+        messageId: entry.messageId ?? null,
         account: entry.account,
       }));
     }
@@ -11162,6 +11172,52 @@ function _attachSessionAttribution(sessionId, session, entry) {
  * and downstream filters that test `e.branch === null` would silently
  * miss those entries.
  */
+// Synthetic-model detector — matches CC's filtering of internal control
+// messages from billable token totals (utils/stats.ts:313-316 in CC v2.1.89:
+// "Skip synthetic messages — they are internal and shouldn't appear in
+// stats"). The exact sentinel value isn't documented but observable
+// patterns are angle-bracket-wrapped tokens (e.g. "<synthetic>") that no
+// real Anthropic model name uses. Real models all start with "claude-".
+const _SYNTHETIC_MODEL_RE = /^<.*>$/;
+function _isSyntheticModel(model) {
+  if (!model || typeof model !== 'string') return false;
+  return _SYNTHETIC_MODEL_RE.test(model);
+}
+
+// Per-message dedup — rejects token-usage rows whose Anthropic message ID
+// has already been recorded for the same session. This catches the common
+// hook-re-fire bug class: dashboard restart mid-turn → Stop fires twice;
+// duplicate hook delivery from CC; manual replay during debugging.
+//
+// The seen-set is bounded to _SEEN_MESSAGES_MAX entries with a 24h TTL.
+// Lazy GC on insert (no timer) — overhead is amortised over inserts.
+const _SEEN_MESSAGES_MAX = 10_000;
+const _SEEN_MESSAGES_TTL_MS = 24 * 60 * 60 * 1000;
+const _seenMessageEntries = new Map();   // key → ts (ms)
+function _isDuplicateMessage(sessionId, messageId) {
+  if (!messageId) return false;          // no ID → can't dedup, accept
+  const key = `${sessionId || '_unknown'}|${messageId}`;
+  if (_seenMessageEntries.has(key)) return true;
+  // GC if oversized: drop expired entries, then drop oldest 25% by
+  // insertion order if still over budget.
+  if (_seenMessageEntries.size >= _SEEN_MESSAGES_MAX) {
+    const cutoff = Date.now() - _SEEN_MESSAGES_TTL_MS;
+    for (const [k, ts] of _seenMessageEntries) {
+      if (ts < cutoff) _seenMessageEntries.delete(k);
+    }
+    if (_seenMessageEntries.size >= _SEEN_MESSAGES_MAX) {
+      const target = Math.floor(_SEEN_MESSAGES_MAX * 0.75);
+      let toDrop = _seenMessageEntries.size - target;
+      for (const k of _seenMessageEntries.keys()) {
+        if (toDrop-- <= 0) break;
+        _seenMessageEntries.delete(k);
+      }
+    }
+  }
+  _seenMessageEntries.set(key, Date.now());
+  return false;
+}
+
 function appendTokenUsage(entry) {
   // Phase D — normalise the entry against the extended schema. Every new
   // nullable field defaults to null (NOT undefined — JSON.stringify drops
@@ -11187,11 +11243,29 @@ function appendTokenUsage(entry) {
     tool: entry.tool ?? null,
     mcpServer: entry.mcpServer ?? null,
     teamId: entry.teamId ?? null,
+    // Anthropic message UUID — null if SSE never delivered a
+    // message_start (e.g. abort before headers, non-streaming
+    // responses) or if entry came from a non-proxy code path.
+    messageId: entry.messageId ?? null,
     // compact_boundary fields (null on usage rows)
     trigger: entry.trigger ?? null,
     preTokens: entry.preTokens ?? null,
     postTokens: entry.postTokens ?? null,
   };
+  // Filter synthetic-model rows (CC's internal control messages — never
+  // billed, must not pollute totals). Compact-boundary rows are exempt:
+  // they're not usage rows, they don't carry a model, and the
+  // <whatever> sentinel test never matches their null.
+  if (normalized.type === 'usage' && _isSyntheticModel(normalized.model)) {
+    log('tokens-filter', `synthetic model "${normalized.model}" — skipped`);
+    return;
+  }
+  // Dedup by (sessionId, messageId). Compact-boundary rows skip dedup
+  // because they don't have a messageId by design.
+  if (normalized.type === 'usage' && _isDuplicateMessage(normalized.sessionId, normalized.messageId)) {
+    log('tokens-dedup', `duplicate messageId ${normalized.messageId} for session ${(normalized.sessionId || '_unknown').slice(0, 12)} — skipped`);
+    return;
+  }
   const usage = loadTokenUsage();
   usage.push(normalized);
   // Prune old entries — honour user-set retention from settings.
@@ -12570,6 +12644,7 @@ function shutdown(signal) {
             inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
             cacheReadInputTokens: entry.cacheReadInputTokens || 0,
             cacheCreationInputTokens: entry.cacheCreationInputTokens || 0,
+            messageId: entry.messageId ?? null,
             account: entry.account,
           }));
         } catch { /* best-effort during shutdown */ }

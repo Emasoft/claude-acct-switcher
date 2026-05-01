@@ -3917,7 +3917,7 @@ describe('createUsageExtractor — happy path (Transform _flush)', () => {
     extractor.on('data', () => {});
     const sse =
       'event: message_start\n' +
-      'data: {"message":{"usage":{"input_tokens":120,"cache_read_input_tokens":40},"model":"claude-opus-4-7"}}\n' +
+      'data: {"message":{"id":"msg_01ABCDEF","usage":{"input_tokens":120,"cache_read_input_tokens":40},"model":"claude-opus-4-7"}}\n' +
       '\n' +
       'event: content_block_delta\n' +
       'data: {"delta":{"text":"hello"}}\n' +
@@ -3933,6 +3933,40 @@ describe('createUsageExtractor — happy path (Transform _flush)', () => {
     assert.equal(u.outputTokens, 250);
     assert.equal(u.cacheReadInputTokens, 40);
     assert.equal(u.model, 'claude-opus-4-7');
+    // Phase I+ — message.id captured for (sessionId, messageId) dedup
+    assert.equal(u.messageId, 'msg_01ABCDEF');
+  });
+
+  it('messageId is null when message_start lacks an id field', async () => {
+    // Defensive: some upstream test fixtures and the abort-rescue path
+    // may produce streams without an id. Must not throw or set
+    // messageId=undefined (JSON.stringify drops undefined keys).
+    const extractor = createUsageExtractor();
+    extractor.on('data', () => {});
+    const sse =
+      'event: message_start\n' +
+      'data: {"message":{"usage":{"input_tokens":1},"model":"claude-haiku-4-5"}}\n' +
+      '\n' +
+      'event: message_delta\n' +
+      'data: {"usage":{"output_tokens":1}}\n' +
+      '\n';
+    extractor.write(Buffer.from(sse, 'utf8'));
+    extractor.end();
+    await new Promise(r => extractor.on('end', r));
+    assert.equal(extractor.getUsage().messageId, null);
+  });
+
+  it('messageId is null for non-string id values (defensive against malformed servers)', async () => {
+    const extractor = createUsageExtractor();
+    extractor.on('data', () => {});
+    const sse =
+      'event: message_start\n' +
+      'data: {"message":{"id":12345,"usage":{"input_tokens":1},"model":"claude-haiku-4-5"}}\n' +
+      '\n';
+    extractor.write(Buffer.from(sse, 'utf8'));
+    extractor.end();
+    await new Promise(r => extractor.on('end', r));
+    assert.equal(extractor.getUsage().messageId, null, 'numeric id rejected, kept as null');
   });
 });
 
@@ -5868,5 +5902,145 @@ describe('Phase I+ — refreshAccountToken wires isPostRefreshTrulyExpired', () 
     // the retry budget). Both must be present in the source.
     assert.match(_src_pe, /isOAuthRevocationError\(result\.error\)/);
     assert.match(_src_pe, /isPostRefreshTrulyExpired\(oauth\.expiresAt\)/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — token-tracking accuracy: synthetic-model filter
+// + per-message dedup (CC v2.1.89's stats.ts:313-316 pattern).
+// Catches two miscount classes:
+//   1. Internal control messages (CC's SYNTHETIC_MODEL) leaking
+//      into billable totals.
+//   2. Hook re-fires (dashboard restart mid-turn, duplicate
+//      delivery) double-counting the same assistant turn.
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — token-tracking filters (batch 12)', () => {
+  const _src_tt = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('_isSyntheticModel rejects angle-bracket-wrapped sentinels', () => {
+    // Source-grep on the regex; the function itself is internal to
+    // dashboard.mjs (no export). The match assertion exercises the
+    // pattern by inspection.
+    assert.match(_src_tt, /_SYNTHETIC_MODEL_RE\s*=\s*\/\^<\.\*>\$\//);
+    assert.match(_src_tt, /function _isSyntheticModel\(model\)/);
+  });
+
+  it('appendTokenUsage filters synthetic models BEFORE persistence', () => {
+    // The filter must run BEFORE the row hits the on-disk usage array
+    // — otherwise the synthetic row leaks to readers via
+    // _tokenUsageCache during the debounce window.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function appendTokenUsage'),
+      _src_tt.indexOf('function appendTokenUsage') + 4000,
+    );
+    assert.match(fn, /_isSyntheticModel\(normalized\.model\)/);
+    assert.match(fn, /'tokens-filter'/);
+    // Must early-return — not just log. Match either a single-quoted
+    // string OR a template literal "synthetic model ..."
+    assert.match(fn, /synthetic model[^]{0,200}— skipped[^]{0,200}return;/);
+  });
+
+  it('_isDuplicateMessage skips dedup when messageId is missing', () => {
+    // Without an ID we can't safely dedup (no canonical key). Accept
+    // the row rather than risk a false-positive that drops legitimate
+    // usage. The function must short-circuit on falsy messageId.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function _isDuplicateMessage'),
+      _src_tt.indexOf('function _isDuplicateMessage') + 1500,
+    );
+    assert.ok(fn.length > 100, 'function body must exist');
+    assert.match(fn, /if \(!messageId\) return false/);
+  });
+
+  it('_isDuplicateMessage uses sessionId|messageId as the key', () => {
+    // Same messageId in different sessions = different turns. CC's
+    // jsonl can have message UUIDs reused across stale projects in
+    // edge cases (test harnesses, replays); scoping by session is
+    // the safe choice.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function _isDuplicateMessage'),
+      _src_tt.indexOf('function _isDuplicateMessage') + 1500,
+    );
+    assert.match(fn, /\$\{sessionId \|\| '_unknown'\}\|\$\{messageId\}/);
+  });
+
+  it('seen-message map is bounded with TTL-based GC', () => {
+    // Without a bound the Map grows unbounded across the lifetime of
+    // the dashboard process. 10K entries × ~50 bytes = ~500 KB upper
+    // bound — tolerable, but only if the cap is enforced.
+    assert.match(_src_tt, /_SEEN_MESSAGES_MAX\s*=\s*10_000/);
+    assert.match(_src_tt, /_SEEN_MESSAGES_TTL_MS\s*=\s*24 \* 60 \* 60 \* 1000/);
+    // GC must drop expired entries first, then drop oldest by
+    // insertion order if still over budget.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function _isDuplicateMessage'),
+      _src_tt.indexOf('function _isDuplicateMessage') + 1500,
+    );
+    assert.match(fn, /Date\.now\(\) - _SEEN_MESSAGES_TTL_MS/);
+    assert.match(fn, /_seenMessageEntries\.delete\(k\)/);
+  });
+
+  it('appendTokenUsage filters synthetic + dedup in that order, BEFORE pushing to the on-disk array', () => {
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function appendTokenUsage'),
+      _src_tt.indexOf('function appendTokenUsage') + 4000,
+    );
+    const synthIdx = fn.indexOf('_isSyntheticModel');
+    const dedupIdx = fn.indexOf('_isDuplicateMessage');
+    const pushIdx = fn.indexOf('usage.push(normalized)');
+    assert.ok(synthIdx > 0, 'synthetic check must exist');
+    assert.ok(dedupIdx > 0, 'dedup check must exist');
+    assert.ok(pushIdx > 0, 'usage.push must exist');
+    assert.ok(synthIdx < pushIdx, 'synthetic check before push');
+    assert.ok(dedupIdx < pushIdx, 'dedup check before push');
+  });
+
+  it('appendTokenUsage row schema includes messageId field', () => {
+    // Without this the dedup map can never populate from the on-disk
+    // history (e.g. on dashboard restart) and re-fires within the
+    // first 24h after restart wouldn't dedup.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function appendTokenUsage'),
+      _src_tt.indexOf('function appendTokenUsage') + 4000,
+    );
+    assert.match(fn, /messageId: entry\.messageId \?\? null/);
+  });
+
+  it('compact_boundary rows BYPASS the synthetic + dedup filters', () => {
+    // Compact-boundary markers don't have a model field and don't have
+    // a messageId. Filtering them out as "synthetic" or dedup-rejecting
+    // them by null messageId would break compaction tracking.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function appendTokenUsage'),
+      _src_tt.indexOf('function appendTokenUsage') + 4000,
+    );
+    // Both filters must guard on `normalized.type === 'usage'`
+    assert.match(fn, /normalized\.type === 'usage' && _isSyntheticModel/);
+    assert.match(fn, /normalized\.type === 'usage' && _isDuplicateMessage/);
+  });
+
+  it('all 6 row-building sites thread entry.messageId through to appendTokenUsage', () => {
+    // Without this, ALL recorded usage carries messageId=null and dedup
+    // is a no-op. Source-grep counts the threading sites.
+    const sites = (_src_tt.match(/messageId: entry\.messageId \?\? null/g) || []).length;
+    assert.ok(
+      sites >= 6,
+      `expected ≥6 messageId-threading sites in row builders; found ${sites}`,
+    );
+  });
+
+  it('recordUsage threads messageId from the SSE extractor', () => {
+    // Closes the loop: extractor → recordUsage → recentUsage entry →
+    // claimUsageInRange → appendTokenUsage. If recordUsage drops the
+    // field, the dedup path is dead at the source.
+    const fn = _src_tt.slice(
+      _src_tt.indexOf('function recordUsage'),
+      _src_tt.indexOf('function recordUsage') + 2000,
+    );
+    assert.match(fn, /messageId: usage\.messageId \|\| null/);
   });
 });
