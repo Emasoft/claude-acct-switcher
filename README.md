@@ -6,7 +6,7 @@
 
 ## Why This Exists / Who Is This For
 
-You don't sleep. Your Claude Code sessions run 24/7 via `--remote-control`. You're doing stuff around town, laptop in backpack connected to hotspot where you're remote-controlling Claude the entire day. While you're in line at the DMV your machine's doing roundhouse kicks, and then, ..., you're rate limited. Session dead. Work stopped.
+You don't sleep. Your Claude Code sessions run 24/7 in the background while you're nowhere near a keyboard — connected over hotspot, dispatched from your phone, scheduled overnight. While you're in line at the DMV your machine's doing roundhouse kicks, and then, ..., you're rate limited. Session dead. Work stopped.
 
 What does Anthropic want you to do? Log in again. Through their slow, annoying UI. Click click click wait click. Meanwhile your autonomous agent is sitting there like a DMV sloth, doing absolutely nothing. Valuable vibe code minutes are being wasted...
 
@@ -16,7 +16,7 @@ Jean-Claude's on automatic mode from now on.
 
 Van Damme-o-Matic does the splits across multiple accounts so you never have to. It auto-switches on rate limits, auto-refreshes expiring tokens, and keeps your sessions alive while you're nowhere near a keyboard. NEVER EVER get bogged down because you need to log in to a new account through Anthropic's slow annoying UI again.
 
-- **`--remote-control` power users**  - your machine works while you don't
+- **Unattended / overnight power users** — your machine works while you don't
 - **People running multiple Claude Code sessions**  - spread the load, never hit a wall
 - **Anyone who refuses to babysit token expiry**  - tokens refresh themselves, accounts rotate automatically
 - **Night owls, insomniacs, and the simply relentless**  - your AI doesn't sleep and neither should your account management
@@ -28,7 +28,7 @@ Van Damme-o-Matic does the splits across multiple accounts so you never have to.
 ## Install
 
 ```bash
-git clone https://github.com/loekj/claude-acct-switcher.git
+git clone https://github.com/Emasoft/claude-acct-switcher.git
 cd claude-acct-switcher
 ./install.sh
 ```
@@ -36,6 +36,10 @@ cd claude-acct-switcher
 Restart your terminal. Done. The proxy auto-starts on new shells.
 
 **Requirements:** macOS, Node.js 18+, python3, Claude Code CLI.
+
+**First-time Keychain prompt:** the first time `vdm` reads or writes the macOS Keychain entry it created, macOS pops a system dialog: *"vdm wants to use your confidential information stored in 'Claude Code-credentials'..."*. Click **Always Allow** to skip the prompt for future reads — otherwise you'll see one prompt per Keychain operation. This happens once per saved account.
+
+**Heads-up — `ANTHROPIC_BASE_URL` is set globally.** The install snippet exports `ANTHROPIC_BASE_URL=http://localhost:3334` in your shell rc. This redirects **every** Anthropic SDK on your machine through vdm — Claude Code, the `anthropic` Python SDK, the `@anthropic-ai/sdk` JS package, LangChain `ChatAnthropic`, and any other tool that respects the standard env var. If the dashboard is down (laptop closed, port collision, fresh shell that didn't auto-start it), every Anthropic SDK call gets `ECONNREFUSED`. Run `./uninstall.sh` if you need to surgically remove this.
 
 ### Upgrade
 
@@ -59,15 +63,19 @@ claude login    # account B — that's it
 ```
 vdm list                    List accounts
 vdm switch [name|--auto]    Switch account (interactive if no name; --auto picks next available)
-vdm remove <name>           Remove account
+vdm add <name>              Save the current Keychain credentials under <name>
+vdm remove <name>           Remove account (refuses to remove the active account)
 vdm status                  Current account + settings
 vdm config [key] [on|off]   View/toggle settings
 vdm dashboard [start|stop]  Dashboard control
+vdm hooks                   Re-install Claude Code + git hooks (idempotent)
 vdm logs [filter]           Stream live proxy logs
 vdm tokens [options]        Show token usage
 vdm prefs [name [key val]]  View / set per-account preferences (e.g. exclude on/off)
 vdm upgrade                 Update to latest version
 ```
+
+`vdm add` is mostly a fallback for headless / CI flows — accounts are auto-discovered the moment the proxy sees a request from a new token, so most users never need it.
 
 ### Slash commands
 
@@ -75,7 +83,7 @@ vdm upgrade                 Update to latest version
 
 | Command | Effect |
 |---------|--------|
-| `/vdm-switch` | Picks the next available saved profile via the dashboard's current rotation strategy and switches to it. Equivalent to `vdm switch --auto` — bypasses the interactive picker, useful for unattended `--remote-control` sessions. |
+| `/vdm-switch` | Picks the next available saved profile via the dashboard's current rotation strategy and switches to it. Equivalent to `vdm switch --auto` — bypasses the interactive picker, useful for unattended sessions. |
 
 ### Dashboard
 
@@ -131,9 +139,9 @@ vdm config commit-tokens on|off  # Token-Usage trailer in commits
 
 | Strategy | Behavior |
 |----------|----------|
-| **Sticky** (default) | Stay on current account, only switch on rate limit |
-| **Conserve** | Drain active accounts first, keep unused ones dormant |
-| **Round-robin** | Rotate every N minutes |
+| **Conserve** (default) | Drain accounts that already have an active 5h window first, keep dormant accounts dormant |
+| **Sticky** | Stay on the current account, only switch on rate-limit / auth-failure |
+| **Round-robin** | Rotate every N minutes (set with `vdm config interval <minutes>`) |
 | **Spread** | Always pick lowest utilization |
 | **Drain first** | Use highest 5hr utilization first |
 
@@ -171,7 +179,9 @@ Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.
 
 All credentials live in the macOS Keychain. The active account sits at the canonical `Claude Code-credentials` entry that Claude Code itself reads on every request. Saved-but-inactive accounts sit at `vdm-account-<name>` entries (one per profile, encrypted at rest by macOS). On 429, the proxy reads the next saved entry and writes its blob to `Claude Code-credentials` — Claude Code picks up the change on its next API call. The keychain *is* the IPC; there is no separate state to keep in sync.
 
-Earlier versions of vdm stored saved profiles as plaintext `accounts/<name>.json` files. On first run, both the dashboard and `vdm` migrate any leftover JSON files into matching keychain entries (write keychain first, delete file only on success — interrupted migrations re-run cleanly).
+> **Caveat — migrating from earlier versions.** vdm < 2.x stored saved profiles as plaintext `accounts/<name>.json` files. On first run after upgrade, both the dashboard and `vdm` CLI migrate any leftover JSON files into matching keychain entries (write keychain first, delete file only on success — interrupted migrations re-run cleanly). If the keychain write succeeds but the file delete fails (rare: read-only filesystem, file in use, etc.), `vdm` logs an error telling you to manually delete the leftover file. Until that file is deleted the plaintext OAuth token is still on disk. A clean install of any 2.x or later release never writes such files.
+
+Account labels (typically the account email) live as plaintext sibling files at `~/.claude/account-switcher/accounts/<name>.label`. They contain no token material but DO contain whatever string vdm derives from the upstream `/v1/oauth/profile` endpoint — usually an email address. State files written by the dashboard are mode 0o600 since the security-hardening commit; pre-existing files from older versions inherit their original mode (run `chmod 600 ~/.claude/account-switcher/*.json ~/.claude/account-switcher/accounts/*.label` once if you upgraded across that boundary).
 
 ### Proxy Resilience
 
@@ -188,7 +198,7 @@ The proxy is designed to never kill your Claude Code sessions, even when things 
 3. Account switch — try a different account
 4. Minimal headers retry — strip all forwarded headers, retry with essentials only
 
-**Sleep recovery** — After laptop sleep, all tokens may expire simultaneously. The proxy detects this and refreshes tokens in parallel (~37s) instead of sequentially (37s × N accounts). A configurable request deadline prevents indefinite hangs (default 10 min, see `CSW_REQUEST_DEADLINE_MS`).
+**Wake-from-sleep refresh** — After laptop sleep, all tokens may expire simultaneously. The next periodic `refreshSweep` (5-minute timer) fans out via `Promise.allSettled`, so N expired tokens refresh in parallel (bounded by the upstream OAuth concurrency cap of 3) instead of serially. A configurable request deadline prevents indefinite hangs (default 10 min, see `CSW_REQUEST_DEADLINE_MS`).
 
 **Per-account stream throttling** — Up to N concurrent streams per bearer token (default 8, env: `CSW_MAX_INFLIGHT_PER_ACCOUNT`); excess requests queue. The cap is enforced for the **full SSE stream lifetime**, not just until headers arrive — so 20 Claude Code instances on one account don't all burst on Anthropic at once and trigger anti-abuse heuristics.
 
@@ -216,6 +226,9 @@ vdm sits between Claude Code and Anthropic via `ANTHROPIC_BASE_URL`. There are *
 |------|---------|-------------|
 | 3333 | Web Dashboard | `CSW_PORT` |
 | 3334 | API Proxy | `CSW_PROXY_PORT` |
+| 3335 | OTLP receiver (opt-in, only when `CSW_OTEL_ENABLED=1`) | `CSW_OTLP_PORT` |
+
+All three servers bind to `127.0.0.1` only and now reject any request whose `Host:` header isn't literal `localhost:PORT` / `127.0.0.1:PORT` / `[::1]:PORT` — DNS-rebind defense for malicious local web pages.
 
 ## Tuning Knobs (env vars)
 
@@ -229,6 +242,9 @@ The proxy queue + timeouts are tunable for different plans and workloads. All de
 | `CSW_MIN_INTERVAL_PER_ACCOUNT_MS` | 100 | Minimum gap (ms) between successive dispatches against one bearer (≈ 10 RPS). |
 | `CSW_MAX_PERMIT_WAIT_MS` | 300000 (5 min) | How long a queued request waits for a per-account permit before failing. |
 | `CSW_QUEUE_TIMEOUT_MS` | `CSW_REQUEST_DEADLINE_MS` + 60s (660 s) | How long a request waits in the settings-level serialization queue before being rejected with `queue_timeout` 503. MUST be ≥ `CSW_REQUEST_DEADLINE_MS`, otherwise queued requests are rejected before the deadline guard fires (re-introduces the audit B1/G1 regression — token tracking silently breaks). The dashboard logs a warn at startup if the configured value is below the deadline. Set to 0 for instant rejection (test mode). |
+| `CSW_OTEL_ENABLED` | `0` | Set to `1` to start the opt-in OTLP/HTTP/JSON receiver on `CSW_OTLP_PORT`. See "Ports" above and the OTLP-receiver section in [CLAUDE.md](CLAUDE.md). |
+| `CSW_OTLP_PORT` | `3335` | TCP port the OTLP receiver binds to (when enabled). |
+| `CSW_OTEL_BUFFER_MAX` | `5000` | Ring-buffer cap for OTLP logs and metrics (in-memory only; not persisted). |
 
 ## Testing
 
@@ -243,6 +259,8 @@ node --test 'test/*.test.mjs'
 ```
 
 The uninstaller stops the dashboard, removes the shell config block, deletes the install dir + symlink, and asks whether to **purge** or **keep** your saved `vdm-account-*` Keychain entries (default: keep — a future re-install picks them up automatically). Your active `Claude Code-credentials` entry is never touched, so Claude Code keeps working with whichever account was last active.
+
+> **What survives uninstall by default.** A small "defensive cleanup" block is added to your shell rc that runs `unset ANTHROPIC_BASE_URL` on every new shell. This prevents stale env-var carry-over from PM2 dumps, parent processes that forked before the original block was removed, and shell snapshots. The block is safe to delete manually after a full reboot. Re-running `install.sh` removes it automatically. Saved Keychain entries (`vdm-account-*`) are kept by default — pass `--purge-keychain` to uninstall.sh to wipe them, or use `purge` answer at the prompt.
 
 ## License
 

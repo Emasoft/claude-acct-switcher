@@ -1672,7 +1672,7 @@ cmd_tokens() {
 
   local usage
   usage=$(curl -s --max-time 5 "$url" 2>/dev/null) || {
-    echo -e "${RED}Could not connect to dashboard. Is it running?${NC}"
+    echo -e "${RED}Dashboard is not running. Start it with: vdm dashboard${NC}"
     return 1
   }
 
@@ -2187,6 +2187,8 @@ cmd_help() {
   echo -e "    ${CYAN}prefs${NC} [name [exclude on|off]]"
   echo -e "                            Show / set per-account preferences"
   echo -e "                            (excludeFromAuto opts an account out of auto-switch)"
+  echo -e "                            (requires the dashboard to be running)"
+  echo -e "    ${CYAN}hooks${NC}                   Re-install Claude Code + git hooks (idempotent)"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
@@ -2223,8 +2225,21 @@ cmd_help() {
 # the script so users can find it; we never block on this even if the log
 # write itself fails.
 _vdm_migration_log="$SCRIPT_DIR/migration.log"
+# Suppress the per-invocation noise after the FIRST failure of the day —
+# previous behaviour printed `[migration] Encountered errors — see ...`
+# on every `vdm <anything>` call (including `vdm help`), which made a
+# transient locked-keychain on the user's first interaction with their
+# laptop turn into hours of error-banner spam. Use a marker file with a
+# 24h TTL so the user sees the warning at least once per day.
+_vdm_migration_marker="$SCRIPT_DIR/.migration-warned"
 migrate_accounts_to_keychain 2>>"$_vdm_migration_log" || {
-  echo -e "${DIM}[migration] Encountered errors — see $_vdm_migration_log${NC}" >&2
+  if [[ ! -f "$_vdm_migration_marker" ]] \
+     || [[ -z "$(find "$_vdm_migration_marker" -mtime -1 2>/dev/null)" ]]; then
+    echo -e "${DIM}[migration] Encountered errors — see $_vdm_migration_log${NC}" >&2
+    echo -e "${DIM}            (this warning is suppressed for 24h after the first display;${NC}" >&2
+    echo -e "${DIM}             rm $_vdm_migration_marker to force re-display)${NC}" >&2
+    touch "$_vdm_migration_marker" 2>/dev/null || true
+  fi
   true
 }
 
