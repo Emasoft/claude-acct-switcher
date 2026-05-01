@@ -4690,3 +4690,57 @@ describe('Phase I+ — defense-in-depth (SEC-9..17, UX-A4)', () => {
     assert.match(_ihSrc_dd, /: "\$\{NC:=/);
   });
 });
+
+describe('Phase I+ — reliability data-loss fixes (STATE-2, CORRUPT-1, CORRUPT-3, CORRUPT-4, TIMER-2, LEAK-1)', () => {
+  const _dashboardSrc_rdl = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('STATE-2: loadPersistedState distinguishes ENOENT from corrupt JSON', () => {
+    // The previous swallow-and-init-empty silently zeroed every account's
+    // ban flags on transient corruption — turning a disk hiccup into a
+    // fresh 7-day rate limit on the next probe.
+    assert.match(_dashboardSrc_rdl, /existsSync\(STATE_FILE\)/);
+    assert.match(_dashboardSrc_rdl, /\.corrupt-/);
+    assert.match(_dashboardSrc_rdl, /persisted-state-recovery/);
+  });
+
+  it('CORRUPT-1: dashboard installs a singleton PID-file lock at startup', () => {
+    assert.match(_dashboardSrc_rdl, /_enforceSingletonDashboard/);
+    assert.match(_dashboardSrc_rdl, /\.dashboard\.lock/);
+    assert.match(_dashboardSrc_rdl, /process\.kill\(livePid, 0\)/);
+  });
+
+  it('CORRUPT-3: viewer-state recovery caches the defaults', () => {
+    // Was leaving _viewerStateCache null, forcing every subsequent
+    // load to re-read disk after recovery.
+    assert.match(_dashboardSrc_rdl, /_viewerStateCache = defaults/);
+  });
+
+  it('CORRUPT-4: account-state.json is pretty-printed', () => {
+    assert.match(
+      _dashboardSrc_rdl,
+      /atomicWriteFileSync\(STATE_FILE, JSON\.stringify\(persistedState, null, 2\)\)/,
+    );
+  });
+
+  it('TIMER-2: _tokenAutoPersistTimer body is wrapped in try/catch', () => {
+    const timerBlock = _dashboardSrc_rdl.slice(
+      _dashboardSrc_rdl.indexOf('const _tokenAutoPersistTimer'),
+      _dashboardSrc_rdl.indexOf('_tokenAutoPersistTimer.unref'),
+    );
+    assert.ok(timerBlock.length > 0, 'timer block must exist');
+    assert.match(timerBlock, /try \{/);
+    assert.match(timerBlock, /_tokenAutoPersistTimer iteration failed/);
+  });
+
+  it('LEAK-1: /api/remove evicts _lastWarnPct entry', () => {
+    const removeBlock = _dashboardSrc_rdl.slice(
+      _dashboardSrc_rdl.indexOf("/api/remove"),
+      _dashboardSrc_rdl.indexOf("/api/remove") + 3000,
+    );
+    assert.ok(removeBlock.length > 0, '/api/remove handler must exist');
+    assert.match(removeBlock, /_lastWarnPct\.delete\(name\)/);
+  });
+});

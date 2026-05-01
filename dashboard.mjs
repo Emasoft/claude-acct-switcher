@@ -1777,6 +1777,11 @@ async function handleAPI(req, res) {
           log('warn', `Failed to persist account-prefs.json after remove: ${e.message}`);
         }
       }
+      // LEAK-1: drop _lastWarnPct entry too. Without this, a removed
+      // account's name pinned a 90%+ warn-percentage tracker entry
+      // forever (small leak per account, but unbounded over a year of
+      // auto-N churn).
+      try { _lastWarnPct.delete(name); } catch {}
       logActivity('account-removed', { name });
       if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
       json(res, { ok: true });
@@ -7733,17 +7738,62 @@ const accountState = createAccountStateManager();
 let persistedState = {};
 
 function loadPersistedState() {
+  // Distinguish ENOENT (fresh install — start clean) from any other
+  // failure (parse error, EIO, partial write that survived a crash).
+  // The previous swallow-and-init-empty silently zeroed ALL accounts'
+  // ban flags on corruption, so the next proxy request happily probed
+  // every account including ones that should still be cooling down on
+  // a 7-day limit — turning a transient disk hiccup into a fresh
+  // 7-day rate limit. Mirror the loadViewerState recovery pattern.
+  if (!existsSync(STATE_FILE)) {
+    persistedState = {};
+    return;
+  }
+  let raw;
   try {
-    const raw = readFileSync(STATE_FILE, 'utf8');
+    raw = readFileSync(STATE_FILE, 'utf8');
+  } catch (e) {
+    // Read failed (permissions / disk error). Keep the previous
+    // in-memory state if we already have one, otherwise empty.
+    try {
+      log('error', `loadPersistedState read failed for ${STATE_FILE}: ${e.message} — keeping previous in-memory state`);
+    } catch { console.error(`loadPersistedState read failed: ${e.message}`); }
+    if (!persistedState) persistedState = {};
+    return;
+  }
+  try {
     persistedState = JSON.parse(raw);
-  } catch {
+    if (!persistedState || typeof persistedState !== 'object') {
+      throw new Error(`expected JSON object, got ${typeof persistedState}`);
+    }
+  } catch (e) {
+    // Parse failed — back up the corrupt file so the user can recover
+    // ban-state forensics, then start clean. Loud log + activity event
+    // so the recovery is visible in the dashboard UI.
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = `${STATE_FILE}.corrupt-${ts}`;
+    try {
+      writeFileSync(backupPath, raw, { mode: 0o600 });
+    } catch (writeErr) {
+      // If we can't even back up, just log and continue.
+      try { log('error', `loadPersistedState corrupt backup write failed: ${writeErr.message}`); } catch {}
+    }
+    try {
+      log('error', `account-state.json was corrupt (${e.message}); backed up to ${basename(backupPath)} and reinitialized to empty. Re-evaluation of ban flags will happen on next proxy request.`);
+    } catch { console.error(`account-state.json corrupt: ${e.message}`); }
+    try {
+      logActivity('persisted-state-recovery', { reason: e.message, backup: basename(backupPath) });
+    } catch {}
     persistedState = {};
   }
 }
 
 function savePersistedState() {
   try {
-    atomicWriteFileSync(STATE_FILE, JSON.stringify(persistedState));
+    // Pretty-print so `cat account-state.json` is human-debuggable
+    // (CORRUPT-4). 2x file size is acceptable — the file is bounded
+    // by account count, typically <10 KB.
+    atomicWriteFileSync(STATE_FILE, JSON.stringify(persistedState, null, 2));
   } catch {}
 }
 
@@ -7788,12 +7838,15 @@ function loadViewerState() {
   }
   if (recovered) {
     // Don't recursively invoke saveViewerState (which sets _viewerStateCache);
-    // write defaults inline, then leave the cache null so the next caller
-    // re-reads from disk.
+    // write defaults inline. CORRUPT-3 fix: cache the defaults in
+    // _viewerStateCache too — the previous code left the cache null,
+    // forcing every API call to re-read from disk forever after recovery.
+    const defaults = { start: null, end: null, tierFilter: ['all'] };
     try {
-      const defaults = { start: null, end: null, tierFilter: ['all'] };
       atomicWriteFileSync(VIEWER_STATE_FILE, JSON.stringify(defaults));
     } catch { /* best-effort recovery */ }
+    _viewerStateCache = defaults;
+    return defaults;
   }
   _viewerStateCache = null;
   return null;
@@ -7957,6 +8010,53 @@ function clearStaleLimitedFlags() {
   }
 }
 setInterval(clearStaleLimitedFlags, 60_000).unref();
+
+// CORRUPT-1: PID-file mutex preventing two-instance startup races.
+// Two dashboards racing the same state files would each call
+// loadPersistedState → pruneStaleHistory → savePersistedState; a
+// silent write race could clobber recent ban state. This is best-effort
+// (no kernel flock — that requires a native module); the protection is
+// "first instance writes its PID, subsequent instances see a live PID
+// and exit cleanly with a clear message." Stale PIDs (process is
+// gone) are reaped; live PIDs cause a clean exit.
+(function _enforceSingletonDashboard() {
+  const lockFile = join(__dirname, '.dashboard.lock');
+  try {
+    if (existsSync(lockFile)) {
+      const livePid = parseInt(readFileSync(lockFile, 'utf8').trim(), 10);
+      if (Number.isFinite(livePid) && livePid > 0) {
+        // `process.kill(pid, 0)` checks existence without signaling.
+        try {
+          process.kill(livePid, 0);
+          // Process exists. Exit cleanly. proxyServer will EADDRINUSE
+          // anyway (port 3334 already bound), but failing here gives
+          // a clearer diagnostic than the EADDRINUSE handler.
+          console.error(`[vdm dashboard] Another dashboard is already running (PID ${livePid}). Exiting.`);
+          process.exit(0);
+        } catch (e) {
+          if (e.code === 'ESRCH') {
+            // Stale lock — previous dashboard died without cleaning up.
+            try { unlinkSync(lockFile); } catch {}
+          } else {
+            // EPERM means the PID exists but we can't signal it (different
+            // user — extremely unusual on a per-user dashboard). Treat as
+            // live to be safe.
+            console.error(`[vdm dashboard] Lock file points at PID ${livePid} which we can't signal — assuming alive. Exiting.`);
+            process.exit(0);
+          }
+        }
+      }
+    }
+    writeFileSync(lockFile, String(process.pid), { mode: 0o600 });
+    // Best-effort cleanup on graceful exit. Hard kill leaves the file —
+    // the next startup will reap it via the ESRCH branch above.
+    process.on('exit', () => { try { unlinkSync(lockFile); } catch {} });
+  } catch (e) {
+    // Lock-file IO failed (read-only fs, etc.). Log and continue —
+    // the EADDRINUSE handler is the second line of defense.
+    console.error(`[vdm dashboard] Singleton lock setup failed (${e.message}); falling back to EADDRINUSE check.`);
+  }
+})();
 
 // Load on startup
 loadPersistedState();
@@ -10095,6 +10195,12 @@ function _autoClaimSession(sessionId, session) {
 // even for long-running sessions that haven't called session-stop yet.
 const TOKEN_AUTO_PERSIST_INTERVAL = 2 * 60 * 1000; // every 2 minutes
 const _tokenAutoPersistTimer = setInterval(() => {
+  // TIMER-2: wrap the body in try/catch so a single bad session
+  // (corrupt cwd, _runGitCached >4096-char rejection, atomicWriteFileSync
+  // ENOSPC, etc.) doesn't prevent the OTHER sessions' entries from
+  // persisting on this tick. The previous behaviour: one throw and
+  // every session in this iteration was skipped, with no log.
+  try {
   // For each active session, claim any unclaimed entries and persist them.
   // Update startedAt so we don't double-count on next interval.
   for (const [id, session] of pendingSessions) {
@@ -10137,6 +10243,9 @@ const _tokenAutoPersistTimer = setInterval(() => {
   // Unclaimed entries outside any session's time range are left in the ring
   // buffer — they'll be claimed by session-stop, or age out naturally.
   // No (unknown) attribution: better to lose data than misattribute it.
+  } catch (e) {
+    try { log('warn', `_tokenAutoPersistTimer iteration failed: ${e.message}`); } catch {}
+  }
 }, TOKEN_AUTO_PERSIST_INTERVAL);
 _tokenAutoPersistTimer.unref?.();
 
