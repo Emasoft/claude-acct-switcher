@@ -752,11 +752,68 @@ else
   echo '    # END claude-account-switcher'
 fi
 
+# ── Atomic install: dashboard MUST be reachable before hooks land ──
+# Why: hooks live in ~/.claude/settings.json, which is read by every CC
+# session in every shell on this machine — instantly. If we install hooks
+# before the dashboard is up, every existing CC session worldwide spams
+# error messages on every prompt + every stop until those shells restart
+# and the rc snippet auto-starts the dashboard. The pre-Phase-I install
+# was non-atomic: hooks landed first, dashboard came up later (only on
+# new shells). This block reverses that ordering: start dashboard, poll
+# /health, ONLY THEN install hooks. If the dashboard fails to come up
+# we kill the orphan and abort — settings.json stays clean.
+_DASH_HEALTH_PORT="$_DASH_PORT_DEFAULT"
+_dashboard_responds() {
+  curl -fsS --connect-timeout 1 --max-time 2 \
+    "http://localhost:${_DASH_HEALTH_PORT}/health" >/dev/null 2>&1
+}
+
+_NEW_DASH_PID=""
+if _dashboard_responds; then
+  echo -e "  ${GREEN}✓${NC} Dashboard already responding on port ${CYAN}${_DASH_HEALTH_PORT}${NC}"
+else
+  _NODE_BIN="$(command -v node 2>/dev/null || true)"
+  if [[ -z "$_NODE_BIN" ]]; then
+    echo -e "  ${RED}!${NC} node not found on PATH — cannot start dashboard for atomic install"
+    echo -e "    Install Node.js 18+ and re-run ${DIM}./install.sh${NC}."
+    exit 1
+  fi
+  echo -ne "  ${YELLOW}…${NC} Starting dashboard on port ${CYAN}${_DASH_HEALTH_PORT}${NC} "
+  # Background-start, suppress output (any failure is detected via /health
+  # poll, so we don't need stdout/stderr in the install transcript).
+  nohup "$_NODE_BIN" "$INSTALL_DIR/dashboard.mjs" \
+    >>"$INSTALL_DIR/startup.log" 2>&1 &
+  _NEW_DASH_PID=$!
+  disown 2>/dev/null || true
+  # Poll /health up to 10s (20 x 0.5s). The first 1-2 polls usually fail
+  # while Node is still parsing the file; the listener is up by ~500ms
+  # on every machine vdm targets.
+  _ok=0
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if _dashboard_responds; then
+      _ok=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ $_ok -eq 1 ]]; then
+    echo -e "${GREEN}up${NC} (PID ${_NEW_DASH_PID})"
+  else
+    echo -e "${RED}timed out after 10s${NC}"
+    echo -e "    Killing orphan PID ${_NEW_DASH_PID} and aborting install."
+    echo -e "    ${DIM}Hooks NOT written — your settings.json stays clean.${NC}"
+    echo -e "    Diagnose with: ${DIM}node $INSTALL_DIR/dashboard.mjs${NC}"
+    echo -e "    Common causes: port ${_DASH_HEALTH_PORT} already taken (lsof -i:${_DASH_HEALTH_PORT}), node version too old, or dashboard crash on startup (check ${CYAN}$INSTALL_DIR/startup.log${NC})."
+    kill "$_NEW_DASH_PID" 2>/dev/null || true
+    exit 1
+  fi
+fi
+
 # ── Install token tracking hooks ──
-# Don't mask install_hooks failures — surface them. install_hooks is
-# itself atomic (settings.json is rewritten via tmp + os.replace), so
-# a failure here means JSON parsing / disk full / permissions, not
-# corruption. Surface so the user knows their tokens won't be tracked.
+# Now safe: dashboard is verified up (above). install_hooks is itself
+# atomic (settings.json is rewritten via tmp + os.replace), so a failure
+# here means JSON parsing / disk full / permissions, not corruption.
+# Surface so the user knows their tokens won't be tracked.
 if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   # shellcheck source=/dev/null
   . "$INSTALL_DIR/install-hooks.sh"

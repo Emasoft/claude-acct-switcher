@@ -227,6 +227,48 @@ if 'hooks' not in settings:
     settings['hooks'] = {}
 hooks = settings['hooks']
 
+# Sentinel marker embedded in every command-type hook so install/uninstall
+# can identify "this entry belongs to vdm" regardless of port changes or
+# command-string drift. Bash treats the trailing `# __VDM_HOOK__` as a
+# comment, so it has zero runtime effect.
+VDM_HOOK_SENTINEL = '__VDM_HOOK__'
+
+def _build_hook_command(url):
+    # Command-type hooks (not http-type) for two reasons:
+    #   1. CC's HTTP-type hook implementation logs ECONNREFUSED loudly on
+    #      every prompt + every stop when the dashboard is down. Across N
+    #      concurrent CC sessions that's N x M errors per minute — the
+    #      "disaster" symptom that motivated this rewrite.
+    #   2. Command-type hooks let us swallow connection failures with
+    #      `|| true` so a momentarily-down dashboard does not break the
+    #      user's session — token tracking degrades gracefully.
+    # Tradeoff: each event spawns sh+curl (~20-50ms vs ~1-5ms HTTP).
+    # Acceptable: hooks are not on the request hot path.
+    # `--connect-timeout 1` keeps the failure path snappy when down;
+    # `--max-time 3` caps total time so a hung dashboard cannot stall CC.
+    return (
+        f"curl -sS --connect-timeout 1 --max-time 3 "
+        f"-X POST -H 'Content-Type: application/json' "
+        f"--data-binary @- {url} "
+        f">/dev/null 2>&1 || true  # {VDM_HOOK_SENTINEL}"
+    )
+
+def _is_vdm_inner_hook(h, target_path):
+    # Recognises BOTH legacy http-type entries (pre-rewrite) AND new
+    # command-type entries. Legacy detection by URL path keeps re-install
+    # idempotent across the upgrade boundary.
+    if not isinstance(h, dict):
+        return False
+    from urllib.parse import urlparse
+    if h.get('type') == 'http':
+        return urlparse(h.get('url', '')).path == target_path
+    if h.get('type') == 'command':
+        cmd = h.get('command', '')
+        if not isinstance(cmd, str):
+            return False
+        return VDM_HOOK_SENTINEL in cmd and target_path in cmd
+    return False
+
 def ensure_hook(event_name, url):
     if event_name not in hooks:
         hooks[event_name] = []
@@ -236,7 +278,7 @@ def ensure_hook(event_name, url):
         hooks[event_name] = event_hooks
     # Filter at the INNER hook level: entries can group multiple hooks
     # (matcher + N hooks). Stripping the whole entry whenever ONE inner
-    # hook matches our path would delete unrelated user/Husky/git-lfs
+    # hook matches ours would delete unrelated user/Husky/git-lfs
     # hooks bundled into the same entry. Drop only OUR inner hook; keep
     # the entry if any other inner hooks remain.
     from urllib.parse import urlparse
@@ -250,10 +292,7 @@ def ensure_hook(event_name, url):
         if not isinstance(inner, list):
             keep.append(entry)
             continue
-        new_inner = [
-            h for h in inner
-            if not (isinstance(h, dict) and urlparse(h.get('url', '')).path == target_path)
-        ]
+        new_inner = [h for h in inner if not _is_vdm_inner_hook(h, target_path)]
         if new_inner:
             # Keep entry with our hook stripped — preserves siblings.
             new_entry = dict(entry)
@@ -263,7 +302,7 @@ def ensure_hook(event_name, url):
             # Entry had no inner hooks to begin with — preserve as-is.
             keep.append(entry)
         # else: entry contained ONLY our hook — drop it entirely.
-    keep.append({'hooks': [{'type': 'http', 'url': url, 'timeout': 5}]})
+    keep.append({'hooks': [{'type': 'command', 'command': _build_hook_command(url), 'timeout': 5}]})
     hooks[event_name] = keep
 
 # Subscribe to the full session lifecycle so we capture usage in every
@@ -425,6 +464,24 @@ if not isinstance(settings, dict) or 'hooks' not in settings:
 
 hooks = settings['hooks']
 
+# Mirrors install-side sentinel + matcher (kept duplicated rather than
+# imported because each python heredoc is its own process — no shared
+# module state).
+VDM_HOOK_SENTINEL = '__VDM_HOOK__'
+
+def _is_vdm_inner_hook(h, target_path):
+    if not isinstance(h, dict):
+        return False
+    from urllib.parse import urlparse
+    if h.get('type') == 'http':
+        return urlparse(h.get('url', '')).path == target_path
+    if h.get('type') == 'command':
+        cmd = h.get('command', '')
+        if not isinstance(cmd, str):
+            return False
+        return VDM_HOOK_SENTINEL in cmd and target_path in cmd
+    return False
+
 def remove_hook(event_name, url):
     if event_name not in hooks:
         return
@@ -437,6 +494,8 @@ def remove_hook(event_name, url):
     # entry's `hooks` list, but preserve the entry whenever sibling
     # hooks (Husky, git-lfs, user-defined) still remain. Removing the
     # whole entry on any match would silently delete unrelated hooks.
+    # Recognises BOTH legacy http-type and new command-type entries so a
+    # mixed-state install (partial upgrade interrupted) cleans fully.
     filtered = []
     for entry in event_hooks:
         if not isinstance(entry, dict):
@@ -446,10 +505,7 @@ def remove_hook(event_name, url):
         if not isinstance(inner, list):
             filtered.append(entry)
             continue
-        new_inner = [
-            h for h in inner
-            if not (isinstance(h, dict) and urlparse(h.get('url', '')).path == target_path)
-        ]
+        new_inner = [h for h in inner if not _is_vdm_inner_hook(h, target_path)]
         if new_inner:
             new_entry = dict(entry)
             new_entry['hooks'] = new_inner

@@ -7333,6 +7333,17 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+    // Health check — used by install.sh during atomic install AND by
+    // the rc-snippet's auto-start guard. Returns 200 with a tiny JSON
+    // body the moment the listener accepts connections, so the installer
+    // can stop polling and proceed to write hooks. No CORS, no auth,
+    // no shared state — must respond regardless of init progress.
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, server: 'dashboard', port: PORT }));
+      return;
+    }
+
     // Reject mutating requests from foreign origins. Reads (GET) are
     // tolerated because the browser still won't expose the response
     // body without matching CORS headers, but mutations could side-

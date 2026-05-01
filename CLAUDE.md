@@ -121,7 +121,7 @@ When you add a new picker variant, route it through `_isPickable` (don't reimple
 
 `install-hooks.sh` is sourced by `install.sh`/`uninstall.sh` and on every `vdm` startup (the migration block at the top of `vdm` re-installs hooks if they're missing). It installs:
 
-1. **Claude Code hooks** into `~/.claude/settings.json`, pointing at the dashboard's session-tracking endpoints. Hook entries are matched by URL marker so re-install is idempotent. The full subscription set is:
+1. **Claude Code hooks** into `~/.claude/settings.json`, posting to the dashboard's session-tracking endpoints via curl. **Hooks are `type: "command"`, NOT `type: "http"`** — that distinction is load-bearing (see "Why command hooks, not HTTP hooks" below). Each command embeds the dashboard URL plus the literal sentinel marker `# __VDM_HOOK__` (a shell comment, ignored at runtime) so install/uninstall can identify "this entry belongs to vdm" regardless of port changes or command-string drift. The Python rewriter in `install-hooks.sh` recognises BOTH the legacy http-type entries (pre-Phase-I) AND the new command-type entries when deduping/uninstalling, so a mixed-state install (partial upgrade interrupted) cleans up fully on the next run. The full subscription set is:
    - `UserPromptSubmit` — anchor a session and stamp the active git repo + branch on every prompt. (NOTE: `SessionStart` is intentionally NOT subscribed via HTTP — the spec only allows `type: "command"` or `type: "mcp_tool"` for SessionStart, so HTTP entries are silently rejected. UserPromptSubmit covers the same signal with at most one prompt of latency.)
    - `Stop` / `StopFailure` / `SubagentStop` / `SessionEnd` — close out a turn (or sub-agent fan-out) so the input/output token totals are flushed before the next turn starts.
    - `SubagentStart` — pairs with `SubagentStop` so parallel sub-agent fan-outs get their tokens attributed to the right repo+branch instead of being silently dropped. The spec carries `agent_id` (per-instance ID) and `transcript_path`; **no `parent_session_id` is in the payload** — parent attribution is best-effort via cwd matching at handler time, or via tail-reading the `transcript_path` JSONL.
@@ -132,7 +132,21 @@ When you add a new picker variant, route it through `_isPickable` (don't reimple
    - **Phase G additions:** `Notification` (auth_success → invalidate keychain caches; other types → activity feed), `ConfigChange` (detects external rewrites of settings.json), `UserPromptExpansion` (logs `/skill-name` and `@`-mention expansion in the activity feed).
 2. **Global git `prepare-commit-msg` hook** in `git config --global core.hooksPath` (created at `~/.config/git/hooks/` if not already set). It chains to any pre-existing repo-local or global hook, then queries `/api/token-usage` and appends a `Token-Usage:` trailer. Look for `_VDM_HOOKS_MARKER` and `_VDM_HOOKS_PATH_MARKER` to see how it tracks ownership for clean uninstall.
 
-If you change the hook payload format, update both ends in lock-step: the writer in `install-hooks.sh` and the reader in the `/api/session-*` handlers and `cmd_tokens` in `vdm`.
+#### Why command hooks, not HTTP hooks (Phase I)
+
+Pre-Phase-I, vdm shipped 18 `type: "http"` hooks. CC's HTTP-hook implementation logs `ECONNREFUSED` loudly on every event when the dashboard is not responding, with no way to silence it. That meant:
+- Any time the dashboard wasn't up (not started yet, crashed, port collision, mid-restart), every CC session globally spammed `Stop hook error: ECONNREFUSED` and `UserPromptSubmit hook error: ECONNREFUSED` on every prompt, every stop, every event — across every running session, until those shells restarted and the rc snippet's auto-start kicked in.
+- The non-atomic install made this guaranteed on first install: hooks landed in `~/.claude/settings.json` (read instantly by every CC session) before the dashboard was started (only happens on new shells via the rc snippet). Existing CC sessions broke immediately.
+
+Phase I switches to `type: "command"` hooks built like:
+```bash
+curl -sS --connect-timeout 1 --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- http://localhost:$VDM_PORT/api/session-start >/dev/null 2>&1 || true  # __VDM_HOOK__
+```
+The `>/dev/null 2>&1 || true` swallows curl's exit code AND its stderr — CC sees a successful exit and logs nothing. Token tracking degrades gracefully when the dashboard is unreachable instead of spamming errors. Tradeoff: each event spawns sh+curl (~20-50ms vs the previous ~1-5ms HTTP-direct), but hooks are not on the request hot path, so this is acceptable.
+
+Phase I also makes `install.sh` **atomic**: it starts the dashboard in the background and polls `http://localhost:$port/health` (added to BOTH the dashboard server and the proxy server) for up to 10 seconds before calling `install_hooks`. If the dashboard fails to come up, the orphan PID is killed and the install aborts WITHOUT touching `settings.json` — there is no longer any window where hooks exist while the dashboard does not.
+
+If you change the hook payload format, update both ends in lock-step: the writer in `install-hooks.sh` and the reader in the `/api/session-*` handlers and `cmd_tokens` in `vdm`. If you ever revisit the http-vs-command choice, **re-read the section above first** — the choice is deliberate and the failure mode is severe.
 
 ## Testing
 
