@@ -1089,6 +1089,283 @@ export function isPostRefreshTrulyExpired(expiresAt, now = Date.now()) {
   return expiresAt <= now;
 }
 
+// ─────────────────────────────────────────────────
+// Phase 1 of TRDD-1645134b — usage tree aggregation
+// ─────────────────────────────────────────────────
+
+/**
+ * Classify a token-usage row's "component" — one level of the
+ * 4-level tree breakdown (CC instance → worktree → COMPONENT → tool).
+ *
+ * Returns one of:
+ *   - 'main'                 — the parent CC's main agent turn
+ *   - 'subagent:<type>'      — a sub-agent turn (Task tool, Explore, etc.)
+ *   - 'skill:<name>'         — a skill execution
+ *   - 'main'                 — fallback when none of the above apply
+ *
+ * The classification is purely from the row's existing fields (no
+ * disk reads, no IPC) so it can be applied to historical rows during
+ * aggregation without inflating run-time.
+ *
+ * @param {Object} row — a token-usage row (Phase D schema)
+ * @returns {string}
+ */
+export function classifyUsageComponent(row) {
+  if (!row || typeof row !== 'object') return 'main';
+  // Subagent: parent attribution + agent type both must be set.
+  // parentSessionId alone isn't enough — sub-agent rows that fell back
+  // through CL-3 attribution have parentSessionId=parentId but
+  // agentType=null. In that case treat as a generic subagent.
+  if (row.parentSessionId) {
+    const t = (row.agentType || '').trim();
+    return t ? `subagent:${t}` : 'subagent:unknown';
+  }
+  // Skill rows — identified by tool name. Claude Code's Skill tool
+  // names follow the convention `Skill(<plugin>:<skill>)`, `Skill: <name>`,
+  // or just `Skill` with mcpServer field carrying the plugin name.
+  if (typeof row.tool === 'string') {
+    const trimmed = row.tool.trim();
+    if (trimmed === 'Skill' || /^Skill[\s(:]/.test(trimmed)) {
+      // Try to extract the skill name. Patterns observed:
+      //   "Skill(plugin:skill)"  → "plugin:skill"
+      //   "Skill: foo"           → "foo"
+      //   "Skill foo"            → "foo"
+      //   "Skill"                → use mcpServer if present, else "unknown"
+      const m = trimmed.match(/^Skill\s*[(:\s]\s*(.+?)\s*\)?$/);
+      if (m && m[1]) return `skill:${m[1].trim()}`;
+      const fallback = (row.mcpServer || '').trim();
+      return `skill:${fallback || 'unknown'}`;
+    }
+  }
+  return 'main';
+}
+
+/**
+ * Aggregate token-usage rows into the 4-level tree structure
+ * documented in TRDD-1645134b §"Tree-view design":
+ *
+ *   repo → branch (worktree) → component → tool → totals
+ *
+ * Returns:
+ *   {
+ *     totals: { input, output, cacheRead, cacheCreate, requests },
+ *     tree:   [ <repoNode>, ... ]
+ *   }
+ *
+ * Each tree node has shape:
+ *   {
+ *     name: string,
+ *     kind: 'repo' | 'branch' | 'component' | 'tool',
+ *     totals: { ... },
+ *     children: [ ... ]   // omitted on tool-level leaves
+ *     isWorktree: boolean // only on 'branch' nodes
+ *   }
+ *
+ * Skips:
+ *   - Rows with type !== 'usage' (compact_boundary markers etc.)
+ *   - Rows with non-finite/missing token fields (defensive — bad rows
+ *     in the on-disk file shouldn't crash the aggregator)
+ *
+ * @param {Array<Object>} rows — token-usage rows
+ * @param {Object} [opts]
+ * @param {string} [opts.repoFilter]    — only this repo
+ * @param {string} [opts.accountFilter] — only this account
+ * @param {string} [opts.modelFilter]   — only this model
+ * @param {number} [opts.from]          — earliest ts (epoch ms)
+ * @param {number} [opts.to]            — latest ts (epoch ms)
+ * @returns {{totals: Object, tree: Array<Object>}}
+ */
+export function aggregateUsageTree(rows, opts = {}) {
+  const TOOL_NULL_KEY = '<assistant>';   // synthetic name for tool=null rows
+  function emptyTotals() {
+    return { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, requests: 0 };
+  }
+  function addToTotals(t, row) {
+    t.input       += row.inputTokens               || 0;
+    t.output      += row.outputTokens              || 0;
+    t.cacheRead   += row.cacheReadInputTokens      || 0;
+    t.cacheCreate += row.cacheCreationInputTokens  || 0;
+    t.requests    += 1;
+  }
+
+  const grandTotals = emptyTotals();
+  // Map<repo, Map<branch, Map<component, Map<tool, totals>>>>
+  const repos = new Map();
+
+  if (!Array.isArray(rows)) return { totals: grandTotals, tree: [] };
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    if ((row.type || 'usage') !== 'usage') continue;
+    if (opts.repoFilter    && row.repo    !== opts.repoFilter)    continue;
+    if (opts.accountFilter && row.account !== opts.accountFilter) continue;
+    if (opts.modelFilter   && row.model   !== opts.modelFilter)   continue;
+    if (opts.from != null && row.ts < opts.from) continue;
+    if (opts.to   != null && row.ts > opts.to)   continue;
+
+    // Defensive: any non-finite token field skips the row rather than
+    // poisoning the totals with NaN.
+    const tokens = [row.inputTokens, row.outputTokens, row.cacheReadInputTokens, row.cacheCreationInputTokens];
+    if (tokens.some(t => t != null && (typeof t !== 'number' || !Number.isFinite(t)))) {
+      continue;
+    }
+
+    const repoKey      = row.repo   || '(unknown-repo)';
+    const branchKey    = row.branch || '(unknown-branch)';
+    const componentKey = classifyUsageComponent(row);
+    const toolKey      = row.tool ? row.tool : TOOL_NULL_KEY;
+
+    addToTotals(grandTotals, row);
+
+    let branches = repos.get(repoKey);
+    if (!branches) { branches = new Map(); repos.set(repoKey, branches); }
+
+    let components = branches.get(branchKey);
+    if (!components) { components = new Map(); branches.set(branchKey, components); }
+
+    let tools = components.get(componentKey);
+    if (!tools) { tools = new Map(); components.set(componentKey, tools); }
+
+    let toolTotals = tools.get(toolKey);
+    if (!toolTotals) { toolTotals = emptyTotals(); tools.set(toolKey, toolTotals); }
+
+    addToTotals(toolTotals, row);
+  }
+
+  // Walk the maps and build the tree array. Roll up child totals as we go.
+  const tree = [];
+  for (const [repoName, branches] of repos) {
+    const repoNode = { name: repoName, kind: 'repo', totals: emptyTotals(), children: [] };
+    for (const [branchName, components] of branches) {
+      // A branch is a "worktree" when it differs from the conventional
+      // primary-branch names. Conservative heuristic: anything other
+      // than 'main', 'master', '(no git)', '(unknown-branch)' is treated
+      // as a worktree. Real heads named 'main' inside a worktree would
+      // mis-classify as non-worktree, but that's a rare and harmless
+      // case (the user can still see the branch name).
+      const branchNode = {
+        name: branchName,
+        kind: 'branch',
+        isWorktree: !['main', 'master', '(no git)', '(unknown-branch)'].includes(branchName),
+        totals: emptyTotals(),
+        children: [],
+      };
+      for (const [componentName, tools] of components) {
+        const compNode = { name: componentName, kind: 'component', totals: emptyTotals(), children: [] };
+        for (const [toolName, toolTotals] of tools) {
+          compNode.children.push({ name: toolName, kind: 'tool', totals: toolTotals });
+          // Roll into component
+          compNode.totals.input       += toolTotals.input;
+          compNode.totals.output      += toolTotals.output;
+          compNode.totals.cacheRead   += toolTotals.cacheRead;
+          compNode.totals.cacheCreate += toolTotals.cacheCreate;
+          compNode.totals.requests    += toolTotals.requests;
+        }
+        branchNode.children.push(compNode);
+        // Roll into branch
+        branchNode.totals.input       += compNode.totals.input;
+        branchNode.totals.output      += compNode.totals.output;
+        branchNode.totals.cacheRead   += compNode.totals.cacheRead;
+        branchNode.totals.cacheCreate += compNode.totals.cacheCreate;
+        branchNode.totals.requests    += compNode.totals.requests;
+      }
+      repoNode.children.push(branchNode);
+      // Roll into repo
+      repoNode.totals.input       += branchNode.totals.input;
+      repoNode.totals.output      += branchNode.totals.output;
+      repoNode.totals.cacheRead   += branchNode.totals.cacheRead;
+      repoNode.totals.cacheCreate += branchNode.totals.cacheCreate;
+      repoNode.totals.requests    += branchNode.totals.requests;
+    }
+    tree.push(repoNode);
+  }
+  // Sort each level by total tokens descending — the heavy hitters
+  // surface at the top, so users see the consequential rows first
+  // without scrolling.
+  function sortByInputDesc(a, b) {
+    return (b.totals.input + b.totals.output) - (a.totals.input + a.totals.output);
+  }
+  tree.sort(sortByInputDesc);
+  for (const repo of tree) {
+    repo.children.sort(sortByInputDesc);
+    for (const branch of repo.children) {
+      branch.children.sort(sortByInputDesc);
+      for (const component of branch.children) {
+        component.children.sort(sortByInputDesc);
+      }
+    }
+  }
+  return { totals: grandTotals, tree };
+}
+
+/**
+ * Cache-miss heuristic per TRDD-1645134b §"Cache-miss detection".
+ *
+ * For each session (grouped by sessionId), iterate rows in
+ * chronological order. A row counts as a likely cache MISS when:
+ *   - Some prior row in the same session had cacheCreationInputTokens > 0
+ *     (i.e. a cache existed at some point)
+ *   - This row's cacheReadInputTokens === 0 (it didn't read the cache)
+ *   - This row's inputTokens >= minInputForMissDetection (default 1000)
+ *
+ * Limitations (documented for the UI's tooltip):
+ *   - First turn of a thread legitimately has no cache → not a miss
+ *     (correctly excluded — no prior creation row exists)
+ *   - User /clear or /compact invalidates the cache → looks like a miss
+ *     but is user-initiated. Not distinguished here; the UI surfaces
+ *     compact-boundary markers separately so the operator can correlate.
+ *   - Different conversations within one sessionId are aggregated
+ *     together (rare in practice — sessionId is per-CC-process)
+ *
+ * @param {Array<Object>} rows
+ * @param {Object} [opts]
+ * @param {number} [opts.minInputForMissDetection] default 1000
+ * @returns {Array<{sessionId, ts, model, inputTokens, repo, branch, reason}>}
+ */
+export function buildCacheMissReport(rows, opts = {}) {
+  if (!Array.isArray(rows)) return [];
+  const minInput = (opts.minInputForMissDetection != null) ? opts.minInputForMissDetection : 1000;
+
+  // Group rows by session. Skip non-usage rows.
+  const bySession = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    if ((row.type || 'usage') !== 'usage') continue;
+    const sid = row.sessionId || '_unknown';
+    let arr = bySession.get(sid);
+    if (!arr) { arr = []; bySession.set(sid, arr); }
+    arr.push(row);
+  }
+
+  const misses = [];
+  for (const [sessionId, sessionRows] of bySession) {
+    sessionRows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    let priorCacheExisted = false;
+    for (const row of sessionRows) {
+      const created = row.cacheCreationInputTokens || 0;
+      const read    = row.cacheReadInputTokens     || 0;
+      const input   = row.inputTokens              || 0;
+
+      if (priorCacheExisted && read === 0 && input >= minInput) {
+        misses.push({
+          sessionId,
+          ts: row.ts,
+          model: row.model || null,
+          inputTokens: input,
+          repo: row.repo || null,
+          branch: row.branch || null,
+          reason: 'TTL-likely',  // best-guess; no API field tells us why
+        });
+      }
+      if (created > 0) priorCacheExisted = true;
+    }
+  }
+  // Sort by ts ascending so the UI can render a chronological list
+  // without an extra step.
+  misses.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return misses;
+}
+
 /**
  * Promise-chain mutex keyed by account name.
  * Ensures only one refresh runs per account at a time.

@@ -61,6 +61,10 @@ import {
   areAllAccountsTerminallyDead,
   // Phase I+ — token attribution guards
   isNonProjectCwd,
+  // TRDD-1645134b Phase 1 — usage tree aggregation
+  classifyUsageComponent,
+  aggregateUsageTree,
+  buildCacheMissReport,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
   vdmAccountNameFromService,
@@ -6185,5 +6189,324 @@ describe('Phase I+ — dashboard.mjs wires isNonProjectCwd into session-start + 
     );
     // Specifically the subagent-cwd-based path should respect the guard
     assert.match(fn, /Subagent[\s\S]{0,400}is non-project[\s\S]{0,200}\(non-project\) sentinel/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// TRDD-1645134b Phase 1 — usage tree aggregation
+// ─────────────────────────────────────────────────────────
+
+describe('classifyUsageComponent', () => {
+  it('main turn (no parentSessionId, no Skill tool) → "main"', () => {
+    assert.equal(classifyUsageComponent({ parentSessionId: null, tool: null }),    'main');
+    assert.equal(classifyUsageComponent({ parentSessionId: null, tool: 'Bash' }),  'main');
+    assert.equal(classifyUsageComponent({ parentSessionId: null, tool: 'Read' }),  'main');
+  });
+
+  it('subagent with agentType → "subagent:<type>"', () => {
+    assert.equal(classifyUsageComponent({ parentSessionId: 'abc', agentType: 'Explore' }), 'subagent:Explore');
+    assert.equal(classifyUsageComponent({ parentSessionId: 'abc', agentType: 'general-purpose' }), 'subagent:general-purpose');
+  });
+
+  it('subagent without agentType (CL-3 fallback) → "subagent:unknown"', () => {
+    // When CL-3 attribution kicks in (subagent never registered via
+    // /api/subagent-start), agentType is null but parentSessionId is set.
+    // Don't classify these as "main" — they ARE subagents, just with
+    // no type info available.
+    assert.equal(classifyUsageComponent({ parentSessionId: 'abc', agentType: null }),  'subagent:unknown');
+    assert.equal(classifyUsageComponent({ parentSessionId: 'abc', agentType: '' }),    'subagent:unknown');
+    assert.equal(classifyUsageComponent({ parentSessionId: 'abc' }),                   'subagent:unknown');
+  });
+
+  it('Skill tool with parsable name → "skill:<name>"', () => {
+    assert.equal(classifyUsageComponent({ tool: 'Skill(my-plugin:foo)' }),     'skill:my-plugin:foo');
+    assert.equal(classifyUsageComponent({ tool: 'Skill: my-skill' }),          'skill:my-skill');
+  });
+
+  it('Skill tool without parsable name → uses mcpServer or "skill:unknown"', () => {
+    assert.equal(classifyUsageComponent({ tool: 'Skill', mcpServer: 'my-plugin' }), 'skill:my-plugin');
+    assert.equal(classifyUsageComponent({ tool: 'Skill', mcpServer: null }),         'skill:unknown');
+    assert.equal(classifyUsageComponent({ tool: 'Skill' }),                          'skill:unknown');
+  });
+
+  it('handles malformed input gracefully', () => {
+    assert.equal(classifyUsageComponent(null),        'main');
+    assert.equal(classifyUsageComponent(undefined),   'main');
+    assert.equal(classifyUsageComponent('not-a-row'), 'main');
+    assert.equal(classifyUsageComponent({}),          'main');
+  });
+});
+
+describe('aggregateUsageTree', () => {
+  // Minimal row builder so the tests aren't 200 lines of repetitive object literals.
+  function row(o) {
+    return Object.assign({
+      ts: 1_000_000_000,
+      type: 'usage',
+      repo: '/proj/a',
+      branch: 'main',
+      model: 'claude-opus-4-7',
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      account: 'acc-1',
+      sessionId: 'sess-1',
+      parentSessionId: null,
+      agentType: null,
+      tool: null,
+    }, o);
+  }
+
+  it('returns empty totals + tree for empty input', () => {
+    const r = aggregateUsageTree([]);
+    assert.deepEqual(r.totals, { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, requests: 0 });
+    assert.deepEqual(r.tree, []);
+  });
+
+  it('returns empty for non-array inputs (defensive)', () => {
+    assert.deepEqual(aggregateUsageTree(null).tree, []);
+    assert.deepEqual(aggregateUsageTree(undefined).tree, []);
+    assert.deepEqual(aggregateUsageTree('not-array').tree, []);
+  });
+
+  it('builds the 4-level tree (repo → branch → component → tool)', () => {
+    const rows = [
+      row({ tool: null,   inputTokens: 1000, outputTokens: 100 }),  // main/<assistant>
+      row({ tool: 'Bash', inputTokens: 200,  outputTokens: 20  }),  // main/Bash
+      row({ tool: 'Read', inputTokens: 300,  outputTokens: 30  }),  // main/Read
+      row({ parentSessionId: 'sess-1', agentType: 'Explore', tool: 'Read', inputTokens: 500, outputTokens: 50 }),
+    ];
+    const r = aggregateUsageTree(rows);
+    assert.equal(r.tree.length, 1);
+    const repo = r.tree[0];
+    assert.equal(repo.kind, 'repo');
+    assert.equal(repo.name, '/proj/a');
+    assert.equal(repo.children.length, 1, 'one branch');
+    const branch = repo.children[0];
+    assert.equal(branch.kind, 'branch');
+    assert.equal(branch.name, 'main');
+    assert.equal(branch.isWorktree, false, "'main' branch is not a worktree");
+    assert.equal(branch.children.length, 2, 'two components: main + subagent:Explore');
+    const componentNames = branch.children.map(c => c.name).sort();
+    assert.deepEqual(componentNames, ['main', 'subagent:Explore']);
+  });
+
+  it('marks non-main/master branches as worktrees', () => {
+    const r = aggregateUsageTree([
+      row({ branch: 'main',          inputTokens: 100 }),
+      row({ branch: 'master',        inputTokens: 100 }),
+      row({ branch: 'feature-x',     inputTokens: 100 }),
+      row({ branch: 'wt-explore-foo',inputTokens: 100 }),
+    ]);
+    const repo = r.tree[0];
+    const byName = Object.fromEntries(repo.children.map(b => [b.name, b]));
+    assert.equal(byName['main'].isWorktree,           false);
+    assert.equal(byName['master'].isWorktree,         false);
+    assert.equal(byName['feature-x'].isWorktree,      true);
+    assert.equal(byName['wt-explore-foo'].isWorktree, true);
+  });
+
+  it('rolls up totals at each level (tool → component → branch → repo → grand)', () => {
+    const rows = [
+      row({ tool: 'Bash', inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 5,  cacheCreationInputTokens: 2 }),
+      row({ tool: 'Bash', inputTokens: 200, outputTokens: 20, cacheReadInputTokens: 10, cacheCreationInputTokens: 4 }),
+      row({ tool: 'Read', inputTokens: 50,  outputTokens: 5,  cacheReadInputTokens: 1 }),
+    ];
+    const r = aggregateUsageTree(rows);
+    assert.equal(r.totals.input,       350);
+    assert.equal(r.totals.output,      35);
+    assert.equal(r.totals.cacheRead,   16);
+    assert.equal(r.totals.cacheCreate, 6);
+    assert.equal(r.totals.requests,    3);
+    const repo = r.tree[0];
+    assert.equal(repo.totals.input, 350);
+    const branch = repo.children[0];
+    assert.equal(branch.totals.input, 350);
+    const main = branch.children.find(c => c.name === 'main');
+    assert.equal(main.totals.input, 350);
+    const bash = main.children.find(t => t.name === 'Bash');
+    assert.equal(bash.totals.input, 300, 'two Bash rows aggregated under one leaf');
+    assert.equal(bash.totals.requests, 2);
+  });
+
+  it('uses <assistant> as the synthetic tool-name for null tool field', () => {
+    const r = aggregateUsageTree([row({ tool: null })]);
+    const main = r.tree[0].children[0].children.find(c => c.name === 'main');
+    assert.equal(main.children[0].name, '<assistant>');
+  });
+
+  it('skips compact_boundary rows', () => {
+    const r = aggregateUsageTree([
+      row({ inputTokens: 100 }),
+      row({ type: 'compact_boundary', inputTokens: 999, preTokens: 50000, postTokens: 8000 }),
+    ]);
+    assert.equal(r.totals.input, 100, 'compact_boundary inputTokens NOT counted');
+    assert.equal(r.totals.requests, 1, 'only the usage row counted');
+  });
+
+  it('respects repo / account / model filters', () => {
+    const rows = [
+      row({ repo: '/proj/a', model: 'claude-opus-4-7',  account: 'acc-1', inputTokens: 100 }),
+      row({ repo: '/proj/b', model: 'claude-sonnet-4-7', account: 'acc-1', inputTokens: 200 }),
+      row({ repo: '/proj/a', model: 'claude-sonnet-4-7', account: 'acc-2', inputTokens: 400 }),
+    ];
+    assert.equal(aggregateUsageTree(rows, { repoFilter: '/proj/a' }).totals.input,  500);
+    assert.equal(aggregateUsageTree(rows, { modelFilter: 'claude-opus-4-7' }).totals.input, 100);
+    assert.equal(aggregateUsageTree(rows, { accountFilter: 'acc-2' }).totals.input, 400);
+    // Combined filters: AND
+    assert.equal(
+      aggregateUsageTree(rows, { repoFilter: '/proj/a', accountFilter: 'acc-1' }).totals.input,
+      100,
+    );
+  });
+
+  it('respects from / to ts filters', () => {
+    const rows = [
+      row({ ts: 1000, inputTokens: 1 }),
+      row({ ts: 2000, inputTokens: 2 }),
+      row({ ts: 3000, inputTokens: 3 }),
+    ];
+    assert.equal(aggregateUsageTree(rows, { from: 2000 }).totals.input,        5);
+    assert.equal(aggregateUsageTree(rows, { to: 2000 }).totals.input,          3);
+    assert.equal(aggregateUsageTree(rows, { from: 2000, to: 2000 }).totals.input, 2);
+  });
+
+  it('skips rows with non-finite token fields (defensive)', () => {
+    const r = aggregateUsageTree([
+      row({ inputTokens: 100 }),
+      row({ inputTokens: NaN }),
+      row({ inputTokens: Infinity }),
+      row({ outputTokens: -Infinity }),
+    ]);
+    assert.equal(r.totals.input, 100, 'only the well-formed row counted');
+    assert.equal(r.totals.requests, 1);
+  });
+
+  it('sorts each level by total tokens desc — heavy hitters first', () => {
+    const rows = [
+      row({ repo: '/proj/light', inputTokens: 10 }),
+      row({ repo: '/proj/heavy', inputTokens: 1000 }),
+      row({ repo: '/proj/medium', inputTokens: 100 }),
+    ];
+    const tree = aggregateUsageTree(rows).tree;
+    assert.equal(tree[0].name, '/proj/heavy');
+    assert.equal(tree[1].name, '/proj/medium');
+    assert.equal(tree[2].name, '/proj/light');
+  });
+
+  it('uses sentinels for missing repo / branch', () => {
+    const r = aggregateUsageTree([
+      row({ repo: null,   branch: null,   inputTokens: 5 }),
+      row({ repo: '',     branch: '',     inputTokens: 5 }),
+    ]);
+    const repo = r.tree[0];
+    assert.equal(repo.name, '(unknown-repo)');
+    assert.equal(repo.children[0].name, '(unknown-branch)');
+  });
+});
+
+describe('buildCacheMissReport', () => {
+  function row(o) {
+    return Object.assign({
+      ts: 1_000_000_000,
+      type: 'usage',
+      sessionId: 'sess-1',
+      model: 'claude-opus-4-7',
+      inputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      repo: '/proj/a',
+      branch: 'main',
+    }, o);
+  }
+
+  it('returns [] for empty / non-array input', () => {
+    assert.deepEqual(buildCacheMissReport([]),          []);
+    assert.deepEqual(buildCacheMissReport(null),        []);
+    assert.deepEqual(buildCacheMissReport(undefined),   []);
+    assert.deepEqual(buildCacheMissReport('garbage'),   []);
+  });
+
+  it('first turn of a session is NEVER a miss (no prior cache existed)', () => {
+    const r = buildCacheMissReport([
+      row({ ts: 1, inputTokens: 5000 }),  // big input, no prior cache
+    ]);
+    assert.deepEqual(r, [], 'no prior creation row exists; first turn cannot miss');
+  });
+
+  it('flags the canonical TTL-miss pattern', () => {
+    const r = buildCacheMissReport([
+      // Turn 1 — creates cache
+      row({ ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      // Turn 2 — within TTL, reads cache. NOT a miss.
+      row({ ts: 2000, inputTokens: 0,    cacheReadInputTokens: 5000 }),
+      // Turn 3 — TTL expired, cacheRead=0 but big input. MISS.
+      row({ ts: 3000, inputTokens: 5500, cacheReadInputTokens: 0,    cacheCreationInputTokens: 5500 }),
+    ]);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].ts, 3000);
+    assert.equal(r[0].sessionId, 'sess-1');
+    assert.equal(r[0].inputTokens, 5500);
+    assert.equal(r[0].reason, 'TTL-likely');
+  });
+
+  it('does NOT flag small-input turns (configurable threshold)', () => {
+    const rows = [
+      row({ ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      row({ ts: 2000, inputTokens: 200,  cacheReadInputTokens: 0 }),    // small input — not a miss
+    ];
+    assert.deepEqual(buildCacheMissReport(rows), [], 'default threshold 1000 excludes small turns');
+
+    // Lowering the threshold should flag it
+    const r = buildCacheMissReport(rows, { minInputForMissDetection: 100 });
+    assert.equal(r.length, 1);
+    assert.equal(r[0].inputTokens, 200);
+  });
+
+  it('groups by sessionId — different sessions do NOT cross-contaminate', () => {
+    const r = buildCacheMissReport([
+      row({ sessionId: 'A', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      row({ sessionId: 'B', ts: 2000, inputTokens: 5000, cacheReadInputTokens: 0 }),
+      // Session B's first turn — no prior cache in session B → not a miss
+    ]);
+    assert.deepEqual(r, []);
+  });
+
+  it('chronological order within a session matters (ts-sorted)', () => {
+    // Provide rows in OUT-of-order, verify the function still detects
+    // the miss based on chronological order. After sort:
+    //   t=1000: first turn, no cache → not a miss
+    //   t=2000: creates cache
+    //   t=3000: big input + cacheRead=0 → MISS (TTL-likely)
+    const r = buildCacheMissReport([
+      row({ ts: 3000, inputTokens: 5000, cacheReadInputTokens: 0 }),
+      row({ ts: 2000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      row({ ts: 1000, inputTokens: 5000 }),
+    ]);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].ts, 3000);
+  });
+
+  it('returned misses are sorted ascending by ts across sessions', () => {
+    const r = buildCacheMissReport([
+      row({ sessionId: 'B', ts: 5000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      row({ sessionId: 'B', ts: 6000, inputTokens: 5000, cacheReadInputTokens: 0 }),  // miss at 6000
+      row({ sessionId: 'A', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      row({ sessionId: 'A', ts: 2000, inputTokens: 5000, cacheReadInputTokens: 0 }),  // miss at 2000
+    ]);
+    assert.equal(r.length, 2);
+    assert.equal(r[0].ts, 2000, 'earlier miss first');
+    assert.equal(r[1].ts, 6000);
+  });
+
+  it('skips compact_boundary rows', () => {
+    const r = buildCacheMissReport([
+      row({ ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
+      row({ ts: 1500, type: 'compact_boundary', inputTokens: 0 }),   // ignored
+      row({ ts: 2000, inputTokens: 5000, cacheReadInputTokens: 0 }), // miss
+    ]);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].ts, 2000);
   });
 });
