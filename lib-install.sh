@@ -425,6 +425,23 @@ except Exception:
 " "$f" "$key" 2>/dev/null
 }
 
+# _validate_port <port>
+# Returns 0 iff the port is a pure decimal integer in 1..65535. Used
+# everywhere a port might come from an untrusted source (env vars,
+# config.json read by old code that did not validate, CLI args). Hard
+# invariant: NEVER let an unvalidated port string reach a `command:`
+# field of a Claude Code hook entry — sh -c interprets shell metachars
+# and a contaminated port becomes RCE on every hook event.
+# Single source of truth so install.sh, install-hooks.sh, uninstall.sh,
+# and vdm all agree on what counts as a valid port.
+_validate_port() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  return 0
+}
+
 # ─────────────────────────────────────────────────────────
 # Detectors — populate VDM_DETECTED_ISSUES.
 #

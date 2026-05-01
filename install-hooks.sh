@@ -51,7 +51,22 @@ fi
 _resolve_vdm_port() {
   local cfg="$HOME/.claude/account-switcher/config.json"
   local from_cfg=""
-  if [[ -z "${CSW_PORT:-}" ]] \
+  local env_port="${CSW_PORT:-}"
+  # SECURITY: validate env BEFORE using it. CSW_PORT is a raw env var —
+  # an unvalidated value reaches a `command:` field of a CC hook entry,
+  # which is run via `sh -c`, so a value like '3333; rm -rf ~' becomes
+  # arbitrary code execution on every CC hook event. Reject and fall
+  # through to config / default. The full validator lives in lib-install.sh
+  # (_validate_port); this inline copy is a backstop because install-hooks.sh
+  # is also sourced from `vdm` and the migration block at the top of `vdm`,
+  # neither of which guarantees lib-install.sh has been sourced yet.
+  if [[ -n "$env_port" ]]; then
+    if ! [[ "$env_port" =~ ^[1-9][0-9]{0,4}$ ]] || ! (( env_port >= 1 && env_port <= 65535 )); then
+      echo "  install-hooks.sh: ignoring malformed CSW_PORT='$env_port' (expected 1..65535)" >&2
+      env_port=""
+    fi
+  fi
+  if [[ -z "$env_port" ]] \
      && [[ -r "$cfg" ]] \
      && command -v python3 >/dev/null 2>&1; then
     # Inline python — _json_get_int from lib-install.sh may not be sourced
@@ -66,11 +81,26 @@ except Exception:
   pass
 ' "$cfg" 2>/dev/null || true)"
   fi
-  printf '%s' "${from_cfg:-${CSW_PORT:-3333}}"
+  printf '%s' "${from_cfg:-${env_port:-3333}}"
 }
 _VDM_PORT="$(_resolve_vdm_port)"
+# Final paranoia check — _resolve_vdm_port is supposed to only emit
+# validated values, but assert anyway. A bad value here would break
+# every downstream consumer (Python f-string interpolation, command-field
+# embedding, etc.) so abort hard rather than emit a bogus hook.
+if ! [[ "$_VDM_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || ! (( _VDM_PORT >= 1 && _VDM_PORT <= 65535 )); then
+  echo "  install-hooks.sh: resolved port '$_VDM_PORT' is invalid; refusing to proceed" >&2
+  return 1 2>/dev/null || exit 1
+fi
 _VDM_HOOKS_MARKER="# vdm-token-usage"
 _VDM_HOOKS_PATH_MARKER=".vdm-set-hooks-path"
+# Sentinel embedded as a literal `# <SENTINEL>` shell comment in every
+# command-type hook command. Used by install + uninstall to identify
+# "this entry belongs to vdm" regardless of port changes / command-string
+# drift. Versioned (v1) so a future schema rev can change the sentinel
+# without breaking removal of older installs. Single source of truth here;
+# both python heredocs receive it via sys.argv to keep them in sync.
+_VDM_HOOK_SENTINEL="__VDM_HOOK_v1_DO_NOT_EDIT__"
 
 install_hooks() {
   # Uninstall-aware guard. install-hooks.sh can be sourced from at least
@@ -157,12 +187,13 @@ _install_claude_code_hooks() {
   local _per_tool_flag="$HOME/.claude/account-switcher/per-tool-attribution.flag"
   local _per_tool_enabled=0
   [[ -f "$_per_tool_flag" ]] && _per_tool_enabled=1
-  if ! python3 - "$settings_file" "$_VDM_PORT" "$_per_tool_enabled" <<'PYEOF'
+  if ! python3 - "$settings_file" "$_VDM_PORT" "$_per_tool_enabled" "$_VDM_HOOK_SENTINEL" <<'PYEOF'
 import json, os, sys
 
 settings_file = sys.argv[1]
 port = sys.argv[2]
 per_tool_enabled = sys.argv[3] == '1'
+VDM_HOOK_SENTINEL = sys.argv[4]
 
 # Load existing settings
 settings = {}
@@ -226,12 +257,6 @@ _peek_managed_settings()
 if 'hooks' not in settings:
     settings['hooks'] = {}
 hooks = settings['hooks']
-
-# Sentinel marker embedded in every command-type hook so install/uninstall
-# can identify "this entry belongs to vdm" regardless of port changes or
-# command-string drift. Bash treats the trailing `# __VDM_HOOK__` as a
-# comment, so it has zero runtime effect.
-VDM_HOOK_SENTINEL = '__VDM_HOOK__'
 
 def _build_hook_command(url):
     # Command-type hooks (not http-type) for two reasons:
@@ -447,11 +472,12 @@ _uninstall_claude_code_hooks() {
   # the missing reference into an error.
   trap "rmdir \"$lock_dir\" 2>/dev/null || true" RETURN
 
-  if ! python3 - "$settings_file" "$_VDM_PORT" <<'PYEOF'
+  if ! python3 - "$settings_file" "$_VDM_PORT" "$_VDM_HOOK_SENTINEL" <<'PYEOF'
 import json, os, sys
 
 settings_file = sys.argv[1]
 port = sys.argv[2]
+VDM_HOOK_SENTINEL = sys.argv[3]
 
 try:
     with open(settings_file) as f:
@@ -464,11 +490,9 @@ if not isinstance(settings, dict) or 'hooks' not in settings:
 
 hooks = settings['hooks']
 
-# Mirrors install-side sentinel + matcher (kept duplicated rather than
-# imported because each python heredoc is its own process — no shared
-# module state).
-VDM_HOOK_SENTINEL = '__VDM_HOOK__'
-
+# VDM_HOOK_SENTINEL comes from sys.argv (set by the bash caller above)
+# so the value stays in sync with the install-side definition without
+# either heredoc embedding it as a literal.
 def _is_vdm_inner_hook(h, target_path):
     if not isinstance(h, dict):
         return False

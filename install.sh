@@ -159,8 +159,29 @@ _resolve_install_ports() {
     _cfg_dash="$(_json_get_int "$cfg" port 2>/dev/null || true)"
     _cfg_proxy="$(_json_get_int "$cfg" proxyPort 2>/dev/null || true)"
   fi
-  _DASH_PORT_DEFAULT="${_cfg_dash:-${CSW_PORT:-3333}}"
-  _PROXY_PORT_DEFAULT="${_cfg_proxy:-${CSW_PROXY_PORT:-3334}}"
+  # SECURITY: validate the env var BEFORE falling through. _json_get_int
+  # already returns int-only, but $CSW_PORT / $CSW_PROXY_PORT are raw
+  # string expansions — a value like 'CSW_PORT=3333; rm -rf ~' would
+  # contaminate every downstream consumer. Promote to default 3333/3334
+  # if the env var is set but malformed; warn so the user knows their
+  # env is being ignored.
+  local _env_dash="${CSW_PORT:-}"
+  local _env_proxy="${CSW_PROXY_PORT:-}"
+  if [[ -n "$_env_dash" ]] && ! _validate_port "$_env_dash"; then
+    echo -e "  ${YELLOW}!${NC} Ignoring malformed CSW_PORT='$_env_dash' (expected 1..65535)" >&2
+    _env_dash=""
+  fi
+  if [[ -n "$_env_proxy" ]] && ! _validate_port "$_env_proxy"; then
+    echo -e "  ${YELLOW}!${NC} Ignoring malformed CSW_PROXY_PORT='$_env_proxy' (expected 1..65535)" >&2
+    _env_proxy=""
+  fi
+  _DASH_PORT_DEFAULT="${_cfg_dash:-${_env_dash:-3333}}"
+  _PROXY_PORT_DEFAULT="${_cfg_proxy:-${_env_proxy:-3334}}"
+  # Final paranoia check — if config.json was hand-edited to a non-int
+  # _json_get_int already rejected it, but assert anyway. Aborting here
+  # is preferable to writing a bad port into a hook command field.
+  _validate_port "$_DASH_PORT_DEFAULT" || { echo -e "  ${RED}Resolved dashboard port '$_DASH_PORT_DEFAULT' is invalid${NC}" >&2; exit 1; }
+  _validate_port "$_PROXY_PORT_DEFAULT" || { echo -e "  ${RED}Resolved proxy port '$_PROXY_PORT_DEFAULT' is invalid${NC}" >&2; exit 1; }
 }
 _resolve_install_ports
 if _kill_running_vdm "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"; then
@@ -423,6 +444,14 @@ _rollback_install_files() {
     for f in "${_NEW_FILES[@]}"; do
       rm -f "$f" 2>/dev/null || true
     done
+  fi
+  # Reap the dashboard PID we spawned during the atomic-install block,
+  # IF we spawned one. Without this, a later install-step failure (e.g.
+  # slash-command install error) would remove vdm files but leave a node
+  # process bound to the dashboard port — confusing rc snippets and
+  # subsequent install.sh runs. _kill_if_ours guards against PID rollover.
+  if [[ -n "${_NEW_DASH_PID:-}" ]] && declare -f _kill_if_ours >/dev/null 2>&1; then
+    _kill_if_ours "$_NEW_DASH_PID"
   fi
   rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
 }
@@ -752,25 +781,68 @@ else
   echo '    # END claude-account-switcher'
 fi
 
-# ── Atomic install: dashboard MUST be reachable before hooks land ──
-# Why: hooks live in ~/.claude/settings.json, which is read by every CC
-# session in every shell on this machine — instantly. If we install hooks
-# before the dashboard is up, every existing CC session worldwide spams
-# error messages on every prompt + every stop until those shells restart
-# and the rc snippet auto-starts the dashboard. The pre-Phase-I install
-# was non-atomic: hooks landed first, dashboard came up later (only on
-# new shells). This block reverses that ordering: start dashboard, poll
-# /health, ONLY THEN install hooks. If the dashboard fails to come up
-# we kill the orphan and abort — settings.json stays clean.
+# ── Atomic install: BOTH servers MUST be reachable before hooks land ──
+# Why: hooks live in ~/.claude/settings.json, read by every CC session
+# in every shell instantly. Any hook write must be preceded by a verified
+# dashboard + proxy on the configured ports — otherwise existing CC
+# sessions spam errors and ANTHROPIC_BASE_URL points at nothing.
+#
+# Defenses layered here (Phase I + audit follow-up):
+#   * Validated ports via _validate_port (lib-install.sh) — no shell-meta
+#     in URL strings, no RCE via $CSW_PORT.
+#   * Body-content check on /health — refuses to trust a squatter that
+#     happens to answer 200 on the same path.
+#   * Polls BOTH dashboard AND proxy /health — proxy is what
+#     ANTHROPIC_BASE_URL points to, so a half-up dashboard would still
+#     break every CC API call.
+#   * Exports the resolved ports into the dashboard child env so the
+#     spawned dashboard binds to what we polled (avoids the env-vs-config
+#     mismatch where install.sh polled config-port but dashboard bound
+#     env-port).
+#   * Truncates startup.log so retries don't leave a forever-growing log.
+#   * SIGINT trap kills the spawned PID if user Ctrl-C's during the poll.
+#   * PID-based kill verifies the process is still ours (cmdline contains
+#     dashboard.mjs) before signaling — defends against PID rollover.
+#   * The spawned PID is also added to the rollback trap so any later
+#     install step that fails reaps the dashboard too, not just files.
 _DASH_HEALTH_PORT="$_DASH_PORT_DEFAULT"
+_PROXY_HEALTH_PORT="$_PROXY_PORT_DEFAULT"
+
 _dashboard_responds() {
+  # Body MUST contain `"server":"dashboard"` so a generic webserver
+  # squatting on the same port can't fool us into installing hooks
+  # pointing at it. JSON-string match (no quoting nuance) is fine.
+  local body
+  body="$(curl -fsS --connect-timeout 1 --max-time 2 \
+    "http://localhost:${_DASH_HEALTH_PORT}/health" 2>/dev/null)" || return 1
+  [[ "$body" == *'"server":"dashboard"'* ]]
+}
+_proxy_responds() {
   curl -fsS --connect-timeout 1 --max-time 2 \
-    "http://localhost:${_DASH_HEALTH_PORT}/health" >/dev/null 2>&1
+    "http://localhost:${_PROXY_HEALTH_PORT}/health" >/dev/null 2>&1
+}
+_both_servers_responding() {
+  _dashboard_responds && _proxy_responds
 }
 
+# Verify the PID we tracked is still our dashboard before signaling it.
+# Defends against PID-rollover causing `kill` to land on an unrelated
+# user process if the dashboard exited during our poll window.
+_kill_if_ours() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  # ps -o command= prints the cmdline; if it contains dashboard.mjs the
+  # PID is still ours and safe to terminate.
+  if ps -o command= -p "$pid" 2>/dev/null | grep -q "dashboard\.mjs"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+}
+
+# Accumulate the spawned PID into a global so the rollback trap (which
+# fires on any later install-step failure) can also reap it.
 _NEW_DASH_PID=""
-if _dashboard_responds; then
-  echo -e "  ${GREEN}✓${NC} Dashboard already responding on port ${CYAN}${_DASH_HEALTH_PORT}${NC}"
+if _both_servers_responding; then
+  echo -e "  ${GREEN}✓${NC} Dashboard + proxy already responding on ports ${CYAN}${_DASH_HEALTH_PORT}/${_PROXY_HEALTH_PORT}${NC}"
 else
   _NODE_BIN="$(command -v node 2>/dev/null || true)"
   if [[ -z "$_NODE_BIN" ]]; then
@@ -778,50 +850,72 @@ else
     echo -e "    Install Node.js 18+ and re-run ${DIM}./install.sh${NC}."
     exit 1
   fi
-  echo -ne "  ${YELLOW}…${NC} Starting dashboard on port ${CYAN}${_DASH_HEALTH_PORT}${NC} "
-  # Background-start, suppress output (any failure is detected via /health
-  # poll, so we don't need stdout/stderr in the install transcript).
-  nohup "$_NODE_BIN" "$INSTALL_DIR/dashboard.mjs" \
+  # Truncate startup.log so a chronically-failing install doesn't grow
+  # the log unbounded. Old content for forensics is in the
+  # rollback-snapshotted copy if the user needs to dig.
+  : > "$INSTALL_DIR/startup.log"
+  echo -ne "  ${YELLOW}…${NC} Starting dashboard+proxy on ports ${CYAN}${_DASH_HEALTH_PORT}/${_PROXY_HEALTH_PORT}${NC} "
+  # Pass the resolved ports into the child env so the dashboard binds
+  # to exactly what we poll. dashboard.mjs reads CSW_PORT / CSW_PROXY_PORT
+  # via parseInt (line 22 / 7415) so even if these were somehow malicious
+  # they could not become RCE on the dashboard side — but we already
+  # passed them through _validate_port, so they are clean.
+  CSW_PORT="$_DASH_HEALTH_PORT" CSW_PROXY_PORT="$_PROXY_HEALTH_PORT" \
+    nohup "$_NODE_BIN" "$INSTALL_DIR/dashboard.mjs" \
     >>"$INSTALL_DIR/startup.log" 2>&1 &
   _NEW_DASH_PID=$!
   disown 2>/dev/null || true
-  # Poll /health up to 10s (20 x 0.5s). The first 1-2 polls usually fail
-  # while Node is still parsing the file; the listener is up by ~500ms
-  # on every machine vdm targets.
+  # SIGINT trap so Ctrl-C during the poll reaps the orphan instead of
+  # leaving it running. Trap is installed AFTER _NEW_DASH_PID is set so
+  # the early-exit branches above are not affected.
+  trap '_kill_if_ours "$_NEW_DASH_PID"; trap - INT; exit 130' INT
+  # Poll for up to 10s (20 x 0.5s). First 1-2 polls usually fail while
+  # Node parses the file; both listeners are up by ~500ms on every
+  # machine vdm targets.
   _ok=0
   for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if _dashboard_responds; then
+    if _both_servers_responding; then
       _ok=1
       break
     fi
     sleep 0.5
   done
+  trap - INT  # remove the SIGINT trap; rollback trap below covers later phases
   if [[ $_ok -eq 1 ]]; then
     echo -e "${GREEN}up${NC} (PID ${_NEW_DASH_PID})"
   else
     echo -e "${RED}timed out after 10s${NC}"
-    echo -e "    Killing orphan PID ${_NEW_DASH_PID} and aborting install."
+    echo -e "    Reaping spawned PID ${_NEW_DASH_PID} and aborting install."
     echo -e "    ${DIM}Hooks NOT written — your settings.json stays clean.${NC}"
     echo -e "    Diagnose with: ${DIM}node $INSTALL_DIR/dashboard.mjs${NC}"
-    echo -e "    Common causes: port ${_DASH_HEALTH_PORT} already taken (lsof -i:${_DASH_HEALTH_PORT}), node version too old, or dashboard crash on startup (check ${CYAN}$INSTALL_DIR/startup.log${NC})."
-    kill "$_NEW_DASH_PID" 2>/dev/null || true
+    echo -e "    Common causes: port ${_DASH_HEALTH_PORT} or ${_PROXY_HEALTH_PORT} already taken (lsof -iTCP:${_DASH_HEALTH_PORT} -iTCP:${_PROXY_HEALTH_PORT}), node version too old, dashboard crash on startup (check ${CYAN}$INSTALL_DIR/startup.log${NC}), or a non-vdm process serving 200 on /health."
+    _kill_if_ours "$_NEW_DASH_PID"
     exit 1
   fi
 fi
 
 # ── Install token tracking hooks ──
-# Now safe: dashboard is verified up (above). install_hooks is itself
+# Now safe: dashboard + proxy verified up. install_hooks is itself
 # atomic (settings.json is rewritten via tmp + os.replace), so a failure
 # here means JSON parsing / disk full / permissions, not corruption.
-# Surface so the user knows their tokens won't be tracked.
+# Escalated from "yellow warning" to "red abort" because a successful
+# dashboard start without hooks leaves the user with a half-installed
+# system (proxy works but no token tracking). Re-running install.sh
+# after fixing the underlying problem (disk space, permissions) is the
+# correct recovery path.
 if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   # shellcheck source=/dev/null
   . "$INSTALL_DIR/install-hooks.sh"
   if install_hooks; then
     echo -e "  ${GREEN}✓${NC} Token tracking hooks installed"
   else
-    echo -e "  ${YELLOW}!${NC} Hook install returned non-zero — token tracking may be off."
-    echo -e "    ${DIM}Re-run ./install.sh later, or check ${CYAN}~/.claude/settings.json${DIM}.${NC}"
+    echo -e "  ${RED}!${NC} install_hooks returned non-zero — aborting install."
+    echo -e "    ${DIM}Dashboard was started but settings.json was not updated.${NC}"
+    echo -e "    ${DIM}Common causes: ~/.claude/settings.json corrupt, disk full,${NC}"
+    echo -e "    ${DIM}lock-dir contention, or directory permissions.${NC}"
+    echo -e "    Reaping spawned dashboard (PID ${_NEW_DASH_PID:-?}) and exiting."
+    _kill_if_ours "${_NEW_DASH_PID:-}"
+    exit 1
   fi
 fi
 

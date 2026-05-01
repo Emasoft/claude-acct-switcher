@@ -7337,8 +7337,10 @@ const server = createServer(async (req, res) => {
     // the rc-snippet's auto-start guard. Returns 200 with a tiny JSON
     // body the moment the listener accepts connections, so the installer
     // can stop polling and proceed to write hooks. No CORS, no auth,
-    // no shared state — must respond regardless of init progress.
-    if (req.method === 'GET' && req.url === '/health') {
+    // no shared state — must respond regardless of init progress. HEAD
+    // is also accepted (Node's http server strips the body automatically
+    // for HEAD), so cheap probes that only care about status work too.
+    if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, server: 'dashboard', port: PORT }));
       return;

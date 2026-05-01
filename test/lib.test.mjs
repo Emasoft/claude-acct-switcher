@@ -4214,3 +4214,240 @@ describe('L5 — _renderedCardCache replaced wholesale per render (no add+remove
     );
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Phase I — install-hooks.sh shell-injection guard.
+// ─────────────────────────────────────────────────────────
+//
+// CONTEXT: install-hooks.sh's _resolve_vdm_port reads $CSW_PORT raw
+// from env, then a Python heredoc f-string interpolates the port into
+// a `command:` field of every CC hook entry. CC runs that command via
+// `sh -c`. A value containing shell metacharacters would therefore
+// become arbitrary code execution on every CC hook event. The guard
+// is _validate_port (regex + IANA range) called from BOTH
+// _resolve_vdm_port AND a final post-resolution paranoia check.
+
+import { execFileSync as _execFileSync_inj, spawnSync as _spawnSync_inj } from 'node:child_process';
+import {
+  mkdtempSync as _mkdtempSync_inj,
+  writeFileSync as _writeFileSync_inj,
+  existsSync as _existsSync_inj,
+} from 'node:fs';
+import { join as _join_inj } from 'node:path';
+import { tmpdir as _tmpdir_inj } from 'node:os';
+
+describe('Phase I — install-hooks.sh rejects malicious $CSW_PORT', () => {
+  const _scriptPath = new URL('../install-hooks.sh', import.meta.url).pathname;
+
+  function _runWithEnv(env) {
+    // Source install-hooks.sh under a tmp HOME with a fake dashboard.mjs
+    // so the dashboard-presence guard inside install_hooks does not
+    // short-circuit before we reach the port check. spawnSync (not
+    // execFileSync) so we capture both stdout AND stderr regardless of
+    // exit status.
+    const home = _mkdtempSync_inj(_join_inj(_tmpdir_inj(), 'vdm-test-inj-'));
+    _execFileSync_inj('mkdir', ['-p', _join_inj(home, '.claude/account-switcher')]);
+    _writeFileSync_inj(_join_inj(home, '.claude/account-switcher/dashboard.mjs'), '');
+    _writeFileSync_inj(_join_inj(home, '.claude/settings.json'), '{}');
+    const r = _spawnSync_inj('bash', ['-c', `. "${_scriptPath}"; install_hooks`], {
+      env: { ...env, HOME: home, PATH: process.env.PATH },
+      encoding: 'utf8',
+    });
+    return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '', home };
+  }
+
+  it('rejects CSW_PORT with shell metacharacter (semicolon)', () => {
+    const r = _runWithEnv({ CSW_PORT: '3333; touch /tmp/vdm-pwned-test' });
+    assert.match(r.stderr, /malformed CSW_PORT/);
+    // Confirm the injection target file does NOT exist on disk.
+    assert.equal(
+      _existsSync_inj('/tmp/vdm-pwned-test'),
+      false,
+      'shell injection token leaked into a real command — guard failed',
+    );
+  });
+
+  it('rejects CSW_PORT with command-substitution backtick', () => {
+    const r = _runWithEnv({ CSW_PORT: '3333`id`' });
+    assert.match(r.stderr, /malformed CSW_PORT/);
+  });
+
+  it('rejects CSW_PORT outside IANA range', () => {
+    const r = _runWithEnv({ CSW_PORT: '70000' });
+    assert.match(r.stderr, /malformed CSW_PORT/);
+  });
+
+  it('rejects CSW_PORT="0"', () => {
+    const r = _runWithEnv({ CSW_PORT: '0' });
+    assert.match(r.stderr, /malformed CSW_PORT/);
+  });
+
+  it('accepts a valid CSW_PORT', () => {
+    const r = _runWithEnv({ CSW_PORT: '3333' });
+    assert.doesNotMatch(r.stderr, /malformed CSW_PORT/);
+  });
+});
+
+describe('Phase I — sentinel marker shape', () => {
+  // Two regression invariants:
+  //   1. Sentinel defined ONCE at bash level, not duplicated as a
+  //      Python string literal in either heredoc (DRY).
+  //   2. Sentinel is versioned so a future schema change can walk
+  //      forward without breaking removal of older installs.
+  const _ihSrc = _readFileSync_xss(
+    new URL('../install-hooks.sh', import.meta.url),
+    'utf8',
+  );
+
+  it('sentinel is defined exactly once at bash level', () => {
+    const matches = _ihSrc.match(/_VDM_HOOK_SENTINEL=/g) || [];
+    assert.equal(
+      matches.length, 1,
+      'expected exactly one bash-level definition of _VDM_HOOK_SENTINEL',
+    );
+  });
+
+  it('sentinel is versioned (contains v1)', () => {
+    assert.match(_ihSrc, /_VDM_HOOK_SENTINEL="__VDM_HOOK_v\d+_DO_NOT_EDIT__"/);
+  });
+
+  it('neither python heredoc embeds the sentinel as a string literal', () => {
+    // Both heredocs must read the value via sys.argv. A literal
+    // Python-style definition like VDM_HOOK_SENTINEL = '__VDM_HOOK...'
+    // is exactly what we removed. The bash-side _VDM_HOOK_SENTINEL=...
+    // (note leading underscore) is the legitimate single source of
+    // truth and must NOT be matched here — the negative lookahead via
+    // [^_A-Za-z] excludes any identifier-character before VDM, so the
+    // bash variable is not a false positive.
+    assert.doesNotMatch(_ihSrc, /(^|[^_A-Za-z])VDM_HOOK_SENTINEL\s*=\s*['"]__VDM_HOOK/);
+  });
+});
+
+describe('Phase I — install.sh atomic block uses validated ports', () => {
+  const _installSrc = _readFileSync_xss(
+    new URL('../install.sh', import.meta.url),
+    'utf8',
+  );
+
+  it('install.sh sources lib-install.sh BEFORE _resolve_install_ports is defined', () => {
+    // _validate_port lives in lib-install.sh; if install.sh ever
+    // referenced it before sourcing the lib, validation would no-op
+    // via the "command not found" exit code.
+    const libIdx = _installSrc.indexOf('. "$SCRIPT_DIR/lib-install.sh"');
+    const resolveIdx = _installSrc.indexOf('_resolve_install_ports()');
+    assert.notEqual(libIdx, -1, 'install.sh must source lib-install.sh');
+    assert.notEqual(resolveIdx, -1, '_resolve_install_ports must be defined');
+    assert.ok(
+      libIdx < resolveIdx,
+      'lib-install.sh must be sourced BEFORE _resolve_install_ports',
+    );
+  });
+
+  it('install.sh exports validated ports into the dashboard child env', () => {
+    // H1 fix: dashboard.mjs reads CSW_PORT/CSW_PROXY_PORT from env.
+    // Forcing the env on the child guarantees it binds to what we polled.
+    assert.match(
+      _installSrc,
+      /CSW_PORT="\$_DASH_HEALTH_PORT" CSW_PROXY_PORT="\$_PROXY_HEALTH_PORT"[\s\S]{0,80}nohup/,
+    );
+  });
+
+  it('install.sh polls BOTH dashboard AND proxy /health', () => {
+    // H2 fix: a half-up dashboard would still break every CC API call.
+    assert.match(_installSrc, /_dashboard_responds && _proxy_responds/);
+  });
+
+  it('install.sh verifies /health body contains "server":"dashboard"', () => {
+    // H3 fix: a generic webserver squatting on the port could otherwise
+    // fool us into installing hooks pointing at it.
+    assert.match(_installSrc, /"server":"dashboard"/);
+  });
+
+  it('rollback trap reaps the spawned dashboard PID', () => {
+    // M1 fix: file-only rollback would leak a node process.
+    assert.match(_installSrc, /_kill_if_ours "\$_NEW_DASH_PID"/);
+  });
+
+  it('_kill_if_ours verifies cmdline before signaling', () => {
+    // M3 fix: defends against PID rollover.
+    assert.match(
+      _installSrc,
+      /ps -o command= -p "\$pid"[\s\S]{0,80}dashboard\\?\.mjs/,
+    );
+  });
+});
+
+describe('Phase I — _validate_port in lib-install.sh', () => {
+  const _scriptPath = new URL('../lib-install.sh', import.meta.url).pathname;
+
+  function _v(port) {
+    try {
+      _execFileSync_inj(
+        'bash',
+        ['-c', `. "${_scriptPath}"; _validate_port "$1"`, '--', port],
+        { stdio: 'ignore' },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it('accepts canonical ports', () => {
+    assert.equal(_v('3333'), true);
+    assert.equal(_v('1'), true);
+    assert.equal(_v('65535'), true);
+  });
+
+  it('rejects out-of-range', () => {
+    assert.equal(_v('0'), false);
+    assert.equal(_v('65536'), false);
+    assert.equal(_v('70000'), false);
+  });
+
+  it('rejects shell metacharacters', () => {
+    assert.equal(_v('3333;ls'), false);
+    assert.equal(_v('3333 4'), false);
+    assert.equal(_v('3333`id`'), false);
+    assert.equal(_v('$(id)'), false);
+  });
+
+  it('rejects empty string', () => {
+    assert.equal(_v(''), false);
+  });
+
+  it('rejects negative / non-decimal', () => {
+    assert.equal(_v('-1'), false);
+    assert.equal(_v('3.14'), false);
+    assert.equal(_v('0x1'), false);
+  });
+});
+
+describe('Phase I — dashboard.mjs /health endpoint', () => {
+  const _dashboardSrc_health = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('UI server defines a /health route', () => {
+    // The proxy server already had /health; this is the UI-server one
+    // added in Phase I so install.sh can poll the port that hooks point at.
+    assert.match(_dashboardSrc_health, /req\.url === '\/health'/);
+  });
+
+  it('UI /health returns the server identity for squatter-detection', () => {
+    // H3 fix: install.sh greps the response body for "server":"dashboard"
+    // before trusting that we found our own dashboard. Removing this
+    // field would break the squatter check silently.
+    assert.match(_dashboardSrc_health, /server: 'dashboard'/);
+  });
+
+  it('UI /health accepts both GET and HEAD', () => {
+    // L4 fix: HEAD requests should not fall through to render the dashboard
+    // HTML — a cheap probe deserves a cheap response.
+    assert.match(
+      _dashboardSrc_health,
+      /req\.method === 'GET' \|\| req\.method === 'HEAD'/,
+    );
+  });
+});

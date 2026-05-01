@@ -74,19 +74,23 @@ fi
 # customised-port install scans the right port without env override.
 #
 # SECURITY: every port-shaped value (env OR config.json) is validated
-# against the strict TCP port pattern below before being trusted. If
-# the env var is set but malformed (e.g. CSW_PROXY_PORT='3334.*' or
-# 'foo;bar'), we IGNORE it and fall back to the config / default rather
-# than passing the bogus value into grep regexes / kill commands /
-# user-facing paths. The validation also enforces the IANA range
-# (1..65535) so a typo like '0' or '70000' falls back too.
-_validate_port() {
-  local p="${1:-}"
-  [[ -n "$p" ]] || return 1
-  [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
-  (( p >= 1 && p <= 65535 )) || return 1
-  return 0
-}
+# against the strict TCP port pattern via _validate_port (in lib-install.sh)
+# before being trusted. If the env var is set but malformed (e.g.
+# CSW_PROXY_PORT='3334.*' or 'foo;bar'), we IGNORE it and fall back to
+# the config / default rather than passing the bogus value into grep
+# regexes / kill commands / user-facing paths. The validation also
+# enforces the IANA range (1..65535) so a typo like '0' or '70000' falls
+# back too. Backstop definition below in case lib-install.sh failed to
+# source (degraded-mode uninstall) — kept identical to the lib version.
+if ! declare -f _validate_port >/dev/null 2>&1; then
+  _validate_port() {
+    local p="${1:-}"
+    [[ -n "$p" ]] || return 1
+    [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+    (( p >= 1 && p <= 65535 )) || return 1
+    return 0
+  }
+fi
 
 _resolve_proxy_port_for_uninstall() {
   if _validate_port "${CSW_PROXY_PORT:-}"; then
