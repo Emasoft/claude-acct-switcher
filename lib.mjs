@@ -159,6 +159,29 @@ export function createAccountStateManager() {
     });
   }
 
+  // Hard-mark a token as permanently revoked, bypassing the 3-strikes-
+  // over-1h threshold. Used for unambiguous account-termination signals
+  // that arrive in a single API response rather than across multiple
+  // refresh attempts — specifically Anthropic's "This organization has
+  // been disabled" 400 from the model API. One occurrence of that
+  // message means the account is dead regardless of how many refresh
+  // attempts succeed; the refresh token may still mint valid bearers,
+  // but the API will reject every model call. Treating it as a hard
+  // revocation lets bypass mode engage immediately instead of churning
+  // 3 OAuth refresh attempts to confirm what we already know.
+  function forceMarkPermanentlyRevoked(token, name, reason = '') {
+    const prev = state.get(token) || {};
+    state.set(token, {
+      ...prev, name,
+      permanentlyRevoked: true,
+      permanentRevocationReason: reason || 'forced',
+      permanentRefreshFailureCount: Math.max(prev.permanentRefreshFailureCount || 0, 3),
+      firstPermanentFailureAtMs: prev.firstPermanentFailureAtMs || Date.now(),
+      lastPermanentFailureAtMs: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+
   function clearPermanentRevocation(token) {
     const prev = state.get(token);
     if (!prev) return;
@@ -242,7 +265,8 @@ export function createAccountStateManager() {
   return {
     update, markLimited, markExpired, clearBillingCooldown,
     markSwitchedFrom, wasRecentlySwitchedFrom,
-    recordPermanentRefreshFailure, clearPermanentRevocation, isPermanentlyRevoked,
+    recordPermanentRefreshFailure, forceMarkPermanentlyRevoked,
+    clearPermanentRevocation, isPermanentlyRevoked,
     get, entries, clear, remove,
   };
 }

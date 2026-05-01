@@ -6180,6 +6180,7 @@ function evtMsg(e) {
     case 'serialize-progressive-drain-end': return '<b>Serialize drain ' + (e.cancelled ? 'cancelled' : 'complete') + '</b>: released ' + h(String(e.released || '0')) + '/' + h(String(e.initial_queued || '?')) + ' (' + h(e.reason || '?') + ')';
     case 'oauth-bypass-enabled': return '<b>OAuth bypass mode</b>: ' + h(e.reason || 'all accounts revoked') + ' — proxy now passes requests transparently. Run <code>claude login</code> to recover.';
     case 'oauth-bypass-disabled': return '<b>OAuth bypass exited</b>: ' + h(e.reason || 'recovery') + (e.duration_min ? ' (was in bypass for ' + h(String(e.duration_min)) + 'min)' : '');
+    case 'account-organization-disabled': return '<b>Account terminated</b>: ' + h(e.account || '?') + ' — Anthropic returned <code>organization has been disabled</code>. Marked permanently revoked.';
     case 'queue-depth-alert': return '<b>Queue depth alert</b>: ' + h(String(e.queued || '?')) + ' queued (≥' + h(String(e.threshold || '?')) + ') for ' + h(String(e.sustainedSeconds || '?')) + 's';
     // C4 fallthrough — events whose detail came in as a string get a .msg
     // field via logActivity's coercion. Surface that to the user. If only
@@ -12153,6 +12154,33 @@ async function handleProxyRequest(clientReq, clientRes) {
       // Billing errors (credit balance too low) are never fixable by token
       // refresh — skip straight to account switching (Strategy 3).
       const isBillingError = /credit balance|billing.*issue|payment.*required/i.test(errorMessage);
+
+      // Per Claude Code's error reference (https://code.claude.com/docs/en/errors),
+      // a 400 with body containing "This organization has been disabled"
+      // is account-level termination by Anthropic — STRONGER signal than
+      // the 3-strikes-over-1h OAuth-revocation heuristic. One occurrence
+      // means this account is dead permanently; rotation/refresh won't
+      // help. Hard-mark and let the bypass-mode evaluator decide whether
+      // ALL accounts are now in this state.
+      const isOrgDisabledError = /organization has been disabled|organization is disabled/i.test(errorMessage);
+      if (isOrgDisabledError && token) {
+        try {
+          accountState.forceMarkPermanentlyRevoked(token, acctName, 'organization-disabled-400');
+        } catch (e) {
+          log('warn', `forceMarkPermanentlyRevoked failed: ${e.message}`);
+        }
+        try {
+          logForensicEvent('account_organization_disabled', {
+            account: acctName,
+            error_message: errorMessage.slice(0, 300),
+          });
+        } catch {}
+        log('error', `${acctName}: organization-disabled 400 — account marked permanently revoked`);
+        logActivity('account-organization-disabled', { account: acctName });
+        try { _evaluateBypassMode(); } catch (e) {
+          log('warn', `_evaluateBypassMode failed: ${e.message}`);
+        }
+      }
 
       // ── Content 400: pass through immediately ──
       // If the API returned a well-formed invalid_request_error and it doesn't

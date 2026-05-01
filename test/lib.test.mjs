@@ -5639,3 +5639,137 @@ describe('Phase I+ — progressive drain wiring (batch 11)', () => {
     assert.match(fn, /_activeProgressiveDrain\.cancel\(\)/);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — "organization has been disabled" hard-revoke
+// path. From the Claude Code error reference: a 400 with body
+// containing "This organization has been disabled" is account-
+// level termination. Stronger signal than the 3-strikes-OAuth
+// heuristic — one occurrence is enough to mark permanently
+// revoked.
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — forceMarkPermanentlyRevoked + organization-disabled detection (batch 12)', () => {
+  it('forceMarkPermanentlyRevoked sets the flag without crossing the threshold', () => {
+    const m = createAccountStateManager();
+    const tok = 'tok-org-disabled';
+    // Fresh state, no prior strikes
+    assert.equal(m.isPermanentlyRevoked(tok), false);
+    m.forceMarkPermanentlyRevoked(tok, 'org-A', 'organization-disabled-400');
+    assert.equal(m.isPermanentlyRevoked(tok), true, 'force-mark trips the flag immediately');
+    const s = m.get(tok);
+    assert.equal(s.permanentlyRevoked, true);
+    assert.equal(s.permanentRevocationReason, 'organization-disabled-400');
+    assert.ok(s.permanentRefreshFailureCount >= 3, 'count is bumped past threshold so subsequent isPermanentlyRevoked checks short-circuit');
+  });
+
+  it('forceMarkPermanentlyRevoked is reversible via clearPermanentRevocation', () => {
+    const m = createAccountStateManager();
+    const tok = 'tok-recover';
+    m.forceMarkPermanentlyRevoked(tok, 'org-B', 'organization-disabled-400');
+    assert.equal(m.isPermanentlyRevoked(tok), true);
+    // If Anthropic later re-enables the org and a 200 lands → we must
+    // be able to UN-mark and resume normal operation.
+    m.clearPermanentRevocation(tok);
+    assert.equal(m.isPermanentlyRevoked(tok), false, 'clearPermanentRevocation must wipe forced marks too');
+  });
+
+  const _src_o = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('400-handler matches organization-disabled message text', () => {
+    // The regex must catch BOTH "has been disabled" (Claude Code's
+    // exact phrasing per the error doc) AND "is disabled" (defensive
+    // for variant phrasings).
+    assert.match(_src_o, /isOrgDisabledError\s*=\s*\/organization has been disabled\|organization is disabled\/i\.test\(errorMessage\)/);
+  });
+
+  it('400-handler calls forceMarkPermanentlyRevoked + _evaluateBypassMode', () => {
+    // The detection branch is only useful if it WIRES the signal into
+    // bypass-mode evaluation. Without _evaluateBypassMode, marking the
+    // account hard-revoked would stop rotation but not engage bypass
+    // even when ALL accounts are now in this state.
+    const idx = _src_o.indexOf('isOrgDisabledError && token');
+    assert.notEqual(idx, -1, 'org-disabled branch must guard on token presence');
+    const block = _src_o.slice(idx, idx + 1500);
+    assert.match(block, /forceMarkPermanentlyRevoked\(token, acctName, 'organization-disabled-400'\)/);
+    assert.match(block, /logForensicEvent\('account_organization_disabled'/);
+    assert.match(block, /logActivity\('account-organization-disabled'/);
+    assert.match(block, /_evaluateBypassMode\(\)/);
+  });
+
+  it('activity-feed renderer escapes account name', () => {
+    const slice = _src_o.slice(
+      _src_o.indexOf("case 'account-organization-disabled'"),
+      _src_o.indexOf("case 'account-organization-disabled'") + 400,
+    );
+    assert.ok(slice.length > 50, 'renderer case must exist');
+    assert.match(slice, /h\(e\.account/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — anthropic-beta header regression. From CC's
+// error reference: a gateway that strips anthropic-beta
+// causes 400 "Extra inputs are not permitted ...
+// context_management" or "Unexpected value(s) for the
+// `anthropic-beta` header". vdm currently forwards it
+// correctly via buildForwardHeaders + the inline OAuth-beta
+// patches in passthrough sites; this test pins that contract.
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — anthropic-beta header forwarding (regression for CC gateway error)', () => {
+  it('buildForwardHeaders preserves an inbound anthropic-beta value AND adds oauth-2025-04-20', () => {
+    // CC sends specific betas (e.g. context_management, prompt-tools-2025-...) —
+    // any beta we drop causes the API to 400 with "Extra inputs are not
+    // permitted". So an inbound value must round-trip unchanged, and the
+    // mandatory oauth-2025-04-20 must be appended (not overwriting).
+    const inbound = {
+      'authorization': 'Bearer client-token',
+      'anthropic-beta': 'context-management-2025-06-30,prompt-tools-2025-04-22',
+      'content-type': 'application/json',
+    };
+    const fwd = buildForwardHeaders(inbound, 'new-token');
+    const betas = fwd['anthropic-beta'].split(',').map(s => s.trim());
+    assert.ok(betas.includes('context-management-2025-06-30'),    'inbound context-management beta preserved');
+    assert.ok(betas.includes('prompt-tools-2025-04-22'),          'inbound prompt-tools beta preserved');
+    assert.ok(betas.includes('oauth-2025-04-20'),                 'mandatory OAuth beta appended');
+  });
+
+  it('buildForwardHeaders does NOT duplicate oauth-2025-04-20 when client already sent it', () => {
+    const inbound = { 'anthropic-beta': 'oauth-2025-04-20,context-management-2025-06-30' };
+    const fwd = buildForwardHeaders(inbound, 'tok');
+    const oauthCount = fwd['anthropic-beta'].split(',').filter(s => s.trim() === 'oauth-2025-04-20').length;
+    assert.equal(oauthCount, 1, 'oauth-2025-04-20 must appear exactly once');
+  });
+
+  it('buildForwardHeaders normalises case-variant Anthropic-Beta to lowercase', () => {
+    // Node duplicates headers when case differs ("Anthropic-Beta" + "anthropic-beta"
+    // become two header lines), and Anthropic rejects duplicate beta headers.
+    const inbound = { 'Anthropic-Beta': 'context-management-2025-06-30' };
+    const fwd = buildForwardHeaders(inbound, 'tok');
+    // Only the lowercase key should be present — buildForwardHeaders deletes the original
+    assert.equal(fwd['Anthropic-Beta'], undefined, 'case-variant key must be removed');
+    assert.match(fwd['anthropic-beta'], /context-management-2025-06-30/);
+  });
+
+  const _src_ab = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('passthrough paths (proxy-disabled, circuit-breaker, oauth-bypass) all preserve anthropic-beta', () => {
+    // These three branches in handleProxyRequest do NOT go through
+    // buildForwardHeaders (they call stripHopByHopHeaders directly and
+    // patch headers inline). All three must explicitly add oauth-2025-04-20
+    // and merge it with any inbound betas — same contract buildForwardHeaders
+    // honours. Source-grep enforces this without standing up a live proxy.
+    const oauthBetaPatches = (_src_ab.match(/if \(!betas\.includes\('oauth-2025-04-20'\)\) betas\.push\('oauth-2025-04-20'\)/g) || []).length;
+    assert.ok(
+      oauthBetaPatches >= 3,
+      `expected ≥3 inline oauth-2025-04-20 patches (proxy-disabled, circuit-breaker, oauth-bypass); found ${oauthBetaPatches}`,
+    );
+  });
+});
