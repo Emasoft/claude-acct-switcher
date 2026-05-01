@@ -497,6 +497,24 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
   function record(fingerprint, u5h, u7d, ts = Date.now()) {
     if (!history.has(fingerprint)) history.set(fingerprint, []);
     const arr = history.get(fingerprint);
+    // STATE-5: clock-jump-backward defense. If `ts` is BEFORE the last
+    // entry's ts (NTP correction after a wrong-clock period, manual
+    // `date -s`, VM clock weirdness), the previous code:
+    //   - update-in-place branch produced a NEGATIVE delta on the
+    //     `ts - last.ts < minInterval` check (still true — collapses
+    //     the entry but with a non-monotonic ts that breaks OLS
+    //     regression in getVelocity downstream)
+    //   - cutoff = ts - maxAge becomes a value BEFORE every existing
+    //     entry, so the prune loop runs zero iterations and stale
+    //     "future" entries persist for hours.
+    // Fix: detect a backward jump (ts strictly older than last entry)
+    // and reset the array to just the new entry. createSlidingWindowCounter
+    // already follows the same convention.
+    if (arr.length > 0 && ts < arr[arr.length - 1].ts) {
+      arr.length = 0;
+      arr.push({ ts, u5h, u7d });
+      return;
+    }
     // If the last entry is too recent, update it in place (keeps latest value)
     if (arr.length > 0 && ts - arr[arr.length - 1].ts < minInterval) {
       arr[arr.length - 1] = { ts, u5h, u7d };
@@ -731,8 +749,17 @@ export function parseRefreshResponse(statusCode, bodyStr) {
       // loop). Negative expires_in produces past expiresAt → token treated
       // as already-expired → another refresh loop. Non-finite (NaN, "huge")
       // produces NaN expiresAt → token treated as never-expiring.
-      if (typeof expiresInRaw !== 'number' || !Number.isFinite(expiresInRaw) || expiresInRaw <= 0) {
-        return { ok: false, error: `expires_in must be a positive finite number, got ${typeof expiresInRaw === 'number' ? expiresInRaw : typeof expiresInRaw}`, retriable: false };
+      // REFRESH-2 fix: distinguish FORMAT errors (non-number, NaN — never
+      // retriable) from VALUE errors (zero / negative — Anthropic might
+      // legitimately emit `expires_in: 0` for a token that needs immediate
+      // re-auth, and the previous non-retriable behavior froze the user
+      // out for 2 hours). Numeric-but-non-positive is now retriable so
+      // the next sweep retries in minutes.
+      if (typeof expiresInRaw !== 'number' || !Number.isFinite(expiresInRaw)) {
+        return { ok: false, error: `expires_in must be a finite number, got ${typeof expiresInRaw === 'number' ? expiresInRaw : typeof expiresInRaw}`, retriable: false };
+      }
+      if (expiresInRaw <= 0) {
+        return { ok: false, error: `expires_in is non-positive (${expiresInRaw}) — token requires re-auth`, retriable: true };
       }
       return { ok: true, accessToken, refreshToken: refreshToken || null, expiresIn: expiresInRaw };
     } catch (e) {

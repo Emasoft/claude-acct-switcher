@@ -198,21 +198,35 @@ const _lastWarnPct = new Map(); // acctName → last logged percentage (dedup 90
 // with its own token / trigger re-auth.  Resets after a cooldown.
 let _circuitOpen = false;
 let _circuitOpenAt = 0;
+let _circuitClosedAt = 0; // PROXY-6: track close time so the "post-close 400 grace window" works
 let _consecutiveExhausted = 0; // count of requests where ALL recovery strategies failed
 const CIRCUIT_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 const CIRCUIT_OPEN_THRESHOLD = 3;           // open after N consecutive exhausted requests
 const CIRCUIT_400_THRESHOLD = 10;           // open circuit after N consecutive 400s across requests
+const CIRCUIT_POST_CLOSE_GRACE_MS = 5000;   // PROXY-6: don't count 400s for 5s after close
 
 function _isCircuitOpen() {
   if (!_circuitOpen) return false;
   if (Date.now() - _circuitOpenAt > CIRCUIT_COOLDOWN_MS) {
     _circuitOpen = false;
+    _circuitClosedAt = Date.now();
     _consecutiveExhausted = 0;
     _consecutive400s = 0;
     log('circuit', 'Circuit breaker closed — retrying proxy mode');
     return false;
   }
   return true;
+}
+
+// PROXY-6: returns true if we're still inside the post-close grace
+// window. Callers use this to decide whether a fresh 400 should count
+// toward the threshold OR be silently absorbed (because 10 in-flight
+// CC sessions all hit a stale-token 400 the instant the breaker
+// closes, racing the increment, can re-open it within seconds for
+// hours of bounce). 5s is enough for the recovery strategy to drain
+// the queued bad-token requests without re-tripping.
+function _inCircuitPostCloseGrace() {
+  return _circuitClosedAt > 0 && (Date.now() - _circuitClosedAt) < CIRCUIT_POST_CLOSE_GRACE_MS;
 }
 
 function _openCircuit(reason) {
@@ -227,6 +241,10 @@ function _openCircuit(reason) {
 // Keychain helpers
 // ─────────────────────────────────────────────────
 
+// KC-1: rate-limit the user-deny notification so a denied permission
+// doesn't notify-spam every 5s as the proxy retries reading. One alert
+// per 10-min window is enough to surface the issue.
+let _lastKeychainDenyNotifyAt = 0;
 function readKeychain() {
   try {
     // execFileSync with argv[] — no shell, no interpolation injection vector.
@@ -238,6 +256,26 @@ function readKeychain() {
     return JSON.parse(raw);
   } catch (e) {
     log('error', `Keychain read failed: ${e.message}`);
+    // KC-1: macOS `security` exits with status 51 (SecAuthFailed) when
+    // the user clicked "Deny" on the keychain prompt. Without surfacing
+    // this, every proxy request returns a generic "no active token" 502
+    // and the user has no idea why. Notify once per 10 min so the
+    // dashboard activity feed + a desktop alert make the cause obvious.
+    const isUserDeny = e.status === 51 || /SecAuthFailed|user.{0,10}deni|interaction is not allowed/i.test(String(e.message || ''));
+    if (isUserDeny) {
+      const now = Date.now();
+      if (now - _lastKeychainDenyNotifyAt > 10 * 60 * 1000) {
+        _lastKeychainDenyNotifyAt = now;
+        try {
+          notify(
+            'vdm — Keychain access denied',
+            `Open Keychain Access, find "${KEYCHAIN_SERVICE}", and re-grant access (or click Always Allow next time).`,
+            'keychain-deny',
+          );
+        } catch {}
+        try { logActivity('keychain-access-denied', { service: KEYCHAIN_SERVICE }); } catch {}
+      }
+    }
     return null;
   }
 }
@@ -11344,8 +11382,16 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (_consecutive400s > 0 && Date.now() - _consecutive400sAt > 30_000) {
         _consecutive400s = 0;
       }
-      _consecutive400s++;
-      _consecutive400sAt = Date.now();
+      // PROXY-6: don't count 400s during the post-close grace window.
+      // Otherwise 10 in-flight CC sessions all hitting stale-token 400
+      // the instant the breaker closes can re-open it within seconds,
+      // bouncing open/closed/open every 2 minutes for hours. Inside
+      // the grace window we still let the recovery strategy run — we
+      // just don't escalate the counter.
+      if (!_inCircuitPostCloseGrace()) {
+        _consecutive400s++;
+        _consecutive400sAt = Date.now();
+      }
 
       // ── Circuit breaker: stop the death spiral ──
       // If we've hit too many consecutive 400s across requests, all accounts

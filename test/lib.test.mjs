@@ -537,12 +537,16 @@ describe('parseRefreshResponse', () => {
     assert.equal(result.refreshToken, null);
   });
 
-  it('rejects expires_in of 0 (would cause immediate-refresh loop)', () => {
+  it('rejects expires_in of 0 — but as a RETRIABLE error (REFRESH-2 fix)', () => {
+    // Anthropic might legitimately emit `expires_in: 0` for a token
+    // that needs immediate re-auth. The previous non-retriable mark
+    // froze the user out of the account for 2h. Now: retriable so the
+    // next sweep retries in minutes.
     const body = JSON.stringify({ access_token: 'ok', expires_in: 0 });
     const result = parseRefreshResponse(200, body);
     assert.equal(result.ok, false);
     assert.match(result.error, /expires_in/);
-    assert.equal(result.retriable, false);
+    assert.equal(result.retriable, true);
   });
 
   it('rejects negative expires_in (would create past expiresAt)', () => {
@@ -4742,5 +4746,54 @@ describe('Phase I+ — reliability data-loss fixes (STATE-2, CORRUPT-1, CORRUPT-
     );
     assert.ok(removeBlock.length > 0, '/api/remove handler must exist');
     assert.match(removeBlock, /_lastWarnPct\.delete\(name\)/);
+  });
+});
+
+describe('Phase I+ — STATE-5 utilizationHistory clock-jump-backward', () => {
+  it('a backward ts jump resets the array (no non-monotonic timeline)', async () => {
+    const { createUtilizationHistory } = await import('../lib.mjs');
+    const hist = createUtilizationHistory();
+    // Seed at t=0
+    hist.record('fp1', 50, 30, 1_000_000);
+    hist.record('fp1', 60, 40, 1_000_000 + 5 * 60 * 1000); // +5min
+    let series = hist.getHistory('fp1');
+    assert.equal(series.length, 2);
+    // NTP correction: clock jumps BACKWARD by 1 hour
+    hist.record('fp1', 70, 50, 1_000_000 - 60 * 60 * 1000);
+    series = hist.getHistory('fp1');
+    assert.equal(series.length, 1, 'backward jump must reset the array');
+    assert.equal(series[0].u5h, 70);
+    assert.equal(series[0].ts, 1_000_000 - 60 * 60 * 1000);
+  });
+});
+
+describe('Phase I+ — circuit breaker post-close grace (PROXY-6)', () => {
+  const _dashboardSrc_pc = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('post-close grace constant + helper exist', () => {
+    assert.match(_dashboardSrc_pc, /CIRCUIT_POST_CLOSE_GRACE_MS = 5000/);
+    assert.match(_dashboardSrc_pc, /function _inCircuitPostCloseGrace\(\)/);
+  });
+
+  it('400 increment is gated on the post-close grace', () => {
+    assert.match(_dashboardSrc_pc, /if \(!_inCircuitPostCloseGrace\(\)\) \{[\s\S]{0,200}_consecutive400s\+\+/);
+  });
+});
+
+describe('Phase I+ — KC-1 keychain-deny notification', () => {
+  const _dashboardSrc_kc = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('readKeychain detects status 51 (SecAuthFailed) and surfaces it', () => {
+    assert.match(_dashboardSrc_kc, /e\.status === 51|SecAuthFailed/);
+    assert.match(_dashboardSrc_kc, /Keychain access denied/);
+    // Rate-limit constant (10-minute window) — prevents notify spam
+    // when every proxy request retries the read in a tight loop.
+    assert.match(_dashboardSrc_kc, /10 \* 60 \* 1000/);
   });
 });
