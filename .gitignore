@@ -13,6 +13,9 @@ session-history.json
 account-prefs.json
 viewer-state.json
 .dashboard.pid
+.dashboard.lock
+events.jsonl
+events.jsonl.*
 
 # Logs
 *.log
