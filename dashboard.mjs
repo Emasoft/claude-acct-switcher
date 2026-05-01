@@ -843,6 +843,9 @@ import {
   areAllAccountsTerminallyDead,
   // Phase I+ — guard against attributing tokens to system / cache dirs
   isNonProjectCwd,
+  // TRDD-1645134b — usage tree aggregation + cache-miss heuristic
+  aggregateUsageTree,
+  buildCacheMissReport,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -3224,6 +3227,86 @@ async function handleAPI(req, res) {
       json(res, filtered);
     } catch (e) {
       json(res, [], 500);
+    }
+    return true;
+  }
+
+  // TRDD-1645134b Phase 2 — /api/token-usage-tree
+  // Returns the 4-level tree (repo → branch/worktree → component → tool)
+  // computed by aggregateUsageTree, plus optionally the cache-miss
+  // report. Mirrors /api/token-usage's query-param contract:
+  //   repo=<path>          — single-repo filter
+  //   account=<name>       — single-account filter
+  //   model=<id>           — single-model filter
+  //   from=<ms>            — earliest ts (epoch ms)
+  //   to=<ms>              — latest ts (epoch ms)
+  //   since=<ms>           — alias for from (matches existing endpoint)
+  //   includeMisses=1      — include cache-miss report (default: off)
+  //   minMissInput=<n>     — override the cache-miss input threshold
+  //                          (default 1000)
+  //
+  // Response:
+  //   {
+  //     ok: true,
+  //     totals: { input, output, cacheRead, cacheCreate, requests },
+  //     tree:   [ <repoNode>, ... ],   // sorted heavy-first
+  //     misses: [...] | undefined      // only when includeMisses=1
+  //   }
+  //
+  // The aggregation is computed on-demand from the on-disk usage rows.
+  // For typical 50K-row token-usage.json this completes in <50ms — no
+  // caching layer needed. If usage volume grows past ~500K rows,
+  // re-evaluate.
+  if (url.pathname === '/api/token-usage-tree' && req.method === 'GET') {
+    try {
+      const rows = loadTokenUsage();
+      const params = url.searchParams;
+      const opts = {};
+      const repoFilter    = params.get('repo');
+      const accountFilter = params.get('account');
+      const modelFilter   = params.get('model');
+      const fromStr       = params.get('from') || params.get('since');
+      const toStr         = params.get('to');
+      if (repoFilter)    opts.repoFilter    = repoFilter;
+      if (accountFilter) opts.accountFilter = accountFilter;
+      if (modelFilter)   opts.modelFilter   = modelFilter;
+      if (fromStr) {
+        const n = Number(fromStr);
+        if (Number.isFinite(n)) opts.from = n;
+      }
+      if (toStr) {
+        const n = Number(toStr);
+        if (Number.isFinite(n)) opts.to = n;
+      }
+      const { totals, tree } = aggregateUsageTree(rows, opts);
+      const response = { ok: true, totals, tree };
+      if (params.get('includeMisses') === '1') {
+        const missOpts = {};
+        const minMissInputStr = params.get('minMissInput');
+        if (minMissInputStr) {
+          const n = Number(minMissInputStr);
+          if (Number.isFinite(n) && n >= 0) missOpts.minInputForMissDetection = n;
+        }
+        // The cache-miss heuristic operates on the same rows but applies
+        // the time-range filter inline (the function has no opts.from/to
+        // because it's session-scoped, not range-scoped — so we pre-
+        // filter here). Other filters (repo/account/model) are NOT
+        // applied to misses on the theory that a user investigating
+        // a cache-miss issue may want the full-session view.
+        let missRows = rows;
+        if (opts.from != null || opts.to != null) {
+          missRows = rows.filter(r => {
+            if (!r || (r.type || 'usage') !== 'usage') return false;
+            if (opts.from != null && r.ts < opts.from) return false;
+            if (opts.to   != null && r.ts > opts.to)   return false;
+            return true;
+          });
+        }
+        response.misses = buildCacheMissReport(missRows, missOpts);
+      }
+      json(res, response);
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
     }
     return true;
   }

@@ -6510,3 +6510,115 @@ describe('buildCacheMissReport', () => {
     assert.equal(r[0].ts, 2000);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// TRDD-1645134b Phase 2 — /api/token-usage-tree wiring
+// ─────────────────────────────────────────────────────────
+
+describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
+  const _src_t2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports aggregateUsageTree + buildCacheMissReport from lib.mjs', () => {
+    assert.match(_src_t2, /aggregateUsageTree,/);
+    assert.match(_src_t2, /buildCacheMissReport,/);
+  });
+
+  it('endpoint is registered for GET /api/token-usage-tree', () => {
+    assert.match(
+      _src_t2,
+      /url\.pathname === '\/api\/token-usage-tree' && req\.method === 'GET'/,
+    );
+  });
+
+  it('builds opts from query params (repo, account, model, from/since, to)', () => {
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    assert.ok(fn.length > 200, 'endpoint body must exist');
+    assert.match(fn, /params\.get\('repo'\)/);
+    assert.match(fn, /params\.get\('account'\)/);
+    assert.match(fn, /params\.get\('model'\)/);
+    // The "since" alias maps to from for compatibility with the
+    // existing /api/token-usage endpoint
+    assert.match(fn, /params\.get\('from'\) \|\| params\.get\('since'\)/);
+    assert.match(fn, /params\.get\('to'\)/);
+  });
+
+  it('numeric query params are validated via Number.isFinite (no NaN propagation)', () => {
+    // A query string like ?from=garbage produces NaN — passing that
+    // straight into opts.from would silently include zero rows
+    // because every row's ts comparison would be false against NaN.
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    assert.match(fn, /Number\.isFinite\(n\)/);
+  });
+
+  it('calls aggregateUsageTree with the rows and opts', () => {
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    assert.match(fn, /aggregateUsageTree\(rows, opts\)/);
+  });
+
+  it('returns the documented response shape { ok, totals, tree }', () => {
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    assert.match(fn, /\bok: true,?\s*totals,?\s*tree\b/);
+  });
+
+  it('includeMisses=1 attaches a miss report; default is off', () => {
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    // Guard exists
+    assert.match(fn, /params\.get\('includeMisses'\) === '1'/);
+    // buildCacheMissReport is called inside the guard
+    const missGuardIdx = fn.indexOf("params.get('includeMisses')");
+    const buildIdx = fn.indexOf('buildCacheMissReport');
+    assert.ok(buildIdx > missGuardIdx, 'buildCacheMissReport must be inside the includeMisses guard');
+  });
+
+  it('miss report respects from/to filter via pre-filter (function takes no opts.from/to)', () => {
+    // The miss heuristic is session-scoped, not range-scoped — so
+    // the endpoint pre-filters rows BEFORE handing them to
+    // buildCacheMissReport when the user supplied from/to. Without
+    // this, a from/to query for the tree would not affect the misses,
+    // confusing operators investigating a specific time window.
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    assert.match(fn, /opts\.from != null \|\| opts\.to != null/);
+    assert.match(fn, /missRows = rows\.filter/);
+  });
+
+  it('minMissInput overrides the cache-miss threshold', () => {
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    assert.match(fn, /params\.get\('minMissInput'\)/);
+    assert.match(fn, /minInputForMissDetection/);
+  });
+
+  it('errors return 500 with { ok: false, error }', () => {
+    const fn = _src_t2.slice(
+      _src_t2.indexOf("'/api/token-usage-tree'"),
+      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+    );
+    // Use [\s\S] so the regex spans newlines (catch blocks are typically
+    // multi-line). A single error path that returns 500 with the
+    // standard {ok:false, error:e.message} shape.
+    assert.match(fn, /catch \(e\)[\s\S]{0,300}ok: false[\s\S]{0,300}error: e\.message[\s\S]{0,300}500/);
+  });
+});
