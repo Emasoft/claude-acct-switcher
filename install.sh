@@ -598,7 +598,10 @@ if [[ -n "$SHELL_RC" ]]; then
 # ANTHROPIC_BASE_URL=http://localhost:* / 127.0.0.1:* (e.g. carried over
 # from a parent process started while vdm WAS installed) so the new shell
 # falls back to Anthropic's default endpoint.
-if [ ! -x "\$HOME/.claude/account-switcher/dashboard.mjs" ]; then
+# Use \`-f\` (regular file) — install.sh writes dashboard.mjs with mode
+# 644 (a Node module, not a shell script); \`-x\` would reject every
+# legitimate install because the .mjs file is not executable.
+if [ ! -f "\$HOME/.claude/account-switcher/dashboard.mjs" ]; then
   case "\${ANTHROPIC_BASE_URL:-}" in
     http*://localhost:*|http*://127.0.0.1:*)
       unset ANTHROPIC_BASE_URL
@@ -710,7 +713,8 @@ else
   echo ""
   echo '    # BEGIN claude-account-switcher'
   echo '    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone.'
-  echo '    if [ ! -x "$HOME/.claude/account-switcher/dashboard.mjs" ]; then'
+  echo '    # `-f` (file exists), NOT `-x` (executable): dashboard.mjs is mode 644.'
+  echo '    if [ ! -f "$HOME/.claude/account-switcher/dashboard.mjs" ]; then'
   echo '      case "${ANTHROPIC_BASE_URL:-}" in'
   echo '        http*://localhost:*|http*://127.0.0.1:*) unset ANTHROPIC_BASE_URL ;;'
   echo '      esac'

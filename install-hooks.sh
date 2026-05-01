@@ -85,7 +85,12 @@ install_hooks() {
   # vector without affecting legitimate callers (install.sh copies
   # dashboard.mjs BEFORE sourcing this file, so the guard always passes
   # during a real install).
-  if [ ! -x "$HOME/.claude/account-switcher/dashboard.mjs" ]; then
+  # `-f` (regular file) — NOT `-x` (executable). install.sh installs
+  # dashboard.mjs with mode 644 (it's a Node module, not a shell
+  # script); only the `vdm` CLI gets +x. The earlier `-x` check
+  # rejected every legitimate install because a non-executable .mjs
+  # file fails -x even when it exists.
+  if [ ! -f "$HOME/.claude/account-switcher/dashboard.mjs" ]; then
     # printf '%s\n' instead of echo: echo interprets backslash escapes
     # under some shells (dash/POSIX) so a $HOME containing literal '\n'
     # bytes (rare but possible on a misconfigured account) would render
