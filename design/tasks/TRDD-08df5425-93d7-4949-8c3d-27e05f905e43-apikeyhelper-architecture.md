@@ -4,10 +4,270 @@
 **Filename:** `design/tasks/TRDD-08df5425-93d7-4949-8c3d-27e05f905e43-apikeyhelper-architecture.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** Not started
+**Status:** Researched-and-rejected (Decision A from §Decision criteria)
 **Created:** 2026-05-01
+**Investigated:** 2026-05-01 (against CC v2.1.89 source mirror)
 **Owner:** unassigned
-**Estimated effort:** 1-2 days investigation + prototype
+**Estimated effort:** done — 2 hours of source reading; no prototype needed because the rejection was unambiguous
+
+## TL;DR (read this first)
+
+Source-code investigation against
+`github.com/chauncygu/collection-claude-code-source-code`
+(CC v2.1.89, which is a few versions behind the current v2.1.126 but
+the auth-resolution code is stable across recent versions per surface
+inspection) produced a **definitive rejection** for the proxy-less
+architecture under apiKeyHelper.
+
+The four decision criteria that this TRDD itself laid out (§Decision
+criteria below) all FAIL for an OAuth-subscriber user — the typical
+vdm target. Specifically:
+
+1. ❌ **Configuring `apiKeyHelper` disables OAuth subscriber mode
+   entirely.** `isAnthropicAuthEnabled()` in `utils/auth.ts:100-149`
+   returns `false` whenever an external API-key source (including
+   apiKeyHelper) is configured. Downstream, `isClaudeAISubscriber()`
+   then returns `false`, and the SDK is constructed with
+   `apiKey: <helper-output>` instead of `authToken: <oauth-bearer>`
+   (`services/api/client.ts:300-313`). The user effectively switches
+   from subscription billing to API-key billing — different pricing,
+   different quotas, different /usage semantics. Not acceptable.
+
+2. ❌ **The helper output is sent in BOTH `Authorization: Bearer`
+   AND `X-Api-Key` headers.** Confirmed in
+   `services/api/client.ts:318-328` (`configureApiKeyHeaders` sets
+   `Authorization: Bearer ${token}`) plus the SDK constructor on
+   line 302 setting `apiKey` from the same source. An OAuth bearer
+   token sent as `X-Api-Key` is rejected by Anthropic with
+   `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`
+   (the literal message is in `services/api/claude.ts:579` as a known
+   error pattern).
+
+3. ❌ **Calling frequency is "stale-while-revalidate, 5-min default
+   TTL"** — NOT per-request. `utils/auth.ts:81` defines
+   `DEFAULT_API_KEY_HELPER_TTL = 5 * 60 * 1000`, tunable via
+   `CLAUDE_CODE_API_KEY_HELPER_TTL_MS`. The cache returns a stale
+   value immediately while a background refresh runs
+   (`utils/auth.ts:469-499`). Even if criteria 1+2 didn't kill this,
+   5-min staleness alone makes per-request rotation impossible.
+
+4. ❌ **Zero observability.** apiKeyHelper is a unidirectional
+   stdin→stdout pipe; the helper script never sees the response
+   side. vdm couldn't read 5h/7d-utilization headers, 429 retry-
+   after, or subscription quota state — losing every signal that
+   currently drives rotation strategy.
+
+**Decision: A.** Keep the current proxy architecture. apiKeyHelper is
+designed for the API-key (Console) flow — vdm's OAuth (subscription)
+users would be silently downgraded if they used it. Do not pursue.
+
+## Findings — exact source citations (CC v2.1.89)
+
+All paths below are relative to
+`/tmp/cc-src-v2189/claude-code-source-code/src/` in the cloned
+mirror; absolute repo path is
+`https://github.com/chauncygu/collection-claude-code-source-code/tree/main/claude-code-source-code/src/`.
+
+### 1. apiKeyHelper disables OAuth subscriber mode
+
+`utils/auth.ts:120-148` — `isAnthropicAuthEnabled()`:
+- Reads `settings.apiKeyHelper` (line 123) and combines it with
+  `ANTHROPIC_AUTH_TOKEN`, FD tokens, and `ANTHROPIC_API_KEY` to
+  compute `hasExternalAuthToken` and `hasExternalApiKey`.
+- Returns `false` (i.e. "Anthropic OAuth auth is DISABLED") if any
+  external source is present (line 143-148).
+
+`utils/auth.ts:1564-1570` — `isClaudeAISubscriber()`:
+- Calls `isAnthropicAuthEnabled()` first; returns `false` if disabled.
+- This is the predicate downstream code uses to decide
+  OAuth-bearer-vs-API-key behavior.
+
+### 2. Helper output goes into BOTH headers
+
+`services/api/client.ts:300-315` — Anthropic SDK construction:
+```ts
+const clientConfig = {
+  apiKey: isClaudeAISubscriber() ? null : apiKey || getAnthropicApiKey(),
+  authToken: isClaudeAISubscriber()
+    ? getClaudeAIOAuthTokens()?.accessToken
+    : undefined,
+  // ...
+}
+```
+
+When apiKeyHelper is configured, `isClaudeAISubscriber()` is `false`
+(per finding #1), so:
+- `apiKey = getAnthropicApiKey()` → resolves to the apiKeyHelper
+  output (`utils/auth.ts:320-337`). The Anthropic SDK puts this in
+  `X-Api-Key`.
+- `authToken = undefined` → no Authorization header from the SDK.
+
+But then `services/api/client.ts:135-137`:
+```ts
+if (!isClaudeAISubscriber()) {
+  await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
+}
+```
+
+`configureApiKeyHeaders` at lines 318-328:
+```ts
+async function configureApiKeyHeaders(headers, isNonInteractiveSession) {
+  const token =
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    (await getApiKeyFromApiKeyHelper(isNonInteractiveSession))
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+}
+```
+
+So when apiKeyHelper runs:
+- The helper's output goes into `X-Api-Key` (via SDK's `apiKey`)
+- The same output ALSO goes into `Authorization: Bearer` (via
+  `configureApiKeyHeaders`)
+
+This is fine for an actual Console API key (which Anthropic accepts
+in either header — they're equivalent identifiers). But an OAuth
+bearer token sent as `X-Api-Key` produces the documented
+`invalid x-api-key` error.
+
+### 3. SWR caching with 5-minute TTL
+
+`utils/auth.ts:80-81`:
+```ts
+/** Default TTL for API key helper cache in milliseconds (5 minutes) */
+const DEFAULT_API_KEY_HELPER_TTL = 5 * 60 * 1000
+```
+
+`utils/auth.ts:435-449` — `calculateApiKeyHelperTTL()`:
+- Reads `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` env var if set
+- Falls back to `DEFAULT_API_KEY_HELPER_TTL` (5 min)
+- Validates the env var; warns and falls back if non-numeric
+
+`utils/auth.ts:469-499` — `getApiKeyFromApiKeyHelper`:
+```ts
+if (_apiKeyHelperCache) {
+  if (Date.now() - _apiKeyHelperCache.timestamp < ttl) {
+    return _apiKeyHelperCache.value     // fresh — return cached
+  }
+  // Stale — return stale value now, refresh in the background.
+  if (!_apiKeyHelperInflight) {
+    _apiKeyHelperInflight = { promise: _runAndCache(...), startedAt: null }
+  }
+  return _apiKeyHelperCache.value     // STALE returned
+}
+// Cold cache — wait for first fetch
+```
+
+The SWR semantics mean even if vdm could meaningfully manipulate the
+helper output, CC would serve a 5-min-stale token before noticing.
+
+### 4. Helper execution mechanics
+
+`utils/auth.ts:538-574` — `_executeApiKeyHelper`:
+- Spawns via `execa(apiKeyHelper, { shell: true, timeout: 600_000, reject: false })`
+- `shell: true` means the command is interpreted by `/bin/sh`
+- 10-minute timeout (way more than needed)
+- Failure: throws Error; outer caller caches `' '` (space) sentinel
+  and prints `apiKeyHelper failed: <stderr>` on stderr (line 517)
+- Success: trims stdout; throws if empty; returns the trimmed string
+
+A trust check (line 546-555) prevents the helper from running when
+configured via project/local settings without workspace trust.
+
+### 5. Auth precedence (definitive order)
+
+From `utils/auth.ts:298-348` — `getAnthropicApiKeyWithSource`:
+
+1. **Bare mode** (`--bare` / `CLAUDE_CODE_SIMPLE=1`) — only env vars.
+2. **`ANTHROPIC_API_KEY`** — wins if it appears in
+   `customApiKeyResponses.approved` (i.e. user explicitly approved
+   it via `/login`-flow approval prompts).
+3. **API key from file descriptor** (`CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`).
+4. **`apiKeyHelper`** (if configured) — uses sync cache; never blocks.
+   If `skipRetrievingKeyFromApiKeyHelper` opt is set, returns
+   `{key: null, source: 'apiKeyHelper'}` to signal "configured but
+   not extracted." When the cache is cold, returns
+   `{key: null, source: 'apiKeyHelper'}` — callers needing a real
+   key MUST `await getApiKeyFromApiKeyHelper()` first. This is the
+   dance `client.ts:136` does (awaits `configureApiKeyHeaders` →
+   awaits `getApiKeyFromApiKeyHelper` → fills Authorization header
+   before the SDK request goes out).
+5. **OAuth keychain** (`getApiKeyFromConfigOrMacOSKeychain`) — only
+   reached when ALL of the above are empty.
+
+So apiKeyHelper sits ABOVE the keychain in priority. If a user
+configures apiKeyHelper, the keychain entry vdm currently
+manipulates becomes IRRELEVANT. This means an apiKeyHelper-based
+vdm would have to abandon its current keychain-rotation model
+entirely — vdm's CLAUDE.md "Credential storage — the load-bearing
+detail" section becomes moot.
+
+## Side findings (not acted on)
+
+These are CC behaviors that the source review surfaced incidentally
+and are worth knowing — but no vdm change is justified by them today
+without testing against the user's actual CC version (v2.1.126).
+
+1. **OAuth keychain memoization has NO TTL** in v2.1.89.
+   `getClaudeAIOAuthTokens` (`utils/auth.ts:1255`) is wrapped in a
+   bare `memoize(...)` with no expiry — the cache is cleared ONLY by
+   internal events: token save (`saveOAuthTokens`), refresh
+   (`utils/auth.ts:1474, 1519, 1542, 1548`), login, logout. There is
+   no time-based invalidation. vdm's CLAUDE.md currently states
+   "Claude Code's keychain-cache TTL is 30 seconds (raised from 5s
+   in v2.1.86)" — this was likely true in some past version but is
+   inaccurate as of v2.1.89. The practical implication: when vdm
+   rotates an account by writing to the keychain, a running CC
+   session may NEVER see the new token until something else
+   triggers a cache-clear (a refresh, a /login, etc.). vdm's
+   continued empirical success suggests SOMETHING is invalidating
+   — likely the `Notification: auth_success` hook chain or the
+   refresh sweep — but the CLAUDE.md statement should be re-tested
+   against v2.1.126 and updated if confirmed wrong.
+
+2. **`CLAUDE_CODE_REMOTE` and `CLAUDE_CODE_ENTRYPOINT=claude-desktop`**
+   define a "managed OAuth context" (`utils/auth.ts:91-96`) that
+   ignores user settings.json apiKeyHelper / ANTHROPIC_API_KEY
+   entirely. Worth knowing if vdm ever adds a desktop integration.
+
+3. **`shouldUseClaudeAIAuth(scopes)`** at line 1569 — subscriber
+   detection requires the OAuth token's `scopes` to satisfy a
+   policy. Env-var tokens (`CLAUDE_CODE_OAUTH_TOKEN`) hardcode
+   scopes to `['user:inference']` (lines 1266, 1280) and DO NOT
+   include `user:profile`. This is why vdm-style env-injected
+   tokens can't call `/usage` etc. — see `hasProfileScope`
+   (line 1580).
+
+4. **The Notification:auth_success hook** is what vdm already uses
+   to invalidate its keychain caches after `/login`. Looking at
+   how CC fires its own auth-success events would tell us what
+   vdm should hook into to detect external token writes.
+
+## Acceptance check (decision criteria from this TRDD)
+
+Proceed with proxy-less architecture ONLY IF all four hold:
+
+- ☑ apiKeyHelper IS called per-request OR on-401 (not just at startup) → **NO**, 5-min SWR cache
+- ☑ apiKeyHelper CAN return an OAuth bearer token without breaking request signatures → **NO**, sent as X-Api-Key too
+- ☑ apiKeyHelper precedence beats both ANTHROPIC_API_KEY and the keychain entry → **PARTIAL**, beats keychain but not approved ANTHROPIC_API_KEY
+- ☑ vdm can still observe enough state to drive rotation (5h/7d utilization headers SOMETIMES) → **NO**, helper is fire-and-forget
+
+ALL FOUR FAIL. Per the TRDD's own logic: rejection.
+
+## Decision (final)
+
+**A. apiKeyHelper is API-key-only; OAuth tokens don't work.**
+Abandon. Keep current proxy architecture. File this TRDD as
+researched-and-rejected for future reference.
+
+The architectural insight that motivated this investigation —
+"could vdm be proxy-less?" — remains a fair question. But the
+answer under the current Claude Code design is "not via
+apiKeyHelper." If a future CC version adds a settings field
+specifically for OAuth-bearer injection (e.g. `oauthTokenHelper`
+returning a `{ accessToken, refreshToken, expiresAt }` JSON), this
+TRDD should be revisited.
 
 ## Origin
 
