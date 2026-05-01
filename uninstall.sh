@@ -63,6 +63,249 @@ else
   render_detected_issues() { return 0; }
 fi
 
+# ── Resolve uninstall-time constants used by both pre- and post-audit ──
+# Both audits need the proxy port (to scan PM2 dump / shell-snapshots for
+# stale ANTHROPIC_BASE_URL=localhost:<port> entries) and COMMANDS_SRC_DIR
+# (to know which slash commands belong to vdm). Section 1 + section 5c
+# also need these — resolve once here so both audit phases agree.
+#
+# Port priority: env CSW_PROXY_PORT > config.json > default 3334. Same
+# precedence install.sh uses (H6 fix), so re-running uninstall on a
+# customised-port install scans the right port without env override.
+_resolve_proxy_port_for_uninstall() {
+  if [[ -n "${CSW_PROXY_PORT:-}" ]]; then
+    printf '%s' "$CSW_PROXY_PORT"
+    return
+  fi
+  if [[ -f "$INSTALL_DIR/config.json" ]] && declare -f _json_get_int >/dev/null 2>&1; then
+    local _from_cfg
+    _from_cfg="$(_json_get_int "$INSTALL_DIR/config.json" "proxyPort" 2>/dev/null || true)"
+    if [[ -n "$_from_cfg" && "$_from_cfg" =~ ^[1-9][0-9]+$ ]]; then
+      printf '%s' "$_from_cfg"
+      return
+    fi
+  fi
+  printf '%s' "3334"
+}
+_PROXY_PORT_RESOLVED="$(_resolve_proxy_port_for_uninstall)"
+_DASH_PORT_RESOLVED="${CSW_PORT:-3333}"
+
+_UNINST_DIR_TOP="$(cd "$(dirname "$0")" && pwd -P 2>/dev/null || true)"
+COMMANDS_SRC_DIR=""
+if [[ -d "$_UNINST_DIR_TOP/commands" ]]; then
+  COMMANDS_SRC_DIR="$_UNINST_DIR_TOP/commands"
+fi
+
+# ── Audit primitives (shared by --detect, pre-uninstall, post-uninstall) ──
+#
+# `_run_full_audit <label> <proxy_port>` runs every read-only artefact
+# scan and populates two arrays in script scope:
+#   - LEFT_ARTIFACTS — human-readable list of leftover items
+#   - ENV_LEAK_SOURCES — keys for the cleanup-instruction matcher
+#                       (pm2-dump | shell-snapshots | running-procs)
+#
+# Returns 0 if the system is clean, otherwise the count of artefacts.
+# Why a count instead of just non-zero: lets the caller decide whether
+# to print the cleanup-instruction block OR exit cleanly with "already
+# clean — re-run any time to re-audit".
+_run_full_audit() {
+  local label="${1:-Audit}"
+  local proxy_port="${2:-3334}"
+
+  echo ""
+  echo -e "  ${BOLD}${label}...${NC}"
+
+  LEFT_ARTIFACTS=()
+  ENV_LEAK_SOURCES=()
+
+  # The install dir itself.
+  if [[ -d "${INSTALL_DIR_ORIG:-$INSTALL_DIR}" ]]; then
+    LEFT_ARTIFACTS+=("${INSTALL_DIR_ORIG:-$INSTALL_DIR}")
+  fi
+  # Lock dirs.
+  [[ -d "$HOME/.claude/.vdm-install.lock.d"  ]] && LEFT_ARTIFACTS+=("$HOME/.claude/.vdm-install.lock.d")
+  [[ -d "$HOME/.claude/.vdm-settings.lock.d" ]] && LEFT_ARTIFACTS+=("$HOME/.claude/.vdm-settings.lock.d")
+  # Settings.json residual hooks.
+  if [[ -f "$HOME/.claude/settings.json" ]]; then
+    if grep -q "localhost:[0-9]*/api/\(session-start\|session-stop\|session-end\|subagent-start\|pre-compact\|post-compact\|cwd-changed\|post-tool-batch\|worktree-create\|worktree-remove\|task-created\|task-completed\|teammate-idle\|notification\|config-change\|user-prompt-expansion\)" \
+          "$HOME/.claude/settings.json" 2>/dev/null; then
+      LEFT_ARTIFACTS+=("$HOME/.claude/settings.json [contains vdm hook URL(s)]")
+    fi
+  fi
+  # Symlinks.
+  for _lnk in "$HOME/.local/bin/vdm" "$HOME/.local/bin/csw" \
+              "/opt/homebrew/bin/vdm" "/opt/homebrew/bin/csw" \
+              "/usr/local/bin/vdm"    "/usr/local/bin/csw"; do
+    if [[ -L "$_lnk" ]]; then
+      _t="$(readlink "$_lnk" 2>/dev/null || true)"
+      if [[ "$_t" == *"/.claude/account-switcher/"* ]]; then
+        LEFT_ARTIFACTS+=("$_lnk -> $_t")
+      fi
+    fi
+  done
+  # Global git hooksPath still pointing at our dir + marker still present.
+  _gp="$(git config --global core.hooksPath 2>/dev/null || true)"
+  _gp="${_gp/#\~/$HOME}"
+  if [[ -n "$_gp" && -f "$_gp/.vdm-set-hooks-path" ]]; then
+    LEFT_ARTIFACTS+=("git config --global core.hooksPath = $_gp (vdm-marker still present)")
+  fi
+  # Shell rc residual markers.
+  for _rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" \
+             "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    [[ -f "$_rc" ]] || continue
+    if grep -q "claude-account-switcher" "$_rc" 2>/dev/null; then
+      LEFT_ARTIFACTS+=("$_rc [contains 'claude-account-switcher' marker]")
+    fi
+  done
+  # Slash commands installed by install.sh.
+  if [[ -n "${COMMANDS_SRC_DIR:-}" ]] && [[ -d "$HOME/.claude/commands" ]]; then
+    for _cmd in "$COMMANDS_SRC_DIR"/*.md; do
+      [[ -f "$_cmd" ]] || continue
+      _bn="$(basename "$_cmd")"
+      if [[ -f "$HOME/.claude/commands/$_bn" ]]; then
+        LEFT_ARTIFACTS+=("$HOME/.claude/commands/$_bn [vdm slash command not removed]")
+      fi
+    done
+  fi
+
+  # NEW — PM2 saved dump.
+  # The transcript at docs_dev/claude-chat-transcript-2.md documented
+  # this as the load-bearing source of "ConnectionRefused after
+  # uninstall" symptoms. PM2 resurrect at boot reads dump.pm2 and
+  # re-injects every env var in it into the resurrected processes;
+  # if `ANTHROPIC_BASE_URL=http://localhost:<port>` was captured in the
+  # dump while vdm was installed, every PM2-managed process will keep
+  # getting that env on every reboot until the dump is rewritten.
+  if [[ -f "$HOME/.pm2/dump.pm2" ]] && grep -q "localhost:${proxy_port}\b" "$HOME/.pm2/dump.pm2" 2>/dev/null; then
+    LEFT_ARTIFACTS+=("$HOME/.pm2/dump.pm2 [carries ANTHROPIC_BASE_URL=http://localhost:${proxy_port} — PM2 will re-inject on every resurrect]")
+    ENV_LEAK_SOURCES+=("pm2-dump")
+  fi
+
+  # NEW — Claude Code shell snapshots.
+  # Claude Code snapshots the shell env at session-start so child shells
+  # inherit consistently. Snapshots taken while vdm was installed carry
+  # the proxy URL until the snapshot is regenerated (next CC session
+  # restart). Long-running CC sessions read these for sub-shells.
+  if [[ -d "$HOME/.claude/shell-snapshots" ]]; then
+    local _snap_count
+    # The "|| true" tolerates zero matches; "wc -l | tr -d ' '" gives a
+    # bare integer regardless of GNU/BSD wc spacing differences.
+    _snap_count=$(grep -lE "localhost:${proxy_port}\b" "$HOME/.claude/shell-snapshots/"*.sh 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+    if [[ "${_snap_count:-0}" -gt 0 ]]; then
+      LEFT_ARTIFACTS+=("$HOME/.claude/shell-snapshots/ [${_snap_count} snapshot(s) reference localhost:${proxy_port}]")
+      ENV_LEAK_SOURCES+=("shell-snapshots")
+    fi
+  fi
+
+  # NEW — Running processes carrying the stale env.
+  # `ps eww` only shows env for processes the user owns; cross-user
+  # processes appear in the listing without env. Best-effort scan; the
+  # cleanup instructions explain this caveat. Using grep -c so an empty
+  # match returns 0 cleanly under set -e.
+  local _live_env_count=0
+  if command -v ps >/dev/null 2>&1; then
+    _live_env_count=$(ps eww -u "$USER" 2>/dev/null \
+                        | grep -cE "ANTHROPIC_BASE_URL=https?://(localhost|127\.0\.0\.1):${proxy_port}\b" \
+                        || true)
+  fi
+  if [[ "${_live_env_count:-0}" -gt 0 ]]; then
+    LEFT_ARTIFACTS+=("${_live_env_count} running process(es) carry ANTHROPIC_BASE_URL=http://localhost:${proxy_port} in their env")
+    ENV_LEAK_SOURCES+=("running-procs")
+  fi
+
+  # ── Report ──
+  if (( ${#LEFT_ARTIFACTS[@]} == 0 )); then
+    echo -e "  ${GREEN}✓${NC} No vdm artefacts detected. System is clean."
+    return 0
+  fi
+
+  echo -e "  ${YELLOW}⚠${NC}  ${BOLD}${#LEFT_ARTIFACTS[@]} artefact(s) found:${NC}"
+  for _a in "${LEFT_ARTIFACTS[@]}"; do
+    echo -e "    ${YELLOW}•${NC} $_a"
+  done
+
+  if (( ${#ENV_LEAK_SOURCES[@]} > 0 )); then
+    _print_env_cleanup_instructions "$proxy_port" "${ENV_LEAK_SOURCES[@]}"
+  fi
+
+  return ${#LEFT_ARTIFACTS[@]}
+}
+
+# Print explicit, copy-pasteable instructions for each detected stale-env
+# source. The exact sequences are the ones a prior debugging session in
+# docs_dev/claude-chat-transcript-2.md landed on after multiple iterations.
+# The "why" notes are critical — `exec zsh` does NOT clear env vars (it
+# re-execs the binary, inheriting the existing env), so naive reset
+# attempts fail silently. Every leak source needs a different fix.
+_print_env_cleanup_instructions() {
+  local proxy_port="$1"; shift
+  local sources=("$@")
+
+  echo ""
+  echo -e "  ${BOLD}── How to flush stale ANTHROPIC_BASE_URL=localhost:${proxy_port} ──${NC}"
+  echo ""
+  echo -e "  ${DIM}Note: \`exec zsh\` does NOT clear env vars (it re-execs the binary, inheriting${NC}"
+  echo -e "  ${DIM}      the parent env). Each leak source below needs its own reset.${NC}"
+  echo ""
+
+  local n=1
+  for src in "${sources[@]}"; do
+    case "$src" in
+      pm2-dump)
+        echo -e "  ${BOLD}${n}. Clean PM2's saved dump (~/.pm2/dump.pm2)${NC}"
+        echo -e "     ${DIM}PM2 resurrect at boot would re-inject the dead URL into every saved process.${NC}"
+        echo -e "     ${DIM}\`pm2 save\` reads from the daemon's in-memory env, so the daemon must be flushed${NC}"
+        echo -e "     ${DIM}FIRST or any save re-pollutes the dump. \`pm2 kill\` is the only way to flush${NC}"
+        echo -e "     ${DIM}the daemon's own env block.${NC}"
+        echo ""
+        echo -e "     ${CYAN}# In a CLEAN shell (no ANTHROPIC_BASE_URL exported)${NC}"
+        echo -e "     ${CYAN}unset ANTHROPIC_BASE_URL${NC}"
+        echo -e "     ${CYAN}echo \"\$ANTHROPIC_BASE_URL\"   # MUST print empty${NC}"
+        echo -e "     ${CYAN}pm2 kill                       # flushes the daemon's polluted in-memory env${NC}"
+        echo -e "     ${CYAN}pm2 resurrect                  # fresh daemon, inherits clean shell, loads dump${NC}"
+        echo -e "     ${CYAN}# verify every PM2 process is clean before re-saving:${NC}"
+        echo -e "     ${CYAN}for pid in \$(pm2 jlist | jq -r '.[].pid'); do${NC}"
+        echo -e "     ${CYAN}  ps eww -p \"\$pid\" 2>/dev/null | tr ' ' '\\n' | grep '^ANTHROPIC_BASE_URL' \\${NC}"
+        echo -e "     ${CYAN}    || echo \"PID \$pid clean\"${NC}"
+        echo -e "     ${CYAN}done${NC}"
+        echo -e "     ${CYAN}pm2 save                       # only after verification — otherwise re-pollutes dump${NC}"
+        echo ""
+        n=$((n+1))
+        ;;
+      shell-snapshots)
+        echo -e "  ${BOLD}${n}. Stale Claude Code shell snapshots${NC}"
+        echo -e "     ${DIM}Claude Code captured your env at session-start while ANTHROPIC_BASE_URL was still${NC}"
+        echo -e "     ${DIM}set. Long-running CC sessions read these snapshots for sub-shells until they restart.${NC}"
+        echo ""
+        echo -e "     ${CYAN}# Safe to delete — Claude Code regenerates them on next session start.${NC}"
+        echo -e "     ${CYAN}# Skip if you have CC sessions actively running off these snapshots; just restart${NC}"
+        echo -e "     ${CYAN}# those sessions instead.${NC}"
+        echo -e "     ${CYAN}rm -f ~/.claude/shell-snapshots/snapshot-zsh-*.sh${NC}"
+        echo ""
+        n=$((n+1))
+        ;;
+      running-procs)
+        echo -e "  ${BOLD}${n}. Running processes still carry the stale env${NC}"
+        echo -e "     ${DIM}You cannot mutate another process's env from outside; you have to either restart${NC}"
+        echo -e "     ${DIM}each process or run \`unset\` inside each shell tab.${NC}"
+        echo ""
+        echo -e "     ${CYAN}# Per-tab manual fix (in each iTerm/Terminal tab):${NC}"
+        echo -e "     ${CYAN}unset ANTHROPIC_BASE_URL${NC}"
+        echo ""
+        echo -e "     ${CYAN}# Broadcast to every iTerm tab at once. Caveat: \`write text\` types into${NC}"
+        echo -e "     ${CYAN}# mid-command sessions too (vim/htop/less/SSH would receive the keystrokes).${NC}"
+        echo -e "     ${CYAN}# Quit those interactive sessions first or omit this step.${NC}"
+        echo -e "     ${CYAN}osascript -e 'tell application \"iTerm\" to tell every window to tell every tab to tell every session to write text \"unset ANTHROPIC_BASE_URL\"'${NC}"
+        echo ""
+        n=$((n+1))
+        ;;
+    esac
+  done
+
+  echo -e "  ${DIM}Re-run \`./uninstall.sh\` after cleanup to verify the system is clean.${NC}"
+  echo ""
+}
+
 # ── Flag parsing ──
 # By default the script is interactive (4 prompts: main confirm, keychain
 # purge/keep, backup-file cleanup, LaunchAgent removal). The flags below
@@ -146,7 +389,7 @@ if [[ "$DETECT_ONLY" == "true" ]]; then
     detect_orphaned_settings_hooks
     detect_malformed_rc_blocks
     detect_dangling_symlinks
-    detect_port_holders "${CSW_PORT:-3333}" "${CSW_PROXY_PORT:-3334}"
+    detect_port_holders "$_DASH_PORT_RESOLVED" "$_PROXY_PORT_RESOLVED"
     detect_orphan_keychain_entries "$INSTALL_DIR"
     detect_truncated_config "$INSTALL_DIR/config.json"
     set +e
@@ -155,6 +398,13 @@ if [[ "$DETECT_ONLY" == "true" ]]; then
   else
     echo -e "  ${YELLOW}Detectors unavailable (lib-install.sh missing)${NC}"
   fi
+  # Also run the comprehensive audit (PM2 dump, shell snapshots, running
+  # processes carrying stale env, etc.) so --detect surfaces the same
+  # leak sources the regular uninstall flow does. Read-only, safe to
+  # repeat indefinitely.
+  set +e
+  _run_full_audit "Comprehensive audit" "$_PROXY_PORT_RESOLVED"
+  set -e
   echo ""
   exit 0
 fi
@@ -165,6 +415,30 @@ echo -e "  ───────────────────────
 if [[ "$NON_INTERACTIVE" == "true" ]]; then
   echo -e "  ${DIM}(non-interactive mode — purge_keychain=$PURGE_KEYCHAIN, purge_backups=$PURGE_BACKUPS, remove_launchagent=$REMOVE_LAUNCHAGENT)${NC}"
 fi
+
+# ── Pre-uninstall audit (always runs) ──
+# Re-running uninstall on an already-clean system MUST still report status
+# (the user explicitly asked for this — re-running is the canonical way to
+# verify cleanness). The audit is read-only, so it cannot make anything
+# worse; it just informs.
+#
+# If the audit shows ZERO artefacts AND the install dir is gone, exit
+# cleanly here — there is nothing to undo. Print the cleanup-instructions
+# block first if any env-leak sources exist (PM2 dump, shell snapshots,
+# running processes carrying the stale env), since those are the
+# "harder-than-uninstall" leftovers users hit when they expect uninstall
+# to be done.
+set +e
+_run_full_audit "Pre-uninstall scan" "$_PROXY_PORT_RESOLVED"
+_pre_audit_count=$?
+set -e
+if (( _pre_audit_count == 0 )); then
+  echo ""
+  echo -e "  ${BOLD}${GREEN}Nothing to uninstall — system is already clean.${NC}"
+  echo ""
+  exit 0
+fi
+
 echo ""
 
 # ── Show what will be removed ──
@@ -785,76 +1059,20 @@ if (( ${#LAUNCHAGENT_CANDIDATES[@]} > 0 )); then
 fi
 
 # ── 9. Final verification audit ──
-# Independently scan the system for anything vdm-shaped that might still be
-# present. The user's main concern: hooks lingering in settings.json,
-# auth tokens on disk, any other artefact uninstall didn't catch. We
-# enumerate the same surfaces install touches and report any that still
-# show vdm content. This is read-only and best-effort — we don't try to
-# re-clean them automatically (the user just told us NOT to keep guessing
-# what they want).
-echo ""
-echo -e "  ${BOLD}Verification — scanning for remaining vdm artefacts...${NC}"
-
-LEFT_ARTIFACTS=()
-# The install dir itself.
-if [[ -d "$INSTALL_DIR_ORIG" ]] 2>/dev/null; then LEFT_ARTIFACTS+=("$INSTALL_DIR_ORIG"); fi
-[[ -d "$HOME/.claude/account-switcher" ]] && LEFT_ARTIFACTS+=("$HOME/.claude/account-switcher")
-# Lock dirs.
-[[ -d "$HOME/.claude/.vdm-install.lock.d"  ]] && LEFT_ARTIFACTS+=("$HOME/.claude/.vdm-install.lock.d")
-[[ -d "$HOME/.claude/.vdm-settings.lock.d" ]] && LEFT_ARTIFACTS+=("$HOME/.claude/.vdm-settings.lock.d")
-# Settings.json residual hooks.
-if [[ -f "$HOME/.claude/settings.json" ]]; then
-  if grep -q "localhost:[0-9]*/api/\(session-start\|session-stop\|session-end\|subagent-start\|pre-compact\|post-compact\|cwd-changed\|post-tool-batch\|worktree-create\|worktree-remove\|task-created\|task-completed\|teammate-idle\|notification\|config-change\|user-prompt-expansion\)" \
-        "$HOME/.claude/settings.json" 2>/dev/null; then
-    LEFT_ARTIFACTS+=("$HOME/.claude/settings.json [contains vdm hook URL(s)]")
-  fi
-fi
-# Symlinks.
-for _lnk in "$HOME/.local/bin/vdm" "$HOME/.local/bin/csw" \
-            "/opt/homebrew/bin/vdm" "/opt/homebrew/bin/csw" \
-            "/usr/local/bin/vdm"    "/usr/local/bin/csw"; do
-  if [[ -L "$_lnk" ]]; then
-    _t="$(readlink "$_lnk" 2>/dev/null || true)"
-    if [[ "$_t" == *"/.claude/account-switcher/"* ]]; then
-      LEFT_ARTIFACTS+=("$_lnk -> $_t")
-    fi
-  fi
-done
-# Global git hooksPath still pointing at our dir + marker still present.
-_gp="$(git config --global core.hooksPath 2>/dev/null || true)"
-_gp="${_gp/#\~/$HOME}"
-if [[ -n "$_gp" && -f "$_gp/.vdm-set-hooks-path" ]]; then
-  LEFT_ARTIFACTS+=("git config --global core.hooksPath = $_gp (vdm-marker still present)")
-fi
-# Shell rc residual markers.
-for _rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" \
-           "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
-  [[ -f "$_rc" ]] || continue
-  if grep -q "claude-account-switcher" "$_rc" 2>/dev/null; then
-    LEFT_ARTIFACTS+=("$_rc [contains 'claude-account-switcher' marker]")
-  fi
-done
-# Slash commands installed by install.sh — anything we recognise from
-# the source `commands/` dir that still exists under ~/.claude/commands/
-# is a leftover.
-if [[ -n "${COMMANDS_SRC_DIR:-}" ]] && [[ -d "$HOME/.claude/commands" ]]; then
-  for _cmd in "$COMMANDS_SRC_DIR"/*.md; do
-    [[ -f "$_cmd" ]] || continue
-    _bn="$(basename "$_cmd")"
-    if [[ -f "$HOME/.claude/commands/$_bn" ]]; then
-      LEFT_ARTIFACTS+=("$HOME/.claude/commands/$_bn [vdm slash command not removed]")
-    fi
-  done
-fi
-
-if (( ${#LEFT_ARTIFACTS[@]} == 0 )); then
-  echo -e "  ${GREEN}✓${NC} No vdm artefacts detected. Uninstall is clean."
-else
-  echo -e "  ${YELLOW}⚠${NC}  ${BOLD}${#LEFT_ARTIFACTS[@]} artefact(s) remain:${NC}"
-  for _a in "${LEFT_ARTIFACTS[@]}"; do
-    echo -e "    ${YELLOW}•${NC} $_a"
-  done
-  echo -e "  ${DIM}(These were not auto-removed — investigate and clean manually.)${NC}"
+# Same audit primitive that ran pre-uninstall — re-running it post-flow
+# proves what's still on disk after the destructive sections completed,
+# and surfaces stale-env leak sources (PM2 dump, shell snapshots, running
+# processes carrying the dead URL) the destructive sections cannot touch.
+# Emits a non-zero exit code internally if anything remains, so a caller
+# scripting around this can detect partial completion; here we just
+# inform the user.
+set +e
+_run_full_audit "Post-uninstall verification" "$_PROXY_PORT_RESOLVED"
+_post_audit_count=$?
+set -e
+if (( _post_audit_count > 0 )); then
+  echo -e "  ${DIM}(The artefacts above were not auto-removed — follow the instructions above${NC}"
+  echo -e "  ${DIM} or investigate manually. Re-run \`./uninstall.sh\` to re-verify.)${NC}"
 fi
 
 # Apple Keychain — audit. Two distinct entry classes live here:
