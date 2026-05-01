@@ -3055,6 +3055,20 @@ function renderHTML() {
      zero-dependency / privacy-first stance and breaking the dashboard
      for users behind captive portals or strict outbound-proxy SOCs. -->
 <style>
+  /* A11y: visually hidden but exposed to assistive tech. Lets us add
+     <label for> associations to the dashboard's CSS-styled toggle
+     switches without affecting the visual layout. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
   :root {
     --bg: hsl(220 14% 96%);
     --card: #fff;
@@ -4347,28 +4361,35 @@ function renderHTML() {
     <span>All accounts rate-limited. Next available: <strong id="exhausted-reset"> -</strong></span>
   </div>
 
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('accounts')">Accounts</button>
-    <button class="tab" onclick="switchTab('activity')">Activity</button>
-    <button class="tab" onclick="switchTab('usage')">Usage</button>
-    <button class="tab" onclick="switchTab('sessions')">Sessions<span id="sessions-badge" class="tab-badge" style="display:none"></span></button>
-    <button class="tab" onclick="switchTab('config')">Config</button>
-    <button class="tab" onclick="switchTab('logs')">Logs</button>
+  <noscript>
+    <div style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:1rem;margin:1rem 0;border-radius:6px">
+      <strong>JavaScript is required.</strong> The dashboard is a single-page app — every panel below this banner is empty without JS.
+      Enable JavaScript for <code>localhost:${PORT}</code> in your browser, or use the CLI: <code>vdm status</code>, <code>vdm list</code>, <code>vdm tokens</code>.
+    </div>
+  </noscript>
+
+  <div class="tabs" role="tablist" aria-label="vdm dashboard sections">
+    <button class="tab active" role="tab" aria-selected="true" aria-controls="tab-accounts" id="tabbtn-accounts" onclick="switchTab('accounts')">Accounts</button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-activity" id="tabbtn-activity" onclick="switchTab('activity')">Activity</button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-usage" id="tabbtn-usage" onclick="switchTab('usage')">Usage</button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-sessions" id="tabbtn-sessions" onclick="switchTab('sessions')">Sessions<span id="sessions-badge" class="tab-badge" style="display:none"></span></button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-config" id="tabbtn-config" onclick="switchTab('config')">Config</button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-logs" id="tabbtn-logs" onclick="switchTab('logs')">Logs</button>
   </div>
 
-  <div id="tab-accounts" class="tab-content active">
+  <div id="tab-accounts" class="tab-content active" role="tabpanel" aria-labelledby="tabbtn-accounts">
     <div id="accounts" class="accounts">
       <div class="empty-state">Loading...</div>
     </div>
   </div>
 
-  <div id="tab-activity" class="tab-content">
+  <div id="tab-activity" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-activity">
     <div id="activity-wrap" class="activity-card">
       <div id="activity-log" style="color:var(--muted);padding:2rem 0">No activity yet</div>
     </div>
   </div>
 
-  <div id="tab-usage" class="tab-content">
+  <div id="tab-usage" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-usage">
     <div id="stats-section" class="usage-card" style="display:none">
       <div class="usage-title">Usage  - All Accounts</div>
       <div id="stats-grid" class="stat-grid"></div>
@@ -4459,13 +4480,13 @@ function renderHTML() {
     </div>
   </div>
 
-  <div id="tab-sessions" class="tab-content">
+  <div id="tab-sessions" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-sessions">
     <div id="sessions-content">
       <div class="empty-state" id="sessions-disabled">Session Monitor is OFF. Enable it in Config (BETA).</div>
     </div>
   </div>
 
-  <div id="tab-config" class="tab-content">
+  <div id="tab-config" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-config">
     <div class="config-card">
       <div class="config-section">
         <div class="config-section-title">Proxy</div>
@@ -4582,9 +4603,16 @@ function renderHTML() {
         <div class="config-section-title">Session Monitor <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
-            <div class="config-label">Enable session monitor</div>
-            <div class="config-desc">Track active Claude Code sessions with AI-summarized timelines. Uses Haiku for summaries (separate token overhead).</div>
+            <div class="config-label">Enable session monitor <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+            <div class="config-desc">
+              Track active Claude Code sessions with AI-summarized timelines.
+              <strong style="color:var(--yellow)">Sends excerpts of your prompts to Anthropic Claude Haiku for summarization</strong>
+              (billed against the active account). Summaries persist to <code>session-history.json</code>
+              (mode 0o600). Off by default; enable only on machines where you accept the extra
+              outbound traffic and the on-disk summary trail.
+            </div>
           </div>
+          <label class="sr-only" for="toggle-session-monitor">Enable session monitor (sends prompts to Claude Haiku)</label>
           <input type="checkbox" class="sw" id="toggle-session-monitor" onchange="toggleSetting('sessionMonitor', this.checked)">
         </div>
       </div>
@@ -4608,7 +4636,7 @@ function renderHTML() {
     </div>
   </div>
 
-  <div id="tab-logs" class="tab-content">
+  <div id="tab-logs" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-logs">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
       <div style="font-size:0.8125rem;color:var(--muted)" id="log-status">Disconnected</div>
       <button onclick="clearLogs()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">Clear</button>
@@ -4622,10 +4650,20 @@ function renderHTML() {
 
 <script>
 function switchTab(id) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  // A11y: maintain aria-selected so screen readers announce the
+  // current tab. Without this, every .tab is announced "button"
+  // with no current-state indication, even though the visual is clear.
+  document.querySelectorAll('.tab').forEach(t => {
+    t.classList.remove('active');
+    t.setAttribute('aria-selected', 'false');
+  });
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
-  document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
+  const btn = document.getElementById('tabbtn-' + id);
+  if (btn) {
+    btn.classList.add('active');
+    btn.setAttribute('aria-selected', 'true');
+  }
   if (id === 'usage') refreshTokens();
   if (id === 'sessions') refreshSessions();
   if (id === 'logs') connectLogStream();
@@ -5160,17 +5198,43 @@ function planBadge(subscriptionType, rateLimitTier) {
   return '<span class="badge ' + cls + '">' + label + '</span>';
 }
 
-function showToast(msg) {
+function showToast(msg, opts) {
+  // UX-D7 fix: longer timeout for errors (8s vs 2.2s default), add a
+  // close button so the user can read at their pace. Errors that
+  // arrive while the user is looking away no longer vanish before
+  // they can be read.
   const t = document.getElementById('toast');
-  t.textContent = msg;
+  const isError = opts && opts.error;
+  const ms = (opts && typeof opts.timeoutMs === 'number') ? opts.timeoutMs : (isError ? 8000 : 2200);
+  // Replace any existing close button + content; toast can be re-fired.
+  t.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = msg;
+  t.appendChild(span);
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '×';
+  closeBtn.setAttribute('aria-label', 'Dismiss notification');
+  closeBtn.style.cssText = 'background:none;border:none;color:inherit;font-size:1.25rem;line-height:1;margin-left:0.75rem;cursor:pointer;padding:0 0.25rem;opacity:0.7';
+  closeBtn.onclick = () => {
+    t.classList.remove('show');
+    clearTimeout(t._tid);
+  };
+  t.appendChild(closeBtn);
   t.classList.add('show');
   clearTimeout(t._tid);
-  t._tid = setTimeout(() => t.classList.remove('show'), 2200);
+  t._tid = setTimeout(() => t.classList.remove('show'), ms);
 }
 
 async function doSwitch(name, displayName, e) {
   if (e) e.stopPropagation();
-  document.querySelectorAll('.card').forEach(c => c.classList.add('switching'));
+  // UX-D6: only grey out the TARGET card (the one being switched TO),
+  // not every card on the dashboard. The previous behaviour made every
+  // card flicker at 50% opacity for the duration of the switch — visual
+  // jank on every action. The target card alone signals "this one is
+  // becoming active in a moment".
+  const targetCard = document.querySelector('.card[data-account-name="' + CSS.escape(name) + '"]')
+    || (typeof e !== 'undefined' && e && e.target && e.target.closest && e.target.closest('.card'));
+  if (targetCard) targetCard.classList.add('switching');
   try {
     const resp = await fetch('/api/switch', {
       method: 'POST',
@@ -5189,9 +5253,9 @@ async function doSwitch(name, displayName, e) {
       }
       setTimeout(refresh, 300);
     }
-    else showToast('Error: ' + data.error);
-  } catch(e) { showToast('Failed to switch'); }
-  document.querySelectorAll('.card').forEach(c => c.classList.remove('switching'));
+    else showToast('Error: ' + data.error, { error: true });
+  } catch(e) { showToast('Failed to switch — ' + (e && e.message ? e.message : 'network error'), { error: true }); }
+  if (targetCard) targetCard.classList.remove('switching');
 }
 
 async function doRemove(name, e) {
@@ -5769,7 +5833,13 @@ function renderAccounts(profiles, animate) {
       buttonsHtml;
     var h = _cardHash(cardClass + '|' + animStyle + '|' + inner);
     newHashes.set(p.name, h);
-    return '<div class="' + cardClass + '" id="' + safeId + '" data-card-hash="' + h + '"' + animStyle + '>' +
+    // data-account-name lets doSwitch (UX-D6) find this card without
+    // depending on the click event's target — useful when the switch
+    // is invoked programmatically (e.g. from a keyboard shortcut).
+    // Account name is escHtml'd at the source (escName) so it's safe
+    // as an HTML attribute value.
+    var escNameAttr = escHtml(p.name);
+    return '<div class="' + cardClass + '" id="' + safeId + '" data-card-hash="' + h + '" data-account-name="' + escNameAttr + '"' + animStyle + '>' +
       inner +
     '</div>';
   });

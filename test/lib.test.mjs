@@ -4797,3 +4797,68 @@ describe('Phase I+ — KC-1 keychain-deny notification', () => {
     assert.match(_dashboardSrc_kc, /10 \* 60 \* 1000/);
   });
 });
+
+describe('Phase I+ — A11y / dashboard polish (UX-D batch)', () => {
+  const _dashboardSrc_a11y = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('renders a <noscript> banner', () => {
+    assert.match(_dashboardSrc_a11y, /<noscript>[\s\S]{0,400}JavaScript is required/);
+  });
+
+  it('tabs have role/aria-selected/aria-controls', () => {
+    assert.match(_dashboardSrc_a11y, /role="tablist"/);
+    assert.match(_dashboardSrc_a11y, /role="tab"/);
+    assert.match(_dashboardSrc_a11y, /aria-selected="true"/);
+    assert.match(_dashboardSrc_a11y, /aria-controls="tab-accounts"/);
+  });
+
+  it('every tab-content has role=tabpanel + aria-labelledby', () => {
+    assert.match(_dashboardSrc_a11y, /id="tab-accounts" class="tab-content active" role="tabpanel"/);
+    assert.match(_dashboardSrc_a11y, /id="tab-activity"[\s\S]{0,40}role="tabpanel"/);
+    assert.match(_dashboardSrc_a11y, /id="tab-usage"[\s\S]{0,40}role="tabpanel"/);
+    assert.match(_dashboardSrc_a11y, /id="tab-sessions"[\s\S]{0,40}role="tabpanel"/);
+    assert.match(_dashboardSrc_a11y, /id="tab-config"[\s\S]{0,40}role="tabpanel"/);
+    assert.match(_dashboardSrc_a11y, /id="tab-logs"[\s\S]{0,40}role="tabpanel"/);
+  });
+
+  it('switchTab maintains aria-selected', () => {
+    assert.match(_dashboardSrc_a11y, /setAttribute\('aria-selected', 'false'\)/);
+    assert.match(_dashboardSrc_a11y, /setAttribute\('aria-selected', 'true'\)/);
+  });
+
+  it('Session Monitor toggle has a <label for> association + privacy warning', () => {
+    assert.match(_dashboardSrc_a11y, /class="sr-only" for="toggle-session-monitor"/);
+    assert.match(_dashboardSrc_a11y, /Sends excerpts of your prompts to Anthropic Claude Haiku/);
+  });
+
+  it('.sr-only utility class exists in CSS', () => {
+    assert.match(_dashboardSrc_a11y, /\.sr-only \{[\s\S]{0,200}position: absolute/);
+  });
+
+  it('showToast accepts opts (error / timeoutMs)', () => {
+    assert.match(_dashboardSrc_a11y, /function showToast\(msg, opts\)/);
+    assert.match(_dashboardSrc_a11y, /opts && opts\.error/);
+  });
+
+  it('doSwitch greys only the target card (UX-D6)', () => {
+    // Was: querySelectorAll('.card').forEach(... add('switching')) —
+    // 50% opacity flash on every card every switch. Now: targetCard only.
+    const switchBlock = _dashboardSrc_a11y.slice(
+      _dashboardSrc_a11y.indexOf('async function doSwitch'),
+      _dashboardSrc_a11y.indexOf('async function doSwitch') + 1500,
+    );
+    assert.ok(switchBlock.length > 0);
+    assert.match(switchBlock, /targetCard\.classList\.add\('switching'\)/);
+    assert.equal(
+      /querySelectorAll\('\.card'\)\.forEach\(c => c\.classList\.add\('switching'\)\)/.test(switchBlock), false,
+      'must NOT use the global card-grey-out pattern',
+    );
+  });
+
+  it('cards carry data-account-name for programmatic switch', () => {
+    assert.match(_dashboardSrc_a11y, /data-account-name="' \+ escNameAttr/);
+  });
+});

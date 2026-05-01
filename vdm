@@ -806,6 +806,25 @@ except Exception:
   fi
 
   if [[ -z "$name" ]]; then
+    # UX-H2: short-circuit for the one-account case. Forcing the user
+    # through a 1-item picker just to land on "Already on profile X" is
+    # silly. With 1 account and no command-line target, the only useful
+    # message is "you have one account; log in to another via claude
+    # login to enable rotation."
+    if [[ ${#names[@]} -eq 1 ]]; then
+      local _only="${names[0]}"
+      local _only_fp
+      _only_fp=$(get_account_fingerprint "$_only" 2>/dev/null || true)
+      if [[ -n "$_only_fp" ]] && [[ "$_only_fp" == "$active_fp" ]]; then
+        echo -e "${YELLOW}Only one saved account ('${_only}') and it is already active.${NC}"
+        echo -e "  Log in to another account to enable rotation: ${DIM}claude login${NC}"
+        return 0
+      fi
+      # 1 saved account, but it is NOT active — switch to it without
+      # the interactive prompt.
+      name="$_only"
+      echo -e "${DIM}Only one saved account ('${_only}') — switching to it without prompt.${NC}"
+    else
     # Interactive mode: show numbered list
     echo ""
     echo -e "${BOLD}  Select account:${NC}"
@@ -843,6 +862,7 @@ except Exception:
       echo -e "  ${RED}Invalid choice.${NC}"
       return 1
     fi
+    fi  # close the UX-H2 multi-account `else` branch
   fi
 
   if ! name=$(sanitize_profile_name "$name"); then
