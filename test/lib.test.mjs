@@ -59,6 +59,8 @@ import {
   isOAuthRevocationError,
   isPostRefreshTrulyExpired,
   areAllAccountsTerminallyDead,
+  // Phase I+ — token attribution guards
+  isNonProjectCwd,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
   vdmAccountNameFromService,
@@ -6042,5 +6044,146 @@ describe('Phase I+ — token-tracking filters (batch 12)', () => {
       _src_tt.indexOf('function recordUsage') + 2000,
     );
     assert.match(fn, /messageId: usage\.messageId \|\| null/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — isNonProjectCwd: guard for token attribution.
+// The user reported tokens being attributed to ~/.claude/
+// plugin-cache dirs that are SHARED across many distinct CC
+// sessions. The fix is to refuse to extract a "repo" identity
+// from any cwd inside a system / cache path.
+// ─────────────────────────────────────────────────────────
+
+describe('isNonProjectCwd — system / cache cwd detector', () => {
+  const HOME = '/Users/test-user';
+
+  it('flags ~/.claude/ subdirs as non-project (the original bug)', () => {
+    assert.equal(isNonProjectCwd(`${HOME}/.claude/plugins/cache/some-plugin`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/.claude/plugins/cache/some-plugin/scripts`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/.claude/projects/proj-123`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/.claude`, HOME), true, '$HOME/.claude itself IS the CC state dir — never a user project');
+  });
+
+  it('flags /tmp/, /var/folders/, /private/ as non-project (worktree spawned in temp)', () => {
+    assert.equal(isNonProjectCwd('/tmp/cc-worktree-foo'), true);
+    assert.equal(isNonProjectCwd('/private/tmp/x'), true);
+    assert.equal(isNonProjectCwd('/var/tmp/x'), true);
+    assert.equal(isNonProjectCwd('/var/folders/8j/abc123/T/cc-tmp'), true, 'macOS per-user tmp');
+    assert.equal(isNonProjectCwd('/private/var/folders/8j/abc/T'), true);
+  });
+
+  it('flags node_modules subdirs', () => {
+    assert.equal(isNonProjectCwd('/Users/me/proj/node_modules/foo'), true);
+    assert.equal(isNonProjectCwd('/Users/me/proj/node_modules'), true);
+    assert.equal(isNonProjectCwd('/Users/me/proj/packages/inner/node_modules/bar'), true, 'monorepo nested node_modules');
+  });
+
+  it('flags ~/.npm/, ~/.cache/, ~/.config/, ~/.local/share/', () => {
+    assert.equal(isNonProjectCwd(`${HOME}/.npm/_cacache/x`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/.cache/foo`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/.config/some-tool`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/.local/share/x`, HOME), true);
+  });
+
+  it('flags macOS Library/Caches and known Application Support trees', () => {
+    assert.equal(isNonProjectCwd(`${HOME}/Library/Caches/com.apple.foo`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/Library/Application Support/Code/User`, HOME), true);
+    assert.equal(isNonProjectCwd(`${HOME}/Library/Application Support/Claude/sessions`, HOME), true);
+  });
+
+  it('does NOT flag normal user project dirs', () => {
+    assert.equal(isNonProjectCwd('/Users/me/Code/my-project', HOME), false);
+    assert.equal(isNonProjectCwd('/Users/me/projects/foo/src', HOME), false);
+    assert.equal(isNonProjectCwd('/home/me/work/repo'), false);
+    assert.equal(isNonProjectCwd('/Users/me/Desktop/scratch', HOME), false, 'Desktop scratch is still a project for token-tracking purposes');
+  });
+
+  it('handles edge inputs gracefully', () => {
+    assert.equal(isNonProjectCwd('', HOME),         false);
+    assert.equal(isNonProjectCwd(null, HOME),       false);
+    assert.equal(isNonProjectCwd(undefined, HOME),  false);
+    assert.equal(isNonProjectCwd(42, HOME),         false);
+    // Trailing slash should not change classification
+    assert.equal(isNonProjectCwd('/tmp/', HOME),    true);
+    assert.equal(isNonProjectCwd('/tmp', HOME),     true);
+  });
+
+  it('respects the HOME-not-set case (returns false for $HOME-relative paths)', () => {
+    // When $HOME is empty, we can't know which paths are user-relative
+    // caches. Refuse to classify ~/.claude paths as non-project — the
+    // alternative (false-positive flag of e.g. /home/user/.claude on a
+    // CI runner that spawned without $HOME) would silently bucket
+    // everything as (non-project).
+    assert.equal(isNonProjectCwd('/home/user/.claude/plugins/cache/x', ''), false);
+    // System paths (no $HOME involvement) still flagged.
+    assert.equal(isNonProjectCwd('/tmp/x', ''), true);
+  });
+});
+
+describe('Phase I+ — dashboard.mjs wires isNonProjectCwd into session-start + subagent-start', () => {
+  const _src_at = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports isNonProjectCwd from lib.mjs', () => {
+    assert.match(_src_at, /isNonProjectCwd,/);
+  });
+
+  it('session-start uses (non-project) sentinel for system cwds', () => {
+    // Anchor on the sentinel string + nearby isNonProjectCwd call.
+    assert.match(_src_at, /isNonProjectCwd\(cwd\)[\s\S]{0,500}repo = '\(non-project\)'/);
+    // Even when git rev-parse returns a path that ITSELF resolves to a
+    // system dir (e.g. plugin-cache dir is a git checkout), the post-
+    // resolution guard catches it.
+    assert.match(_src_at, /isNonProjectCwd\(repo\)[\s\S]{0,300}repo = '\(non-project\)'/);
+  });
+
+  it('subagent-start tries ancestor-cwd matching before falling back to subagent cwd', () => {
+    // The new path (b): for each pendingSession, check if subagent's
+    // cwd starts with the main session's cwd + '/'.
+    const fn = _src_at.slice(
+      _src_at.indexOf("'/api/subagent-start'"),
+      _src_at.indexOf("'/api/subagent-start'") + 6000,
+    );
+    assert.match(fn, /subPath\.startsWith\(mainPath \+ '\/'\)/);
+    assert.match(fn, /parentResolution = 'ancestor-cwd'/);
+  });
+
+  it('subagent-start falls back to most-recently-active main session ONLY for non-project cwds', () => {
+    // Path (c): we don't want to grab a random main session for a
+    // legitimate orphan — that would mis-attribute. Only fire this
+    // fallback when the subagent's cwd is itself non-project (plugin
+    // cache, /tmp, etc.) — in that case "wrong main" is strictly
+    // better than "the plugin path itself".
+    const fn = _src_at.slice(
+      _src_at.indexOf("'/api/subagent-start'"),
+      _src_at.indexOf("'/api/subagent-start'") + 6000,
+    );
+    assert.match(fn, /isNonProjectCwd\(cwd\)[\s\S]{0,800}parentResolution = 'most-recent-main'/);
+  });
+
+  it('subagent-start logs the parent-resolution path it took', () => {
+    // Without the log line, debugging "why did this token attribute
+    // here" becomes guesswork. The log emits the resolution mode so
+    // operators can trace.
+    const fn = _src_at.slice(
+      _src_at.indexOf("'/api/subagent-start'"),
+      _src_at.indexOf("'/api/subagent-start'") + 6000,
+    );
+    assert.match(fn, /parent resolved via \$\{parentResolution\}/);
+  });
+
+  it('subagent-start path (d) applies the non-project guard before computing repo from subagent cwd', () => {
+    // The original bug: subagent's cwd was inside ~/.claude/plugins/cache/
+    // which IS a git checkout, so vdm computed repo=plugin-path. The
+    // guard short-circuits this case to (non-project) sentinel.
+    const fn = _src_at.slice(
+      _src_at.indexOf("'/api/subagent-start'"),
+      _src_at.indexOf("'/api/subagent-start'") + 6000,
+    );
+    // Specifically the subagent-cwd-based path should respect the guard
+    assert.match(fn, /Subagent[\s\S]{0,400}is non-project[\s\S]{0,200}\(non-project\) sentinel/);
   });
 });

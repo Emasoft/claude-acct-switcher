@@ -841,6 +841,8 @@ import {
   isOAuthRevocationError,
   isPostRefreshTrulyExpired,
   areAllAccountsTerminallyDead,
+  // Phase I+ — guard against attributing tokens to system / cache dirs
+  isNonProjectCwd,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -2419,20 +2421,41 @@ async function handleAPI(req, res) {
         // sites coerce to null when persisting so the on-disk schema
         // matches the spec (branchAtWriteTime: string|null).
         let repo = '(non-git)', branch = '(no git)', commitHash = '';
-        try {
-          // Use --git-common-dir to resolve to main repo root (not worktree directory)
-          // so worktree sessions group with the parent repo in the dashboard.
-          // _runGitCached: session-start fires on every UserPromptSubmit, so
-          // without TTL cache these four execFileSync calls would block the
-          // event loop on every prompt.
+        // Skip git lookup for system/cache cwds. Without this, a CC
+        // session that happens to fire its first prompt while cwd is
+        // inside ~/.claude/plugins/cache/<plugin>/ (which is itself a
+        // git checkout) attributes ALL of its tokens to that plugin —
+        // even though dozens of unrelated sessions share the same
+        // plugin dir. The (non-project) sentinel keeps usage bucketed
+        // separately from real projects.
+        if (isNonProjectCwd(cwd)) {
+          repo = '(non-project)';
+          log('tokens', `Session ${sessionId.slice(0, 8)}… cwd=${cwd} is non-project — using (non-project) sentinel`);
+        } else {
           try {
-            repo = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
-          } catch {
-            repo = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
-          }
-          branch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
-          commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
-        } catch { /* not a git repo — keep sentinel `repo` */ }
+            // Use --git-common-dir to resolve to main repo root (not worktree directory)
+            // so worktree sessions group with the parent repo in the dashboard.
+            // _runGitCached: session-start fires on every UserPromptSubmit, so
+            // without TTL cache these four execFileSync calls would block the
+            // event loop on every prompt.
+            try {
+              repo = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
+            } catch {
+              repo = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
+            }
+            branch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+            commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+            // Defense-in-depth: even if cwd looks like a real project,
+            // the resolved repo path itself may be inside a system dir
+            // (e.g. cwd=/Users/me/projects, but a sibling worktree
+            // points back to ~/.claude/plugins/...). Apply the same
+            // guard to the resolved path.
+            if (repo && isNonProjectCwd(repo)) {
+              log('tokens', `Session ${sessionId.slice(0, 8)}… resolved repo=${repo} is non-project — using sentinel`);
+              repo = '(non-project)';
+            }
+          } catch { /* not a git repo — keep sentinel `repo` */ }
+        }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
         // Fire-and-forget — async (file IO under the `_hookedRepoPaths`
         // gate). Errors are logged inside the function; awaiting would
@@ -2548,14 +2571,57 @@ async function handleAPI(req, res) {
         json(res, { ok: true, registered: 'subagent', idempotent: true });
         return true;
       }
-      // Locate the parent session. Two paths:
-      //   (a) parentSessionId is in pendingSessions → inherit repo/branch/commitHash
-      //       (the user's PR attribution stays with the orchestrator's session).
-      //   (b) parent unknown → register the sub-agent standalone, best-effort
-      //       attribution via cwd. Per the contract: "If parent not found:
-      //       register the subagent standalone (best-effort, attribute via cwd)."
+      // Locate the parent session. Three paths in priority order:
+      //   (a) parentSessionId is provided AND in pendingSessions → inherit
+      //       repo/branch/commitHash (the user's PR attribution stays with
+      //       the orchestrator's session).
+      //   (b) parentSessionId not provided OR not in pendingSessions, but
+      //       there IS an active main session whose cwd is an ANCESTOR of
+      //       the subagent's cwd → inherit from that. Catches the worktree
+      //       case where the subagent runs in /tmp/cc-worktree-xyz spawned
+      //       from /Users/.../my-project (no exact-cwd match).
+      //   (c) Still no match → use the most-recently-active main session
+      //       (no parentSessionId) as the inferred parent. Catches subagents
+      //       spawned with totally unrelated cwds (plugin caches, etc.).
+      //   (d) Last resort: compute repo from subagent's own cwd, with the
+      //       isNonProjectCwd guard so plugin/system paths fall through to
+      //       a sentinel rather than polluting the project list.
       let repo = '(non-git)', branch = '(no git)', commitHash = '';
-      const parent = parentSessionId ? pendingSessions.get(parentSessionId) : null;
+      let parent = parentSessionId ? pendingSessions.get(parentSessionId) : null;
+      let parentResolution = parent ? 'explicit' : null;
+
+      // Path (b): ancestor-cwd matching across active main sessions.
+      if (!parent && cwd) {
+        let bestMatch = null;
+        let bestStart = -Infinity;
+        for (const [, s] of pendingSessions) {
+          if (s.parentSessionId) continue; // skip subagents — only main sessions can be parents
+          if (!s.cwd) continue;
+          // Subagent's cwd is inside the main session's cwd?
+          const subPath = cwd.replace(/\/+$/, '');
+          const mainPath = s.cwd.replace(/\/+$/, '');
+          if (subPath === mainPath || subPath.startsWith(mainPath + '/')) {
+            if (s.startedAt > bestStart) { bestStart = s.startedAt; bestMatch = s; }
+          }
+        }
+        if (bestMatch) { parent = bestMatch; parentResolution = 'ancestor-cwd'; }
+      }
+
+      // Path (c): most-recently-active main session, regardless of cwd.
+      // Only fires when cwd is non-project (plugin cache / temp / system) —
+      // otherwise we'd risk attributing a legitimate orphan subagent to the
+      // wrong main session. For non-project cwds, "wrong main session" is
+      // strictly better than "the plugin that hosts the script".
+      if (!parent && cwd && isNonProjectCwd(cwd)) {
+        let bestMatch = null;
+        let bestStart = -Infinity;
+        for (const [, s] of pendingSessions) {
+          if (s.parentSessionId) continue;
+          if (s.startedAt > bestStart) { bestStart = s.startedAt; bestMatch = s; }
+        }
+        if (bestMatch) { parent = bestMatch; parentResolution = 'most-recent-main'; }
+      }
+
       if (parent) {
         // Inherit parent's repo/branch but record the sub-agent's own cwd
         // (a sub-agent in a worktree has a distinct cwd; the dashboard
@@ -2565,15 +2631,28 @@ async function handleAPI(req, res) {
         branch = parent.branch;
         commitHash = parent.commitHash;
       } else if (cwd) {
-        try {
+        // Path (d): resolve from subagent's own cwd. Apply the non-project
+        // guard so plugin caches / system dirs fall through to sentinel.
+        if (isNonProjectCwd(cwd)) {
+          repo = '(non-project)';
+          log('tokens', `Subagent ${sessionId.slice(0, 8)}… cwd=${cwd} is non-project AND no parent resolvable — using (non-project) sentinel`);
+        } else {
           try {
-            repo = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
-          } catch {
-            repo = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
-          }
-          branch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
-          commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
-        } catch { /* not a git repo — keep sentinel `repo` */ }
+            try {
+              repo = _runGitCached(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim().replace(/\/\.git\/?$/, '');
+            } catch {
+              repo = _runGitCached(cwd, ['rev-parse', '--show-toplevel']).trim();
+            }
+            if (repo && isNonProjectCwd(repo)) {
+              repo = '(non-project)';
+            }
+            branch = _resolveWorktreeBranch(cwd, _runGitCached(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim());
+            commitHash = _runGitCached(cwd, ['rev-parse', '--short', 'HEAD']).trim();
+          } catch { /* not a git repo — keep sentinel `repo` */ }
+        }
+      }
+      if (parentResolution) {
+        log('tokens', `Subagent ${sessionId.slice(0, 8)}… parent resolved via ${parentResolution} → repo=${repo}`);
       }
       pendingSessions.set(sessionId, {
         repo,

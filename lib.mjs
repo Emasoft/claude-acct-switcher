@@ -996,6 +996,68 @@ export function shouldRefreshToken(expiresAt, bufferMs = 60 * 60 * 1000, now = D
 }
 
 /**
+ * Return true if `cwd` points inside a directory that is NEVER a real
+ * user project — system caches, plugin caches, temp dirs, package
+ * installation dirs, etc. Token-usage rows whose attribution would
+ * otherwise resolve to one of these paths are misleading because the
+ * SAME directory hosts code shared across many distinct CC sessions
+ * (e.g. ~/.claude/plugins/cache/<plugin>/ is referenced by every
+ * session that uses that plugin — attributing tokens to the plugin
+ * instead of the user's project hides who actually consumed them).
+ *
+ * Detection is conservative: only matches well-known system paths.
+ * Anything in $HOME outside the listed prefixes is still treated as
+ * a real project.
+ *
+ * @param {string} cwd absolute path to test (typically from a hook
+ *   payload's `cwd` field).
+ * @param {string} [home] override $HOME for testing
+ * @returns {boolean}
+ */
+export function isNonProjectCwd(cwd, home = process.env.HOME || '') {
+  if (typeof cwd !== 'string' || !cwd) return false;
+  // Normalise trailing slashes — `/foo/` and `/foo` are the same.
+  const norm = cwd.replace(/\/+$/, '');
+  // System / temp roots — never user projects.
+  const SYSTEM_PREFIXES = [
+    '/tmp/',
+    '/private/tmp/',
+    '/var/tmp/',
+    '/var/folders/',     // macOS per-user tmp under /var/folders/<X>/<Y>/T/
+    '/private/var/',
+    '/usr/',
+    '/opt/',
+  ];
+  for (const p of SYSTEM_PREFIXES) {
+    if (norm === p.replace(/\/$/, '') || norm.startsWith(p)) return true;
+  }
+  // node_modules anywhere in path — the package install lives there but
+  // the project isn't node_modules itself.
+  if (norm.includes('/node_modules/') || norm.endsWith('/node_modules')) {
+    return true;
+  }
+  // $HOME-relative caches — only if $HOME is known.
+  if (home && norm.startsWith(home + '/')) {
+    const HOME_PREFIXES = [
+      '/.claude/',         // CC's own state — sessions, plugins, settings
+      '/.npm/',
+      '/.cache/',
+      '/.local/share/',
+      '/.local/state/',
+      '/.config/',
+      '/Library/Caches/',  // macOS user caches
+      '/Library/Application Support/Code/',
+      '/Library/Application Support/Claude/',
+    ];
+    const tail = norm.slice(home.length);
+    for (const p of HOME_PREFIXES) {
+      if (tail === p.replace(/\/$/, '') || tail.startsWith(p)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Stronger "this refresh token is dead" detector than `shouldRefreshToken`.
  * Returns true ONLY when `expiresAt` is in the ACTUAL past (no buffer). The
  * 5-minute / 1-hour proactive-refresh buffer that `shouldRefreshToken` uses
