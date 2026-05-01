@@ -50,6 +50,9 @@ import {
   isUsageRow,
   buildCompactBoundaryEntry,
   mergeSessionAttribution,
+  // H4 regression — production refresh composition primitives
+  createPerAccountLock,
+  createSemaphore,
 } from '../lib.mjs';
 
 describe('OAuth refresh helpers (lib.mjs) against in-process mock OAuth server', () => {
@@ -715,5 +718,200 @@ describe('OAuth refresh retry-loop simulation', () => {
     assert.equal(parseRefreshResponse(500, 'oops').retriable, true);
     assert.equal(parseRefreshResponse(502, 'oops').retriable, true);
     assert.equal(parseRefreshResponse(503, 'oops').retriable, true);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// H4 — Production refresh composition (per-account lock + global semaphore)
+// ─────────────────────────────────────────────────
+//
+// Why this exists:
+//   The earlier `simulateRefreshLoop` tests cover the retry/backoff loop and
+//   the JSON request/response shape, but they DO NOT exercise the
+//   composition primitives that dashboard.mjs's `refreshAccountToken` wraps
+//   around the OAuth call:
+//
+//     refreshLock.withLock(account, () =>
+//       _refreshSem.run(() =>
+//         doRefresh()))
+//
+//   That nesting (per-account lock OUTSIDE, global semaphore INSIDE) is
+//   load-bearing:
+//     - lock-outside dedupes same-account concurrent refreshes — only the
+//       lock winner spends a semaphore slot, never two for the same name.
+//     - sem-inside caps total in-flight OAuth POSTs across DIFFERENT
+//       accounts, so the 400-recovery `Promise.allSettled(toRefresh.map(…))`
+//       fan-out can't fire 10+ parallel POSTs from one IP.
+//
+//   If a refactor accidentally swaps the nesting (sem outside lock), or
+//   drops one of the two layers, the production behaviour breaks silently
+//   — same-account dedup vanishes, or the global cap is bypassed. The
+//   tests below catch each failure mode against the in-process mock OAuth
+//   server.
+//
+//   We compose the primitives EXACTLY the same way refreshAccountToken
+//   does (lib.mjs createPerAccountLock + createSemaphore are the production
+//   implementations). We do NOT import refreshAccountToken itself —
+//   dashboard.mjs has no exports and starts servers + touches the macOS
+//   Keychain on import; isolating those side effects would require a
+//   structural refactor outside the scope of this test.
+
+describe('H4 — production refresh composition (lock + semaphore)', () => {
+  let mockServer, mockUrl;
+  let postCount = 0;
+  let inflightSeen = 0;
+  let maxInflight = 0;
+
+  before(async () => {
+    const mock = await createMockOAuthServer((req, res) => {
+      postCount++;
+      inflightSeen++;
+      if (inflightSeen > maxInflight) maxInflight = inflightSeen;
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        // Hold the response open briefly so concurrent POSTs overlap and
+        // the inflight counter actually reflects parallelism. Without the
+        // delay, fast localhost responses serialise before parallel
+        // callers ever see each other.
+        setTimeout(() => {
+          inflightSeen--;
+          let payload = {};
+          try { payload = JSON.parse(body); } catch {}
+          const rt = payload.refresh_token || '';
+          if (rt.startsWith('account-')) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              access_token: `at-for-${rt}-${postCount}`,
+              refresh_token: `rt-for-${rt}-${postCount}`,
+              expires_in: 28800,
+            }));
+            return;
+          }
+          if (rt === 'failing-rt') {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('boom');
+            return;
+          }
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_grant' }));
+        }, 30);
+      });
+    });
+    mockServer = mock.server;
+    mockUrl = mock.url;
+  });
+
+  after(async () => {
+    if (mockServer) await closeServer(mockServer);
+  });
+
+  // Helper: do ONE OAuth POST against the mock and return the parsed
+  // response. Mirrors the inner body of dashboard.mjs::callRefreshEndpoint
+  // (uses the same buildRefreshRequestBody + parseRefreshResponse pair).
+  async function doOneRefresh(refreshToken) {
+    const body = buildRefreshRequestBody(refreshToken);
+    const res = await fetch(`${mockUrl}/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    return parseRefreshResponse(res.status, await res.text());
+  }
+
+  // Helper: build the SAME wrapper dashboard.mjs uses around doRefresh.
+  // Returns { refreshAccount, lock, sem } so each test can introspect the
+  // primitives' diagnostics (_size, _inFlight, _pending).
+  function makeRefreshWrapper(maxConcurrent) {
+    const lock = createPerAccountLock();
+    const sem = createSemaphore(maxConcurrent);
+    function refreshAccount(name, refreshToken) {
+      return lock.withLock(name, () => sem.run(() => doOneRefresh(refreshToken)));
+    }
+    return { refreshAccount, lock, sem };
+  }
+
+  it('dedupes concurrent same-account refreshes (per-account lock)', async () => {
+    postCount = 0; inflightSeen = 0; maxInflight = 0;
+    const { refreshAccount } = makeRefreshWrapper(3);
+    // Five concurrent calls for SAME account → lock must serialise → mock
+    // sees five POSTs total (the lock serialises but does NOT collapse —
+    // each waiter gets its own keychain re-read in production), but they
+    // must NEVER overlap: maxInflight against the mock should be exactly 1.
+    const results = await Promise.all([
+      refreshAccount('alice', 'account-alice'),
+      refreshAccount('alice', 'account-alice'),
+      refreshAccount('alice', 'account-alice'),
+      refreshAccount('alice', 'account-alice'),
+      refreshAccount('alice', 'account-alice'),
+    ]);
+    assert.equal(results.every(r => r.ok), true, 'all five calls should succeed');
+    assert.equal(maxInflight, 1, 'per-account lock must prevent overlap for same account');
+    assert.equal(postCount, 5, 'each waiter calls the endpoint once after acquiring the lock');
+  });
+
+  it('parallelises concurrent different-account refreshes up to the semaphore cap', async () => {
+    postCount = 0; inflightSeen = 0; maxInflight = 0;
+    const SEM_CAP = 3;
+    const { refreshAccount } = makeRefreshWrapper(SEM_CAP);
+    // Eight concurrent calls for EIGHT distinct accounts → no per-account
+    // dedup, but the global semaphore must cap inflight at SEM_CAP.
+    const calls = [];
+    for (let i = 0; i < 8; i++) calls.push(refreshAccount(`acc${i}`, `account-${i}`));
+    const results = await Promise.all(calls);
+    assert.equal(results.every(r => r.ok), true, 'all eight calls should succeed');
+    assert.equal(postCount, 8, 'eight distinct accounts → eight OAuth POSTs');
+    assert.ok(maxInflight >= 2, `expected real parallelism (got maxInflight=${maxInflight})`);
+    assert.ok(maxInflight <= SEM_CAP, `semaphore cap violated: maxInflight=${maxInflight}, cap=${SEM_CAP}`);
+  });
+
+  it('releases the per-account lock when the refresh function throws', async () => {
+    postCount = 0; inflightSeen = 0; maxInflight = 0;
+    const { lock, sem } = makeRefreshWrapper(3);
+    // First call rejects synchronously inside the wrapped fn.
+    await assert.rejects(
+      lock.withLock('bob', () => sem.run(() => { throw new Error('synthetic refresh failure'); })),
+      /synthetic refresh failure/,
+    );
+    // Second call must NOT be wedged behind the failed first call.
+    const result = await lock.withLock('bob', () => sem.run(() => doOneRefresh('account-bob')));
+    assert.equal(result.ok, true, 'second call must proceed after first call released the lock');
+    assert.equal(sem._inFlight(), 0, 'semaphore must release on inner-fn throw');
+  });
+
+  it('releases the semaphore slot when the OAuth call rejects', async () => {
+    postCount = 0; inflightSeen = 0; maxInflight = 0;
+    const SEM_CAP = 2;
+    const { refreshAccount, sem } = makeRefreshWrapper(SEM_CAP);
+    // Saturate the semaphore with two failing calls, then verify a third
+    // call (different account) acquires the slot rather than hanging.
+    const fail1 = refreshAccount('carol', 'failing-rt');   // 500 → response
+    const fail2 = refreshAccount('dave',  'failing-rt');   // 500 → response
+    await Promise.all([fail1, fail2]);
+    assert.equal(sem._inFlight(), 0, 'both failing slots must release');
+    // Third call should succeed promptly.
+    const result = await refreshAccount('erin', 'account-erin');
+    assert.equal(result.ok, true);
+  });
+
+  it('per-account lock map evicts entries when no waiters remain', async () => {
+    const { refreshAccount, lock } = makeRefreshWrapper(3);
+    // Sequential call → lock entry created, then evicted when finally fires.
+    await refreshAccount('lock-evict-acct', 'account-lock-evict');
+    assert.equal(lock._size(), 0, 'lock map must drop entries with no chained waiters');
+  });
+
+  it('semaphore cap is honoured under burst-then-quiet load', async () => {
+    postCount = 0; inflightSeen = 0; maxInflight = 0;
+    const SEM_CAP = 4;
+    const { refreshAccount, sem } = makeRefreshWrapper(SEM_CAP);
+    // 16 distinct accounts in one burst → semaphore must keep inflight ≤ 4
+    // through the whole window.
+    const calls = [];
+    for (let i = 0; i < 16; i++) calls.push(refreshAccount(`burst-${i}`, `account-burst-${i}`));
+    await Promise.all(calls);
+    assert.ok(maxInflight <= SEM_CAP, `semaphore cap violated: maxInflight=${maxInflight}, cap=${SEM_CAP}`);
+    assert.equal(sem._inFlight(), 0, 'semaphore must drain to 0 after the burst');
+    assert.equal(sem._pending(), 0, 'semaphore pending queue must drain to 0');
   });
 });
