@@ -48,3 +48,7 @@ node_modules/
 # Janitor / rechecker plugin runtime state
 /.janitor/
 /.rechecker/
+
+# Stray output files from `tokf` typos / mishaps (e.g. `tokf raw 1` → `1tokf`)
+/1tokf
+/[0-9]*tokf
