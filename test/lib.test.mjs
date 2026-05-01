@@ -4892,3 +4892,83 @@ describe('Phase I+ — slash commands (UX-G2)', () => {
     }
   });
 });
+
+describe('Phase I+ — notification heuristics (batch 9)', () => {
+  const _src_n = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('NOTIFY_SUPPRESS_ALWAYS lists routine events', () => {
+    assert.match(_src_n, /NOTIFY_SUPPRESS_ALWAYS = new Set\(/);
+    // refresh / circuitClose / queue-depth-alert MUST be in the suppress
+    // set so they don't OS-notify on every tick.
+    assert.match(_src_n, /'refresh'/);
+    assert.match(_src_n, /'circuitClose'/);
+    assert.match(_src_n, /'queue-depth-alert'/);
+  });
+
+  it('NOTIFY_COALESCE batches switch + 400-recovery toasts', () => {
+    assert.match(_src_n, /NOTIFY_COALESCE = \{/);
+    assert.match(_src_n, /switch: \{ windowMs:/);
+    assert.match(_src_n, /'400-recovery':/);
+  });
+
+  it('_decideNotifyPolicy returns one of fire / suppress / coalesce', () => {
+    assert.match(_src_n, /function _decideNotifyPolicy\(eventType\)/);
+    // Must check suppress-list first, then high-priority, then coalesce.
+    assert.match(_src_n, /NOTIFY_SUPPRESS_ALWAYS\.has\(eventType\)/);
+    assert.match(_src_n, /NOTIFY_HIGH_PRIORITY\.has\(eventType\)/);
+    assert.match(_src_n, /NOTIFY_COALESCE\[eventType\]/);
+  });
+
+  it('notify() honours coalesce + emits a burst summary at window end', () => {
+    // The coalesce branch sets a setTimeout that emits a "burst summary"
+    // toast at end-of-window if more than maxInWindow events fired.
+    assert.match(_src_n, /vdm — burst summary/);
+  });
+});
+
+describe('Phase I+ — forensic event log + rotation (batch 9)', () => {
+  const _src_f = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('logForensicEvent appends JSON Lines to events.jsonl', () => {
+    assert.match(_src_f, /function logForensicEvent\(category, details\)/);
+    assert.match(_src_f, /JSON\.stringify\(entry\) \+ '\\n'/);
+    assert.match(_src_f, /flag: 'a', mode: 0o600/);
+  });
+
+  it('events.jsonl + startup.log rotate daily, 7-day retention', () => {
+    assert.match(_src_f, /EVENTS_RETENTION_DAYS = 7/);
+    assert.match(_src_f, /function _rotateForensicLog\(\)/);
+    assert.match(_src_f, /function _rotateStartupLog\(\)/);
+    // Both rotated files are gzipped at rotate time
+    assert.match(_src_f, /execFileSync\('gzip',/);
+  });
+
+  it('rotation timer runs every 6 hours after startup', () => {
+    assert.match(_src_f, /6 \* 60 \* 60 \* 1000/);
+    assert.match(_src_f, /_startLogRotationTimer\(\)/);
+  });
+
+  it('forensic events fire at every incident site', () => {
+    assert.match(_src_f, /logForensicEvent\('rate_limit'/);
+    assert.match(_src_f, /logForensicEvent\('auth_failure'/);
+    assert.match(_src_f, /logForensicEvent\('server_error'/);
+    assert.match(_src_f, /logForensicEvent\('client_disconnect'/);
+    assert.match(_src_f, /logForensicEvent\('queue_saturation'/);
+    assert.match(_src_f, /logForensicEvent\('inflight_escalation'/);
+    assert.match(_src_f, /logForensicEvent\('dashboard_start'/);
+  });
+
+  it('rate_limit forensic entry includes reset windows + retry-after + utilization', () => {
+    // The `headers[...]` lookups must extract every dimension we need
+    // to reconstruct the incident.
+    assert.match(_src_f, /'anthropic-ratelimit-unified-5h-reset'/);
+    assert.match(_src_f, /'anthropic-ratelimit-unified-7d-reset'/);
+    assert.match(_src_f, /'anthropic-ratelimit-unified-5h-utilization'/);
+  });
+});

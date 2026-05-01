@@ -523,6 +523,145 @@ function atomicWriteFileSync(filePath, content) {
   }
 }
 
+// ─────────────────────────────────────────────────
+// Forensic event log (events.jsonl) + log rotation
+// ─────────────────────────────────────────────────
+//
+// Per the Phase I+ user request: detailed enough to reconstruct rate
+// limits, bans, server errors, disconnects, queue saturation, and
+// inflight escalation events without ambiguity. Append-only JSON Lines
+// so jq / awk / grep / cut all work directly. One line per event;
+// each event carries a `category` plus a typed payload.
+//
+// File: ~/.claude/account-switcher/events.jsonl
+// Rotation: daily, keep 7 days. Active file is `events.jsonl`; daily
+// snapshots are `events.jsonl.YYYY-MM-DD.gz` (compressed at rotate
+// time). `events.jsonl` itself is mode 0o600 — same rationale as
+// every other state file (paths, fingerprints, error excerpts).
+//
+// Categories vdm currently emits:
+//   - rate_limit       — 429 from upstream (fingerprint + reset-at + retry-after)
+//   - auth_failure     — 401 from upstream (token expired / revoked)
+//   - server_error     — 5xx from upstream (status + error_type + body excerpt)
+//   - client_disconnect — SSE client closed mid-stream (bytes + duration)
+//   - queue_saturation — settings queue rejected request with queue_timeout
+//   - inflight_escalation — per-account inflight cap reached (queueing started)
+//   - circuit_open / circuit_close
+//   - refresh_success / refresh_failure
+//   - token_rotation   — keychain swap from one account to another
+const EVENTS_FILE = join(__dirname, 'events.jsonl');
+const EVENTS_RETENTION_DAYS = 7;
+const EVENTS_MAX_BYTES = 32 * 1024 * 1024; // 32 MiB rotate threshold (catches runaway days)
+
+// Lazy-initialised at first use so the file path is always relative
+// to the current __dirname even if the test harness moves it.
+let _eventsRotationTimer = null;
+
+function logForensicEvent(category, details) {
+  // Best-effort: a forensic logger that throws would defeat its
+  // purpose. Swallow every failure and continue.
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      category,
+      ...(details && typeof details === 'object' ? details : { detail: details }),
+    };
+    // appendFileSync with mode option creates the file with 0o600 if
+    // it doesn't exist. Existing file's mode is preserved.
+    let _appendFileSync;
+    try { _appendFileSync = require('node:fs').appendFileSync; } catch {}
+    if (_appendFileSync) {
+      try { _appendFileSync(EVENTS_FILE, JSON.stringify(entry) + '\n', { mode: 0o600 }); } catch {}
+    } else {
+      // ESM path — use the import we already have.
+      try { writeFileSync(EVENTS_FILE, JSON.stringify(entry) + '\n', { flag: 'a', mode: 0o600 }); } catch {}
+    }
+  } catch {}
+}
+
+// Daily rotation: any day older than EVENTS_RETENTION_DAYS is deleted.
+// Run at startup AND on a daily timer. Best-effort; never throws.
+function _rotateForensicLog() {
+  try {
+    if (!existsSync(EVENTS_FILE)) return;
+    const st = require('node:fs').statSync(EVENTS_FILE);
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const fileMtimeDay = st.mtime.toISOString().slice(0, 10);
+    const sizeOver = st.size >= EVENTS_MAX_BYTES;
+    // Rotate when:
+    //   (a) the active file is from a different day, OR
+    //   (b) it has exceeded the size budget for any single day.
+    if (fileMtimeDay !== today || sizeOver) {
+      const dayTag = sizeOver ? `${fileMtimeDay}-${process.pid}` : fileMtimeDay;
+      const rotated = `${EVENTS_FILE}.${dayTag}`;
+      try { renameSync(EVENTS_FILE, rotated); } catch {}
+      // Try to gzip the rotated file so old days don't bloat the
+      // install dir. Best-effort: if gzip is missing or busy, leave
+      // the plain .jsonl in place — still gets retention-pruned.
+      try {
+        execFileSync('gzip', ['-q', '-9', rotated], { timeout: 30_000, stdio: 'ignore' });
+      } catch {}
+    }
+  } catch {}
+  // Retention: remove files older than EVENTS_RETENTION_DAYS days.
+  try {
+    const dirEntries = readdirSync(__dirname);
+    const cutoff = Date.now() - EVENTS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    for (const f of dirEntries) {
+      // Match events.jsonl.YYYY-MM-DD(.gz)? or startup.log.YYYY-MM-DD(.gz)?
+      if (!/^(events\.jsonl|startup\.log)\.\d{4}-\d{2}-\d{2}/.test(f)) continue;
+      const fp = join(__dirname, f);
+      try {
+        const st = require('node:fs').statSync(fp);
+        if (st.mtimeMs < cutoff) {
+          try { unlinkSync(fp); } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+// Same rotation policy applied to startup.log so it doesn't grow
+// unbounded across uptime weeks. Active file is appended-to by the
+// nohup line that starts the dashboard; we just rotate-and-prune the
+// historical snapshots here.
+const STARTUP_LOG_FILE = join(__dirname, 'startup.log');
+function _rotateStartupLog() {
+  try {
+    if (!existsSync(STARTUP_LOG_FILE)) return;
+    const st = require('node:fs').statSync(STARTUP_LOG_FILE);
+    const today = new Date().toISOString().slice(0, 10);
+    const fileMtimeDay = st.mtime.toISOString().slice(0, 10);
+    const sizeOver = st.size >= EVENTS_MAX_BYTES;
+    if (fileMtimeDay !== today || sizeOver) {
+      const dayTag = sizeOver ? `${fileMtimeDay}-${process.pid}` : fileMtimeDay;
+      const rotated = `${STARTUP_LOG_FILE}.${dayTag}`;
+      try { renameSync(STARTUP_LOG_FILE, rotated); } catch {}
+      try {
+        execFileSync('gzip', ['-q', '-9', rotated], { timeout: 30_000, stdio: 'ignore' });
+      } catch {}
+      // Touch a fresh empty file so the next nohup append writes to
+      // the new active file (not the renamed one — Linux/macOS keep
+      // the open fd alive on rename, so the old logs would still
+      // accumulate if we didn't truncate).
+      try { writeFileSync(STARTUP_LOG_FILE, '', { mode: 0o600 }); } catch {}
+    }
+  } catch {}
+}
+
+// Schedule rotation at startup + every 6 hours. The 6h cadence catches
+// both "day boundary" rotations and any sudden-burst size-exceed cases.
+function _startLogRotationTimer() {
+  _rotateForensicLog();
+  _rotateStartupLog();
+  if (_eventsRotationTimer) clearInterval(_eventsRotationTimer);
+  _eventsRotationTimer = setInterval(() => {
+    try { _rotateForensicLog(); } catch {}
+    try { _rotateStartupLog(); } catch {}
+  }, 6 * 60 * 60 * 1000);
+  if (_eventsRotationTimer.unref) _eventsRotationTimer.unref();
+}
+
 // Run a `git -C <cwd> ...` command without invoking a shell. cwd is passed
 // as a separate argv element, so any character in it (including ;, |, &,
 // `, $, ", newline, single-quote, glob) is treated as a literal directory
@@ -1161,7 +1300,40 @@ const NOTIFY_THROTTLE_MS = 10_000;          // default throttle (per type)
 const NOTIFY_HIGH_PRIORITY = new Set([      // bypass throttling
   'exhausted', 'expired', 'circuitBreaker', 'refreshFailed',
 ]);
+// Notification policy (Phase I+ heuristic re-tightening):
+//   - SUPPRESS_ALWAYS: events that fire constantly during normal
+//     operation. Activity feed still records them; OS desktop alert
+//     stays silent. The user opted in to vdm; they don't need a toast
+//     every refresh / circuit-close / discovery-after-the-first.
+//   - COALESCE_WINDOW: events that ARE worth notifying about but only
+//     once per N seconds. e.g. account-switch in burst rate-limit
+//     storms — instead of N toasts, get one summary toast.
+//   - HIGH_PRIORITY (above): always fire, no coalescing.
+//
+// Goal: a typical user who installs vdm and uses it normally for a
+// week should see at most a handful of OS notifications — not one per
+// proxy event.
+const NOTIFY_SUPPRESS_ALWAYS = new Set([
+  'refresh',                  // routine background refresh — silent
+  'refresh-success',
+  'circuitClose',             // good news, no action needed
+  'config_change',            // user just toggled it themselves
+  'queue-depth-alert',        // already surfaced in activity feed + UI badge
+  'serialize-auto-disabled',  // surfaces in dashboard banner
+  'all429-burst',
+  'account-discovered-again', // only the FIRST discovery is worth a toast
+]);
+// COALESCE: type → { window_ms, max_in_window } — when more than
+// max_in_window OS-notifications of this type would fire within
+// window_ms, collapse into a single "(N more switches in last 5m)"
+// summary at the END of the window.
+const NOTIFY_COALESCE = {
+  switch: { windowMs: 300_000, maxInWindow: 1 },           // 1 toast per 5 min
+  '400-recovery': { windowMs: 600_000, maxInWindow: 1 },   // 1 per 10 min
+  worktree: { windowMs: 60_000, maxInWindow: 0 },          // never (activity-only)
+};
 const _lastNotifyAtByType = Object.create(null);
+const _coalesceState = Object.create(null);  // type → { count, firstAt, timer }
 
 function _isNotifyEnabled(eventType) {
   const n = settings.notifications;
@@ -1172,6 +1344,16 @@ function _isNotifyEnabled(eventType) {
     return !!n[eventType];
   }
   return n._default !== false; // default ON unless explicitly disabled
+}
+
+// _decideNotifyPolicy(eventType) → 'fire' | 'suppress' | 'coalesce'
+// Pure function (besides reading the always-suppress set). Lets us
+// unit-test the heuristic without booting any OS-notification backend.
+function _decideNotifyPolicy(eventType) {
+  if (NOTIFY_SUPPRESS_ALWAYS.has(eventType)) return 'suppress';
+  if (NOTIFY_HIGH_PRIORITY.has(eventType)) return 'fire';
+  if (NOTIFY_COALESCE[eventType]) return 'coalesce';
+  return 'fire';
 }
 
 // Detect available notification backends ONCE at startup so we don't
@@ -1241,17 +1423,50 @@ const _NOTIFY_BINARY = _NOTIFY_CHANNEL_INFO.path;
 function notify(title, message, eventType = '') {
   if (!_isNotifyEnabled(eventType)) return;
   const now = Date.now();
-  // High-priority events bypass throttling so a "switch" notification
-  // doesn't suppress a critical follow-up "exhausted" / "expired".
+  // Policy decision: fire / suppress / coalesce. The activity-log entry
+  // ALWAYS happens (so the dashboard feed remains canonical); only the
+  // OS-level desktop alert is filtered.
+  try { log('info', `[notify:${eventType || '?'}] ${title} — ${message}`); } catch {}
+
+  const policy = _decideNotifyPolicy(eventType);
+  if (policy === 'suppress') return;
+  if (policy === 'coalesce') {
+    const cfg = NOTIFY_COALESCE[eventType] || { windowMs: 300_000, maxInWindow: 1 };
+    let s = _coalesceState[eventType];
+    if (!s || (now - s.firstAt) > cfg.windowMs) {
+      // Window started: fire this notification, count subsequent ones.
+      s = _coalesceState[eventType] = { count: 1, firstAt: now, timer: null };
+      // Schedule a flush at end-of-window so any coalesced count gets
+      // a follow-up summary toast.
+      s.timer = setTimeout(() => {
+        const cur = _coalesceState[eventType];
+        if (cur && cur.count > 1) {
+          const dropped = cur.count - cfg.maxInWindow;
+          // Re-enter notify() with a synthetic title; the
+          // _coalesceState is cleared FIRST so this call doesn't
+          // re-coalesce itself.
+          delete _coalesceState[eventType];
+          if (dropped > 0) {
+            notify('vdm — burst summary', `${dropped} more "${eventType}" event(s) in the last ${Math.round(cfg.windowMs/60000)}min (see dashboard activity feed for detail)`, '_summary');
+          }
+        } else {
+          delete _coalesceState[eventType];
+        }
+      }, cfg.windowMs);
+      if (s.timer.unref) s.timer.unref();
+      // Fall through to actually fire this first one.
+    } else {
+      s.count++;
+      // Only the first cfg.maxInWindow fires; subsequent are silenced.
+      if (s.count > cfg.maxInWindow) return;
+    }
+  }
+  // Default 10s throttle still applies as a backstop for fire/coalesce.
   if (!NOTIFY_HIGH_PRIORITY.has(eventType)) {
     const last = _lastNotifyAtByType[eventType || '_'] || 0;
     if (now - last < NOTIFY_THROTTLE_MS) return;
   }
   _lastNotifyAtByType[eventType || '_'] = now;
-  // Always log to the activity feed regardless of channel — that's the
-  // canonical record of what was emitted, and the only thing visible
-  // when the GUI channel is unavailable (CI, headless server, etc.).
-  try { log('info', `[notify:${eventType || '?'}] ${title} — ${message}`); } catch {}
 
   if (_NOTIFY_CHANNEL === 'osascript' && _NOTIFY_BINARY) {
     try {
@@ -8179,6 +8394,18 @@ migrateAccountsToKeychain();
 // round-trip per banned account rediscovering bans we already had on disk.
 rehydrateAccountStateFromPersisted();
 
+// Phase I+ — start log rotation. Rotates events.jsonl + startup.log
+// at startup, then every 6h. 7-day retention; older snapshots get
+// unlinked. logForensicEvent() (defined above) writes to events.jsonl.
+_startLogRotationTimer();
+logForensicEvent('dashboard_start', {
+  pid: process.pid,
+  port: PORT,
+  proxyPort: PROXY_PORT,
+  nodeVersion: process.version,
+  vdmVersion: PROJECT_VERSION || 'unknown',
+});
+
 // Prune history entries that predate a known window reset
 (function pruneStaleHistory() {
   const nowSec = Math.floor(Date.now() / 1000);
@@ -8465,6 +8692,18 @@ function _tokenFromHeaders(headers) {
 async function acquireAccountPermit(fp) {
   const s = _slot(fp);
   if (s.inflight >= MAX_INFLIGHT_PER_ACCOUNT) {
+    // Forensic event — captures inflight escalation: when did queueing
+    // start, how many were in flight, how many waiters were ahead.
+    // Useful for "why did my prompt sit for 5 minutes" investigations.
+    try {
+      logForensicEvent('inflight_escalation', {
+        account_fp: fp,
+        inflight: s.inflight,
+        waiters: s.waiters.length,
+        cap: MAX_INFLIGHT_PER_ACCOUNT,
+        max_wait_ms: MAX_PERMIT_WAIT_MS,
+      });
+    } catch {}
     // Wait for a permit. Bounded so a wedged limiter cannot pin a request
     // forever — instead the await rejects and the caller surfaces a 504.
     await new Promise((resolve, reject) => {
@@ -10658,6 +10897,19 @@ async function _runStreamingContinuation(cont, clientRes) {
     // any of the three streams propagates to the others via destroy(), so
     // proxyRes is always destroyed when the chain ends — which fires its
     // 'close' event and reliably releases the permit.
+    // Track stream metrics for the forensic log entry that fires if
+    // the client disconnects mid-stream.
+    const _sseStartedAt = Date.now();
+    let _sseBytesOut = 0;
+    let _clientClosedEarly = false;
+    extractor.on('data', chunk => { _sseBytesOut += chunk.length; });
+    clientRes.on('close', () => {
+      // 'close' fires on graceful end too; only treat as early close
+      // if proxyRes hasn't ended yet.
+      if (proxyRes && proxyRes.readableEnded === false && !proxyRes.destroyed) {
+        _clientClosedEarly = true;
+      }
+    });
     await new Promise(resolve => {
       _streamPipeline(proxyRes, extractor, clientRes, () => {
         // Errors here are expected on client-abort; we don't surface them
@@ -10675,6 +10927,19 @@ async function _runStreamingContinuation(cont, clientRes) {
       try { log('debug', `extractor.finishParsing() failed: ${e.message}`); } catch {}
     }
     recordUsage(extractor.getUsage(), acctName);
+    // Forensic event — log mid-stream client disconnects so the user
+    // can investigate "why are my long Opus turns dropping". Records
+    // the bytes that DID make it through and the duration before close.
+    if (_clientClosedEarly) {
+      try {
+        logForensicEvent('client_disconnect', {
+          account_name: acctName,
+          bytes_streamed: _sseBytesOut,
+          duration_ms: Date.now() - _sseStartedAt,
+          partial_usage: extractor.getUsage(),
+        });
+      } catch {}
+    }
     setImmediate(() => {
       try {
         if (!settings.sessionMonitor) return;
@@ -10754,6 +11019,21 @@ const proxyServer = createServer((clientReq, clientRes) => {
     .catch(err => {
       if (err.message === 'queue_timeout') {
         log('warn', 'Request timed out in serialization queue');
+        // Forensic event — captures everything you'd want to know to
+        // reconstruct WHY the queue timed out: queue depth, in-flight
+        // count, and the configured timeout that was hit.
+        try {
+          const stats = (typeof getQueueStats === 'function') ? getQueueStats() : {};
+          logForensicEvent('queue_saturation', {
+            queued: stats.queued,
+            inflight: stats.inflight,
+            queueTimeoutMs: QUEUE_TIMEOUT_MS,
+            requestDeadlineMs: REQUEST_DEADLINE_MS,
+            serializeRequests: !!settings.serializeRequests,
+            serializeMaxConcurrent: settings.serializeMaxConcurrent || 1,
+            url: clientReq.url,
+          });
+        } catch {}
         // Safeguard A — feed the breaker. Trip + auto-disable serialize
         // when the count crosses threshold within window.
         try { _recordQueueTimeout(); } catch (e) {
@@ -11134,6 +11414,24 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     // ── 429: Rate limited → auto-switch (if enabled) ──
     if (status === 429) {
+      // Forensic event — captures everything you'd need to reconstruct
+      // a rate-limit incident: which account, which reset windows,
+      // what retry-after the server asked for, what error type.
+      try {
+        const fp = getFingerprintFromToken(token);
+        const headers = proxyRes.headers || {};
+        logForensicEvent('rate_limit', {
+          account_fp: fp,
+          account_name: acctName,
+          retry_after_raw: headers['retry-after'] || null,
+          ratelimit_5h_reset: headers['anthropic-ratelimit-unified-5h-reset'] || null,
+          ratelimit_7d_reset: headers['anthropic-ratelimit-unified-7d-reset'] || null,
+          ratelimit_5h_util: headers['anthropic-ratelimit-unified-5h-utilization'] || null,
+          ratelimit_7d_util: headers['anthropic-ratelimit-unified-7d-utilization'] || null,
+          ratelimit_status: headers['anthropic-ratelimit-unified-status'] || null,
+          url: clientReq.url,
+        });
+      } catch {}
       // Safeguard C — feed the all-accounts-429 breaker. Records by
       // FINGERPRINT (not name) so a rename mid-incident doesn't desync.
       // No-op if serialize is off.
@@ -11293,6 +11591,13 @@ async function handleProxyRequest(clientReq, clientRes) {
     // ── 401: Auth error → try refresh first, then fallback to switch ──
     if (status === 401) {
       log('switch', `${acctName} → 401 auth error`);
+      try {
+        logForensicEvent('auth_failure', {
+          account_fp: getFingerprintFromToken(token),
+          account_name: acctName,
+          url: clientReq.url,
+        });
+      } catch {}
 
       await drainResponse(proxyRes);
 
@@ -11635,6 +11940,15 @@ async function handleProxyRequest(clientReq, clientRes) {
     // ── 529: Overloaded → pass through, switching won't help ──
     if (status === 529) {
       log('info', `${acctName} → 529 overloaded (not switching  - server-side issue)`);
+      try {
+        logForensicEvent('server_error', {
+          account_fp: getFingerprintFromToken(token),
+          account_name: acctName,
+          status_code: 529,
+          error_type: 'overloaded_error',
+          url: clientReq.url,
+        });
+      } catch {}
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       clientRes.on('close', () => { proxyRes.destroy(); });
@@ -11644,6 +11958,19 @@ async function handleProxyRequest(clientReq, clientRes) {
       // duration. Returning a continuation lets the queue release at the
       // headers boundary; the body pipe runs OUTSIDE the queue.
       return { kind: 'pipe', proxyRes };
+    }
+
+    // Catch all OTHER 5xx responses for the forensic log.
+    if (status >= 500 && status !== 529) {
+      try {
+        logForensicEvent('server_error', {
+          account_fp: getFingerprintFromToken(token),
+          account_name: acctName,
+          status_code: status,
+          error_type: proxyRes.headers['anthropic-error-type'] || 'unknown',
+          url: clientReq.url,
+        });
+      } catch {}
     }
 
     // ── Any other response: success or client error → pipe through ──
