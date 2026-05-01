@@ -86,7 +86,11 @@ install_hooks() {
   # dashboard.mjs BEFORE sourcing this file, so the guard always passes
   # during a real install).
   if [ ! -x "$HOME/.claude/account-switcher/dashboard.mjs" ]; then
-    echo "install-hooks.sh: $HOME/.claude/account-switcher/dashboard.mjs not found — refusing to install hooks against a missing dashboard. Run install.sh from the source repo to (re)install vdm." >&2
+    # printf '%s\n' instead of echo: echo interprets backslash escapes
+    # under some shells (dash/POSIX) so a $HOME containing literal '\n'
+    # bytes (rare but possible on a misconfigured account) would render
+    # garbage. printf '%s' treats the path as opaque text.
+    printf 'install-hooks.sh: %s/.claude/account-switcher/dashboard.mjs not found — refusing to install hooks against a missing dashboard. Run install.sh from the source repo to (re)install vdm.\n' "$HOME" >&2
     return 1
   fi
   _install_claude_code_hooks

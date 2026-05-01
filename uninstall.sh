@@ -72,23 +72,136 @@ fi
 # Port priority: env CSW_PROXY_PORT > config.json > default 3334. Same
 # precedence install.sh uses (H6 fix), so re-running uninstall on a
 # customised-port install scans the right port without env override.
+#
+# SECURITY: every port-shaped value (env OR config.json) is validated
+# against the strict TCP port pattern below before being trusted. If
+# the env var is set but malformed (e.g. CSW_PROXY_PORT='3334.*' or
+# 'foo;bar'), we IGNORE it and fall back to the config / default rather
+# than passing the bogus value into grep regexes / kill commands /
+# user-facing paths. The validation also enforces the IANA range
+# (1..65535) so a typo like '0' or '70000' falls back too.
+_validate_port() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  return 0
+}
+
 _resolve_proxy_port_for_uninstall() {
-  if [[ -n "${CSW_PROXY_PORT:-}" ]]; then
+  if _validate_port "${CSW_PROXY_PORT:-}"; then
     printf '%s' "$CSW_PROXY_PORT"
     return
   fi
   if [[ -f "$INSTALL_DIR/config.json" ]] && declare -f _json_get_int >/dev/null 2>&1; then
     local _from_cfg
     _from_cfg="$(_json_get_int "$INSTALL_DIR/config.json" "proxyPort" 2>/dev/null || true)"
-    if [[ -n "$_from_cfg" && "$_from_cfg" =~ ^[1-9][0-9]+$ ]]; then
+    if _validate_port "$_from_cfg"; then
       printf '%s' "$_from_cfg"
       return
     fi
   fi
   printf '%s' "3334"
 }
+_resolve_dash_port_for_uninstall() {
+  if _validate_port "${CSW_PORT:-}"; then
+    printf '%s' "$CSW_PORT"
+    return
+  fi
+  if [[ -f "$INSTALL_DIR/config.json" ]] && declare -f _json_get_int >/dev/null 2>&1; then
+    local _from_cfg
+    _from_cfg="$(_json_get_int "$INSTALL_DIR/config.json" "port" 2>/dev/null || true)"
+    if _validate_port "$_from_cfg"; then
+      printf '%s' "$_from_cfg"
+      return
+    fi
+  fi
+  printf '%s' "3333"
+}
 _PROXY_PORT_RESOLVED="$(_resolve_proxy_port_for_uninstall)"
-_DASH_PORT_RESOLVED="${CSW_PORT:-3333}"
+_DASH_PORT_RESOLVED="$(_resolve_dash_port_for_uninstall)"
+
+# ── Python-backed file/process scanners (replace bash grep regex builds) ──
+#
+# The audit needs to count occurrences of `(http(s)?://)?(localhost|127.0.0.1):<port>`
+# across various files and process listings. Building those patterns in
+# bash via string interpolation makes the regex sensitive to the exact
+# bytes in $port — even with our port-validator (digits-only), there is
+# zero downside to also `re.escape()`-ing the port in Python and reading
+# the file via Python's open() with binary fallback. Defence-in-depth:
+# even if a future patch loosens the port validator, the Python helper
+# stays safe because it never passes unescaped input to a regex compiler.
+#
+# Both helpers accept the port as argv (NOT shell interpolation), so the
+# value transits as a literal Python string. Files are opened with
+# errors='replace' so a binary blob doesn't crash the helper.
+
+# Count occurrences of the proxy URL inside one file (or 0 on missing).
+_scan_file_for_proxy_url() {
+  local file="$1" port="$2"
+  python3 - "$file" "$port" <<'PYEOF' 2>/dev/null || printf '%s' 0
+import os, re, sys
+fp, port = sys.argv[1], sys.argv[2]
+if not os.path.isfile(fp):
+    print(0)
+    sys.exit(0)
+try:
+    with open(fp, 'r', errors='replace') as f:
+        body = f.read()
+except OSError:
+    print(0)
+    sys.exit(0)
+# Match optional scheme + (localhost|127.0.0.1) + ':' + the literal port
+# followed by a non-digit boundary so localhost:3334 doesn't match
+# localhost:33340. re.escape() neutralises any regex metachars in port.
+pattern = r'(?:https?://)?(?:localhost|127\.0\.0\.1):' + re.escape(port) + r'(?!\d)'
+print(len(re.findall(pattern, body)))
+PYEOF
+}
+
+# Count files in a directory whose contents reference the proxy URL.
+# Iterates the directory in Python so a shell glob can't be tricked
+# by filenames containing whitespace, control chars, or globs.
+_scan_dir_for_proxy_url_files() {
+  local dir="$1" port="$2"
+  python3 - "$dir" "$port" <<'PYEOF' 2>/dev/null || printf '%s' 0
+import os, re, sys
+dp, port = sys.argv[1], sys.argv[2]
+if not os.path.isdir(dp):
+    print(0)
+    sys.exit(0)
+pattern = re.compile(r'(?:https?://)?(?:localhost|127\.0\.0\.1):' + re.escape(port) + r'(?!\d)')
+hits = 0
+try:
+    for entry in os.listdir(dp):
+        if not entry.endswith('.sh'):
+            continue
+        full = os.path.join(dp, entry)
+        try:
+            with open(full, 'r', errors='replace') as f:
+                if pattern.search(f.read()):
+                    hits += 1
+        except OSError:
+            continue
+except OSError:
+    pass
+print(hits)
+PYEOF
+}
+
+# Count current-user processes whose env (visible via `ps eww`) carries
+# ANTHROPIC_BASE_URL pointing at our localhost:<port>. The ps output is
+# piped to Python where the pattern is built with re.escape(); bash
+# never sees the regex string.
+_scan_running_procs_for_proxy_url() {
+  local port="$1"
+  ps eww -u "$USER" 2>/dev/null | python3 - "$port" <<'PYEOF' 2>/dev/null || printf '%s' 0
+import re, sys
+port = sys.argv[1]
+pattern = re.compile(r'ANTHROPIC_BASE_URL=https?://(?:localhost|127\.0\.0\.1):' + re.escape(port) + r'(?!\d)')
+print(sum(1 for line in sys.stdin if pattern.search(line)))
+PYEOF
+}
 
 _UNINST_DIR_TOP="$(cd "$(dirname "$0")" && pwd -P 2>/dev/null || true)"
 COMMANDS_SRC_DIR=""
@@ -176,7 +289,10 @@ _run_full_audit() {
   # if `ANTHROPIC_BASE_URL=http://localhost:<port>` was captured in the
   # dump while vdm was installed, every PM2-managed process will keep
   # getting that env on every reboot until the dump is rewritten.
-  if [[ -f "$HOME/.pm2/dump.pm2" ]] && grep -q "localhost:${proxy_port}\b" "$HOME/.pm2/dump.pm2" 2>/dev/null; then
+  # Scan via Python (re.escape on port) — see _scan_file_for_proxy_url.
+  local _pm2_hits
+  _pm2_hits="$(_scan_file_for_proxy_url "$HOME/.pm2/dump.pm2" "$proxy_port")"
+  if [[ "${_pm2_hits:-0}" -gt 0 ]]; then
     LEFT_ARTIFACTS+=("$HOME/.pm2/dump.pm2 [carries ANTHROPIC_BASE_URL=http://localhost:${proxy_port} — PM2 will re-inject on every resurrect]")
     ENV_LEAK_SOURCES+=("pm2-dump")
   fi
@@ -186,27 +302,24 @@ _run_full_audit() {
   # inherit consistently. Snapshots taken while vdm was installed carry
   # the proxy URL until the snapshot is regenerated (next CC session
   # restart). Long-running CC sessions read these for sub-shells.
-  if [[ -d "$HOME/.claude/shell-snapshots" ]]; then
-    local _snap_count
-    # The "|| true" tolerates zero matches; "wc -l | tr -d ' '" gives a
-    # bare integer regardless of GNU/BSD wc spacing differences.
-    _snap_count=$(grep -lE "localhost:${proxy_port}\b" "$HOME/.claude/shell-snapshots/"*.sh 2>/dev/null | wc -l | tr -d ' ' || echo 0)
-    if [[ "${_snap_count:-0}" -gt 0 ]]; then
-      LEFT_ARTIFACTS+=("$HOME/.claude/shell-snapshots/ [${_snap_count} snapshot(s) reference localhost:${proxy_port}]")
-      ENV_LEAK_SOURCES+=("shell-snapshots")
-    fi
+  # Python iterates the directory entries — no shell glob expansion that
+  # could be tricked by filenames containing spaces or control chars.
+  local _snap_count
+  _snap_count="$(_scan_dir_for_proxy_url_files "$HOME/.claude/shell-snapshots" "$proxy_port")"
+  if [[ "${_snap_count:-0}" -gt 0 ]]; then
+    LEFT_ARTIFACTS+=("$HOME/.claude/shell-snapshots/ [${_snap_count} snapshot(s) reference localhost:${proxy_port}]")
+    ENV_LEAK_SOURCES+=("shell-snapshots")
   fi
 
   # NEW — Running processes carrying the stale env.
   # `ps eww` only shows env for processes the user owns; cross-user
-  # processes appear in the listing without env. Best-effort scan; the
-  # cleanup instructions explain this caveat. Using grep -c so an empty
-  # match returns 0 cleanly under set -e.
+  # processes appear in the listing without env. Best-effort scan;
+  # cleanup instructions explain this caveat. Python builds the regex
+  # via re.escape() so the port can never inject regex metachars even
+  # if a future patch loosens the validator.
   local _live_env_count=0
   if command -v ps >/dev/null 2>&1; then
-    _live_env_count=$(ps eww -u "$USER" 2>/dev/null \
-                        | grep -cE "ANTHROPIC_BASE_URL=https?://(localhost|127\.0\.0\.1):${proxy_port}\b" \
-                        || true)
+    _live_env_count="$(_scan_running_procs_for_proxy_url "$proxy_port")"
   fi
   if [[ "${_live_env_count:-0}" -gt 0 ]]; then
     LEFT_ARTIFACTS+=("${_live_env_count} running process(es) carry ANTHROPIC_BASE_URL=http://localhost:${proxy_port} in their env")
@@ -536,8 +649,13 @@ echo ""
 # Defaults match install.sh. The actual kill logic (graceful → port-bound
 # SIGTERM → cmdline pkill → drain → SIGKILL) lives in lib-install.sh's
 # _kill_running_vdm so install.sh and uninstall.sh share one implementation.
-_DASH_PORT="${CSW_PORT:-3333}"
-_PROXY_PORT="${CSW_PROXY_PORT:-3334}"
+#
+# Reuse the same VALIDATED resolved ports the audit uses
+# (_resolve_*_port_for_uninstall enforces TCP-port shape). Without this
+# both _kill_running_vdm and the audit could disagree on which port to
+# scan when CSW_*_PORT is set to a malformed value.
+_DASH_PORT="$_DASH_PORT_RESOLVED"
+_PROXY_PORT="$_PROXY_PORT_RESOLVED"
 
 if _kill_running_vdm "$_DASH_PORT" "$_PROXY_PORT"; then
   echo -e "  ${GREEN}✓${NC} Stopped dashboard/proxy"
