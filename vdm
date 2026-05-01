@@ -883,8 +883,46 @@ cmd_remove() {
     return 1
   fi
 
+  # Mirror the dashboard's safety check at /api/remove (dashboard.mjs:1712).
+  # Removing the saved-profile keychain entry of the CURRENTLY-active
+  # account effectively bricks auto-switch — the picker can't rotate
+  # AWAY from a token whose vdm-account-* is gone. Force the user to
+  # switch first, just like the dashboard UI does.
+  local _saved_creds _active_creds _saved_fp _active_fp
+  _saved_creds=$(read_account_keychain "$name" 2>/dev/null || true)
+  _active_creds=$(read_keychain 2>/dev/null || true)
+  if [[ -n "$_saved_creds" ]] && [[ -n "$_active_creds" ]]; then
+    _saved_fp=$(get_fingerprint "$_saved_creds" 2>/dev/null || true)
+    _active_fp=$(get_fingerprint "$_active_creds" 2>/dev/null || true)
+    if [[ -n "$_saved_fp" ]] && [[ "$_saved_fp" == "$_active_fp" ]]; then
+      echo -e "${RED}Cannot remove the active account.${NC} Switch to another account first:"
+      echo -e "    ${DIM}vdm switch <other-account>${NC}"
+      return 1
+    fi
+  fi
+
   delete_account_keychain "$name"
   rm -f -- "$ACCOUNTS_DIR/${name}.label"
+  # Drop matching entry from account-prefs.json so a re-added account with
+  # the same name does NOT inherit stale `excludeFromAuto` / `priority`
+  # flags. This mirrors the dashboard's /api/remove cleanup. Best-effort:
+  # if python3 is missing or the file is malformed, skip — the picker
+  # gracefully ignores prefs entries with no matching account.
+  local _prefs_file="$SCRIPT_DIR/account-prefs.json"
+  if [[ -f "$_prefs_file" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, os, sys
+p = sys.argv[1]; n = sys.argv[2]
+try:
+  d = json.load(open(p))
+  if isinstance(d, dict) and n in d:
+    del d[n]
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    os.replace(tmp, p)
+except Exception: pass
+' "$_prefs_file" "$name" 2>/dev/null || true
+  fi
   echo -e "${GREEN}✓${NC} Removed profile ${BOLD}$name${NC}"
 }
 
@@ -1094,7 +1132,21 @@ cmd_config() {
     activity-max-entries|activityMaxEntries) key="activityMaxEntries"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, serialize-max-concurrent, commit-tokens, session-monitor, per-tool-attribution, token-usage-max-age, token-usage-max-entries, activity-max-entries"
+      echo "  Available settings:"
+      echo "    proxy                       on|off       enable/disable the API proxy"
+      echo "    autoswitch                  on|off       auto-rotate accounts on rate limit"
+      echo "    notifications               on|off       desktop notification on switch"
+      echo "    rotation                    sticky|conserve|round-robin|spread|drain-first"
+      echo "    interval                    <seconds>    round-robin rotation interval"
+      echo "    serialize                   on|off       serialize all proxy requests"
+      echo "    serialize-delay             <ms>         delay between serialized requests"
+      echo "    serialize-max-concurrent    <1-16>       global concurrent in-flight cap"
+      echo "    commit-tokens               on|off       append Token-Usage trailer to commits"
+      echo "    session-monitor             on|off       BETA: track session timelines (sends prompts to Haiku)"
+      echo "    per-tool-attribution        on|off       per-tool token attribution (verbose)"
+      echo "    token-usage-max-age         <days>       prune token-usage rows older than N days"
+      echo "    token-usage-max-entries     <n>          cap token-usage rows by count"
+      echo "    activity-max-entries        <n>          cap activity log rows by count"
       return 1
       ;;
   esac

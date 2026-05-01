@@ -4451,3 +4451,143 @@ describe('Phase I — dashboard.mjs /health endpoint', () => {
     );
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Phase I+ — competitor-audit fixes
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — security/privacy hardening', () => {
+  const _dashboardSrc_audit = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('atomicWriteFileSync writes with mode 0o600', () => {
+    // SEC fix: state files contain emails, paths, fingerprints. The
+    // previous default-umask write left them mode 644 → world-readable
+    // on multi-user macOS. The mode option enforces 600 at file creation
+    // (no TOCTOU window between write and chmod).
+    assert.match(_dashboardSrc_audit, /writeFileSync\(tmpPath, content, \{ mode: 0o600 \}\)/);
+  });
+
+  it('atomicWriteFileSync cleans up .tmp on disk-full / EIO', () => {
+    // Without the unlinkSync(tmpPath) in the catch path, a chronically
+    // failing write would accumulate .tmp leftovers indefinitely.
+    assert.match(
+      _dashboardSrc_audit,
+      /catch \(e\) \{[\s\S]{0,80}unlinkSync\(tmpPath\)[\s\S]{0,80}throw e/,
+    );
+  });
+
+  it('auto-discover never uses console.log for dynamic content', () => {
+    // SEC fix: the three previous console.log call sites in auto-discover
+    // bypassed the _redactForLog pipeline and leaked email addresses
+    // into mode-644 startup.log. log() is the only correct path.
+    const autoDiscoverBlock = _dashboardSrc_audit.slice(
+      _dashboardSrc_audit.indexOf('_autoDiscoverAccountImpl'),
+      _dashboardSrc_audit.indexOf('// Auto-discover runs on proxy requests'),
+    );
+    assert.ok(autoDiscoverBlock.length > 0, 'auto-discover block must exist');
+    assert.equal(
+      /console\.log\(/.test(autoDiscoverBlock), false,
+      'console.log MUST NOT appear inside the auto-discover impl',
+    );
+  });
+
+  it('all three HTTP servers validate Host header (DNS-rebind defense)', () => {
+    // SEC fix: dashboard, proxy, and OTLP servers all need a Host check
+    // because GETs aren't covered by the Origin allow-list. _isLocalhostHost
+    // is the canonical guard.
+    assert.match(_dashboardSrc_audit, /function _isLocalhostHost\(host, expectedPort\)/);
+    // Three call sites — one per createServer block.
+    const matches = _dashboardSrc_audit.match(/_isLocalhostHost\(\w+\.headers\.host,/g) || [];
+    assert.ok(
+      matches.length >= 3,
+      `expected at least 3 _isLocalhostHost call sites (dashboard + proxy + OTLP); found ${matches.length}`,
+    );
+  });
+
+  it('Host check rejects spoofed prefixes (localhost.attacker.example etc.)', () => {
+    // The allow-list uses literal containment in a small array, not
+    // startsWith / regex. This regression test asserts the exact form.
+    assert.match(
+      _dashboardSrc_audit,
+      /allowed\.includes\(host\.toLowerCase\(\)\)/,
+    );
+  });
+
+  it('dashboard does not load Google Fonts', () => {
+    // Privacy: fetching Inter from Google Fonts on every page load leaks
+    // dashboard visit metadata to Google's edge.
+    assert.equal(
+      /fonts\.googleapis\.com/.test(_dashboardSrc_audit), false,
+      'fonts.googleapis.com MUST NOT appear in dashboard.mjs',
+    );
+    assert.equal(
+      /fonts\.gstatic\.com/.test(_dashboardSrc_audit), false,
+      'fonts.gstatic.com MUST NOT appear in dashboard.mjs',
+    );
+  });
+
+  it('Remove confirm dialog does not say "credentials FILE"', () => {
+    // UX: credentials moved out of files into the keychain ages ago.
+    // The dialog text was 3 versions stale.
+    assert.equal(
+      /deletes the saved credentials file/i.test(_dashboardSrc_audit), false,
+      'Remove dialog must not refer to "credentials FILE"',
+    );
+  });
+
+  it('"No accounts yet" empty-state has no double-space typo', () => {
+    // The previous text was "Code  - accounts" (two spaces before dash).
+    assert.equal(
+      /Code  - accounts/.test(_dashboardSrc_audit), false,
+      'No double-space-dash artifact in the empty-state copy',
+    );
+  });
+});
+
+describe('Phase I+ — reliability fixes', () => {
+  const _dashboardSrc_rel = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('Breaker C reads a.token (not a.accessToken)', () => {
+    // REL-1 fix: previous code read a.accessToken (undefined) → fingerprint
+    // null → knownFps always [] → breaker never trips. The structure has
+    // a.token at the top level; a.accessToken nests under a.creds.claudeAiOauth.
+    const breakerCBlock = _dashboardSrc_rel.slice(
+      _dashboardSrc_rel.indexOf('function _record429ForAccount'),
+      _dashboardSrc_rel.indexOf('function _record429ForAccount') + 4000,
+    );
+    assert.match(breakerCBlock, /\.map\(a => getFingerprintFromToken\(a\.token\)\)/);
+    assert.equal(
+      /\.map\(a => getFingerprintFromToken\(a\.accessToken\)\)/.test(breakerCBlock), false,
+      'must NOT use the broken a.accessToken field',
+    );
+  });
+
+  it('migrateAccountState propagates `expired` flag', () => {
+    // REL-3 fix: accountState.update always writes expired:false (no
+    // header signal). Without an explicit markExpired after the update,
+    // a token that was 401-expired before refresh would lose the flag
+    // and the picker would re-select it → infinite refresh loop.
+    const migBlock = _dashboardSrc_rel.slice(
+      _dashboardSrc_rel.indexOf('function migrateAccountState'),
+      _dashboardSrc_rel.indexOf('function migrateAccountState') + 1500,
+    );
+    assert.match(migBlock, /if \(oldState\.expired\) accountState\.markExpired\(newToken, name\)/);
+  });
+
+  it('refreshSweep fans out via Promise.allSettled (not serial await)', () => {
+    // REL-2 fix: serial for-await meant N expired tokens × ~17s each on
+    // wake from sleep blocked the user for minutes. _refreshSem caps
+    // upstream concurrency at 3 so allSettled is safe.
+    const sweepBlock = _dashboardSrc_rel.slice(
+      _dashboardSrc_rel.indexOf('async function refreshSweep'),
+      _dashboardSrc_rel.indexOf('async function refreshSweep') + 1500,
+    );
+    assert.match(sweepBlock, /Promise\.allSettled\(/);
+  });
+});

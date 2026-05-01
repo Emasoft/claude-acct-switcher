@@ -448,8 +448,24 @@ function migrateAccountsToKeychain() {
 // state file. Used for every state file whose corruption would lose data.
 function atomicWriteFileSync(filePath, content) {
   const tmpPath = filePath + '.tmp';
-  writeFileSync(tmpPath, content);
-  renameSync(tmpPath, filePath);
+  // SECURITY: state files under ~/.claude/account-switcher/ contain
+  // absolute paths, session IDs, account labels, fingerprints, and
+  // (for token-usage / activity-log) prompt-derived metadata. Default
+  // umask-derived 644 leaves them world-readable on multi-user macOS.
+  // Force 0o600 so other local users cannot harvest the metadata. Mode
+  // is applied at file CREATION via writeFileSync's mode option to avoid
+  // a TOCTOU window between create and chmod.
+  // Note: a 2nd-process race writing the same file is NOT defended here
+  // (Node sync writes don't yield to the event loop, so a single-process
+  // race is impossible; cross-process races require a file lock — see
+  // the dashboard-startup mutex). Cleanup the .tmp on disk-full / EIO.
+  try {
+    writeFileSync(tmpPath, content, { mode: 0o600 });
+    renameSync(tmpPath, filePath);
+  } catch (e) {
+    try { unlinkSync(tmpPath); } catch {}
+    throw e;
+  }
 }
 
 // Run a `git -C <cwd> ...` command without invoking a shell. cwd is passed
@@ -929,7 +945,11 @@ async function _autoDiscoverAccountImpl() {
         writeAccountKeychain(savedName, creds);
         const oldFp = getFingerprint(saved);
         migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
-        console.log(`[auto-discover] Updated "${savedName}" with refreshed token (same refreshToken)`);
+        // log() routes through _redactForLog (line 7508); console.log
+        // bypasses the redactor and leaks dynamic content (savedName,
+        // email, etc.) into mode-644 startup.log. Keep all dynamic fields
+        // out of console.log forever.
+        log('info', `[auto-discover] Updated "${savedName}" with refreshed token (same refreshToken)`);
         if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
         invalidateTokenCache();
         return;
@@ -944,7 +964,7 @@ async function _autoDiscoverAccountImpl() {
           // Migrate persisted state / history from old fingerprint to new
           const oldFp = getFingerprint(saved);
           migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
-          console.log(`[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
+          log('info', `[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
           if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
           invalidateTokenCache(); // ensure getActiveToken() sees the updated token
           return;
@@ -966,7 +986,7 @@ async function _autoDiscoverAccountImpl() {
   // Cap auto-discovered accounts to prevent runaway creation during error spirals
   const MAX_AUTO_ACCOUNTS = 5;
   if (idx > MAX_AUTO_ACCOUNTS) {
-    console.log(`[auto-discover] Skipping — already ${idx - 1} auto accounts (max ${MAX_AUTO_ACCOUNTS})`);
+    log('info', `[auto-discover] Skipping — already ${idx - 1} auto accounts (max ${MAX_AUTO_ACCOUNTS})`);
     return;
   }
 
@@ -981,7 +1001,7 @@ async function _autoDiscoverAccountImpl() {
 
   const displayName = email || name;
   logActivity('account-discovered', { name, label: displayName });
-  console.log(`[auto-discover] New account saved as "${name}" (${displayName})`);
+  log('info', `[auto-discover] New account saved as "${name}" (${displayName})`);
 
   // Invalidate caches so the proxy picks it up
   if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
@@ -2919,9 +2939,12 @@ function renderHTML() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Van Damme-o-Matic</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- vdm intentionally uses the OS system-ui stack instead of fetching
+     Inter from Google Fonts. The previous preconnect+stylesheet pair
+     leaked the dashboard visit (IP, User-Agent, timing) to Google's
+     edge on every page load, contradicting the project's
+     zero-dependency / privacy-first stance and breaking the dashboard
+     for users behind captive portals or strict outbound-proxy SOCs. -->
 <style>
   :root {
     --bg: hsl(220 14% 96%);
@@ -2955,7 +2978,7 @@ function renderHTML() {
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     background: var(--bg);
     color: var(--foreground);
     min-height: 100vh;
@@ -5064,7 +5087,7 @@ async function doSwitch(name, displayName, e) {
 
 async function doRemove(name, e) {
   if (e) e.stopPropagation();
-  if (!confirm('Remove account "' + name + '"? This deletes the saved credentials file.')) return;
+  if (!confirm('Remove account "' + name + '"? This removes the saved keychain entry (vdm-account-' + name + ') and its label. The active Claude Code-credentials entry is not touched.')) return;
   try {
     const resp = await fetch('/api/remove', {
       method: 'POST',
@@ -5521,7 +5544,7 @@ function _safeIdForName(name) {
 function renderAccounts(profiles, animate) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
-    el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code  - accounts are auto-discovered.</div>';
+    el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>claude login</code> in your terminal — vdm auto-discovers each account on the next API call.</div>';
     _renderedCardCache.clear();
     return;
   }
@@ -7320,8 +7343,37 @@ function _isOriginAllowed(origin) {
   return _getAllowedOrigins().has(origin);
 }
 
+// SECURITY: Host-header allow-list for DNS-rebinding defense. The
+// previous Origin allow-list only fires on mutating requests, leaving
+// every GET (`/api/profiles` returns emails+fingerprints; `/api/sessions`
+// returns prompt excerpts; `/api/logs/stream` is a live SSE feed) exposed
+// to a malicious local web page that DNS-rebinds attacker.example to
+// 127.0.0.1. The browser treats the iframe as same-origin to attacker.example
+// AND lets attacker JS hit `/api/profiles` once the rebind takes effect.
+// Validating Host: shuts that path because the browser sends Host: attacker.example
+// even after the IP rebinds — only literal localhost / 127.0.0.1 / [::1]
+// pass. Applied to dashboard, proxy, and OTLP servers.
+function _isLocalhostHost(host, expectedPort) {
+  if (typeof host !== 'string' || !host) return false;
+  // Accept `localhost`, `127.0.0.1`, `[::1]` (IPv6 bracketed) on the
+  // configured port. Reject everything else, including spoofed Hosts that
+  // happen to start with localhost (e.g. localhost.attacker.example).
+  const allowed = [
+    `localhost:${expectedPort}`,
+    `127.0.0.1:${expectedPort}`,
+    `[::1]:${expectedPort}`,
+  ];
+  return allowed.includes(host.toLowerCase());
+}
+
 const server = createServer(async (req, res) => {
   try {
+    // DNS-rebind defense — see comment above.
+    if (!_isLocalhostHost(req.headers.host, PORT)) {
+      res.writeHead(421, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'misdirected request: invalid Host header' }));
+      return;
+    }
     // CORS — same-host allow-list, NOT wildcard. Browser CSRF guard.
     const origin = req.headers.origin || '';
     if (origin && _getAllowedOrigins().has(origin)) {
@@ -8538,6 +8590,14 @@ function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
       'anthropic-ratelimit-unified-5h-reset': String(oldState.resetAt || 0),
       'anthropic-ratelimit-unified-7d-reset': String(oldState.resetAt7d || 0),
     });
+    // BUG FIX: accountState.update(...) always sets `expired: false` because
+    // there is no header-derived expiry signal — the response above only
+    // covers `limited`. Without the explicit markExpired below, a token
+    // that was 401-expired BEFORE refresh would have its `expired` flag
+    // silently dropped during migration. The picker would then re-select
+    // the (still-expired) token, get another 401, and loop until the
+    // circuit breaker opens. Mirror the `limited` path for `expired`.
+    if (oldState.expired) accountState.markExpired(newToken, name);
     accountState.remove(oldToken);
   }
 
@@ -8769,25 +8829,36 @@ _queueDepthPollTimer.unref?.();
 
 async function refreshSweep(label = 'refresh-bg') {
   const accounts = loadAllAccountTokens();
+  // Decide which accounts are due for refresh BEFORE dispatching, so we
+  // can fan out via Promise.allSettled. The serial `for...await` form
+  // (pre-fix) made wake-from-sleep painful: with N expired tokens and
+  // ~17 s worst-case per OAuth refresh (1 connect + 3 retries × ~5 s
+  // each), N=5 → 85 s end-to-end before ANY healthy account is usable.
+  // The OAuth client itself is bounded by `_refreshSem` (cap 3) so this
+  // does NOT issue more than 3 concurrent refreshes against the
+  // upstream — it just stops blocking accounts 2..N behind account 1.
+  const dueAccounts = [];
   for (const acct of accounts) {
-    if (shouldRefreshToken(acct.expiresAt, REFRESH_BUFFER_MS)) {
-      const prior = refreshFailures.get(acct.name);
-      if (prior && !prior.retriable) {
-        if (Date.now() - prior.ts < REFRESH_FAILURE_TTL) continue;
-        // TTL expired — retry
-        log(label, `${acct.label || acct.name}: retrying after non-retriable failure (${Math.round((Date.now() - prior.ts) / 60000)}m ago)`);
-      }
-      log(label, `${acct.label || acct.name}: token near expiry, refreshing...`);
-      try {
-        await refreshAccountToken(acct.name);
-      } catch (e) {
-        log(label, `${acct.label || acct.name}: background refresh error: ${e.message}`);
-        const failFp = getFingerprintFromToken(acct.token);
-        refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now(), fp: failFp });
-        logActivity('refresh-failed', { account: acct.label || acct.name, error: e.message, retriable: true });
-      }
+    if (!shouldRefreshToken(acct.expiresAt, REFRESH_BUFFER_MS)) continue;
+    const prior = refreshFailures.get(acct.name);
+    if (prior && !prior.retriable) {
+      if (Date.now() - prior.ts < REFRESH_FAILURE_TTL) continue;
+      // TTL expired — retry
+      log(label, `${acct.label || acct.name}: retrying after non-retriable failure (${Math.round((Date.now() - prior.ts) / 60000)}m ago)`);
     }
+    log(label, `${acct.label || acct.name}: token near expiry, refreshing...`);
+    dueAccounts.push(acct);
   }
+  await Promise.allSettled(dueAccounts.map(async (acct) => {
+    try {
+      await refreshAccountToken(acct.name);
+    } catch (e) {
+      log(label, `${acct.label || acct.name}: background refresh error: ${e.message}`);
+      const failFp = getFingerprintFromToken(acct.token);
+      refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now(), fp: failFp });
+      logActivity('refresh-failed', { account: acct.label || acct.name, error: e.message, retriable: true });
+    }
+  }));
 }
 
 // Run immediately on startup (handles expired tokens after sleep/restart)
@@ -9012,8 +9083,16 @@ function _record429ForAccount(fingerprint) {
   // on than auto-disable on a transient keychain error).
   let knownFps;
   try {
+    // BUG FIX: was a.accessToken (undefined on every account object)
+    // → getFingerprintFromToken(undefined) returned null → knownFps was
+    // always [] after the .filter(Boolean) → the early return at the
+    // empty-knownFps check fired unconditionally, so this safeguard had
+    // never been able to trip in production. loadAllAccountTokens() emits
+    // objects with `.token` (the access token string); the OAuth blob
+    // also lives at `.creds.claudeAiOauth.accessToken`. Every other
+    // call site uses `a.token`. See lib.mjs for the source-of-truth shape.
     knownFps = loadAllAccountTokens()
-      .map(a => getFingerprintFromToken(a.accessToken))
+      .map(a => getFingerprintFromToken(a.token))
       .filter(Boolean);
   } catch {
     return;
@@ -10357,6 +10436,18 @@ async function _runStreamingContinuation(cont, clientRes) {
 // ── Proxy server ──
 
 const proxyServer = createServer((clientReq, clientRes) => {
+  // DNS-rebind defense — same rationale as on the dashboard server.
+  // The proxy receives ALL Anthropic API traffic, including request
+  // bodies that contain the user's prompts. A rebinding attacker could
+  // POST to localhost:3334/v1/messages with their own bearer to steal
+  // tokens, or read responses via SSE. Reject non-localhost Hosts up
+  // front; legitimate Claude Code traffic always sends Host: localhost:<port>
+  // because ANTHROPIC_BASE_URL is http://localhost:<port>.
+  if (!_isLocalhostHost(clientReq.headers.host, PROXY_PORT)) {
+    clientRes.writeHead(421, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ error: 'misdirected request: invalid Host header' }));
+    return;
+  }
   // Health checks bypass the serialization queue
   if (clientReq.method === 'GET' && clientReq.url === '/health') {
     handleProxyRequest(clientReq, clientRes).catch(err => {
@@ -11532,6 +11623,15 @@ function _appendOtelMetrics(records) {
 let _otlpServer = null;
 if (OTEL_ENABLED) {
   const otlpServer = createServer(async (req, res) => {
+    // DNS-rebind defense — same rationale as the dashboard / proxy
+    // servers. The OTLP receiver buffers Claude Code telemetry which
+    // can include `claude_code.user_prompt` events with prompt text
+    // when OTEL_LOG_USER_PROMPTS=1. Reject any non-localhost Host.
+    if (!_isLocalhostHost(req.headers.host, OTLP_PORT)) {
+      res.writeHead(421, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'misdirected request: invalid Host header' }));
+      return;
+    }
     // Only handle the two endpoints we care about; everything else 404s.
     const u = new URL(req.url, `http://localhost:${OTLP_PORT}`);
     const isLogs = u.pathname === '/v1/logs';
