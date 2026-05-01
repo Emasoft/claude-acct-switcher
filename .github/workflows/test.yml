@@ -1,0 +1,57 @@
+name: test
+
+# Runs on every push to main + every PR. Per the project's audit response,
+# the absence of CI was a competitor takedown angle — even a basic
+# bash-syntax + node-test gate raises the floor materially.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax-and-tests:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Bash syntax check (every shell file)
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n install-hooks.sh
+          bash -n lib-install.sh
+          bash -n vdm
+
+      - name: Node parse check (dashboard.mjs + lib.mjs)
+        run: |
+          node --check dashboard.mjs
+          node --check lib.mjs
+
+      - name: Run unit tests
+        run: node --test test/lib.test.mjs test/api.test.mjs
+        env:
+          # Tests must never reach real Anthropic / OAuth endpoints —
+          # the api.test.mjs suite spins up an in-process mock OAuth
+          # server. CI has no network reach, so any test that tries a
+          # live call would fail loud here.
+          OAUTH_TOKEN_URL: http://127.0.0.1:0/never

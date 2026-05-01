@@ -92,6 +92,19 @@ fi
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/lib-install.sh"
 
+# UX-A6 fix — abort on non-Darwin BEFORE acquiring the install lock.
+# vdm uses the macOS Keychain as its credential store; a Linux user who
+# runs `./install.sh` to "see what happens" should get a clean error
+# message immediately, not a lock dir created in their home that
+# subsequent runs trip on if cleanup ever leaks. The full check moves
+# below into the standard prerequisites block; this is just the
+# fast-fail gate.
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo -e "${RED}vdm requires macOS (uses the macOS Keychain for credential storage).${NC}" >&2
+  echo "  Detected: $(uname). vdm will not work on this platform." >&2
+  exit 1
+fi
+
 # Wire up signal-safe cleanup BEFORE acquiring any lock or writing
 # anything. INT/TERM/HUP/EXIT all flow through _run_cleanup which
 # pops the cleanup stack in LIFO order. Without this, ^C between

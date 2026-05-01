@@ -1396,7 +1396,20 @@ cmd_dashboard() {
 }
 
 cmd_upgrade() {
-  local REPO_URL="https://github.com/loekj/claude-acct-switcher.git"
+  # Resolve the upgrade URL in this priority order:
+  #   1. $VDM_UPGRADE_URL — explicit override (CI / fork users)
+  #   2. The `origin` remote of the source repo this install came from,
+  #      if SCRIPT_DIR is itself a git checkout.
+  #   3. The Emasoft canonical fork (active fork; previous hardcoded
+  #      `loekj/` URL silently rolled active-fork users back to upstream
+  #      on every upgrade — see audit DOC-1).
+  local REPO_URL="${VDM_UPGRADE_URL:-}"
+  if [[ -z "$REPO_URL" ]] && [[ -d "$SCRIPT_DIR/.git" ]]; then
+    REPO_URL="$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)"
+  fi
+  if [[ -z "$REPO_URL" ]]; then
+    REPO_URL="https://github.com/Emasoft/claude-acct-switcher.git"
+  fi
   local tmpdir
   tmpdir=$(mktemp -d)
   # Ensure cleanup on any exit from this function
@@ -1404,12 +1417,14 @@ cmd_upgrade() {
 
   echo ""
   echo -e "${BOLD}  Upgrading Van Damme-o-Matic…${NC}"
+  echo -e "  ${DIM}Source: $REPO_URL${NC}"
   echo ""
 
   # Fetch latest from remote
   echo -e "  ${DIM}Fetching latest version…${NC}"
   if ! git clone --depth 1 "$REPO_URL" "$tmpdir" 2>/dev/null; then
     echo -e "  ${RED}Failed to fetch from $REPO_URL${NC}"
+    echo -e "  ${DIM}Override the upgrade URL with: ${CYAN}VDM_UPGRADE_URL=https://github.com/<owner>/<repo>.git vdm upgrade${NC}"
     return 1
   fi
   # Shallow clone may miss tags — fetch them explicitly
