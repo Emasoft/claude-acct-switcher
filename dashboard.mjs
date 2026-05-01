@@ -151,6 +151,14 @@ const DEFAULT_SETTINGS = {
   // Default ON. Set false to disable JUST this safeguard while still
   // keeping the auto-disable safeguards above active.
   serializeAutoEnableEnabled: true,
+  // OAuth bypass mode — when ALL saved accounts have permanently
+  // revoked refresh tokens (3+ invalid_grant/etc. failures spread over
+  // 1h), stop trying to rotate and just forward requests transparently
+  // with whatever the keychain currently has. Notifies the user once
+  // with HIGH_PRIORITY ("Run `claude login`"). Auto-exits the moment
+  // any account responds 200. Default ON. Set false ONLY if you want
+  // vdm to keep churning rotation attempts even when nothing works.
+  oauthBypassEnabled: true,
   // Breaker A — N queue_timeout 503s within window → auto-disable.
   // Defaults: 5 trips within 10 min. Conservative — a healthy serialize
   // run won't hit any queue_timeout 503 (the queue timeout default of
@@ -829,6 +837,9 @@ import {
   vdmAccountServiceName,
   vdmAccountNameFromService,
   VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
+  // Phase I+ — bypass mode (all accounts revoked → transparent forward)
+  isOAuthRevocationError,
+  areAllAccountsTerminallyDead,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -2221,8 +2232,11 @@ async function handleAPI(req, res) {
     }
     if (typeof patch.serializeRequests === 'boolean') {
       settings.serializeRequests = patch.serializeRequests;
-      // If turning off, drain queued requests immediately
-      if (!patch.serializeRequests) drainSerializationQueue();
+      // If turning off, drain queued requests progressively so a
+      // backlog doesn't flood Anthropic in one millisecond and trip
+      // an immediate rate-limit cascade. Cadence defaults to the
+      // user's configured serializeDelayMs (≥250ms floor).
+      if (!patch.serializeRequests) progressivelyDrainSerializationQueue('user-toggle-off');
     }
     if (typeof patch.serializeDelayMs === 'number' && patch.serializeDelayMs >= 0 && patch.serializeDelayMs <= 2000) {
       settings.serializeDelayMs = patch.serializeDelayMs;
@@ -6162,6 +6176,10 @@ function evtMsg(e) {
     case 'serialize-auto-disabled': return '<b>Serialize auto-disabled</b>: ' + h(e.reason || '?') + (e.count ? ' (count=' + h(String(e.count)) + ')' : '') + (e.accountCount ? ' (' + h(String(e.accountCount)) + ' accounts)' : '');
     case 'serialize-auto-enabled': return '<b>Serialize auto-enabled</b>: ' + h(e.reason || '?') + (e.account ? ' (' + h(e.account) + ')' : '') + (e.revert_after_quiet_min ? ' — auto-revert after ' + h(String(e.revert_after_quiet_min)) + 'min quiet' : '');
     case 'serialize-auto-reverted': return '<b>Serialize auto-reverted</b>: ' + h(String(e.quiet_min || '?')) + 'min of no rate-limits';
+    case 'serialize-progressive-drain-start': return '<b>Serialize disengaging</b> (' + h(e.reason || '?') + ') — progressive drain of ' + h(String(e.queued || '?')) + ' queued at ' + h(String(Math.round(1000 / (e.interval_ms || 250)))) + '/s';
+    case 'serialize-progressive-drain-end': return '<b>Serialize drain ' + (e.cancelled ? 'cancelled' : 'complete') + '</b>: released ' + h(String(e.released || '0')) + '/' + h(String(e.initial_queued || '?')) + ' (' + h(e.reason || '?') + ')';
+    case 'oauth-bypass-enabled': return '<b>OAuth bypass mode</b>: ' + h(e.reason || 'all accounts revoked') + ' — proxy now passes requests transparently. Run <code>claude login</code> to recover.';
+    case 'oauth-bypass-disabled': return '<b>OAuth bypass exited</b>: ' + h(e.reason || 'recovery') + (e.duration_min ? ' (was in bypass for ' + h(String(e.duration_min)) + 'min)' : '');
     case 'queue-depth-alert': return '<b>Queue depth alert</b>: ' + h(String(e.queued || '?')) + ' queued (≥' + h(String(e.threshold || '?')) + ') for ' + h(String(e.sustainedSeconds || '?')) + 's';
     // C4 fallthrough — events whose detail came in as a string get a .msg
     // field via logActivity's coercion. Surface that to the user. If only
@@ -8441,6 +8459,26 @@ const _sparkCache = {};
 
 function updateAccountState(token, name, headers, fingerprint) {
   accountState.update(token, name, headers);
+  // Stamp last-success timestamp + clear any prior revocation strikes
+  // — these feed the all-accounts-dead detector. Every 200 from
+  // Anthropic is unambiguous proof the token is alive, so we erase
+  // any speculation that built up from earlier refresh failures.
+  try {
+    const prev = accountState.get(token) || {};
+    // Reuse the state-set primitive via a follow-up update — the
+    // accountState API doesn't expose direct field setters, so we
+    // hide the field on the existing entry by re-running .update
+    // with an extra header-shaped tag. Cleaner to mutate prev in
+    // place since accountState.update already ran above and the
+    // returned object reference is held in the Map.
+    prev.lastSuccessAtMs = Date.now();
+  } catch {}
+  try { accountState.clearPermanentRevocation(token); } catch {}
+  // If we were in bypass mode and just got a 200, that means SOMEONE'S
+  // token works. Re-evaluate so we exit bypass on the next path through.
+  if (_oauthBypassMode) {
+    try { _evaluateBypassMode(); } catch {}
+  }
   if (fingerprint) {
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization'] || '0');
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization'] || '0');
@@ -9248,6 +9286,25 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
         log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
         refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
         logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
+        // Bypass-mode trigger: classify the error. If it's a revocation
+        // (invalid_grant / unauthorized_client / invalid_client /
+        // access_denied), record one strike against this account. After
+        // 3 strikes spread over 1 hour, isPermanentlyRevoked() flips
+        // permanentlyRevoked=true. Then evaluate whether ALL accounts
+        // are now terminally dead → enter bypass mode.
+        if (!result.retriable && isOAuthRevocationError(result.error)) {
+          try {
+            accountState.recordPermanentRefreshFailure(oldToken, accountName);
+            // Calling isPermanentlyRevoked has the side effect of
+            // flipping the flag if the threshold is crossed.
+            accountState.isPermanentlyRevoked(oldToken);
+          } catch (e) {
+            log('warn', `recordPermanentRefreshFailure failed: ${e.message}`);
+          }
+          try { _evaluateBypassMode(); } catch (e) {
+            log('warn', `_evaluateBypassMode failed: ${e.message}`);
+          }
+        }
         if (!result.retriable) {
           notify(
             'Token Refresh Failed',
@@ -9257,6 +9314,12 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
         }
         return { ok: false, error: result.error };
       }
+      // Successful refresh — clear any prior revocation strikes against
+      // the OLD token (the new token gets its own clean state via the
+      // migrateAccountState call further down). If we were in bypass
+      // mode and any account just refreshed successfully, exit bypass.
+      try { accountState.clearPermanentRevocation(oldToken); } catch {}
+      try { _evaluateBypassMode(); } catch {}
 
       // 5. Build new credentials and write to the keychain
       const newExpiresAt = result.expiresIn
@@ -9470,8 +9533,51 @@ function getQueueStats() {
   };
 }
 
-function drainSerializationQueue() {
-  _serializationQueue.drain();
+// Progressive drain — used by every "serialize is turning OFF" path
+// (user toggle, Breakers A/C auto-disable, Safeguard D auto-revert)
+// so a backlog of pending payloads doesn't hit Anthropic in one
+// microsecond and trigger an immediate rate-limit cascade. The
+// dispatch cadence defaults to whatever serializeDelayMs was tuned
+// to (so we never drain faster than the user's chosen rate); falls
+// back to 250ms = 4 RPS, which is below tier-1's ~50 RPM sustained
+// limit and therefore safe for any account tier.
+//
+// Returns the controller from createSerializationQueue.drainProgressively
+// so the caller can cancel mid-drain (e.g. user re-enables serialize
+// while we're still draining the previous backlog).
+let _activeProgressiveDrain = null;
+function progressivelyDrainSerializationQueue(reason = '') {
+  // If a drain is already running, cancel it first — we don't want
+  // two drains racing through the same queue.
+  if (_activeProgressiveDrain) {
+    try { _activeProgressiveDrain.cancel(); } catch {}
+    _activeProgressiveDrain = null;
+  }
+  const intervalMs = Math.max(
+    250,
+    Math.min(settings.serializeDelayMs | 0 || 250, 5_000),
+  );
+  const initialQueued = _serializationQueue.getStats().queued;
+  if (initialQueued === 0) return; // nothing to drain
+  log('info', `serialize disengaging (${reason}): progressive drain of ${initialQueued} queued at ${1000 / intervalMs}/s`);
+  logActivity('serialize-progressive-drain-start', {
+    reason: reason || 'unspecified',
+    queued: initialQueued,
+    interval_ms: intervalMs,
+  });
+  _activeProgressiveDrain = _serializationQueue.drainProgressively({
+    intervalMs,
+    onDrained: ({ released, cancelled }) => {
+      _activeProgressiveDrain = null;
+      log('info', `serialize progressive drain ${cancelled ? 'cancelled' : 'complete'}: released ${released}/${initialQueued}`);
+      logActivity('serialize-progressive-drain-end', {
+        reason: reason || 'unspecified',
+        released,
+        cancelled: !!cancelled,
+        initial_queued: initialQueued,
+      });
+    },
+  });
 }
 
 function withSerializationQueue(fn, isRetry = false) {
@@ -9577,7 +9683,9 @@ function _autoDisableSerialize(reason, detail = {}) {
   try { saveSettings(settings); } catch (e) {
     log('warn', `auto-disable: saveSettings failed: ${e.message}`);
   }
-  try { drainSerializationQueue(); } catch {}
+  // Progressive drain — a backlog from a queue_timeout / all-429 burst
+  // would otherwise flood Anthropic the moment we flip the flag.
+  try { progressivelyDrainSerializationQueue(`auto-disable: ${reason}`); } catch {}
   // Reset the breakers so the user can re-enable without an immediate
   // re-trip from the same recorded events.
   _queueTimeoutCounter.reset();
@@ -9679,7 +9787,10 @@ function _maybeAutoRevertSerialize() {
   _serializeAutoEnabledAt = 0;
   _burst429ByFingerprint.clear();
   try { saveSettings(settings); } catch {}
-  try { drainSerializationQueue(); } catch {}
+  // Progressive drain on auto-revert too — same flood risk as
+  // _autoDisableSerialize. Without this, a queue that filled up
+  // during the just-elapsed quiet window dumps in one shot.
+  try { progressivelyDrainSerializationQueue('auto-revert: quiet-window-elapsed'); } catch {}
   try {
     logForensicEvent('serialize_auto_reverted', {
       reason: 'quiet-window-elapsed',
@@ -9692,6 +9803,140 @@ function _maybeAutoRevertSerialize() {
 }
 const _serializeAutoRevertTimer = setInterval(_maybeAutoRevertSerialize, 60_000);
 if (_serializeAutoRevertTimer.unref) _serializeAutoRevertTimer.unref();
+
+// ─────────────────────────────────────────────────
+// OAuth-bypass mode — when ALL saved accounts have permanently
+// revoked refresh tokens (per RFC 6749 §5.2 invalid_grant /
+// unauthorized_client / invalid_client / access_denied), there's
+// nothing for vdm to rotate to. Switching from a dead token to
+// another dead token isn't a "switch", it's just churn that confuses
+// the user with cascading "switching account..." toasts. In bypass
+// mode, the proxy stops trying to rotate or refresh — it just
+// forwards whatever the keychain currently has, transparently. The
+// serialize queue still applies (it's upstream of rotation logic).
+//
+// User contract: vdm notifies once with HIGH_PRIORITY ("Run
+// `claude login`") and STOPS trying to be helpful until that happens.
+// As soon as ANY account responds 200 (the user just logged in →
+// new token in keychain → autoDiscover → forward → 200 → bypass
+// exits), we leave bypass and resume normal rotation.
+//
+// Detection caveats — bypass mode engages ONLY when:
+//   - settings.oauthBypassEnabled is true (default ON; user can disable)
+//   - At least one account is on file (zero accounts = nothing to
+//     conclude, just forward the request and let Anthropic 401)
+//   - EVERY account is in `permanentlyRevoked` state (which itself
+//     requires 3+ revocation-class refresh failures spread over 1h —
+//     so a brief OAuth-server outage cannot trip bypass)
+//   - No account has a 5h/7d-reset window in the future (those are
+//     temporary, will recover)
+//   - No account has had a 200 response in last 24h
+let _oauthBypassMode = false;
+let _oauthBypassEnteredAt = 0;
+let _oauthBypassRecoveryTimer = null;
+const _OAUTH_BYPASS_RECOVERY_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+
+function _enterOAuthBypass(reason) {
+  if (_oauthBypassMode) return; // already in bypass
+  _oauthBypassMode = true;
+  _oauthBypassEnteredAt = Date.now();
+  log('warn', `OAuth bypass mode ENTERED: ${reason}`);
+  logActivity('oauth-bypass-enabled', { reason: reason || 'all-accounts-revoked' });
+  try {
+    logForensicEvent('oauth_bypass_enabled', {
+      reason: reason || 'all-accounts-revoked',
+      account_count: 0,  // populated below if available
+    });
+  } catch {}
+  notify(
+    'vdm: All OAuth tokens revoked',
+    'Run `claude login` to authenticate, then `vdm add` to register the new account. The proxy is now passing requests transparently — no rotation.',
+    'circuitBreaker',  // HIGH_PRIORITY → bypasses 10s throttle
+  );
+  // Start a low-frequency probe — if any revoked account refreshes
+  // successfully (e.g. user did `claude login` AND the new credentials
+  // happen to be in a vdm-account-* slot), we want to detect it without
+  // waiting for a fresh request to reach updateAccountState.
+  if (_oauthBypassRecoveryTimer === null) {
+    _oauthBypassRecoveryTimer = setInterval(_probeBypassRecovery, _OAUTH_BYPASS_RECOVERY_INTERVAL_MS);
+    if (_oauthBypassRecoveryTimer.unref) _oauthBypassRecoveryTimer.unref();
+  }
+}
+
+function _exitOAuthBypass(reason) {
+  if (!_oauthBypassMode) return;
+  const durationMs = Date.now() - _oauthBypassEnteredAt;
+  _oauthBypassMode = false;
+  _oauthBypassEnteredAt = 0;
+  if (_oauthBypassRecoveryTimer) {
+    clearInterval(_oauthBypassRecoveryTimer);
+    _oauthBypassRecoveryTimer = null;
+  }
+  log('info', `OAuth bypass mode EXITED: ${reason} (was in bypass for ${Math.round(durationMs / 60_000)}min)`);
+  logActivity('oauth-bypass-disabled', { reason: reason || 'recovery', duration_min: Math.round(durationMs / 60_000) });
+  try {
+    logForensicEvent('oauth_bypass_disabled', {
+      reason: reason || 'recovery',
+      duration_ms: durationMs,
+    });
+  } catch {}
+  // No notification on exit — it's good news (the user fixed their auth),
+  // and they'll see normal vdm operation resume on their next prompt.
+}
+
+// Recompute "all accounts dead" using the current state, then enter or
+// exit bypass mode accordingly. Cheap to call from any code path
+// (refresh-failed, refresh-success, 200-response). Respects the user's
+// opt-out via settings.oauthBypassEnabled.
+function _evaluateBypassMode() {
+  if (settings.oauthBypassEnabled === false) {
+    // Feature disabled by user — exit if currently engaged.
+    if (_oauthBypassMode) _exitOAuthBypass('user-disabled');
+    return;
+  }
+  let accounts;
+  try { accounts = loadAllAccountTokens(); } catch { return; }
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    // No accounts saved — no decision to make. Exit if somehow in bypass.
+    if (_oauthBypassMode) _exitOAuthBypass('no-accounts');
+    return;
+  }
+  const allDead = areAllAccountsTerminallyDead(accounts, accountState);
+  if (allDead && !_oauthBypassMode) {
+    _enterOAuthBypass(`${accounts.length} accounts all permanently revoked`);
+  } else if (!allDead && _oauthBypassMode) {
+    _exitOAuthBypass('at-least-one-account-recovered');
+  }
+}
+
+// Background probe — every 5 min while bypass is engaged, attempt to
+// refresh each account once. If any succeeds, the refresh handler
+// clears that account's revocation state and calls _evaluateBypassMode,
+// which exits bypass. The probe is bounded by _refreshSem (3 concurrent
+// upstream OAuth POSTs across all accounts) so it can't hammer the
+// OAuth server even with N revoked accounts.
+async function _probeBypassRecovery() {
+  if (!_oauthBypassMode) return;
+  let accounts;
+  try { accounts = loadAllAccountTokens(); } catch { return; }
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    _exitOAuthBypass('no-accounts');
+    return;
+  }
+  log('info', `OAuth bypass recovery probe: attempting refresh on ${accounts.length} accounts`);
+  // Best-effort, fire-and-forget. The refresh handler itself will call
+  // _evaluateBypassMode on success/failure, so we don't need to await
+  // each one in series.
+  for (const a of accounts) {
+    if (!a || !a.name) continue;
+    try {
+      // refreshAccountToken handles its own retries + classification.
+      // force=true so we attempt the refresh even if the cached
+      // expiresAt says the token is still valid (it isn't — it's revoked).
+      refreshAccountToken(a.name, { force: true }).catch(() => {});
+    } catch {}
+  }
+}
 
 // Called from the proxy queue_timeout 503 catch handler. Records the
 // event, then trips the breaker if the count crosses threshold AND
@@ -11289,6 +11534,40 @@ async function handleProxyRequest(clientReq, clientRes) {
     fwd['anthropic-beta'] = betas.join(',');
     try {
       await _smartPassthrough(clientReq, clientRes, body, fwd, 'circuit-breaker');
+    } catch (err) {
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Passthrough error: ${err.message}` } }));
+      }
+    }
+    return;
+  }
+
+  // ── OAuth bypass: all accounts permanently revoked ──
+  // When the bypass detector concludes EVERY account has a dead refresh
+  // token (3+ invalid_grant failures spread over 1h, no recent 200, no
+  // future rate-limit reset), there's nothing to rotate to. Forward
+  // requests transparently — Anthropic will return 401 against the
+  // user's keychain token, and Claude Code's own re-auth UI handles it.
+  // Serialize queue still applies (it wraps this whole function from
+  // the createServer layer).
+  if (_oauthBypassMode) {
+    log('bypass', 'OAuth bypass mode — smart passthrough (all accounts revoked)');
+    const bodyChunks = [];
+    await new Promise((resolve, reject) => {
+      clientReq.on('data', c => bodyChunks.push(c));
+      clientReq.on('end', resolve);
+      clientReq.on('error', reject);
+    });
+    const body = Buffer.concat(bodyChunks);
+    const fwd = stripHopByHopHeaders(clientReq.headers);
+    fwd['host'] = 'api.anthropic.com';
+    fwd['content-length'] = String(body.length);
+    const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
+    fwd['anthropic-beta'] = betas.join(',');
+    try {
+      await _smartPassthrough(clientReq, clientRes, body, fwd, 'oauth-bypass');
     } catch (err) {
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' });

@@ -136,6 +136,69 @@ export function createAccountStateManager() {
     state.set(token, { ...prev, name, expired: true, updatedAt: Date.now() });
   }
 
+  // Permanent-revocation tracking — feeds the "all accounts dead →
+  // proxy bypass" detector. `recordPermanentRefreshFailure` records ONE
+  // refresh attempt that returned an OAuth revocation error (per
+  // isOAuthRevocationError); after PERMANENT_REVOCATION_FAILURE_THRESHOLD
+  // such failures spread across PERMANENT_REVOCATION_MIN_DURATION_MS,
+  // the token is considered permanently revoked. Any subsequent
+  // successful refresh OR 200 response clears the marker via
+  // `clearPermanentRevocation`. This conservative threshold prevents
+  // a brief OAuth server outage (returning invalid_grant for legitimate
+  // tokens) from tripping bypass mode prematurely.
+  function recordPermanentRefreshFailure(token, name, nowMs = Date.now()) {
+    const prev = state.get(token) || {};
+    const count = (prev.permanentRefreshFailureCount || 0) + 1;
+    const firstAt = prev.firstPermanentFailureAtMs || nowMs;
+    state.set(token, {
+      ...prev, name,
+      permanentRefreshFailureCount: count,
+      firstPermanentFailureAtMs: firstAt,
+      lastPermanentFailureAtMs: nowMs,
+      updatedAt: nowMs,
+    });
+  }
+
+  function clearPermanentRevocation(token) {
+    const prev = state.get(token);
+    if (!prev) return;
+    if (
+      prev.permanentlyRevoked ||
+      prev.permanentRefreshFailureCount ||
+      prev.firstPermanentFailureAtMs ||
+      prev.lastPermanentFailureAtMs
+    ) {
+      state.set(token, {
+        ...prev,
+        permanentlyRevoked: false,
+        permanentRefreshFailureCount: 0,
+        firstPermanentFailureAtMs: 0,
+        lastPermanentFailureAtMs: 0,
+        updatedAt: Date.now(),
+      });
+    }
+  }
+
+  // Returns true if the token has crossed the count + duration threshold
+  // for "permanent revocation" — i.e. enough consecutive revocation-class
+  // refresh failures spread over enough wall-clock time that a transient
+  // OAuth-server outage is no longer a plausible explanation. Also flips
+  // the `permanentlyRevoked` flag the first time it crosses the threshold
+  // so callers can read the flag directly via .get().
+  function isPermanentlyRevoked(token, nowMs = Date.now(), threshold = 3, minDurationMs = 60 * 60 * 1000) {
+    const s = state.get(token);
+    if (!s) return false;
+    if (s.permanentlyRevoked) return true;
+    const count = s.permanentRefreshFailureCount || 0;
+    const firstAt = s.firstPermanentFailureAtMs || 0;
+    if (count >= threshold && firstAt > 0 && (nowMs - firstAt) >= minDurationMs) {
+      // Flip the flag so future reads short-circuit.
+      state.set(token, { ...s, permanentlyRevoked: true, updatedAt: nowMs });
+      return true;
+    }
+    return false;
+  }
+
   function clearBillingCooldown(token) {
     const prev = state.get(token);
     if (prev && prev.retryAfter > 0) {
@@ -179,8 +242,52 @@ export function createAccountStateManager() {
   return {
     update, markLimited, markExpired, clearBillingCooldown,
     markSwitchedFrom, wasRecentlySwitchedFrom,
+    recordPermanentRefreshFailure, clearPermanentRevocation, isPermanentlyRevoked,
     get, entries, clear, remove,
   };
+}
+
+/**
+ * Returns true if EVERY known account is in a state where vdm rotation
+ * cannot help — typically because every refresh token has been revoked.
+ * An account is "alive" if ANY of:
+ *   - permanentlyRevoked is not set / false
+ *   - it has a 5h-reset or 7d-reset window in the future (so it's
+ *     temporarily limited, not permanently dead)
+ *   - it has had a successful response within liveResponseWindowMs
+ *
+ * Returns false if no accounts are known (we can't conclude "all dead"
+ * from zero data) — bypass mode should only engage when we have at
+ * least one account on file and ALL of them have failed.
+ *
+ * @param {Array<{token: string, expiresAt?: number}>} accounts
+ * @param {Object} stateManager — accountStateManager instance
+ * @param {Object} [opts]
+ * @param {number} [opts.now] — current timestamp (ms since epoch)
+ * @param {number} [opts.liveResponseWindowMs] — default 24h
+ */
+export function areAllAccountsTerminallyDead(accounts, stateManager, opts = {}) {
+  if (!Array.isArray(accounts) || accounts.length === 0) return false;
+  const now = opts.now || Date.now();
+  const liveWindow = opts.liveResponseWindowMs ?? (24 * 60 * 60 * 1000);
+  for (const a of accounts) {
+    if (!a || !a.token) continue;
+    const s = stateManager.get(a.token);
+    // No state recorded yet → unknown, treat as alive (don't false-flag
+    // a freshly-added account)
+    if (!s) return false;
+    // Any successful response within the live-window → alive
+    const lastSuccessAt = s.lastSuccessAtMs || 0;
+    if (lastSuccessAt > 0 && (now - lastSuccessAt) < liveWindow) return false;
+    // Permanently revoked? If not, alive.
+    if (!s.permanentlyRevoked) return false;
+    // Permanently revoked AND has a future rate-limit reset window?
+    // That would be a contradictory state (a revoked token shouldn't
+    // get rate-limit responses), but we play conservative: alive.
+    if (s.resetAt && s.resetAt * 1000 > now) return false;
+    if (s.resetAt7d && s.resetAt7d * 1000 > now) return false;
+  }
+  return true;
 }
 
 // ─────────────────────────────────────────────────
@@ -782,6 +889,62 @@ export function parseRefreshResponse(statusCode, bodyStr) {
  */
 export function computeExpiresAt(expiresInSec, now = Date.now()) {
   return now + expiresInSec * 1000;
+}
+
+/**
+ * Classify an OAuth refresh-endpoint error as "the refresh token itself
+ * is dead" (true) vs "transient / try again later / unknown" (false).
+ *
+ * Per RFC 6749 §5.2, the refresh endpoint emits a 400 with `error` set
+ * to one of: `invalid_request` | `invalid_client` | `invalid_grant` |
+ * `unauthorized_client` | `unsupported_grant_type` | `invalid_scope`.
+ *
+ * Of those, three indicate the GRANT (refresh token) itself is dead:
+ *   - `invalid_grant`         — refresh token revoked/expired/invalid
+ *   - `unauthorized_client`   — client_id no longer allowed for this grant
+ *   - `invalid_client`        — client_id rejected (also terminal for vdm,
+ *                               which uses one hardcoded client_id)
+ *
+ * `access_denied` is added because Anthropic occasionally returns it for
+ * accounts that have been administratively suspended.
+ *
+ * Distinguishing these from transient failures is what lets vdm's
+ * "all-accounts-revoked → bypass mode" detector avoid false positives:
+ * a 429 / 5xx / network timeout will NEVER classify as a revocation, so
+ * an OAuth-server outage cannot trip bypass mode.
+ *
+ * @param {string} errorText — error text or JSON body from refresh
+ *   response. Tolerates JSON, key=value pairs, or a bare error code.
+ * @returns {boolean} true if the error indicates permanent revocation
+ */
+export function isOAuthRevocationError(errorText) {
+  if (typeof errorText !== 'string' || !errorText) return false;
+  const PERMANENT = new Set([
+    'invalid_grant',
+    'unauthorized_client',
+    'invalid_client',
+    'access_denied',
+  ]);
+  // Try JSON parse first — RFC 6749 standard form.
+  try {
+    const parsed = JSON.parse(errorText);
+    if (parsed && typeof parsed === 'object') {
+      if (typeof parsed.error === 'string' && PERMANENT.has(parsed.error)) return true;
+      // Some non-conformant servers nest under `error.code`
+      if (parsed.error && typeof parsed.error.code === 'string' && PERMANENT.has(parsed.error.code)) return true;
+    }
+  } catch { /* fall through to substring match */ }
+  // Substring fallback — covers cases where the caller already extracted
+  // the error_description string (parseRefreshResponse does this) and
+  // the raw `error` code is no longer in the text. We look for the bare
+  // token preceded by a non-word character (or start-of-string) and
+  // followed by a non-word character (or end-of-string) so we don't
+  // false-positive on `not_invalid_grant_lookup_table` etc.
+  for (const code of PERMANENT) {
+    const re = new RegExp(`(^|[^a-z_])${code}([^a-z_]|$)`, 'i');
+    if (re.test(errorText)) return true;
+  }
+  return false;
 }
 
 /**
@@ -2053,11 +2216,92 @@ export function createSerializationQueue(opts = {}) {
     }
   }
 
+  // Progressive drain — releases queued entries one at a time at
+  // `intervalMs` cadence instead of flushing all at once. Used when
+  // serialize mode disengages (user toggle, breaker auto-disable,
+  // Safeguard D auto-revert): without it, a backlog of N pending
+  // payloads hits Anthropic in the same millisecond and produces an
+  // immediate rate-limit cascade across whichever account is active.
+  // Returns a controller object so callers can cancel mid-drain
+  // (e.g. if the user re-enables serialize while a drain is running).
+  //
+  // Contract:
+  //   - intervalMs ≥ 50 ms (anything tighter is "instant flush" in
+  //     practice; that's what drain() is for).
+  //   - Cancels and replaces any pending _maybeDispatch timer so we
+  //     don't have two dispatchers racing.
+  //   - If queue is already empty, fires onDrained() synchronously
+  //     and returns.
+  //   - Schedules at most ONE dispatch per interval. inflight cap is
+  //     ignored (the whole point of progressive drain is to release
+  //     the backlog regardless of normal-mode concurrency caps —
+  //     though no in-flight will exceed serializeMaxConcurrent at any
+  //     instant because each tick releases exactly one entry).
+  //   - onDrained() fires when the queue empties, OR when cancel()
+  //     is called externally.
+  function drainProgressively(opts = {}) {
+    const intervalMs = Math.max(50, opts.intervalMs | 0 || 250);
+    const onDrained = typeof opts.onDrained === 'function' ? opts.onDrained : null;
+    if (dispatchTimer) {
+      clearTimeout(dispatchTimer);
+      dispatchTimer = null;
+    }
+    if (queue.length === 0) {
+      if (onDrained) try { onDrained({ released: 0, cancelled: false }); } catch {}
+      return { cancel: () => {}, released: () => 0, remaining: () => 0 };
+    }
+    let released = 0;
+    let cancelled = false;
+    let tickHandle = null;
+    const tick = () => {
+      tickHandle = null;
+      if (cancelled) return;
+      if (queue.length === 0) {
+        if (onDrained) try { onDrained({ released, cancelled: false }); } catch {}
+        return;
+      }
+      const entry = queue.shift();
+      clearTimeout(entry.timeoutHandle);
+      entry.dispatched = true;
+      inflight++;
+      lastDispatchAt = now();
+      released++;
+      Promise.resolve()
+        .then(() => entry.run())
+        .finally(() => {
+          inflight--;
+          // Don't call _maybeDispatch here — we own the dispatch
+          // schedule for the duration of the progressive drain.
+        });
+      if (queue.length > 0) {
+        tickHandle = setTimeout(tick, intervalMs);
+        if (tickHandle.unref) tickHandle.unref();
+      } else if (onDrained) {
+        try { onDrained({ released, cancelled: false }); } catch {}
+      }
+    };
+    // Fire the first dispatch immediately (rate is "1 per intervalMs"
+    // counted from now, not "1 after intervalMs delay").
+    tick();
+    return {
+      cancel: () => {
+        cancelled = true;
+        if (tickHandle) {
+          clearTimeout(tickHandle);
+          tickHandle = null;
+        }
+        if (onDrained) try { onDrained({ released, cancelled: true }); } catch {}
+      },
+      released: () => released,
+      remaining: () => queue.length,
+    };
+  }
+
   function getStats() {
     return { inflight, queued: queue.length };
   }
 
-  return { acquire, drain, getStats };
+  return { acquire, drain, drainProgressively, getStats };
 }
 
 // ─────────────────────────────────────────────────

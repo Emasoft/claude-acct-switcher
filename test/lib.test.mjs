@@ -55,6 +55,9 @@ import {
   otlpAttrsToObject,
   parseOtlpLogs,
   parseOtlpMetrics,
+  // Phase I+ — bypass mode (all-accounts-revoked detection)
+  isOAuthRevocationError,
+  areAllAccountsTerminallyDead,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
   vdmAccountNameFromService,
@@ -5165,5 +5168,474 @@ describe('Phase I+ — Safeguard D: burst-429 → auto-enable serialize (batch 1
     cb2.record(60_000);
     cb2.record(120_000);
     assert.equal(cb2.tripped(120_000), false, 'spaced 429s must NOT trip the burst breaker');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Phase I+ — OAuth bypass mode (all-accounts-revoked detection).
+// Pure-function tests against isOAuthRevocationError +
+// accountStateManager's permanent-revocation tracking +
+// areAllAccountsTerminallyDead. The dashboard.mjs wiring is
+// covered by source-grep tests further down.
+// ─────────────────────────────────────────────────
+
+describe('isOAuthRevocationError — RFC 6749 §5.2 classifier', () => {
+  it('returns true for the four canonical revocation codes (JSON form)', () => {
+    assert.equal(isOAuthRevocationError('{"error":"invalid_grant"}'),       true);
+    assert.equal(isOAuthRevocationError('{"error":"unauthorized_client"}'), true);
+    assert.equal(isOAuthRevocationError('{"error":"invalid_client"}'),      true);
+    assert.equal(isOAuthRevocationError('{"error":"access_denied"}'),       true);
+  });
+
+  it('returns true when the code is in error_description / nested error.code', () => {
+    // Some servers return {"error_description":"... invalid_grant ..."}
+    // after parseRefreshResponse extracts that field as the .error string.
+    assert.equal(isOAuthRevocationError('Token has been revoked: invalid_grant'), true);
+    // Nested form
+    assert.equal(isOAuthRevocationError('{"error":{"code":"invalid_grant","message":"..."}}'), true);
+  });
+
+  it('returns false for transient / retry-recoverable errors', () => {
+    assert.equal(isOAuthRevocationError('{"error":"temporarily_unavailable"}'), false);
+    assert.equal(isOAuthRevocationError('{"error":"server_error"}'),            false);
+    assert.equal(isOAuthRevocationError('HTTP 500 Internal Server Error'),       false);
+    assert.equal(isOAuthRevocationError('HTTP 429 Too Many Requests'),           false);
+    assert.equal(isOAuthRevocationError('ECONNRESET'),                            false);
+    assert.equal(isOAuthRevocationError('socket hang up'),                        false);
+  });
+
+  it('returns false for malformed / empty / non-string inputs', () => {
+    assert.equal(isOAuthRevocationError(''),         false);
+    assert.equal(isOAuthRevocationError(null),       false);
+    assert.equal(isOAuthRevocationError(undefined),  false);
+    assert.equal(isOAuthRevocationError(42),         false);
+    assert.equal(isOAuthRevocationError({}),         false);
+    assert.equal(isOAuthRevocationError([]),         false);
+  });
+
+  it('avoids false-positives on substring lookups', () => {
+    // "preinvalid_grant_handler" — contains the substring but should
+    // NOT match because of the word-boundary regex.
+    assert.equal(isOAuthRevocationError('preinvalid_grant_handler missing'), false);
+    assert.equal(isOAuthRevocationError('not_invalid_grant_lookup'),         false);
+  });
+
+  it('handles bare error code without JSON wrapping', () => {
+    assert.equal(isOAuthRevocationError('invalid_grant'),       true);
+    assert.equal(isOAuthRevocationError('access_denied'),       true);
+  });
+});
+
+describe('accountStateManager — permanent-revocation tracking', () => {
+  it('records strikes and trips after 3 failures over 1h', () => {
+    const m = createAccountStateManager();
+    const tok = 'tok-A';
+    const t0 = 1_000_000_000;
+    // First strike at t0
+    m.recordPermanentRefreshFailure(tok, 'A', t0);
+    assert.equal(m.isPermanentlyRevoked(tok, t0 + 1000),               false, '1 strike alone does NOT trip');
+    // Second strike at t0+30min
+    m.recordPermanentRefreshFailure(tok, 'A', t0 + 30 * 60_000);
+    assert.equal(m.isPermanentlyRevoked(tok, t0 + 30 * 60_000 + 1000), false, '2 strikes within 30min does NOT trip');
+    // Third strike at t0+61min — count threshold met AND duration ≥1h
+    m.recordPermanentRefreshFailure(tok, 'A', t0 + 61 * 60_000);
+    assert.equal(m.isPermanentlyRevoked(tok, t0 + 61 * 60_000 + 1000), true, '3 strikes spread over >1h trips');
+  });
+
+  it('does NOT trip when 3+ strikes happen in <1h (transient outage protection)', () => {
+    const m = createAccountStateManager();
+    const tok = 'tok-B';
+    const t0 = 2_000_000_000;
+    // 5 strikes in 30s — looks like an OAuth-server outage, not a revocation
+    for (let i = 0; i < 5; i++) {
+      m.recordPermanentRefreshFailure(tok, 'B', t0 + i * 5_000);
+    }
+    assert.equal(m.isPermanentlyRevoked(tok, t0 + 30_000), false, 'rapid strikes < 1h MUST NOT trip — protects against OAuth outages');
+  });
+
+  it('clearPermanentRevocation wipes both flag and counter', () => {
+    const m = createAccountStateManager();
+    const tok = 'tok-C';
+    const t0 = 3_000_000_000;
+    for (let i = 0; i < 3; i++) {
+      m.recordPermanentRefreshFailure(tok, 'C', t0 + i * 30 * 60_000);
+    }
+    // Cross threshold to set the flag
+    assert.equal(m.isPermanentlyRevoked(tok, t0 + 90 * 60_000), true);
+    m.clearPermanentRevocation(tok);
+    const s = m.get(tok);
+    assert.equal(s.permanentlyRevoked,             false);
+    assert.equal(s.permanentRefreshFailureCount,   0);
+    assert.equal(s.firstPermanentFailureAtMs,      0);
+  });
+
+  it('clearPermanentRevocation is a no-op for tokens with clean state', () => {
+    const m = createAccountStateManager();
+    // Doesn't throw, doesn't create a state entry
+    m.clearPermanentRevocation('never-seen');
+    assert.equal(m.get('never-seen'),               undefined);
+  });
+});
+
+describe('areAllAccountsTerminallyDead', () => {
+  function _setupRevoked(m, tok, name, nowMs) {
+    // Helper: drive token to permanentlyRevoked=true via threshold
+    for (let i = 0; i < 3; i++) {
+      m.recordPermanentRefreshFailure(tok, name, nowMs - (61 - i * 30) * 60_000);
+    }
+    m.isPermanentlyRevoked(tok, nowMs);
+  }
+
+  it('returns false when no accounts are on file (zero data → no decision)', () => {
+    const m = createAccountStateManager();
+    assert.equal(areAllAccountsTerminallyDead([], m),                                false);
+    assert.equal(areAllAccountsTerminallyDead(null, m),                              false);
+    assert.equal(areAllAccountsTerminallyDead(undefined, m),                         false);
+  });
+
+  it('returns false when at least one account has no state recorded', () => {
+    const m = createAccountStateManager();
+    const now = 5_000_000_000;
+    _setupRevoked(m, 'tok-A', 'A', now);
+    // tok-B has never been touched → unknown → must be treated as alive
+    assert.equal(
+      areAllAccountsTerminallyDead([{ token: 'tok-A' }, { token: 'tok-B' }], m, { now }),
+      false,
+      'unknown account must be treated as alive — no false-positive on freshly-added accounts',
+    );
+  });
+
+  it('returns false when at least one account had a 200 in last 24h', () => {
+    const m = createAccountStateManager();
+    const now = 6_000_000_000;
+    _setupRevoked(m, 'tok-A', 'A', now);
+    _setupRevoked(m, 'tok-B', 'B', now);
+    // tok-A has a recent success — overrides the revocation marker
+    const sA = m.get('tok-A');
+    sA.lastSuccessAtMs = now - 60 * 60_000; // 1h ago
+    assert.equal(
+      areAllAccountsTerminallyDead([{ token: 'tok-A' }, { token: 'tok-B' }], m, { now }),
+      false,
+      'recent 200 means the token is alive regardless of past revocation strikes',
+    );
+  });
+
+  it('returns false when a future 5h-reset window exists (temporary, not permanent)', () => {
+    const m = createAccountStateManager();
+    const now = 7_000_000_000;
+    _setupRevoked(m, 'tok-A', 'A', now);
+    const sA = m.get('tok-A');
+    sA.resetAt = Math.floor((now + 60_000) / 1000); // 1 min in the future (epoch seconds)
+    assert.equal(
+      areAllAccountsTerminallyDead([{ token: 'tok-A' }], m, { now }),
+      false,
+      'future rate-limit reset means recovery is expected',
+    );
+  });
+
+  it('returns true ONLY when EVERY account is revoked, no recent success, no future reset', () => {
+    const m = createAccountStateManager();
+    const now = 8_000_000_000;
+    _setupRevoked(m, 'tok-A', 'A', now);
+    _setupRevoked(m, 'tok-B', 'B', now);
+    assert.equal(
+      areAllAccountsTerminallyDead([{ token: 'tok-A' }, { token: 'tok-B' }], m, { now }),
+      true,
+      'all accounts dead — bypass mode should engage',
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// createSerializationQueue.drainProgressively — progressive
+// flush so a backlog doesn't flood Anthropic in one millisecond
+// when serialize mode disengages.
+// ─────────────────────────────────────────────────────────
+
+describe('createSerializationQueue — drainProgressively', () => {
+  it('releases ONE entry per intervalMs, not all at once', async () => {
+    const q = createSerializationQueue({
+      getEnabled: () => true,
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+    });
+    // Slow tasks (250ms) so the queue genuinely backs up — async no-op
+    // functions complete fast enough that with cap=1+delay=0 the queue
+    // could empty in milliseconds, before drainProgressively engages.
+    const dispatched = [];
+    const tasks = [];
+    for (let i = 0; i < 5; i++) {
+      tasks.push(q.acquire(async () => {
+        await new Promise(r => setTimeout(r, 250));
+        dispatched.push(i);
+      }).catch(() => {}));
+    }
+    // Wait for the queue to settle: 1 task in flight, 4 queued.
+    await new Promise(r => setTimeout(r, 30));
+
+    // Now drainProgressively at 60ms intervals — fast enough to be
+    // visibly faster than natural cap=1 dispatch.
+    const ctrl = q.drainProgressively({ intervalMs: 60 });
+    const afterDrainStart = ctrl.released();
+    // After ~150ms post-drain, several entries should have been
+    // RELEASED by the drain (released() counts entries the drain
+    // dispatched, regardless of whether their async work has finished).
+    await new Promise(r => setTimeout(r, 150));
+    const after150 = ctrl.released();
+    assert.ok(after150 > afterDrainStart, `drain released entries over time (start=${afterDrainStart}, after150ms=${after150})`);
+
+    ctrl.cancel();
+    await Promise.allSettled(tasks);
+  });
+
+  it('cancel() stops further dispatches', async () => {
+    const q = createSerializationQueue({
+      getEnabled: () => true,
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+    });
+    const dispatched = [];
+    for (let i = 0; i < 10; i++) {
+      q.acquire(async () => { dispatched.push(i); }).catch(() => {});
+    }
+    await new Promise(r => setTimeout(r, 20));
+    const ctrl = q.drainProgressively({ intervalMs: 50 });
+    await new Promise(r => setTimeout(r, 80));
+    ctrl.cancel();
+    const atCancel = dispatched.length;
+    // Wait long enough that another ~5 dispatches WOULD have happened
+    // if cancel were ignored
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal(dispatched.length, atCancel, 'no dispatches after cancel()');
+  });
+
+  it('onDrained fires once with the released count', async () => {
+    const q = createSerializationQueue({
+      getEnabled: () => true,
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+    });
+    for (let i = 0; i < 3; i++) {
+      q.acquire(async () => {}).catch(() => {});
+    }
+    await new Promise(r => setTimeout(r, 20));
+    let drained = null;
+    let calls = 0;
+    q.drainProgressively({
+      intervalMs: 50,
+      onDrained: (info) => { calls++; drained = info; },
+    });
+    await new Promise(r => setTimeout(r, 400));
+    assert.equal(calls, 1, 'onDrained must fire exactly once');
+    assert.ok(drained && typeof drained.released === 'number', 'onDrained receives released count');
+    assert.equal(drained.cancelled, false, 'natural completion → cancelled: false');
+  });
+
+  it('returns a no-op controller when queue is empty', () => {
+    const q = createSerializationQueue({ getEnabled: () => true });
+    let drainedCalled = 0;
+    const ctrl = q.drainProgressively({
+      onDrained: () => { drainedCalled++; },
+    });
+    assert.equal(typeof ctrl.cancel, 'function');
+    assert.equal(ctrl.released(), 0);
+    assert.equal(drainedCalled, 1, 'onDrained fires immediately when nothing to drain');
+  });
+
+  it('intervalMs floored at 50ms to prevent flush-flood-by-mistake', async () => {
+    const q = createSerializationQueue({
+      getEnabled: () => true,
+      getMaxConcurrent: () => 1,
+      getDelayMs: () => 0,
+    });
+    // Slow tasks (300ms each) so the queue actually backs up — fast
+    // tasks would finish during the 20ms warm-up wait and drain the
+    // queue before drainProgressively even sees it.
+    for (let i = 0; i < 5; i++) {
+      q.acquire(async () => { await new Promise(r => setTimeout(r, 300)); }).catch(() => {});
+    }
+    // Wait for the dispatch loop to settle: 1 in flight, 4 queued.
+    await new Promise(r => setTimeout(r, 30));
+    // Try to drain at "0ms" interval — should clamp to 50ms.
+    const ctrl = q.drainProgressively({ intervalMs: 0 });
+    // After 30ms post-drain-call, the floor (50ms) means at most ONE
+    // additional tick has fired: one synchronous on the call + one
+    // pending. Either way, at least 2 entries should still be queued.
+    await new Promise(r => setTimeout(r, 30));
+    assert.ok(ctrl.remaining() >= 2, `floor of 50ms prevents instant flush — got remaining=${ctrl.remaining()}`);
+    ctrl.cancel();
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Source-level wiring tests — verify dashboard.mjs hooks the
+// pure-function detector into the right code paths.
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — OAuth bypass mode wiring (batch 11)', () => {
+  const _src_b = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports isOAuthRevocationError + areAllAccountsTerminallyDead', () => {
+    assert.match(_src_b, /isOAuthRevocationError,/);
+    assert.match(_src_b, /areAllAccountsTerminallyDead,/);
+  });
+
+  it('exposes oauthBypassEnabled in DEFAULT_SETTINGS (default ON)', () => {
+    assert.match(_src_b, /oauthBypassEnabled:\s*true/);
+  });
+
+  it('refresh handler classifies failures and records strikes', () => {
+    // The refresh-failed branch must check isOAuthRevocationError BEFORE
+    // recording a strike — otherwise transient errors (network, 5xx)
+    // would falsely accumulate strikes.
+    assert.match(_src_b, /isOAuthRevocationError\(result\.error\)/);
+    assert.match(_src_b, /accountState\.recordPermanentRefreshFailure\(/);
+  });
+
+  it('refresh success clears prior revocation strikes for the old token', () => {
+    // Without this, a single revocation event would mark the account
+    // permanently dead even if it later refreshes successfully.
+    assert.match(_src_b, /accountState\.clearPermanentRevocation\(oldToken\)/);
+  });
+
+  it('200 response stamps lastSuccessAtMs and clears revocation', () => {
+    // updateAccountState is the canonical 200-handler. Both the
+    // success-time stamp and the revocation clear must happen there.
+    const block = _src_b.slice(
+      _src_b.indexOf('function updateAccountState'),
+      _src_b.indexOf('function updateAccountState') + 1500,
+    );
+    assert.ok(block.length > 0, 'updateAccountState must exist');
+    assert.match(block, /lastSuccessAtMs/);
+    assert.match(block, /clearPermanentRevocation/);
+  });
+
+  it('_enterOAuthBypass starts a recovery probe timer with unref', () => {
+    const fn = _src_b.slice(
+      _src_b.indexOf('function _enterOAuthBypass'),
+      _src_b.indexOf('function _enterOAuthBypass') + 2500,
+    );
+    assert.ok(fn.length > 100, 'function body must exist');
+    assert.match(fn, /_OAUTH_BYPASS_RECOVERY_INTERVAL_MS/);
+    assert.match(fn, /_oauthBypassRecoveryTimer\.unref/);
+    // HIGH_PRIORITY notification → user must see this even if throttle
+    assert.match(fn, /'circuitBreaker'/);
+  });
+
+  it('_exitOAuthBypass clears the recovery timer', () => {
+    const fn = _src_b.slice(
+      _src_b.indexOf('function _exitOAuthBypass'),
+      _src_b.indexOf('function _exitOAuthBypass') + 1500,
+    );
+    assert.match(fn, /clearInterval\(_oauthBypassRecoveryTimer\)/);
+    assert.match(fn, /_oauthBypassRecoveryTimer = null/);
+  });
+
+  it('_evaluateBypassMode honours settings.oauthBypassEnabled = false', () => {
+    const fn = _src_b.slice(
+      _src_b.indexOf('function _evaluateBypassMode'),
+      _src_b.indexOf('function _evaluateBypassMode') + 1500,
+    );
+    assert.match(fn, /settings\.oauthBypassEnabled === false/);
+  });
+
+  it('_probeBypassRecovery iterates accounts and calls refreshAccountToken with force=true', () => {
+    const fn = _src_b.slice(
+      _src_b.indexOf('async function _probeBypassRecovery'),
+      _src_b.indexOf('async function _probeBypassRecovery') + 1500,
+    );
+    assert.ok(fn.length > 100, 'function body must exist');
+    assert.match(fn, /refreshAccountToken\(a\.name, \{ force: true \}\)/);
+  });
+
+  it('proxy hot path skips rotation when _oauthBypassMode is true', () => {
+    // The bypass branch must be in handleProxyRequest, not just in
+    // updateAccountState (which has a separate _oauthBypassMode check
+    // for re-evaluation on 200 responses). Anchor on the unique log
+    // message used inside the proxy branch.
+    const anchor = 'OAuth bypass mode — smart passthrough';
+    const idx = _src_b.indexOf(anchor);
+    assert.notEqual(idx, -1, `bypass-mode log line "${anchor}" must exist in handleProxyRequest`);
+    // It must use _smartPassthrough, like proxy-disabled and circuit-breaker.
+    const block = _src_b.slice(idx, idx + 1500);
+    assert.match(block, /_smartPassthrough\([^,]+,[^,]+,[^,]+,[^,]+,\s*'oauth-bypass'\)/);
+  });
+
+  it('activity-feed cases for oauth-bypass-enabled / disabled use h(...) escaping', () => {
+    const enabled = _src_b.slice(
+      _src_b.indexOf("case 'oauth-bypass-enabled'"),
+      _src_b.indexOf("case 'oauth-bypass-enabled'") + 400,
+    );
+    assert.ok(enabled.length > 50, 'oauth-bypass-enabled case must exist');
+    assert.match(enabled, /h\(e\.reason/);
+    const disabled = _src_b.slice(
+      _src_b.indexOf("case 'oauth-bypass-disabled'"),
+      _src_b.indexOf("case 'oauth-bypass-disabled'") + 400,
+    );
+    assert.ok(disabled.length > 50, 'oauth-bypass-disabled case must exist');
+    assert.match(disabled, /h\(e\.reason/);
+    assert.match(disabled, /h\(String\(e\.duration_min/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Source-level wiring — progressive drain replaces instant
+// flush at every "serialize is turning OFF" callsite.
+// ─────────────────────────────────────────────────────────
+
+describe('Phase I+ — progressive drain wiring (batch 11)', () => {
+  const _src_p = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('progressivelyDrainSerializationQueue is defined', () => {
+    assert.match(_src_p, /function progressivelyDrainSerializationQueue\(reason/);
+  });
+
+  it('user-toggle-off path uses progressive drain', () => {
+    assert.match(_src_p, /progressivelyDrainSerializationQueue\('user-toggle-off'\)/);
+  });
+
+  it('_autoDisableSerialize path uses progressive drain', () => {
+    assert.match(_src_p, /progressivelyDrainSerializationQueue\(`auto-disable: \$\{reason\}`\)/);
+  });
+
+  it('_maybeAutoRevertSerialize path uses progressive drain', () => {
+    assert.match(_src_p, /progressivelyDrainSerializationQueue\('auto-revert: quiet-window-elapsed'\)/);
+  });
+
+  it('the legacy synchronous drainSerializationQueue wrapper is removed', () => {
+    // Caller-level `drainSerializationQueue()` calls would silently
+    // bypass the progressive cadence. The wrapper itself was deleted;
+    // any future `drainSerializationQueue(` callsite is a regression.
+    // We allow the factory's internal `_serializationQueue.drain()`
+    // method to remain (it backs the progressive path).
+    const sites = (_src_p.match(/\bdrainSerializationQueue\s*\(/g) || []).length;
+    assert.equal(sites, 0, `drainSerializationQueue() callsites must be zero (got ${sites})`);
+  });
+
+  it('intervalMs respects serializeDelayMs but is floored at 250ms', () => {
+    // Floor protects against a misconfigured user setting (e.g. delayMs=0)
+    // turning progressive drain into instant flush.
+    const fn = _src_p.slice(
+      _src_p.indexOf('function progressivelyDrainSerializationQueue'),
+      _src_p.indexOf('function progressivelyDrainSerializationQueue') + 2000,
+    );
+    assert.match(fn, /Math\.max\(\s*250,/);
+    assert.match(fn, /settings\.serializeDelayMs/);
+  });
+
+  it('cancels any prior progressive drain when a new one starts', () => {
+    // Two drains racing through one queue would re-introduce the flush
+    // problem — entries dispatched twice as fast as either expects.
+    const fn = _src_p.slice(
+      _src_p.indexOf('function progressivelyDrainSerializationQueue'),
+      _src_p.indexOf('function progressivelyDrainSerializationQueue') + 2000,
+    );
+    assert.match(fn, /_activeProgressiveDrain\.cancel\(\)/);
   });
 });
