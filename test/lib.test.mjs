@@ -7678,9 +7678,12 @@ describe('Phase 5 — UI: per-session misses card', () => {
   });
 
   it('renders per-session <details> blocks with hit-rate badges', () => {
+    // Slice bumped from 4500 → 10000 to span the UX-CM1 sticky-state
+    // resolution block + UX-CM3 expand toggle added in batch H. The
+    // function is ~9K now (was ~4K when this test was written).
     const fn = _src_t5ui.slice(
       _src_t5ui.indexOf('function renderCacheMisses'),
-      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+      _src_t5ui.indexOf('function renderCacheMisses') + 10000,
     );
     assert.match(fn, /miss-session/);
     assert.match(fn, /miss-rate-badge/);
@@ -7691,11 +7694,12 @@ describe('Phase 5 — UI: per-session misses card', () => {
   });
 
   it('per-row miss line shows model + reason columns (XSS-safe)', () => {
-    // Slice bumped from 4500 → 6000 to span the SC-OPUS-002
-    // KNOWN_MISS_REASONS allow-list block added in round-2.
+    // Slice bumped from 6000 → 10000 to span the UX batch H expansion
+    // (UX-CM1 sticky-state + UX-CM3 expand toggle). The function is ~9K
+    // now; previously ~6K when SC-OPUS-002 added the allow-list block.
     const fn = _src_t5ui.slice(
       _src_t5ui.indexOf('function renderCacheMisses'),
-      _src_t5ui.indexOf('function renderCacheMisses') + 6000,
+      _src_t5ui.indexOf('function renderCacheMisses') + 10000,
     );
     assert.match(fn, /miss-model/);
     assert.match(fn, /miss-reason/);
@@ -7711,16 +7715,24 @@ describe('Phase 5 — UI: per-session misses card', () => {
   });
 
   it('caps DOM at 5 sessions x 10 rows-per-session, footer reports overflow', () => {
-    // Slice bumped from 4500 → 6000 (see XSS test above).
+    // Slice bumped from 6000 → 10000 (see XSS test above).
+    // UX-CM3 replaced the per-session "older miss(es) in this session"
+    // <div> footer with a <button class="miss-show-more"> that says
+    // "Show N older miss(es)" — assert that copy too.
     const fn = _src_t5ui.slice(
       _src_t5ui.indexOf('function renderCacheMisses'),
-      _src_t5ui.indexOf('function renderCacheMisses') + 6000,
+      _src_t5ui.indexOf('function renderCacheMisses') + 10000,
     );
     assert.match(fn, /SESSION_CAP = 5/);
     assert.match(fn, /ROWS_PER_SESSION_CAP = 10/);
-    // Both overflow footers must exist (per-session and global)
+    // Both overflow footers must exist: the global sessions footer
+    // (still a <div>) and the per-session inline-expand button.
     assert.match(fn, /more session\(s\) with cache misses/);
-    assert.match(fn, /older miss\(es\) in this session/);
+    // UX-CM3: the per-session truncation row is now a <button> labelled
+    // "Show N older miss(es)" — pin the button class so a future
+    // refactor cannot silently revert to the old non-actionable <div>.
+    assert.match(fn, /miss-show-more/);
+    assert.match(fn, /Show ' \+ hiddenCount \+ ' older miss/);
   });
 
   it('falls back to flat list when missSessions is empty (back-compat)', () => {
@@ -8388,9 +8400,12 @@ describe('Audit SC-OPUS-002 — reason → CSS class uses allow-list (XSS harden
     // refactor that allows colons in reason strings, or derives reason
     // from a row field, would silently open an XSS sink. Allow-list
     // closes the footgun.
+    // Slice bumped from 5500 → 10000 to span UX batch H expansion
+    // (UX-CM1 sticky-state + UX-CM3 expand toggle pushed the
+    // KNOWN_MISS_REASONS block further down the function body).
     const fn = _src_sc2.slice(
       _src_sc2.indexOf('function renderCacheMisses'),
-      _src_sc2.indexOf('function renderCacheMisses') + 5500,
+      _src_sc2.indexOf('function renderCacheMisses') + 10000,
     );
     assert.match(fn, /var KNOWN_MISS_REASONS\s*=\s*\{ 'compact-boundary': 1, 'model-changed': 1, 'TTL-likely': 1, 'unknown': 1 \}/);
     assert.match(fn, /var reasonKey\s*=\s*KNOWN_MISS_REASONS\[reasonText\] \? reasonText : 'unknown'/);
@@ -9701,5 +9716,131 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
     // redundant visual cue, not a label.
     assert.match(_src_vh,
       /<span class="evt-icon" aria-hidden="true"/);
+  });
+});
+
+
+// ─────────────────────────────────────────────────
+// UX batch H — UX-CM1 / UX-CM3 / UX-BR1 / UX-BR2 source-grep regressions
+//
+// Cache-miss list and Account/Repo breakdown polish:
+//  - UX-CM1: persist user-collapsed/opened state of cache-miss sessions
+//    in localStorage (key vdm.cacheMissOpen.<sessionId>); default = closed
+//    for sessions older than 24h, otherwise the first session auto-opens.
+//  - UX-CM3: clickable "Show N older miss(es)" toggle that uncaps a
+//    single session's miss list inline (no CSV export needed).
+//  - UX-BR1: Account Breakdown rows carry a plan badge (PRO / MAX / FREE)
+//    next to the account name, sourced from _cachedProfiles. Falls back
+//    gracefully when no profile match exists.
+//  - UX-BR2: Repository & Branch collapse default is now driven per-repo
+//    by branch count (collapsed when >3 branches). Section header has
+//    explicit "Expand all" / "Collapse all" buttons.
+//
+// Source-greps below pin the load-bearing pieces so a future refactor
+// can't silently revert them. The renderers all live inside renderHTML()
+// template literal and ship as a string to the browser, so behavioural
+// DOM tests aren't viable from this test file.
+// ─────────────────────────────────────────────────
+describe('UX batch H — UX-CM1 / UX-CM3 / UX-BR1 / UX-BR2 source-grep regressions', () => {
+  const _src_uxh = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-CM1 — sticky open/closed state per cache-miss session ──
+  it('UX-CM1 — _openMissSessions / _collapsedMissSessions Sets exist as state holders', () => {
+    assert.match(_src_uxh, /var _openMissSessions\s*=\s*new Set\(\)/);
+    assert.match(_src_uxh, /var _collapsedMissSessions\s*=\s*new Set\(\)/);
+  });
+
+  it('UX-CM1 — bounded localStorage parse for vdm.cacheMissOpen and vdm.cacheMissClosed keys', () => {
+    // Mirror the _CPF_MAX_ITEMS / _CPF_MAX_STRLEN / _CPF_MAX_BLOB pattern so
+    // a corrupted localStorage entry can't either land junk strings or
+    // DoS the dropdown render with millions of items.
+    assert.match(_src_uxh, /_MISS_MAX_ITEMS\s*=\s*200/);
+    assert.match(_src_uxh, /_MISS_MAX_STRLEN\s*=\s*1024/);
+    assert.match(_src_uxh, /_MISS_MAX_BLOB\s*=\s*256\s*\*\s*1024/);
+    assert.match(_src_uxh, /vdm\.cacheMissOpen/);
+    assert.match(_src_uxh, /vdm\.cacheMissClosed/);
+  });
+
+  it('UX-CM1 — onToggle handler routes through _onMissSessionToggle (data-sid)', () => {
+    assert.match(_src_uxh, /function _onMissSessionToggle\(/);
+    assert.match(_src_uxh, /data-sid="/);
+    assert.match(_src_uxh, /ontoggle="_onMissSessionToggle\(this\)"/);
+  });
+
+  it('UX-CM1 — open-by-default rule honours a 24h sliding cutoff', () => {
+    // 24h sliding cutoff so very old sessions never auto-pop on page load.
+    assert.match(_src_uxh, /_MISS_DEFAULT_OPEN_AGE_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
+  });
+
+  it('UX-CM1 — XSS hardening: data-sid attribute escapes the sessionId', () => {
+    // The session ID flows from server JSON into an attribute. Make sure
+    // it is piped through escHtml.
+    assert.match(_src_uxh, /data-sid="'\s*\+\s*escHtml\(/);
+  });
+
+  // ── UX-CM3 — inline expansion of older misses ──
+  it('UX-CM3 — _expandedMissSessions Set + _toggleMissSessionExpand helper', () => {
+    assert.match(_src_uxh, /var _expandedMissSessions\s*=\s*new Set\(\)/);
+    assert.match(_src_uxh, /function _toggleMissSessionExpand\(/);
+  });
+
+  it('UX-CM3 — Show N older / Hide button replaces dead truncation row', () => {
+    // Old shape (a styled <div> reading "and N older misses in this session")
+    // was non-actionable. New shape: <button class="miss-show-more"> routed
+    // through _toggleMissSessionExpand via this.dataset.sid (the canonical
+    // pattern from toggleRepoCollapse / data-key).
+    assert.match(_src_uxh, /miss-show-more/);
+    assert.match(_src_uxh, /onclick="_toggleMissSessionExpand\(this\.dataset\.sid\)"/);
+  });
+
+  it('UX-CM3 — XSS hardening: sessionId reaches button via escHtml-wrapped data-sid', () => {
+    // sessionId reaches the DOM only via a data-sid attribute that is
+    // escHtml-wrapped. This avoids the JS-quote-escape footgun that an
+    // inline onclick string literal would have. Slice generous (10000)
+    // because the function is ~9K and miss-show-more lives at the end.
+    const fnSlice = _src_uxh.slice(
+      _src_uxh.indexOf('function renderCacheMisses'),
+      _src_uxh.indexOf('function renderCacheMisses') + 10000,
+    );
+    assert.match(fnSlice, /miss-show-more[\s\S]{0,400}data-sid="'\s*\+\s*escHtml\(/);
+  });
+
+  // ── UX-BR1 — plan badge in Account Breakdown ──
+  it('UX-BR1 — plan-badge built from _cachedProfiles via planBadge()', () => {
+    const fnSlice = _src_uxh.slice(
+      _src_uxh.indexOf('function renderAccountBreakdown'),
+      _src_uxh.indexOf('function renderAccountBreakdown') + 3500,
+    );
+    assert.match(fnSlice, /_cachedProfiles/);
+    assert.match(fnSlice, /planBadge\(/);
+  });
+
+  it('UX-BR1 — plan badge gracefully degrades when no matching profile', () => {
+    const fnSlice = _src_uxh.slice(
+      _src_uxh.indexOf('function renderAccountBreakdown'),
+      _src_uxh.indexOf('function renderAccountBreakdown') + 3500,
+    );
+    assert.match(fnSlice, /prof\s*\?\s*planBadge\(|profileMap\[[^\]]+\]\s*\?\s*planBadge\(/);
+  });
+
+  // ── UX-BR2 — explicit collapse-default + Expand/Collapse all buttons ──
+  it('UX-BR2 — Expand all / Collapse all buttons exist in Repository & Branch header', () => {
+    assert.match(_src_uxh, /onclick="_repoBranchExpandAll\(\)"/);
+    assert.match(_src_uxh, /onclick="_repoBranchCollapseAll\(\)"/);
+    assert.match(_src_uxh, /Expand all/);
+    assert.match(_src_uxh, /Collapse all/);
+  });
+
+  it('UX-BR2 — _repoBranchCollapseAll / _repoBranchExpandAll helpers exist', () => {
+    assert.match(_src_uxh, /function _repoBranchCollapseAll\(\s*\)/);
+    assert.match(_src_uxh, /function _repoBranchExpandAll\(\s*\)/);
+  });
+
+  it('UX-BR2 — collapse default is per-repo and depends on branch count, not active count', () => {
+    // The new rule: collapse a repo by default when its branch count > 3.
+    assert.match(_src_uxh, /_REPO_COLLAPSE_BRANCH_THRESHOLD\s*=\s*3/);
   });
 });

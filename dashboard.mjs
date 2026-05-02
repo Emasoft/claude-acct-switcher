@@ -4916,6 +4916,29 @@ function renderHTML() {
     background: var(--purple-soft);
     color: var(--purple);
   }
+  /* UX-CM3: actionable inline expansion of older misses. Replaces the
+     previous read-only italic <div> truncation row with a real button.
+     Visually distinct from the row content but unobtrusive — same muted
+     palette as the surrounding miss-rate-counts text. */
+  .tree-misses-card .miss-show-more {
+    display: block;
+    margin: 0.25rem 0 0.25rem 1.5rem;
+    padding: 0.2rem 0.6rem;
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .tree-misses-card .miss-show-more:hover,
+  .tree-misses-card .miss-show-more:focus-visible {
+    background: var(--bg);
+    color: var(--foreground);
+    border-color: var(--foreground);
+  }
 
   .tok-export-btn {
     background: var(--card);
@@ -5588,7 +5611,14 @@ function renderHTML() {
         <div id="tok-accounts"></div>
       </div>
       <div class="usage-card">
-        <div class="usage-title">Repository &amp; Branch</div>
+        <!-- UX-BR2: Repository & Branch header with explicit Expand all /
+             Collapse all buttons. Removes the "default depends on active
+             count" surprise — user always has a one-click recovery path. -->
+        <div class="usage-title" style="display:flex;align-items:center;gap:.5rem">
+          <span>Repository &amp; Branch</span>
+          <button type="button" class="cpf-link" onclick="_repoBranchExpandAll()" title="Expand every repository card so all branches are visible" style="margin-left:auto">Expand all</button>
+          <button type="button" class="cpf-link" onclick="_repoBranchCollapseAll()" title="Collapse every repository card to header-only">Collapse all</button>
+        </div>
         <div id="tok-repos"></div>
       </div>
       <div class="usage-card" id="tok-tools-card" style="margin-top:1rem">
@@ -7619,6 +7649,115 @@ var TOK_PLANS = {
 var _tokPrevPeriodData = [];
 var _tokRepoCollapsed = {};
 
+// UX-CM1 / UX-CM3 — sticky open/closed state for the cache-miss session
+// list, plus per-session "show all misses" expansion. Three Sets:
+//
+//   _openMissSessions       — sessionIds the user explicitly OPENED. These
+//                              stay open across re-renders even when they
+//                              would otherwise default-collapse (e.g. very
+//                              old sessions).
+//   _collapsedMissSessions  — sessionIds the user explicitly CLOSED. These
+//                              stay closed across re-renders even when
+//                              they would otherwise auto-open (the first
+//                              session, or any session younger than 24h).
+//   _expandedMissSessions   — sessionIds whose miss-list cap was lifted by
+//                              the user clicking the "Show N older" link.
+//                              Survives re-render so the user does not have
+//                              to re-click on every 5s poll tick.
+//
+// Persistence: _openMissSessions and _collapsedMissSessions are persisted
+// to localStorage (vdm.cacheMissOpen / vdm.cacheMissClosed) with the same
+// bounded-parse pattern as _chartProjectFilter — max 200 ids, 1024 chars
+// each, 256 KB raw blob — so a corrupted entry cannot land junk strings or
+// DoS the renderer with millions of items. _expandedMissSessions is
+// in-memory only because it is purely a session-scoped UX preference.
+var _MISS_MAX_ITEMS  = 200;
+var _MISS_MAX_STRLEN = 1024;
+var _MISS_MAX_BLOB   = 256 * 1024;
+// 24h sliding cutoff for the "default open" rule: only the first session
+// AND only if it is younger than 24h auto-opens. Old data quietly stays
+// collapsed so loading the page mid-week does not pop a stale session.
+var _MISS_DEFAULT_OPEN_AGE_MS = 24 * 60 * 60 * 1000;
+var _openMissSessions = new Set();
+var _collapsedMissSessions = new Set();
+var _expandedMissSessions = new Set();
+function _hydrateMissSessionSet(key, target) {
+  try {
+    var raw = localStorage.getItem(key);
+    if (!raw || raw.length > _MISS_MAX_BLOB) return;
+    var arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+    var max = Math.min(arr.length, _MISS_MAX_ITEMS);
+    for (var i = 0; i < max; i++) {
+      var v = arr[i];
+      if (typeof v === 'string' && v.length > 0 && v.length <= _MISS_MAX_STRLEN) {
+        target.add(v);
+      }
+    }
+  } catch (e) { /* ignore — clean slate is fine */ }
+}
+_hydrateMissSessionSet('vdm.cacheMissOpen',   _openMissSessions);
+_hydrateMissSessionSet('vdm.cacheMissClosed', _collapsedMissSessions);
+var _persistMissSessionWarned = false;
+function _persistMissSessionSet(key, target) {
+  try {
+    // Cap on write too — defensive: if a malicious caller stuffed the Set
+    // with junk we never persist more than _MISS_MAX_ITEMS.
+    var arr = Array.from(target).slice(0, _MISS_MAX_ITEMS);
+    localStorage.setItem(key, JSON.stringify(arr));
+  } catch (e) {
+    if (!_persistMissSessionWarned) {
+      _persistMissSessionWarned = true;
+      console.warn('vdm: localStorage write failed for cache-miss session state:', e && e.message);
+    }
+  }
+}
+// Toggle handler wired by the <details ontoggle=...> attribute. Mirrors
+// the Sessions tab's _collapsedSessions Set pattern but is more nuanced:
+// we need to remember BOTH "user opened me" AND "user closed me" because
+// the default-open rule is age-based, not "always closed". A single
+// "is-collapsed" Set would not be enough — opening session #2 on first
+// load (where #1 is the default-open) needs to leave #2 in
+// _openMissSessions so it stays open after a refresh, AND we need to
+// know if the user CLOSED #1 so it stays closed even though it would
+// auto-open by default.
+function _onMissSessionToggle(d) {
+  if (!d) return;
+  var sid = d.getAttribute('data-sid');
+  if (!sid) return;
+  if (d.open) {
+    _openMissSessions.add(sid);
+    _collapsedMissSessions.delete(sid);
+  } else {
+    _collapsedMissSessions.add(sid);
+    _openMissSessions.delete(sid);
+  }
+  _persistMissSessionSet('vdm.cacheMissOpen',   _openMissSessions);
+  _persistMissSessionSet('vdm.cacheMissClosed', _collapsedMissSessions);
+}
+// UX-CM3 — toggle the per-session "show all misses" cap. Re-renders the
+// cache-miss list so the affected session expands inline. Reused for
+// the inverse "Hide" action via the same handler — the renderer reads
+// _expandedMissSessions to decide whether to cap or not.
+function _toggleMissSessionExpand(sid) {
+  if (typeof sid !== 'string' || !sid) return;
+  if (_expandedMissSessions.has(sid)) _expandedMissSessions.delete(sid);
+  else _expandedMissSessions.add(sid);
+  // Re-render the cache-miss list using the most-recent dataset. The
+  // cached _wastedSpendRaw sits adjacent to the misses array but the
+  // full data round-trip is done by refreshUsageTree. We reuse the
+  // last-rendered slice held in _lastMissesArgs so we don't have to
+  // refetch — the user's intent is purely visual.
+  if (_lastMissesArgs) {
+    renderCacheMisses(_lastMissesArgs.misses, _lastMissesArgs.missSessions);
+  }
+}
+// Snapshot of the most recent renderCacheMisses arguments so the
+// _toggleMissSessionExpand handler can re-render with the same dataset
+// without a network refetch. NOT persisted — purely an in-memory cache
+// for the user's last-seen miss data.
+var _lastMissesArgs = null;
+
 function estimateCost(model, inTok, outTok, cacheReadTok, cacheCreationTok) {
   var key = Object.keys(TOK_PRICING).find(function(k) { return model && model.indexOf(k) === 0; });
   var p = key ? TOK_PRICING[key] : TOK_PRICING_DEFAULT;
@@ -7657,6 +7796,31 @@ function formatCost(dollars) {
 
 function toggleRepoCollapse(repoKey) {
   _tokRepoCollapsed[repoKey] = !_tokRepoCollapsed[repoKey];
+  renderRepoBranchBreakdown(_tokFilteredData || []);
+}
+
+// UX-BR2: explicit Expand all / Collapse all controls for the
+// Repository & Branch panel. The per-repo collapsed state lives in
+// _tokRepoCollapsed; bulk-flipping every key gives users a one-click
+// recovery from the per-repo branch-count default (see
+// _REPO_COLLAPSE_BRANCH_THRESHOLD in renderRepoBranchBreakdown). We
+// iterate only over the keys we already know about — adding a synthetic
+// "expand-everything-including-future-repos" mode would surprise the user
+// when a new repo appears later in a 5s poll.
+function _repoBranchCollapseAll() {
+  for (var k in _tokRepoCollapsed) {
+    if (Object.prototype.hasOwnProperty.call(_tokRepoCollapsed, k)) {
+      _tokRepoCollapsed[k] = true;
+    }
+  }
+  renderRepoBranchBreakdown(_tokFilteredData || []);
+}
+function _repoBranchExpandAll() {
+  for (var k in _tokRepoCollapsed) {
+    if (Object.prototype.hasOwnProperty.call(_tokRepoCollapsed, k)) {
+      _tokRepoCollapsed[k] = false;
+    }
+  }
   renderRepoBranchBreakdown(_tokFilteredData || []);
 }
 
@@ -8002,6 +8166,10 @@ function renderCacheMisses(misses, missSessions) {
   card.style.display = '';
   if (countEl) countEl.textContent = String(misses.length);
 
+  // UX-CM3: snapshot the args so _toggleMissSessionExpand can re-render
+  // without a network refetch when the user expands a session inline.
+  _lastMissesArgs = { misses: misses, missSessions: missSessions };
+
   // Render per-session groups (preferred). Cap at 5 sessions for DOM
   // bounds; within each session, cap at 10 most-recent misses. The full
   // count is always shown in the header so the operator knows what's
@@ -8034,6 +8202,7 @@ function renderCacheMisses(misses, missSessions) {
   }
 
   var sessionsToShow = sessions.slice(0, SESSION_CAP);
+  var nowMs = Date.now();
   var html = '';
   for (var s = 0; s < sessionsToShow.length; s++) {
     var sess = sessionsToShow[s];
@@ -8042,7 +8211,36 @@ function renderCacheMisses(misses, missSessions) {
     // Truncate the sessionId display: keep the first 12 chars (the UUID
     // prefix is enough to be recognisable but doesn't dominate the row).
     var sidShort = (sess.sessionId || '?').slice(0, 12);
-    html += '<details class="miss-session"' + (s === 0 ? ' open' : '') + '>'
+    var sidRaw = sess.sessionId || '';
+    // UX-CM1: open-state resolution — three Sets feed the decision.
+    //
+    //   1. If the user explicitly closed this session, it stays closed.
+    //   2. Otherwise, if the user explicitly opened it, it stays open.
+    //   3. Otherwise, the default rule kicks in: only the first session
+    //      (s === 0) AND only if its most recent miss is younger than
+    //      24h. Older "first session" sessions stay collapsed so loading
+    //      the page next week does not re-pop a stale session.
+    //
+    // Compute the most recent miss timestamp from missDetails (which is
+    // chronological, oldest-first, so the LAST entry is the most recent).
+    var lastMissTs = 0;
+    if (Array.isArray(sess.missDetails) && sess.missDetails.length) {
+      var lastMiss = sess.missDetails[sess.missDetails.length - 1];
+      lastMissTs = (lastMiss && Number(lastMiss.ts)) || 0;
+    }
+    var ageMs = lastMissTs ? (nowMs - lastMissTs) : Infinity;
+    var defaultOpen = (s === 0 && ageMs < _MISS_DEFAULT_OPEN_AGE_MS);
+    var isOpen;
+    if (sidRaw && _collapsedMissSessions.has(sidRaw))    isOpen = false;
+    else if (sidRaw && _openMissSessions.has(sidRaw))    isOpen = true;
+    else                                                  isOpen = defaultOpen;
+    // data-sid attribute carries the sessionId for both the toggle
+    // handler and the "show more" button below. escHtml-protected so
+    // a future server-side change to opaque tokens with arbitrary
+    // punctuation cannot open an attribute-injection sink.
+    html += '<details class="miss-session"' + (isOpen ? ' open' : '')
+      + ' data-sid="' + escHtml(sidRaw) + '"'
+      + ' ontoggle="_onMissSessionToggle(this)">'
       + '<summary>'
       + '<span class="miss-sess-id" title="' + escHtml(sess.sessionId || '?') + '">' + escHtml(sidShort) + '</span>'
       + '<span class="miss-sess-loc">' + escHtml((sess.repo || '?') + ' / ' + (sess.branch || '?')) + '</span>'
@@ -8051,8 +8249,14 @@ function renderCacheMisses(misses, missSessions) {
         + ' <span class="miss-rate-counts">(' + (sess.hits | 0) + ' hits, ' + (sess.misses | 0) + ' misses)</span>'
       + '</span>'
       + '</summary>';
-    // Per-session miss details — most recent first
-    var details = (sess.missDetails || []).slice(-ROWS_PER_SESSION_CAP).reverse();
+    // UX-CM3: when this session has been "expanded" by the user, lift
+    // the per-session row cap so every miss is visible inline. Default
+    // is the bounded ROWS_PER_SESSION_CAP slice (most recent first).
+    var allDetails = sess.missDetails || [];
+    var expanded = sidRaw && _expandedMissSessions.has(sidRaw);
+    var details = expanded
+      ? allDetails.slice().reverse()
+      : allDetails.slice(-ROWS_PER_SESSION_CAP).reverse();
     for (var d = 0; d < details.length; d++) {
       var m2 = details[d];
       var ts2 = m2.ts ? new Date(m2.ts).toLocaleString() : '?';
@@ -8085,9 +8289,26 @@ function renderCacheMisses(misses, missSessions) {
         + '<span class="miss-reason ' + reasonClass + '" title="' + escHtml(reasonTip) + '">' + escHtml(reasonText) + '</span>'
         + '</div>';
     }
-    if ((sess.missDetails || []).length > ROWS_PER_SESSION_CAP) {
-      html += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and '
-        + (sess.missDetails.length - ROWS_PER_SESSION_CAP) + ' older miss(es) in this session</div>';
+    // UX-CM3: replace the old non-actionable "… and N older" <div> with
+    // a real <button> that toggles per-session expansion. The button
+    // text flips between "Show N older" and "Hide" depending on
+    // _expandedMissSessions membership. SessionId reaches the handler
+    // via this.dataset.sid (escHtml-protected attribute), mirroring the
+    // toggleRepoCollapse pattern — never inlined into a JS string.
+    if (allDetails.length > ROWS_PER_SESSION_CAP) {
+      var hiddenCount = allDetails.length - ROWS_PER_SESSION_CAP;
+      var btnLabel = expanded
+        ? 'Hide ' + hiddenCount + ' older miss' + (hiddenCount === 1 ? '' : 'es')
+        : 'Show ' + hiddenCount + ' older miss' + (hiddenCount === 1 ? '' : 'es');
+      var btnTitle = expanded
+        ? 'Collapse this session back to the most recent ' + ROWS_PER_SESSION_CAP + ' misses'
+        : 'Expand this session inline to see every miss (no CSV export needed)';
+      html += '<button type="button" class="miss-show-more"'
+        + ' data-sid="' + escHtml(sidRaw) + '"'
+        + ' title="' + escHtml(btnTitle) + '"'
+        + ' onclick="_toggleMissSessionExpand(this.dataset.sid)">'
+        + escHtml(btnLabel)
+        + '</button>';
     }
     html += '</details>';
   }
@@ -9101,6 +9322,19 @@ function renderAccountBreakdown(data) {
   var grandTotal = 0;
   for (var j = 0; j < sortedAccounts.length; j++) grandTotal += accountMap[sortedAccounts[j]].total;
   if (!grandTotal) grandTotal = 1;
+  // UX-BR1: build a name/label-keyed map of profiles so each row can
+  // surface the plan badge (PRO / MAX / FREE) without flipping to the
+  // Accounts tab. _cachedProfiles is populated by refresh() and may be
+  // empty on first paint — the per-row guard handles that gracefully.
+  var profileMap = {};
+  if (Array.isArray(_cachedProfiles)) {
+    for (var pi = 0; pi < _cachedProfiles.length; pi++) {
+      var prof = _cachedProfiles[pi];
+      if (!prof) continue;
+      if (prof.name)  profileMap[prof.name]  = prof;
+      if (prof.label) profileMap[prof.label] = prof;
+    }
+  }
   var propBar = '<div class="tok-proportion">';
   for (var k = 0; k < sortedAccounts.length; k++) {
     var pct = (accountMap[sortedAccounts[k]].total / grandTotal) * 100;
@@ -9112,11 +9346,17 @@ function renderAccountBreakdown(data) {
     var ad = accountMap[sortedAccounts[r]];
     var pctR = Math.round((ad.total / grandTotal) * 100);
     var cost = ad.cost;
+    // UX-BR1: graceful degradation — when a row's account name is not in
+    // _cachedProfiles (e.g. removed account, or profiles still loading),
+    // emit the empty string so the row layout stays identical with no
+    // "[object Object]" or undefined.
+    var prof = profileMap[sortedAccounts[r]];
+    var planHtml = prof ? planBadge(prof.subscriptionType, prof.rateLimitTier) : '';
     // UX-X9: hover-exact for the per-account totals so two accounts
     // displayed at "1.2M" can be distinguished by hover.
     rows += '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
-      '<div class="tok-model-name">' + escHtml(sortedAccounts[r]) + '</div>' +
+      '<div class="tok-model-name">' + escHtml(sortedAccounts[r]) + (planHtml ? ' ' + planHtml : '') + '</div>' +
       '<div class="tok-model-detail" title="' + fmtTokenCountExact(ad.input) + ' input / ' + fmtTokenCountExact(ad.output) + ' output">' + formatNum(ad.input) + ' in / ' + formatNum(ad.output) + ' out</div>' +
       '<div class="tok-model-total" title="' + fmtTokenCountExact(ad.total) + ' total tokens">' + formatNum(ad.total) + '</div>' +
       '<div class="tok-model-cost">' + formatCost(cost) + '</div>' +
@@ -9173,11 +9413,17 @@ function renderRepoBranchBreakdown(data) {
   var inactive = repoList.filter(function(r) { return r.lastTs < inactiveThreshold; });
   active.sort(function(a,b) { return b.total - a.total; });
   inactive.sort(function(a,b) { return b.total - a.total; });
-  // Default collapse: collapsed if more than 3 active repos
-  var defaultCollapsed = active.length > 3;
+  // UX-BR2: Per-repo branch-count threshold replaces the global "default
+  // depends on active count" surprise. A repo with > 3 branches is
+  // collapsed by default (signal-to-noise — opening it would dump the
+  // full per-branch table on the user); a repo with ≤ 3 branches starts
+  // expanded so the data is immediately visible. Inactive repos still
+  // start collapsed regardless of branch count (lower priority surface).
+  var _REPO_COLLAPSE_BRANCH_THRESHOLD = 3;
   function renderRepoGroup(repo, isInactive) {
     if (_tokRepoCollapsed[repo.key] === undefined) {
-      _tokRepoCollapsed[repo.key] = isInactive ? true : defaultCollapsed;
+      var branchCount = repo.branches ? Object.keys(repo.branches).length : 0;
+      _tokRepoCollapsed[repo.key] = isInactive ? true : (branchCount > _REPO_COLLAPSE_BRANCH_THRESHOLD);
     }
     var collapsed = _tokRepoCollapsed[repo.key];
     var pct = Math.round((repo.total / grandTotal) * 100);
