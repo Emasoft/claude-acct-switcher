@@ -191,6 +191,42 @@ A 4-level hierarchical breakdown of the Tokens tab plus a heuristic for cache-mi
 - Tool Breakdown panel MUST stay visible when `!hasAttributed` and render an inline explainer pointing to Config → Per-Tool Attribution (clickable `<a href="#" onclick="switchTab('config')">` link). The previous `card.style.display = 'none'` made the panel auto-hide silently with no recourse.
 - Sessions tab initial markup MUST be `<div class="empty-state" id="sessions-loading">Loading sessions…</div>`. The runtime `renderSessions()` then dispatches truthful copy: "Session Monitor is OFF" when `!data.enabled`, or "No sessions yet" when enabled-but-empty. Hardcoding "Session Monitor is OFF" in the initial markup was a UX-S1 race that misled users during the brief loading window.
 
+**UX batch F invariants** (UX-H1 / UX-H2 / UX-CO1 / UX-CO3 / UX-CO4 — header + Config tab polish):
+- Header MUST emit a `<div class="header-right">` wrapper hosting status pills + settings (gear) and help (?) icon `<button>` controls. The bare `flex space-between` with empty right column was a UX-H1 dead zone.
+- Exhausted-account banner uses `var(--red-soft)` background + `var(--red)` border (palette-consistent), NEVER full-saturation red on a light dashboard (UX-H2).
+- Config tab sections MUST carry stable `id=` attributes (`id="config-<section>"`) and a small TOC at the top of the tab content; without these, the section anchor links break (UX-CO1).
+- Session Monitor description MUST include an explicit `<div class="privacy-callout">` block listing what is/isn't transmitted. Burying the "this reads transcripts" note inside flowing prose was UX-CO3 (the "serious privacy info hidden" finding).
+- Strategy section consolidation: the `STRATEGY_HINTS[strategy]` map is REMOVED. The strategy-list dropdown is the single source of strategy descriptions; the inline hint slot is reserved for unique supplementary detail (e.g. "currently active: <name>"). Source-grep regression tests pin the absence of `STRATEGY_HINTS[strategy]` and forbid re-injecting `STRATEGY_DETAILS[strategy].desc` into the strategy-hint slot — both would just rename the duplication (UX-CO4).
+
+**UX batch G invariants** (UX-A6 / UX-A7 — account-card stale + hover):
+- `.card.stale { opacity: 0.5 }` MUST be GONE. Whole-card opacity greyed out the red `.stale-msg` and the Refresh button, forcing hover-to-read interaction. Targeted opacity on `.card-top` (dot + name + badges) ONLY — rate bars, error message, and action buttons stay at full opacity (UX-A6).
+- Stale cards carry a small `.stale-pill` in the header with an `aria-label` for screen-reader announcement (colour-blind / SR-only users would otherwise have no signal).
+- `.card:hover` no longer uses `var(--shadow-lg)` (12px diffuse blooms onto the next card). Instead `.accounts` gap bumped to `0.875rem` AND `.card:hover` adds `transform: translateY(-1px)` lift so the smaller `var(--shadow)` has somewhere to go without overlapping. Hover border picks up `--primary` so the boundary stays crisp (UX-A7).
+
+**UX batch H invariants** (UX-CM1 / UX-CM3 / UX-BR1 / UX-BR2 — cache-miss + breakdown polish):
+- Cache-miss session open/closed state persists in localStorage under `vdm.cacheMissOpen.<sessionId>` and `vdm.cacheMissClosed.<sessionId>` (`_openMissSessions` / `_collapsedMissSessions` `Set` instances). Default = closed for sessions older than 24h (UX-CM1).
+- localStorage parse for those keys MUST be bounded (mirror `_CPF_MAX_ITEMS` / `_CPF_MAX_STRLEN` / `_CPF_MAX_BLOB` pattern from chartProjectFilter) — defense against quota poisoning.
+- "… and N older miss(es)" tail row MUST be a real `<button>` with `_toggleMissSessionExpand` handler that uncaps a single session's miss list inline. Source-grep regression tests pin the button (not a div) and the escHtml-wrapped sessionId argument (UX-CM3).
+- Account Breakdown rows carry a `.plan-badge` (PRO / MAX / FREE) sourced from `_cachedProfiles`. MUST fall back gracefully when no profile match exists — never throw or render `undefined` (UX-BR1).
+- Repository & Branch collapse default is per-repo, driven by branch count: collapsed when `branchCount > _REPO_COLLAPSE_BRANCH_THRESHOLD = 3`. Section header MUST carry explicit "Expand all" / "Collapse all" buttons (UX-BR2).
+
+**UX batch I invariants** (UX-CPF1 / UX-WS2 / UX-VS1 / UX-VS3 — wasted-spend + scrubber polish):
+- The `.chart-project-filter` (cpf-panel) MUST be a SIBLING above the carousel, NOT inside it. The pre-fix structure had cpf-panel positioned over the carousel; opening pushed nothing aside and overlapped the chart (UX-CPF1).
+- Wasted-spend bar colour comes from `wastedSeverity(value, allValues)` (pure function in `lib.mjs`) — percentile thresholds (≤50th = `WASTED_SEVERITY_LOW` / `var(--yellow-soft)`, ≤90th = `WASTED_SEVERITY_MED` / `var(--yellow)`, >90th = `WASTED_SEVERITY_HIGH` / `var(--red)`). Fixed yellow regardless of severity was UX-WS2.
+- Scrubber MUST display an inline composition hint near the track: "Scrubber narrows within the selected window from the dropdown above". Without this, scrubber+tok-time confusion was reproducible (UX-VS1).
+- An "edit dates" affordance for the `<input type="datetime-local">` fallback MUST be reachable at all viewport widths, not gated behind the `< 600px` media query (UX-VS3). Honor existing batch-D `vs-thumb` ≥ 24px invariant unchanged.
+
+**UX batch J invariants** (UX-S3 / UX-S4 — sessions tab polish):
+- Session copy button MUST NOT use `\\uD83D\\uDCCB` (📋 surrogate pair) — renders as □ on platforms without emoji fonts (servers, older Linux). The button is `opacity:0` by default (only on hover), so a missing glyph means the button completely vanishes. Use inline SVG for guaranteed cross-platform rendering AND `aria-label="Copy session timeline"` for keyboard/SR users (UX-S3).
+- Session timeline `max-height: 500px` clipping is paired with a fade-out gradient at the bottom edge when content overflows AND a "Show all" / "Show less" toggle button (`toggleSessionTimelineExpand`) that expands to natural height. Silent clip with no indicator was UX-S4.
+- The new copy + expand `onclick` handlers use the same `\\\\'` JS-string escaping as the existing `toggleSessionCollapse` — the `s.id` UUID is the only user-controlled piece, but defense-in-depth keeps the pattern consistent.
+
+**UX batch K invariants** (UX-L1 / UX-X10 — logs theme + muted-color overuse):
+- Logs tab container MUST use the design-token palette (`var(--card)` background + `var(--foreground)` text), NEVER hardcoded GitHub-dark hex colours (`#0d1117` / `#c9d1d9`). The dark-on-light contrast was UX-L1; hardcoded hex bypasses the design tokens and blocks any future dark-mode rebinding via `--card` / `--foreground`.
+- Logs tab keeps the monospace font; only the colour palette changed.
+- UX-X10 is a SURGICAL change — only the ambiguous active/inactive pairings using `var(--muted)` for both states are rewritten. The lower bound of `var(--muted)` uses (`>= 60` occurrences) is asserted by source-grep regression so a future "let me clean up muted" refactor can't break the design tokens en masse without updating the K-batch invariants.
+- Don't break the Logs tab filter UI from batch E (`.vdm-filter-bar`, `.evt-hidden`, `.log-line-hidden`) — the filter bar's CSS depends on the `var(--card)` / `var(--foreground)` rebinding from batch K.
+
 ### OAuth refresh
 
 `OAUTH_TOKEN_URL` defaults to `https://console.anthropic.com/v1/oauth/token` (Anthropic retired the older `platform.claude.com` host during the platform→console migration; the old URL silently 404s and refreshes against it never recover), `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.

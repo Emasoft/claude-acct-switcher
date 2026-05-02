@@ -4,7 +4,7 @@
 **Filename:** `design/tasks/TRDD-2b0eed81-7035-4829-b88e-b3c800df5df0-ux-audit-followups.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** All 6 suggested batches complete (batches 2, A, B, C, D, E done — remaining findings are individual MAJOR/MINOR/NIT items that were not part of the original suggested batching)
+**Status:** All 6 suggested batches PLUS round-3 individual MAJORs (batches F, G, H, I, J, K) complete. Only deferred MINOR/NIT items remain.
 **Created:** 2026-05-02
 **Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (95 findings, Opus)
 **Owner:** unassigned
@@ -27,6 +27,23 @@ Round 3 of the dashboard.mjs audit was a UX usability audit. Opus flagged 95 fin
 - `.remove-btn` tinted with `var(--red)` border+text at rest so the destructive action is visually distinct (audit-adjacent — was hex `#dc2626` only on hover).
 
 The other 80 findings are catalogued below for follow-up. None are merge-blockers; many are quality-of-life or polish.
+
+## Applied in **batches F + G + H + I + J + K** (round-3 parallel-Opus dispatch — 19 findings)
+
+Six Opus agents launched in parallel (one per batch), each in an isolated worktree. All 6 completed; merged sequentially with mechanical conflict resolution (each batch added its own describe block to test/lib.test.mjs at end-of-file).
+
+- **Batch F** (UX-H1, UX-H2, UX-CO1, UX-CO3, UX-CO4): header right-side action chrome (`<div class="header-right">` + settings/help icon buttons), exhausted-banner palette swap, Config tab anchor IDs + TOC, Session Monitor explicit privacy callout, strategy-list de-duplication (`STRATEGY_HINTS[strategy]` removed).
+- **Batch G** (UX-A6, UX-A7): account-card stale opacity now targets `.card-top` only (rate bars + error message + Refresh button stay full opacity); `.stale-pill` with `aria-label` for SR/colour-blind users; hover lift via `transform: translateY(-1px)` instead of bigger shadow + bumped `.accounts` gap.
+- **Batch H** (UX-CM1, UX-CM3, UX-BR1, UX-BR2): cache-miss session open/closed state persists in bounded localStorage (`vdm.cacheMissOpen.<id>` / `vdm.cacheMissClosed.<id>`); "Show N older miss(es)" tail row is a real `<button>` with inline expand; Account Breakdown rows carry `.plan-badge` (PRO / MAX / FREE) sourced from `_cachedProfiles`; Repository & Branch collapse default driven by `_REPO_COLLAPSE_BRANCH_THRESHOLD = 3` per-repo with explicit "Expand all" / "Collapse all" buttons.
+- **Batch I** (UX-CPF1, UX-WS2, UX-VS1, UX-VS3): cpf-panel restructured as carousel sibling (no more chart overlap); wasted-spend bar colour from `wastedSeverity()` percentile-based gradient (low/med/high); scrubber composition hint near track explaining the dropdown+scrubber rule; `<input type="datetime-local">` "edit dates" affordance reachable at all viewport widths.
+- **Batch J** (UX-S3, UX-S4): session copy button replaced 📋 emoji surrogate pair with inline SVG + `aria-label`; session timeline `max-height: 500px` clip paired with fade-out gradient + `toggleSessionTimelineExpand` "Show all" / "Show less" toggle.
+- **Batch K** (UX-L1, UX-X10): logs tab container migrated from hardcoded `#0d1117` / `#c9d1d9` GitHub-dark hex to the design-token palette (`var(--card)` / `var(--foreground)`); UX-X10 surgical — only the ambiguous active/inactive `var(--muted)` pairings rewritten, `>= 60` `var(--muted)` uses preserved (regression-asserted).
+
+### Lessons learned (round 3 — 6 parallel Opus agents)
+- The path-discipline guard (relative paths only for source files) **partially worked**: 4 of 6 agents (F, G, J, K) edited only their worktree. 2 of 6 (H, I) leaked edits to MAIN despite the guard. The leaked edits were intermediate drafts; the canonical final versions DID land in each agent's worktree commit, so discarding MAIN's dirty state and merging from branches recovered the canonical versions.
+- Merge conflict resolution was mechanical for 5 of 6 batches: each conflict was at the SAME location in `test/lib.test.mjs` (where each batch added its describe block at end-of-file). Pattern: keep both blocks, add `});` `});` to close the previous describe, open the new describe afresh. Identical pattern across all conflict types — a small auto-resolver script could handle this.
+- Janitor's `worktree-janitor.sh` `branch_HEAD == main_HEAD` heuristic produced **dangerous** false-positive `--force` prune suggestions for newly-spawned, no-commits-yet agent worktrees. Issue filed upstream as Emasoft/ai-maestro-janitor#5 with strict-ancestry + locked-worktree-skip patches proposed.
+- Final state: 918 tests pass (up from 822 baseline), 12 commits added, all worktrees + branches cleaned up.
 
 ## Applied in **batches A + C** (second parallel-agent dispatch — 9 findings)
 
@@ -87,16 +104,16 @@ The other 80 findings are catalogued below for follow-up. None are merge-blocker
 Grouped by area. See the full audit report for code-level fixes per finding.
 
 ### Header / global chrome
-- **UX-H1** — Header right-side empty; add settings/help affordance.
-- **UX-H2** — Exhausted banner colour scheme clashes with light dashboard.
+- ~~UX-H1~~ — *(addressed by .header-right wrapper + settings/help icon buttons, batch F)*
+- ~~UX-H2~~ — *(addressed by var(--red-soft) palette swap on exhausted banner, batch F)*
 
 ### Accounts tab
 - ~~UX-A2~~ — *(addressed by toggle moved to .card-actions row, batch A)*
 - ~~UX-A3~~ — *(addressed by .badge-excluded palette-consistent class, batch A)*
 - ~~UX-A4~~ — *(addressed by binding-ETA-only renderVelocityInline + title= for the other, batch A)*
 - ~~UX-A5~~ — *(addressed by .card-status-info hint with title= explainer, batch C)*
-- **UX-A6** — Stale account opacity hides info instead of dimming chrome.
-- **UX-A7** — Card hover `box-shadow: var(--shadow-lg)` overlaps neighbour card.
+- ~~UX-A6~~ — *(addressed by targeted .card-top opacity + .stale-pill, batch G)*
+- ~~UX-A7~~ — *(addressed by translateY(-1px) lift + bumped .accounts gap + smaller shadow, batch G)*
 
 ### Activity tab
 - ~~UX-AC1~~ — *(addressed by Activity tab filter input + regex toggle + clear, batch E)*
@@ -107,43 +124,43 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - **UX-CA2** — *(addressed by aria-labels)* Add visible labels under dots, not only tooltip.
 
 ### Usage tab — project filter
-- **UX-CPF1** — Multi-select dropdown overlaps carousel controls.
+- ~~UX-CPF1~~ — *(addressed by cpf-panel restructured as carousel sibling, batch I)*
 - ~~UX-CPF3~~ — *(addressed by listbox semantics + arrow-key nav, A11y batch 2)*
 
 ### Usage tab — wasted-spend
-- **UX-WS2** — Bars use fixed yellow regardless of severity (no gradient by spend level).
+- ~~UX-WS2~~ — *(addressed by wastedSeverity() percentile-based gradient, batch I)*
 
 ### Usage tab — scrubber (rest)
 - ~~UX-VS2~~ — *(addressed by 28px touch-friendly thumbs + native range thumb defaults, batch D)*
 
 ### Usage tab — cache misses
-- **UX-CM1** — First session details auto-open on every page load (sticky preference?).
-- **UX-CM3** — `… and N older miss(es)` truncation hides actionable detail.
+- ~~UX-CM1~~ — *(addressed by bounded-localStorage sticky open/closed state per session, batch H)*
+- ~~UX-CM3~~ — *(addressed by clickable "Show N older miss(es)" toggle button, batch H)*
 
 ### Usage tab — breakdown cards
-- **UX-BR1** — `Account Breakdown` rows have no plan badge / tier indicator.
-- **UX-BR2** — `Repository & Branch` collapse-all default depends on count, surprising users.
+- ~~UX-BR1~~ — *(addressed by .plan-badge sourced from _cachedProfiles, batch H)*
+- ~~UX-BR2~~ — *(addressed by per-repo branch-count threshold + Expand/Collapse all buttons, batch H)*
 - ~~UX-BR3~~ — *(addressed by inline explainer + Config link instead of auto-hide, batch C)*
 
 ### Usage tab — scrubber
-- **UX-VS1** — Scrubber's role conflicts with `tok-time` dropdown — both filter time.
+- ~~UX-VS1~~ — *(addressed by inline composition hint near track, batch I)*
 - ~~UX-VS2~~ — *(see "Usage tab — scrubber (rest)" below — addressed in batch D)*
-- **UX-VS3** — Fallback `<input type="datetime-local">` only shown at <600px.
+- ~~UX-VS3~~ — *(addressed by edit-dates affordance reachable at all viewport widths, batch I)*
 
 ### Sessions tab
 - ~~UX-S1~~ — *(addressed by neutral "Loading sessions…" initial markup + truth-based renderSessions branches, batch C)*
 - ~~UX-S2~~ — *(addressed by chevron hover/focus colour transition, A11y batch 2)*
-- **UX-S3** — Copy button uses 📋 emoji that won't render on all platforms.
-- **UX-S4** — Session timeline `max-height: 500px` clips long sessions silently.
+- ~~UX-S3~~ — *(addressed by inline SVG copy icon + aria-label, batch J)*
+- ~~UX-S4~~ — *(addressed by fade-out gradient + Show all/less toggle, batch J)*
 
 ### Config tab
-- **UX-CO1** — Config sections have no anchor links / search.
+- ~~UX-CO1~~ — *(addressed by section anchor IDs + TOC, batch F)*
 - ~~UX-CO2~~ — *(addressed by .beta-badge unification + duplicate session-monitor BETA removed, batch A)*
-- **UX-CO3** — Session Monitor description hides serious privacy info.
-- **UX-CO4** — Strategy hint + strategy-list duplicate the same information.
+- ~~UX-CO3~~ — *(addressed by .privacy-callout block on Session Monitor, batch F)*
+- ~~UX-CO4~~ — *(addressed by removal of STRATEGY_HINTS map + strategy-list as single source, batch F)*
 
 ### Logs tab
-- **UX-L1** — Log container uses dark theme inside light dashboard.
+- ~~UX-L1~~ — *(addressed by var(--card)/var(--foreground) design-token migration from #0d1117/#c9d1d9, batch K)*
 - ~~UX-L2~~ — *(addressed by Logs tab filter input + regex toggle + clear, batch E)*
 
 ### Cross-cutting
@@ -151,7 +168,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - ~~UX-X7~~ — *(addressed by proportional sparkline + min/max overlays + screen-reader label, batch D)*
 - ~~UX-X8~~ — *(addressed by `fmtTokenCount` + `fmtDuration` unification in lib.mjs, batch B)*
 - ~~UX-X9~~ — *(addressed by `title=` hover-exact attribute on every compact-form display, batch B)*
-- **UX-X10** — Many controls use `var(--muted)` for both placeholder text and active state.
+- ~~UX-X10~~ — *(addressed by surgical pairing rewrite, regression-asserted >= 60 var(--muted) uses preserved, batch K)*
 
 ## Deferred MINOR + NIT findings (≈30)
 
@@ -166,26 +183,16 @@ See the original report for the full list. Prioritisation rule: pick up MAJORs f
 5. ~~**Sparkline + scrubber refresh (D)**~~ ✅ done.
 6. ~~**Logs / Activity search batch (E)**~~ ✅ done.
 
-## What's left (individual MAJORs not in any suggested batch)
+## What's left
 
-These were not part of the original suggested batching and remain deferred:
-- **UX-H1 / UX-H2** — header/global chrome
-- **UX-A6 / UX-A7** — account-card stale opacity + hover overlap
-- **UX-CPF1** — multi-select dropdown overlaps carousel controls
-- **UX-WS2** — wasted-spend bars use fixed yellow regardless of severity
-- **UX-CM1 / UX-CM3** — cache-miss UX details
-- **UX-BR1 / UX-BR2** — breakdown-card plan-tier and collapse-default polish
-- **UX-VS1 / UX-VS3** — scrubber role + datetime-local fallback
-- **UX-S3 / UX-S4** — sessions tab copy button + timeline clip
-- **UX-CO1 / UX-CO3 / UX-CO4** — config tab anchor links / privacy / strategy duplication
-- **UX-L1** — logs container dark theme inside light dashboard
-- **UX-X10** — `var(--muted)` overuse for placeholder + active state
-
-Plus the ~30 deferred MINOR/NIT items listed in the original audit. Pick these up opportunistically when refactoring the surrounding area, per the prioritisation rule below.
+All MAJOR findings have been addressed across the original 6 suggested batches PLUS the round-3 individual-MAJOR batches (F, G, H, I, J, K). Only the ~30 deferred MINOR/NIT items from the original audit remain — pick them up opportunistically when refactoring the surrounding area, per the prioritisation rule below.
 
 ## What to do next session
 
-The 6 suggested batches are all complete. New work can pick from the "What's left" list above, or wait for the next round of audits.
+The TRDD's full MAJOR backlog is closed. Options:
+- Pick up MINOR/NIT items as they cross your path during other work.
+- Run a fresh UX audit to surface findings the round-1 audit missed.
+- Move on to non-UX work — the dashboard's UX is now in a known-good state with comprehensive source-grep regression coverage.
 
 ## Acceptance criteria (per batch)
 
