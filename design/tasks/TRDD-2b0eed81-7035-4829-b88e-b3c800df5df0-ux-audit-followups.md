@@ -4,7 +4,7 @@
 **Filename:** `design/tasks/TRDD-2b0eed81-7035-4829-b88e-b3c800df5df0-ux-audit-followups.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** In progress (batches 2, B, D, E of 6 done — 4/6 remaining)
+**Status:** All 6 suggested batches complete (batches 2, A, B, C, D, E done — remaining findings are individual MAJOR/MINOR/NIT items that were not part of the original suggested batching)
 **Created:** 2026-05-02
 **Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (95 findings, Opus)
 **Owner:** unassigned
@@ -27,6 +27,28 @@ Round 3 of the dashboard.mjs audit was a UX usability audit. Opus flagged 95 fin
 - `.remove-btn` tinted with `var(--red)` border+text at rest so the destructive action is visually distinct (audit-adjacent — was hex `#dc2626` only on hover).
 
 The other 80 findings are catalogued below for follow-up. None are merge-blockers; many are quality-of-life or polish.
+
+## Applied in **batches A + C** (second parallel-agent dispatch — 9 findings)
+
+### Batch A — Visual hierarchy (UX-A2 + UX-A3 + UX-A4 + UX-CO2 + UX-AC2)
+- "Exclude from auto-switch" toggle promoted from card bottom to the `.card-actions` row (top-right) on every account card.
+- `.badge-excluded` palette-consistent CSS class replaces the WCAG-failing inline-style grey-on-near-white.
+- `renderVelocityInline` shows ONLY the binding ETA; the other constraint goes into `title=`. Dual-badge noise gone.
+- All four BETA badges in Config tab unified under `.beta-badge`; duplicate "Enable session monitor" toggle-label BETA removed.
+- Activity feed entries carry an `evt-icon` glyph (▲ ✕ ⓘ ✓ ✦) paired with the dot's colour for colour-blind users (`aria-hidden="true"` on the icon span).
+
+**Recovery note:** Agent A was killed before reaching the commit step but had completed implementation + tests (810/0 pass, syntax clean). Work was rescued from the worktree and committed as `dbcac5a` on its branch, then merged.
+
+### Batch C — Empty + error state pass (UX-AC3 + UX-A5 + UX-BR3 + UX-S1)
+- Activity tab empty-state replaced "No activity yet" with `'No activity yet. Start a Claude Code session — every prompt, response, account switch, rate-limit hit, and token refresh appears here.'` Both initial markup and runtime `renderActivity()` empty branch emit the same string.
+- Dormant accounts get a `.card-status-info` hint with a `title=` explainer of what dormant means and how to activate.
+- Tool Breakdown panel no longer auto-hides when `!hasAttributed` — renders an inline explainer with a clickable link to Config → Per-Tool Attribution.
+- Sessions tab initial markup is now a neutral `Loading sessions…` placeholder; the truth-based `renderSessions()` then dispatches "Session Monitor is OFF" or "No sessions yet" based on actual state.
+
+### Lessons learned (round 2 of parallel-agent dispatch)
+- The path-discipline guard ("use relative paths only for source files") in the agent prompts WORKED — neither agent leaked edits to MAIN this round.
+- Conflict resolution was straightforward: both agents added their own `describe(...)` block to `test/lib.test.mjs`, and the renderAccounts/renderActivityFeed edits in `dashboard.mjs` were local enough that auto-merge succeeded for dashboard.mjs and only the test file needed manual resolution (kept both describe blocks).
+- One agent (batch A) was killed before committing — rescuing from the worktree (verify syntax + tests pass, then `git commit` on the worktree branch) is reliable. The agent's TDD workflow had completed implementation + tests before being killed at the report-writing step.
 
 ## Applied in **batches B + D + E** (parallel agent worktree dispatch — 6 findings)
 
@@ -69,17 +91,17 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - **UX-H2** — Exhausted banner colour scheme clashes with light dashboard.
 
 ### Accounts tab
-- **UX-A2** — "Exclude from auto-switch" toggle buried at card bottom.
-- **UX-A3** — `excluded` badge contrast poor and unstyled.
-- **UX-A4** — Two ETA badges (5h + 7d) on a single row become noise.
-- **UX-A5** — Dormant accounts have no actionable hint.
+- ~~UX-A2~~ — *(addressed by toggle moved to .card-actions row, batch A)*
+- ~~UX-A3~~ — *(addressed by .badge-excluded palette-consistent class, batch A)*
+- ~~UX-A4~~ — *(addressed by binding-ETA-only renderVelocityInline + title= for the other, batch A)*
+- ~~UX-A5~~ — *(addressed by .card-status-info hint with title= explainer, batch C)*
 - **UX-A6** — Stale account opacity hides info instead of dimming chrome.
 - **UX-A7** — Card hover `box-shadow: var(--shadow-lg)` overlaps neighbour card.
 
 ### Activity tab
 - ~~UX-AC1~~ — *(addressed by Activity tab filter input + regex toggle + clear, batch E)*
-- **UX-AC2** — Activity dot colour is the only differentiator for event severity.
-- **UX-AC3** — Empty state "No activity yet" provides no next action.
+- ~~UX-AC2~~ — *(addressed by evt-icon glyph paired with dot colour for colour-blind users, batch A)*
+- ~~UX-AC3~~ — *(addressed by actionable empty-state copy + .empty-state shell, batch C)*
 
 ### Usage tab — carousel
 - **UX-CA2** — *(addressed by aria-labels)* Add visible labels under dots, not only tooltip.
@@ -101,7 +123,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 ### Usage tab — breakdown cards
 - **UX-BR1** — `Account Breakdown` rows have no plan badge / tier indicator.
 - **UX-BR2** — `Repository & Branch` collapse-all default depends on count, surprising users.
-- **UX-BR3** — `Tool Breakdown` panel auto-hides without explaining "why empty".
+- ~~UX-BR3~~ — *(addressed by inline explainer + Config link instead of auto-hide, batch C)*
 
 ### Usage tab — scrubber
 - **UX-VS1** — Scrubber's role conflicts with `tok-time` dropdown — both filter time.
@@ -109,13 +131,14 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - **UX-VS3** — Fallback `<input type="datetime-local">` only shown at <600px.
 
 ### Sessions tab
+- ~~UX-S1~~ — *(addressed by neutral "Loading sessions…" initial markup + truth-based renderSessions branches, batch C)*
 - ~~UX-S2~~ — *(addressed by chevron hover/focus colour transition, A11y batch 2)*
 - **UX-S3** — Copy button uses 📋 emoji that won't render on all platforms.
 - **UX-S4** — Session timeline `max-height: 500px` clips long sessions silently.
 
 ### Config tab
 - **UX-CO1** — Config sections have no anchor links / search.
-- **UX-CO2** — BETA badges are visually loud and repeated 4 times.
+- ~~UX-CO2~~ — *(addressed by .beta-badge unification + duplicate session-monitor BETA removed, batch A)*
 - **UX-CO3** — Session Monitor description hides serious privacy info.
 - **UX-CO4** — Strategy hint + strategy-list duplicate the same information.
 
@@ -134,22 +157,35 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 
 See the original report for the full list. Prioritisation rule: pick up MAJORs first, MINORs only when refactoring the surrounding area.
 
-## Suggested batching (when work resumes)
+## Suggested batching (all 6 ✅ done)
 
-1. ~~**A11y batch 2**~~ ✅ done — see "Applied in A11y batch 2" above.
-2. **Visual hierarchy batch** (UX-A2/A3/A4 + UX-CO2 + UX-AC2): account-card layout polish, BETA badge consolidation, activity dot icon redesign.
+1. ~~**A11y batch 2**~~ ✅ done.
+2. ~~**Visual hierarchy batch (A)**~~ ✅ done.
 3. ~~**Time formatting batch (B)**~~ ✅ done.
-4. **Empty + error state pass** (UX-AC3 + UX-A5 + UX-BR3 + UX-S1): every empty state suggests a next action.
+4. ~~**Empty + error state pass (C)**~~ ✅ done.
 5. ~~**Sparkline + scrubber refresh (D)**~~ ✅ done.
 6. ~~**Logs / Activity search batch (E)**~~ ✅ done.
 
+## What's left (individual MAJORs not in any suggested batch)
+
+These were not part of the original suggested batching and remain deferred:
+- **UX-H1 / UX-H2** — header/global chrome
+- **UX-A6 / UX-A7** — account-card stale opacity + hover overlap
+- **UX-CPF1** — multi-select dropdown overlaps carousel controls
+- **UX-WS2** — wasted-spend bars use fixed yellow regardless of severity
+- **UX-CM1 / UX-CM3** — cache-miss UX details
+- **UX-BR1 / UX-BR2** — breakdown-card plan-tier and collapse-default polish
+- **UX-VS1 / UX-VS3** — scrubber role + datetime-local fallback
+- **UX-S3 / UX-S4** — sessions tab copy button + timeline clip
+- **UX-CO1 / UX-CO3 / UX-CO4** — config tab anchor links / privacy / strategy duplication
+- **UX-L1** — logs container dark theme inside light dashboard
+- **UX-X10** — `var(--muted)` overuse for placeholder + active state
+
+Plus the ~30 deferred MINOR/NIT items listed in the original audit. Pick these up opportunistically when refactoring the surrounding area, per the prioritisation rule below.
+
 ## What to do next session
 
-Two batches remain:
-- **Visual hierarchy batch** (UX-A2/A3/A4 + UX-CO2 + UX-AC2) — highest-impact remaining: account-card noise, BETA badge spam, undifferentiated activity feed.
-- **Empty + error state pass** (UX-AC3 + UX-A5 + UX-BR3 + UX-S1) — every empty state suggests a next action.
-
-Both touch `renderAccounts` and `renderActivityFeed`, so they should run SEQUENTIALLY in main (not in parallel worktree branches) to avoid the merge-conflict + worktree-isolation-leak problems documented in "Lessons learned about parallel agent worktrees" above.
+The 6 suggested batches are all complete. New work can pick from the "What's left" list above, or wait for the next round of audits.
 
 ## Acceptance criteria (per batch)
 
