@@ -3801,20 +3801,61 @@ function renderHTML() {
   .tab-content.active { display: block; }
 
   /* ── Account cards ── */
-  .accounts { display: flex; flex-direction: column; gap: 0.625rem; }
+  /* UX-A7: gap bumped from 0.625rem to 0.875rem so the hover lift +
+     reduced shadow have vertical room and stop bleeding onto the next
+     card. The audit explicitly called the prior tight gap out as the
+     root cause of the "fuzzy hover boundary" complaint. */
+  .accounts { display: flex; flex-direction: column; gap: 0.875rem; }
 
+  /* UX-A7: the transform property is in the transition list because
+     .card:hover now lifts by -1px — without listing transform here, the
+     lift snaps and looks like a layout glitch. Keep the list short
+     (the resting state is intentionally calm). */
   .card {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
     padding: 1.25rem 1.5rem;
-    transition: box-shadow 0.2s, border-color 0.2s;
+    transition: box-shadow 0.2s, border-color 0.2s, transform 0.2s;
   }
-  .card:hover { box-shadow: var(--shadow-lg); }
+  /* UX-A7: replaced the var(--shadow-lg) hover (12px diffuse shadow
+     that bled onto the neighbour given the previous 0.625rem gap) with
+     a crisper border emphasis + a small translateY(-1px) lift so the
+     resting shadow has somewhere to go. The border picks up var(--primary)
+     so the hover boundary stays crisp on dense lists — that was the
+     audit's recommended fix. */
+  .card:hover {
+    border-color: var(--primary);
+    box-shadow: var(--shadow);
+    transform: translateY(-1px);
+  }
   .card.active { border-color: var(--green); border-width: 2px; }
-  .card.stale { opacity: 0.5; }
-  .card.stale:hover { opacity: 0.7; }
+  /* UX-A6: previous .card.stale { opacity: 0.5 } greyed out the WHOLE
+     card — including the red stale-msg Token-expired copy and the
+     Refresh button. Users had to hover the card just to read what was
+     wrong. The fix dims ONLY the header chrome (.card-top: status dot,
+     account name, badges wrapper) plus the rate bars. The .stale-msg
+     copy + the .card-actions row stay at full opacity (1) below — the
+     two source-grep regression tests on .stale-msg and .card-actions
+     pin this. */
+  .card.stale .card-top {
+    opacity: 0.55;
+  }
+  .card.stale .rate-bars {
+    opacity: 0.55;
+  }
+  /* UX-A6: actionable / informational regions MUST stay at full opacity
+     so the user can read the error and click the buttons WITHOUT
+     hovering. The opacity:1 declarations are belt-and-braces against a
+     future refactor that reintroduces a broad whole-card stale opacity
+     rule — the prior line-3816 selector was the audit complaint. */
+  .card.stale .stale-msg {
+    opacity: 1;
+  }
+  .card.stale .card-actions {
+    opacity: 1;
+  }
   .stale-msg {
     margin-top: 0.5rem;
     font-size: 0.8rem;
@@ -3896,6 +3937,20 @@ function renderHTML() {
     color: var(--muted);
     background: var(--card);
     border-color: var(--border);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.6875rem;
+  }
+  /* UX-A6: stale pill rendered inside .card-badges for stale cards.
+     Soft-red palette signals "needs attention" without competing with
+     the .stale-msg block below. Carries an aria-label at the renderer
+     so screen readers (and colour-blind users for whom the soft red is
+     ambiguous) get an explicit textual signal. */
+  .badge-stale {
+    color: var(--red);
+    background: var(--red-soft);
+    border-color: var(--red-border);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -7121,6 +7176,18 @@ function renderAccounts(profiles, animate) {
     var excludedBadge = p.excludeFromAuto
       ? '<span class="badge badge-excluded" title="This account is excluded from auto-switch — only manual switches will reach it">excluded</span>'
       : '';
+    // UX-A6: stale pill in the header badges row gives a redundant,
+    // text-based signal that the card is in an error state — important
+    // because the new selective-opacity rule no longer dims the whole
+    // card (so a colour-blind user could otherwise miss the soft-red
+    // stale-msg block lower in the card). The aria-label is the
+    // load-bearing part for screen readers — text "stale" alone is too
+    // terse to be useful when announced. The pill is sourced from the
+    // boolean isStale (computed from server-side fields, not user data)
+    // so there's no XSS surface here.
+    var staleBadge = isStale
+      ? '<span class="badge badge-stale" aria-label="This account is stale — token is expired or refresh failed">stale</span>'
+      : '';
     // UX-A2: pull the "Exclude from auto-switch" toggle out of the
     // muted-text label that used to hide between the rate bars and
     // the buttons row. It now sits inside .card-actions on the same
@@ -7155,6 +7222,7 @@ function renderAccounts(profiles, animate) {
         '<div class="card-badges">' +
           planBadge(p.subscriptionType, p.rateLimitTier) +
           (active ? '<span class="badge badge-active">Active</span>' : '') +
+          staleBadge +
           excludedBadge +
         '</div>' +
       '</div>' +
