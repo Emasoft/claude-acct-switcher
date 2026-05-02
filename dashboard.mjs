@@ -3827,6 +3827,18 @@ function renderHTML() {
     border-radius: 3px;
     font-size: 0.85em;
   }
+  /* UX-A5: hint shown for dormant accounts. cursor:help + dotted
+     underline signal "hover for explanation"; the long-form copy
+     lives in the title= attribute on the inline element. */
+  .card-status-info {
+    font-size: 0.8125rem;
+    color: var(--cyan);
+    margin-top: 0.25rem;
+    font-weight: 500;
+    cursor: help;
+    text-decoration: underline dotted var(--muted) 1px;
+    text-underline-offset: 3px;
+  }
 
   .card-top {
     display: flex;
@@ -5383,7 +5395,10 @@ function renderHTML() {
       <span class="vdm-filter-count" id="activity-filter-count" aria-live="polite"></span>
     </div>
     <div id="activity-wrap" class="activity-card">
-      <div id="activity-log" style="color:var(--muted);padding:2rem 0">No activity yet</div>
+      <!-- UX-AC3: empty state suggests next action so users don't wonder
+           "is the dashboard broken?" on first paint. The actionable copy
+           is mirrored in renderActivity() for the post-fetch empty branch. -->
+      <div id="activity-log" class="empty-state">No activity yet. Start a Claude Code session — every prompt, response, account switch, rate-limit hit, and token refresh appears here.</div>
     </div>
   </div>
 
@@ -5513,7 +5528,12 @@ function renderHTML() {
 
   <div id="tab-sessions" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-sessions">
     <div id="sessions-content">
-      <div class="empty-state" id="sessions-disabled">Session Monitor is OFF. Enable it in Config (BETA).</div>
+      <!-- UX-S1: generic loading state on first paint. The truth-based
+           copy ("Session Monitor is OFF" vs "No sessions yet") only
+           renders after /api/sessions replies — without this, users who
+           just enabled Session Monitor in Config would see "OFF" because
+           of the race condition between markup-paint and first-fetch. -->
+      <div class="empty-state" id="sessions-loading">Loading sessions…</div>
     </div>
   </div>
 
@@ -6963,7 +6983,12 @@ function renderAccounts(profiles, animate) {
         '</div>' +
       '</div>';
     } else if (p.dormant) {
-      barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant  - window preserved</div>';
+      // UX-A5: explain *why* the account is dormant + reassure. The Switch
+      // button rendered below in buttonsHtml is the actionable next step
+      // (no extra button needed). Hover title carries the long-form
+      // conserve-strategy explanation; the inline copy stays terse to
+      // fit the card.
+      barsHtml = '<div class="card-status-info" title="Conserve strategy: this account&#39;s 5h/7d window has not started because no requests have been made on it yet. It will activate the moment another account is rate-limited, or when you click Switch below to start using it.">Dormant — windows not started yet</div>';
     } else {
       barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Rate limits unavailable</div>';
     }
@@ -7157,7 +7182,10 @@ function renderActivity(log) {
   // render (before any switchTab call). Idempotent — see _vdmWireFilterControls.
   _vdmWireFilterControls();
   if (!log.length) {
-    el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity yet</div>';
+    // UX-AC3: actionable empty state. Mirror the initial markup at
+    // line ~5386 so users see the same hint regardless of whether
+    // we land here via first-paint or post-fetch.
+    el.innerHTML = '<div class="empty-state">No activity yet. Start a Claude Code session — every prompt, response, account switch, rate-limit hit, and token refresh appears here.</div>';
     _vdmApplyActivityFilter();
     return;
   }
@@ -9099,11 +9127,18 @@ function renderToolBreakdown(data) {
     buckets[key].total += inT + outT;
     buckets[key].count += 1;
   }
-  // Hide the card entirely when no row has a tool field — the gate is off
-  // and showing only "(no per-tool attribution)" would be useless.
+  // UX-BR3: instead of silently hiding the card (which leaves users
+  // wondering "is per-tool tracking broken?"), render an inline explainer
+  // that names the gate AND the page where to flip it. Gives discoverability
+  // for users who heard about the feature and went looking for it.
   if (!hasAttributed) {
-    card.style.display = 'none';
-    el.innerHTML = '';
+    card.style.display = '';
+    el.innerHTML = '<div class="empty-state" style="padding:1rem">'
+      + 'Per-tool attribution is OFF. '
+      + 'Enable it in <a href="#" onclick="switchTab(\\'config\\');return false">Config → Per-Tool Attribution</a> '
+      + 'to see token usage broken down by tool (Read, Edit, Bash, etc.). '
+      + 'Note: this materially increases the size of token-usage.json.'
+      + '</div>';
     return;
   }
   card.style.display = '';
