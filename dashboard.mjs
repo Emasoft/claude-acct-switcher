@@ -4434,6 +4434,110 @@ function renderHTML() {
     min-width: 4rem;
     text-align: right;
   }
+  /* TRDD-1645134b Phase 3 — usage tree view */
+  .tree-view {
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+  .tree-view details { margin: 0; }
+  .tree-view summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .tree-view summary::-webkit-details-marker { display: none; }
+  .tree-view summary:hover { background: var(--bg); }
+  .tree-view summary::before {
+    content: "▶";
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    transition: transform 0.1s ease-in-out;
+    display: inline-block;
+    width: 0.625rem;
+    flex-shrink: 0;
+  }
+  .tree-view details[open] > summary::before { transform: rotate(90deg); }
+  .tree-view .tree-leaf {
+    padding: 0.25rem 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .tree-view .tree-leaf::before {
+    content: "·";
+    color: var(--text-muted);
+    width: 0.625rem;
+    flex-shrink: 0;
+    text-align: center;
+  }
+  .tree-view .tree-children { padding-left: 1.25rem; }
+  .tree-view .tree-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tree-view .tree-kind-icon {
+    flex-shrink: 0;
+    font-size: 0.6875rem;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 3px;
+    background: var(--bg);
+    color: var(--text-muted);
+  }
+  .tree-view .tree-kind-icon.repo      { background: var(--blue-soft);    color: var(--blue); }
+  .tree-view .tree-kind-icon.branch    { background: var(--green-soft);   color: var(--green); }
+  .tree-view .tree-kind-icon.worktree  { background: var(--yellow-soft);  color: var(--yellow); }
+  .tree-view .tree-kind-icon.component { background: var(--purple-soft);  color: var(--purple); }
+  .tree-view .tree-kind-icon.tool      { background: var(--bg); color: var(--text-muted); }
+  .tree-view .tree-totals {
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .tree-view .tree-totals .tree-pct {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    margin-left: 0.375rem;
+  }
+  .tree-view .tree-cache-badge {
+    flex-shrink: 0;
+    font-size: 0.625rem;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 3px;
+    background: var(--bg);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .tree-view .tree-cache-badge.high { background: var(--green-soft); color: var(--green); }
+  .tree-view .tree-cache-badge.low  { background: var(--yellow-soft); color: var(--yellow); }
+  .tree-view .tree-loading,
+  .tree-view .tree-empty,
+  .tree-view .tree-error {
+    padding: 0.5rem;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+  .tree-view .tree-error { color: var(--red); }
+  .tree-misses-card { margin-top: 1rem; }
+  .tree-misses-card .miss-row {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.25rem 0.5rem;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .tree-misses-card .miss-row:last-child { border-bottom: none; }
+  .tree-misses-card .miss-ts { color: var(--text-muted); flex-shrink: 0; }
+  .tree-misses-card .miss-account { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .tree-misses-card .miss-tokens { font-variant-numeric: tabular-nums; flex-shrink: 0; }
+
   .tok-export-btn {
     background: var(--card);
     border: 1px solid var(--border);
@@ -4877,6 +4981,21 @@ function renderHTML() {
       <div class="usage-card" id="tok-tools-card" style="margin-top:1rem">
         <div class="usage-title">Tool Breakdown</div>
         <div id="tok-tools"></div>
+      </div>
+      <!-- TRDD-1645134b Phase 3 — usage tree view -->
+      <div class="usage-card" id="tok-tree-card" style="margin-top:1rem">
+        <div class="usage-title" style="display:flex;align-items:center;gap:0.5rem">
+          <span>Usage Tree</span>
+          <span style="font-size:0.625rem;font-weight:500;color:var(--text-muted);background:var(--bg);border-radius:3px;padding:0.125rem 0.375rem">repo &rsaquo; worktree &rsaquo; component &rsaquo; tool</span>
+        </div>
+        <div id="tok-tree" class="tree-view"><div class="tree-loading">Loading…</div></div>
+      </div>
+      <div class="usage-card tree-misses-card" id="tok-misses-card" style="display:none">
+        <div class="usage-title" style="display:flex;align-items:center;gap:0.5rem">
+          <span>Likely Cache Misses</span>
+          <span style="font-size:0.625rem;font-weight:500;color:var(--text-muted);background:var(--bg);border-radius:3px;padding:0.125rem 0.375rem" id="tok-misses-count">0</span>
+        </div>
+        <div id="tok-misses"></div>
       </div>
     </div>
   </div>
@@ -6722,6 +6841,12 @@ async function refreshTokens() {
     _tokensRawData = data.filter(function(e) { return (e.timestamp || e.ts || 0) >= currentCutoff; });
     _tokPrevPeriodData = data.filter(function(e) { var t = e.timestamp || e.ts || 0; return t < currentCutoff; });
     applyTokenModelFilter();
+    // TRDD-1645134b Phase 3 — kick off the tree-view fetch in parallel.
+    // Independent endpoint, independent error path; failure doesn't break
+    // the existing usage panes.
+    refreshUsageTree(currentCutoff).catch(function(e) {
+      console.warn('Usage tree refresh failed:', e);
+    });
   } catch (e) {
     console.error('Token fetch:', e);
     // Show empty state on error if no cached data
@@ -6735,6 +6860,144 @@ async function refreshTokens() {
     _tokFetching = false;
     if (_tokNeedsRefresh) refreshTokens();
   }
+}
+
+// TRDD-1645134b Phase 3 — usage tree view rendering.
+//
+// Fetches the pre-aggregated tree from /api/token-usage-tree (which
+// computes the 4-level breakdown server-side via aggregateUsageTree),
+// then renders nested <details>/<summary> elements. Native HTML
+// collapse/expand — no JS framework, no event listeners per node.
+//
+// Cache-miss data piggybacks on the same fetch via includeMisses=1
+// so we don't double-load token-usage.json.
+//
+// XSS-safe: every dynamic field flows through escHtml().
+var _lastTreeHash = '';
+var _treeFetching = false;
+async function refreshUsageTree(currentCutoff) {
+  if (_treeFetching) return;
+  _treeFetching = true;
+  try {
+    var url = '/api/token-usage-tree?includeMisses=1&from=' + currentCutoff;
+    // Inherit the time-window from the main usage refresh (currentCutoff).
+    // Repo/branch filters from the dropdowns already apply via the main
+    // tab's filter logic; the tree shows the FULL view by design (the
+    // user uses the tree to pick what to drill into).
+    var resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var data = await resp.json();
+    if (!data || data.ok !== true) throw new Error(data && data.error || 'malformed response');
+
+    // Hash the tree skeleton + miss count so we don't re-render when
+    // nothing visible changed (saves DOM churn on every 5s poll).
+    var hash = (data.totals.requests | 0) + ':' + (data.misses ? data.misses.length : 0)
+             + ':' + (data.tree ? data.tree.length : 0);
+    if (hash === _lastTreeHash) return;
+    _lastTreeHash = hash;
+
+    renderUsageTree(data.totals, data.tree || []);
+    renderCacheMisses(data.misses || []);
+  } finally {
+    _treeFetching = false;
+  }
+}
+
+function renderUsageTree(grandTotals, tree) {
+  var el = document.getElementById('tok-tree');
+  if (!el) return;
+  if (!tree.length) {
+    el.innerHTML = '<div class="tree-empty">No usage data in this time range.</div>';
+    return;
+  }
+  // Render top-level repos open by default (so users see the breakdown
+  // immediately), deeper levels collapsed.
+  var html = '';
+  for (var i = 0; i < tree.length; i++) {
+    html += renderTreeNode(tree[i], grandTotals, /*depth*/0);
+  }
+  el.innerHTML = html;
+}
+
+// Recursive renderer. Each node renders as either a <details> (if it
+// has children) or a flat row (leaf). The depth parameter controls
+// the open-by-default policy: depth 0 (repos) opens automatically,
+// depth >= 1 stays collapsed until the user clicks.
+function renderTreeNode(node, parentTotals, depth) {
+  var totals = node.totals || { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, requests: 0 };
+  var totalIO = (totals.input || 0) + (totals.output || 0);
+  var parentIO = parentTotals
+    ? ((parentTotals.input || 0) + (parentTotals.output || 0))
+    : totalIO;
+  var pct = parentIO > 0 ? Math.round((totalIO / parentIO) * 100) : 100;
+  var pctStr = parentTotals && parentIO > 0 && pct < 100 ? ' <span class="tree-pct">' + pct + '%</span>' : '';
+
+  // Cache hit-rate — read / (read + create) when there's any cache
+  // activity. No badge when a node has no cache history at all.
+  var cacheBadge = '';
+  var cacheTotal = (totals.cacheRead || 0) + (totals.cacheCreate || 0);
+  if (cacheTotal > 0) {
+    var hitRate = Math.round((totals.cacheRead / cacheTotal) * 100);
+    var cls = hitRate >= 50 ? 'high' : 'low';
+    cacheBadge = '<span class="tree-cache-badge ' + cls + '" title="Cache hit rate (read / (read + create))">cache ' + hitRate + '%</span>';
+  }
+
+  var kindClass = node.kind || 'tool';
+  if (node.kind === 'branch' && node.isWorktree) kindClass = 'worktree';
+  var kindLabel = (node.kind === 'branch' && node.isWorktree) ? 'wt' : (node.kind || 'tool').slice(0, 4);
+
+  var totalsHtml = '<span class="tree-totals">'
+    + formatNum(totalIO) + ' tok'
+    + pctStr
+    + '</span>';
+  var nameHtml = '<span class="tree-name" title="' + escHtml(node.name) + '">' + escHtml(node.name) + '</span>';
+  var kindHtml = '<span class="tree-kind-icon ' + kindClass + '">' + escHtml(kindLabel) + '</span>';
+
+  if (!node.children || !node.children.length) {
+    // Leaf — flat row, no <details>
+    return '<div class="tree-leaf">' + kindHtml + nameHtml + cacheBadge + totalsHtml + '</div>';
+  }
+  // Branch — recursive <details>
+  var openAttr = depth === 0 ? ' open' : '';
+  var html = '<details' + openAttr + '><summary>'
+    + kindHtml + nameHtml + cacheBadge + totalsHtml
+    + '</summary><div class="tree-children">';
+  for (var i = 0; i < node.children.length; i++) {
+    html += renderTreeNode(node.children[i], totals, depth + 1);
+  }
+  html += '</div></details>';
+  return html;
+}
+
+function renderCacheMisses(misses) {
+  var card = document.getElementById('tok-misses-card');
+  var el = document.getElementById('tok-misses');
+  var countEl = document.getElementById('tok-misses-count');
+  if (!card || !el) return;
+  if (!misses.length) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = '';
+  if (countEl) countEl.textContent = String(misses.length);
+  // Cap rendered list at 50 to keep DOM bounded — the underlying data
+  // can be hundreds for a heavily-used session, but the user only
+  // needs the most recent ones to investigate.
+  var shown = misses.slice(-50).reverse();
+  var html = '';
+  for (var i = 0; i < shown.length; i++) {
+    var m = shown[i];
+    var ts = m.ts ? new Date(m.ts).toLocaleString() : '?';
+    html += '<div class="miss-row">'
+      + '<span class="miss-ts">' + escHtml(ts) + '</span>'
+      + '<span class="miss-account">' + escHtml((m.repo || '?') + ' / ' + (m.branch || '?')) + '</span>'
+      + '<span class="miss-tokens">' + formatNum(m.inputTokens || 0) + ' input</span>'
+      + '</div>';
+  }
+  if (misses.length > 50) {
+    html += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and ' + (misses.length - 50) + ' more</div>';
+  }
+  el.innerHTML = html;
 }
 
 function applyTokenModelFilter() {

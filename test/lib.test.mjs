@@ -6622,3 +6622,158 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
     assert.match(fn, /catch \(e\)[\s\S]{0,300}ok: false[\s\S]{0,300}error: e\.message[\s\S]{0,300}500/);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// TRDD-1645134b Phase 3 — UI tree view
+// ─────────────────────────────────────────────────────────
+
+describe('Phase 3 — UI tree view (renderHTML + client JS)', () => {
+  const _src_t3 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('Usage Tree card is present in the Tokens tab', () => {
+    assert.match(_src_t3, /<div class="usage-card" id="tok-tree-card"/);
+    assert.match(_src_t3, /<span>Usage Tree<\/span>/);
+    // The breadcrumb hint must show the 4 levels in order
+    assert.match(_src_t3, /repo[^<]*worktree[^<]*component[^<]*tool/);
+  });
+
+  it('Cache misses card is present (collapsed by default)', () => {
+    assert.match(_src_t3, /<div class="usage-card tree-misses-card" id="tok-misses-card" style="display:none">/);
+    assert.match(_src_t3, /<span>Likely Cache Misses<\/span>/);
+  });
+
+  it('CSS for the tree view is defined (no JS framework, plain <details>)', () => {
+    assert.match(_src_t3, /\.tree-view \{/);
+    assert.match(_src_t3, /\.tree-view details \{/);
+    assert.match(_src_t3, /\.tree-view summary \{/);
+    // Custom collapse marker rotates on open — confirm both states.
+    assert.match(_src_t3, /\.tree-view summary::before \{[\s\S]{0,400}content:\s*"▶"/);
+    assert.match(_src_t3, /\.tree-view details\[open\] > summary::before \{[\s\S]{0,200}rotate\(90deg\)/);
+  });
+
+  it('CSS uses existing dashboard variables (no hard-coded colors per TRDD)', () => {
+    // The TRDD §Phase 3 mandates "CSS using existing dashboard variables (no
+    // new color palette)". Spot-check a few of the new classes use var(--*).
+    // The tree view inherits the card chrome from .usage-card (which already
+    // uses var(--card) / var(--shadow)), so this block focuses on the
+    // tree-specific properties.
+    const css = _src_t3.slice(
+      _src_t3.indexOf('/* TRDD-1645134b Phase 3 — usage tree view */'),
+      _src_t3.indexOf('.tok-export-btn {'),
+    );
+    assert.ok(css.length > 1000, 'tree-view CSS block must exist');
+    assert.match(css, /var\(--bg\)/);
+    assert.match(css, /var\(--border\)/);
+    assert.match(css, /var\(--text-muted\)/);
+    // Kind-icon palette uses the existing soft-color system
+    assert.match(css, /var\(--blue-soft\)/);
+    assert.match(css, /var\(--green-soft\)/);
+    assert.match(css, /var\(--purple-soft\)/);
+    // No raw hex / rgb colors — the only literal #/rgb in this block
+    // would mean someone bypassed the design tokens. Search for any
+    // `#[0-9a-fA-F]` pattern outside CSS variable declarations.
+    const rawColors = css.match(/[^a-z]#[0-9a-fA-F]{3,6}\b/g);
+    assert.equal(rawColors, null, `tree-view CSS must not contain raw hex colors; found: ${rawColors}`);
+  });
+
+  it('refreshTokens kicks off refreshUsageTree in parallel', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('async function refreshTokens'),
+      _src_t3.indexOf('async function refreshTokens') + 4000,
+    );
+    assert.match(fn, /refreshUsageTree\(currentCutoff\)\.catch/);
+    // Failure must be non-fatal — tree view is independent of the rest
+    assert.match(fn, /Usage tree refresh failed/);
+  });
+
+  it('refreshUsageTree fetches /api/token-usage-tree with includeMisses=1', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('async function refreshUsageTree'),
+      _src_t3.indexOf('async function refreshUsageTree') + 2000,
+    );
+    assert.match(fn, /\/api\/token-usage-tree\?includeMisses=1&from=/);
+    // Must validate the response shape before dereferencing
+    assert.match(fn, /data\.ok !== true/);
+  });
+
+  it('refreshUsageTree caches by hash to avoid DOM churn on identical data', () => {
+    // Without the hash gate, the 5s poll re-renders the entire tree
+    // every tick — wasting render time and causing visual flicker.
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('async function refreshUsageTree'),
+      _src_t3.indexOf('async function refreshUsageTree') + 2000,
+    );
+    assert.match(fn, /_lastTreeHash/);
+    assert.match(fn, /if \(hash === _lastTreeHash\) return/);
+  });
+
+  it('renderTreeNode escapes node names + uses native <details> for branches', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('function renderTreeNode'),
+      _src_t3.indexOf('function renderTreeNode') + 3500,
+    );
+    assert.ok(fn.length > 200, 'function body must exist');
+    // XSS — every dynamic field must run through escHtml
+    assert.match(fn, /escHtml\(node\.name\)/);
+    assert.match(fn, /escHtml\(kindLabel\)/);
+    // Branches use <details>, leaves use <div class="tree-leaf">
+    assert.match(fn, /<details/);
+    assert.match(fn, /<div class="tree-leaf"/);
+    // Top-level (depth 0) is open by default; deeper levels collapsed
+    assert.match(fn, /depth === 0 \? ' open' : ''/);
+  });
+
+  it('renderTreeNode shows cache hit-rate badge when cache activity exists', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('function renderTreeNode'),
+      _src_t3.indexOf('function renderTreeNode') + 3500,
+    );
+    // Hit-rate computed as cacheRead / (cacheRead + cacheCreate)
+    assert.match(fn, /totals\.cacheRead \/ cacheTotal/);
+    // Class chosen by 50% threshold (high vs low)
+    assert.match(fn, /hitRate >= 50 \? 'high' : 'low'/);
+    // Badge is omitted when there's no cache history
+    assert.match(fn, /if \(cacheTotal > 0\)/);
+  });
+
+  it('renderTreeNode tags worktree branches with "wt" kind class', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('function renderTreeNode'),
+      _src_t3.indexOf('function renderTreeNode') + 3500,
+    );
+    // The "branch" kind for a worktree gets a different visual treatment
+    // than the main/master branch, per the TRDD's worktree-vs-main
+    // distinction surfaced in aggregateUsageTree's isWorktree field.
+    assert.match(fn, /isWorktree[\s\S]{0,200}kindClass = 'worktree'/);
+    // The kindLabel ternary uses isWorktree to pick 'wt' as the badge text
+    assert.match(fn, /isWorktree[\s\S]{0,200}'wt'/);
+  });
+
+  it('renderCacheMisses caps DOM at 50 rows but reports the true count', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('function renderCacheMisses'),
+      _src_t3.indexOf('function renderCacheMisses') + 2000,
+    );
+    assert.ok(fn.length > 100, 'function body must exist');
+    // Cap visible rows
+    assert.match(fn, /misses\.slice\(-50\)/);
+    // But the count badge shows the FULL count
+    assert.match(fn, /countEl\.textContent = String\(misses\.length\)/);
+    // "… and N more" footer when truncated (note: real ellipsis char, not "...")
+    assert.match(fn, /and ' \+ \(misses\.length - 50\) \+ ' more/);
+  });
+
+  it('renderCacheMisses escapes every dynamic field (XSS regression)', () => {
+    const fn = _src_t3.slice(
+      _src_t3.indexOf('function renderCacheMisses'),
+      _src_t3.indexOf('function renderCacheMisses') + 2000,
+    );
+    // The repo and branch fields are user-controlled (file paths +
+    // git branch names). Both must run through escHtml.
+    assert.match(fn, /escHtml\(\(m\.repo \|\| '\?'\) \+ ' \/ ' \+ \(m\.branch \|\| '\?'\)\)/);
+    assert.match(fn, /escHtml\(ts\)/);
+  });
+});
