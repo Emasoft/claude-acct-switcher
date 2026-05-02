@@ -8764,3 +8764,82 @@ describe('A11y batch 2 — UX-X3 / UX-CPF3 / UX-S2 source-grep regressions', () 
 });
 
 
+
+// ─────────────────────────────────────────────────
+// UX batch E — UX-L2 / UX-AC1 source-grep regressions
+//
+// Filter UIs added to the Logs tab (UX-L2) and the Activity tab (UX-AC1).
+// Both filters share an identical UX: substring (default) / regex toggle /
+// clear / count badge. Source-grep so a future refactor cannot silently
+// drop any of these pieces.
+// ─────────────────────────────────────────────────
+describe("UX batch E — UX-L2 / UX-AC1 logs/activity filter regressions", () => {
+  const _src_filterE = _readFileSync_xss(
+    new URL("../dashboard.mjs", import.meta.url),
+    "utf8",
+  );
+
+  it("UX-L2 — Logs tab has filter input + regex toggle + clear button + count", () => {
+    assert.match(_src_filterE,
+      /<input type="text"[^>]*id="logs-filter-input"/);
+    assert.match(_src_filterE,
+      /<input type="checkbox"[^>]*id="logs-filter-regex"/);
+    assert.match(_src_filterE,
+      /<button[^>]*id="logs-filter-clear"/);
+    assert.match(_src_filterE,
+      /id="logs-filter-count"/);
+  });
+
+  it("UX-AC1 — Activity tab has filter input + regex toggle + clear button + count", () => {
+    assert.match(_src_filterE,
+      /<input type="text"[^>]*id="activity-filter-input"/);
+    assert.match(_src_filterE,
+      /<input type="checkbox"[^>]*id="activity-filter-regex"/);
+    assert.match(_src_filterE,
+      /<button[^>]*id="activity-filter-clear"/);
+    assert.match(_src_filterE,
+      /id="activity-filter-count"/);
+  });
+
+  it("UX-L2/AC1 — both filter inputs cap input length at 256 chars", () => {
+    assert.match(_src_filterE, /_VDM_FILTER_MAX_LEN\s*=\s*256/);
+    const occ = _src_filterE.match(/_VDM_FILTER_MAX_LEN/g) || [];
+    assert.ok(occ.length >= 3,
+      "expected _VDM_FILTER_MAX_LEN in cap definition + at least 2 use-sites, found " + occ.length);
+    assert.match(_src_filterE,
+      /<input type="text"[^>]*id="logs-filter-input"[^>]*maxlength="256"/);
+    assert.match(_src_filterE,
+      /<input type="text"[^>]*id="activity-filter-input"[^>]*maxlength="256"/);
+  });
+
+  it("UX-L2/AC1 — regex compilation is wrapped in try/catch so an invalid pattern surfaces inline", () => {
+    assert.match(_src_filterE,
+      /function _vdmCompileFilterRegex\(/);
+    assert.match(_src_filterE, /Invalid regex/);
+    const fnSlice = _src_filterE.slice(
+      _src_filterE.indexOf("function _vdmCompileFilterRegex"),
+      _src_filterE.indexOf("function _vdmCompileFilterRegex") + 800,
+    );
+    assert.match(fnSlice, /try \{[\s\S]+catch/);
+  });
+
+  it("UX-L2/AC1 — localStorage keys use the bounded vdm.* namespace", () => {
+    assert.match(_src_filterE, /vdm\.logsFilter/);
+    assert.match(_src_filterE, /vdm\.logsRegex/);
+    assert.match(_src_filterE, /vdm\.activityFilter/);
+    assert.match(_src_filterE, /vdm\.activityRegex/);
+  });
+
+  it("UX-L2/AC1 — filter values not interpolated into innerHTML (XSS defence)", () => {
+    const innerHtmlMatches = _src_filterE.match(
+      /innerHTML\s*=[^;]*_vdmFilter(Logs|Activity)Pattern[^;]*\+/g,
+    ) || [];
+    assert.equal(innerHtmlMatches.length, 0,
+      "filter pattern must not be interpolated into innerHTML — use input.value (DOM-escaped) only");
+  });
+
+  it("UX-L2/AC1 — filter applies via CSS class toggle (DOM-stable, can be cleared)", () => {
+    assert.match(_src_filterE, /\.evt-hidden\s*\{\s*display:\s*none/);
+    assert.match(_src_filterE, /\.log-line-hidden\s*\{\s*display:\s*none/);
+  });
+});
