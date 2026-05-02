@@ -9703,3 +9703,291 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
       /<span class="evt-icon" aria-hidden="true"/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// Sessions tab polish — UX-S3 / UX-S4 source-grep regressions (batch J)
+//
+// UX-S3 — Copy button used the U+1F4CB clipboard emoji (📋) which
+//   doesn't render on every platform; on servers/older Linux without
+//   emoji fonts it shows as □. The button is also opacity:0 by default
+//   (only visible on hover), so a missing glyph means the button
+//   completely vanishes. Replace with inline SVG (universally rendered)
+//   and add aria-label so keyboard/screen-reader users discover it.
+//
+// UX-S4 — Session timeline `max-height: 500px` clipped long sessions
+//   silently; the WebKit scrollbar is ~6px wide and translucent so
+//   users couldn't tell there was more content below the fold. Add a
+//   fade-out gradient at the bottom edge when content overflows + a
+//   "Show all" / "Show less" toggle button to expand the timeline to
+//   its natural height.
+//
+// As with the other UX batches, these are source-grep tests: the
+// renderers live only inside the renderHTML() template literal and the
+// established convention here is to grep the source string for the
+// invariants we care about.
+// ─────────────────────────────────────────────────
+describe('Sessions tab polish — UX-S3 / UX-S4 source-grep regressions (batch J)', () => {
+  const _src_uxj = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-S3 — Copy button: SVG icon + aria-label ──
+  it('UX-S3 — copy button no longer uses the 📋 emoji surrogate pair', () => {
+    // The pre-fix shape was `>\\uD83D\\uDCCB</button>`. That escape
+    // sequence MUST not appear inside a session-copy-btn emit-site any
+    // longer (it can still appear elsewhere in the file for other
+    // purposes — the assertion is scoped to the copy button specifically).
+    assert.doesNotMatch(_src_uxj,
+      /<button class="session-copy-btn"[^>]*>\\uD83D\\uDCCB<\/button>/);
+  });
+
+  it('UX-S3 — copy button uses inline SVG icon (cross-platform, no emoji-font dependency)', () => {
+    // The icon is interpolated via a `SESSION_COPY_ICON_SVG` constant
+    // (so the same SVG is used by both the active + recent emit-sites
+    // and any future emit-site picks it up automatically). Verify the
+    // constant is defined as an inline SVG with aria-hidden, AND that
+    // both emit-sites reference it.
+    assert.match(_src_uxj,
+      /var SESSION_COPY_ICON_SVG = '<svg [^']*aria-hidden="true"[^']*>/);
+    const refs = _src_uxj.match(
+      /<button class="session-copy-btn"[^>]*>'\s*\+\s*SESSION_COPY_ICON_SVG\s*\+\s*'<\/button>/g
+    ) || [];
+    assert.ok(refs.length >= 2,
+      'expected >= 2 references to SESSION_COPY_ICON_SVG inside copy-button emit-sites, found ' + refs.length);
+  });
+
+  it('UX-S3 — copy button SVG contains NO <script> tags (XSS hardening)', () => {
+    // The inline SVG lives in the static `SESSION_COPY_ICON_SVG`
+    // constant — verify that constant has no <script> tag. Defense
+    // in depth against a future refactor that interpolates user-text
+    // into the SVG.
+    const m = _src_uxj.match(/var SESSION_COPY_ICON_SVG = '([^']*)'/);
+    assert.ok(m, 'SESSION_COPY_ICON_SVG constant must be defined');
+    assert.doesNotMatch(m[1], /<script/i,
+      'SESSION_COPY_ICON_SVG must not contain <script> tags');
+    // Also verify the literal text contains <svg ... </svg> (sanity).
+    assert.match(m[1], /<svg[\s\S]*<\/svg>/);
+  });
+
+  it('UX-S3 — copy button carries aria-label (accessible name for screen readers)', () => {
+    // The pre-fix button had only the emoji glyph as its content, with
+    // no aria-label. Screen readers either announced "U+1F4CB" or
+    // nothing at all. The new button MUST have a descriptive
+    // aria-label.
+    const matches = _src_uxj.match(
+      /<button class="session-copy-btn"[^>]*aria-label="[^"]+"/g
+    ) || [];
+    assert.ok(matches.length >= 2,
+      'expected >= 2 session-copy-btn emit-sites with aria-label, found ' + matches.length);
+  });
+
+  it('UX-S3 — copy button aria-label mentions "session timeline" (descriptive, not generic)', () => {
+    // A generic aria-label="Copy" is a common a11y mistake. The label
+    // must describe WHAT is being copied so a screen reader user
+    // navigating multiple Copy buttons can tell them apart.
+    assert.match(_src_uxj,
+      /<button class="session-copy-btn"[^>]*aria-label="Copy session timeline[^"]*"/);
+  });
+
+  it('UX-S3 — copy button carries title= attribute for sighted-mouse users', () => {
+    // The button is opacity:0 by default and only visible on
+    // .session-card:hover — discoverability for sighted users is
+    // already poor. A title= tooltip provides on-hover affordance.
+    const matches = _src_uxj.match(
+      /<button class="session-copy-btn"[^>]*title="[^"]+"/g
+    ) || [];
+    assert.ok(matches.length >= 2,
+      'expected >= 2 session-copy-btn emit-sites with title, found ' + matches.length);
+  });
+
+  it('UX-S3 — SVG icon set to pointer-events: none so clicks land on the button', () => {
+    // A common SVG pitfall: clicks on the inner <svg> can target the
+    // SVG element instead of the button, breaking event handlers that
+    // rely on `event.target === button`. pointer-events: none on the
+    // SVG funnels every click to the button itself.
+    assert.match(_src_uxj,
+      /\.session-copy-btn svg \{[\s\S]{0,200}pointer-events: none;/);
+  });
+
+  it('UX-S3 — copy button onclick stops event propagation (does not toggle session collapse)', () => {
+    // The button is a sibling of session-header so click bubbling
+    // shouldn't reach the collapse handler — but defense-in-depth:
+    // the onclick passes the event through and copyTimeline calls
+    // stopPropagation. This guards against a future refactor moving
+    // the button INSIDE the header.
+    // Source pattern: onclick="copyTimeline(\\'' + s.id + '\\', event)"
+    // (the four backslashes in the regex match two literal backslashes
+    // each — one to escape the apostrophe at HTML emit time, the other
+    // is just the regex-literal escape of the single backslash).
+    assert.match(_src_uxj,
+      /onclick="copyTimeline\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+  });
+
+  it('UX-S3 — copyTimeline accepts and stops propagation on the event arg', () => {
+    // The function signature must accept the event arg and call
+    // stopPropagation on it (when present — keyboard-triggered .click()
+    // calls don't pass an event).
+    assert.match(_src_uxj,
+      /function copyTimeline\(sessionId, ev\) \{[\s\S]{0,800}if \(ev && ev\.stopPropagation\) ev\.stopPropagation\(\);/);
+  });
+
+  // ── UX-S4 — Timeline overflow: fade-out + Show all/less toggle ──
+  it('UX-S4 — .session-timeline keeps max-height: 500px in the default state', () => {
+    // The audit complaint was the silent clip, not the cap itself —
+    // we keep the cap as a sensible default but add an opt-in expander
+    // (UX-S4 below).
+    assert.match(_src_uxj,
+      /\.session-timeline \{[\s\S]{0,400}max-height: 500px;/);
+  });
+
+  it('UX-S4 — .session-timeline-expanded class lifts the height cap', () => {
+    // The toggle flips this class on the .session-timeline element.
+    // When set, max-height becomes none so the timeline grows to its
+    // natural height.
+    assert.match(_src_uxj,
+      /\.session-timeline\.session-timeline-expanded \{[\s\S]{0,200}max-height: none;/);
+  });
+
+  it('UX-S4 — .session-timeline-fade pseudo-element creates the fade-out gradient', () => {
+    // Browser-rendered linear gradient at the bottom of the
+    // overflowing timeline. Must use ::after pseudo-element + position
+    // sticky so it sits at the bottom edge regardless of scroll
+    // position. Visible only when .session-timeline-clipped class is
+    // toggled on (set by JS when scrollHeight > clientHeight).
+    assert.match(_src_uxj,
+      /\.session-timeline-fade \{[\s\S]{0,500}linear-gradient/);
+  });
+
+  it('UX-S4 — fade-out element hidden when timeline is expanded', () => {
+    // When the user expands the timeline (clicks "Show all"), the
+    // fade-out indicator becomes meaningless and must be hidden.
+    assert.match(_src_uxj,
+      /\.session-timeline\.session-timeline-expanded \+ \.session-timeline-fade,?\s*\.session-timeline\.session-timeline-expanded ~ \.session-timeline-fade \{[\s\S]{0,200}display: none;/);
+  });
+
+  it('UX-S4 — Show all/less toggle button is rendered as a sibling of the timeline', () => {
+    // Two emit-sites (active + recent). The button MUST be a real
+    // <button> (not a div) so the browser handles Enter/Space natively
+    // and screen readers announce it as a button.
+    const matches = _src_uxj.match(
+      /<button class="session-timeline-expand"[^>]*>/g
+    ) || [];
+    assert.ok(matches.length >= 2,
+      'expected >= 2 session-timeline-expand emit-sites, found ' + matches.length);
+  });
+
+  it('UX-S4 — expand toggle initial label is "Show all" (collapsed state)', () => {
+    // The initial render shows "Show all" because the timeline starts
+    // capped. After click, JS swaps the textContent to "Show less".
+    assert.match(_src_uxj,
+      /<button class="session-timeline-expand"[^>]*>Show all<\/button>/);
+  });
+
+  it('UX-S4 — toggleSessionTimelineExpand is the click handler and accepts a session id', () => {
+    // The handler must:
+    //   1. Find the .session-timeline element by data-sid lookup
+    //   2. Toggle the .session-timeline-expanded class
+    //   3. Swap the button textContent between "Show all" and "Show less"
+    //   4. Update aria-expanded on the button for screen readers
+    assert.match(_src_uxj,
+      /function toggleSessionTimelineExpand\(id, ev\) \{/);
+    // Must call stopPropagation so the click doesn't bubble up to the
+    // session-header collapse handler.
+    const fn = _src_uxj.slice(
+      _src_uxj.indexOf('function toggleSessionTimelineExpand'),
+      _src_uxj.indexOf('function toggleSessionTimelineExpand') + 1500,
+    );
+    assert.match(fn, /if \(ev && ev\.stopPropagation\) ev\.stopPropagation\(\);/);
+    assert.match(fn, /classList\.toggle\('session-timeline-expanded'\)/);
+    // Updates the visible label on the toggle button — accept either
+    // the literal strings or the SESSION_TIMELINE_LABEL_* constants
+    // (current source uses the constants for single-source-of-truth).
+    assert.match(fn, /textContent = .{0,80}\?\s*(?:'Show less'|SESSION_TIMELINE_LABEL_SHOW_LESS)\s*:\s*(?:'Show all'|SESSION_TIMELINE_LABEL_SHOW_ALL)/);
+    // The constants must be defined (single source of truth — handler
+    // and overflow-applier both reference them).
+    assert.match(_src_uxj, /var SESSION_TIMELINE_LABEL_SHOW_ALL\s*=\s*'Show all'/);
+    assert.match(_src_uxj, /var SESSION_TIMELINE_LABEL_SHOW_LESS\s*=\s*'Show less'/);
+    // Mirrors aria-expanded for screen readers.
+    assert.match(fn, /setAttribute\('aria-expanded'/);
+  });
+
+  it('UX-S4 — toggle button initial aria-expanded="false" (timeline starts capped)', () => {
+    assert.match(_src_uxj,
+      /<button class="session-timeline-expand"[^>]*aria-expanded="false"/);
+  });
+
+  it('UX-S4 — toggle button onclick passes the event through (defense-in-depth)', () => {
+    // Source pattern (same backslash convention as the copy button):
+    //   onclick="toggleSessionTimelineExpand(\\'' + s.id + '\\', event)"
+    assert.match(_src_uxj,
+      /onclick="toggleSessionTimelineExpand\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+  });
+
+  it('UX-S4 — applySessionTimelineOverflow detects overflow and toggles the fade indicator class', () => {
+    // After renderSessions paints, JS measures each timeline and
+    // toggles .session-timeline-clipped if scrollHeight > clientHeight.
+    // The fade-out indicator only shows when the class is present.
+    assert.match(_src_uxj,
+      /function applySessionTimelineOverflow\(\) \{/);
+    const fn = _src_uxj.slice(
+      _src_uxj.indexOf('function applySessionTimelineOverflow'),
+      _src_uxj.indexOf('function applySessionTimelineOverflow') + 2000,
+    );
+    assert.match(fn, /scrollHeight > .{0,30}clientHeight/);
+    assert.match(fn, /classList\.(?:add|toggle)\('session-timeline-clipped'/);
+  });
+
+  it('UX-S4 — applySessionTimelineOverflow runs after renderSessions', () => {
+    // Without this call, the .session-timeline-clipped class never
+    // gets set and the fade-out + Show all button stay hidden even
+    // when the timeline overflows. The slice must extend past the
+    // last `el.innerHTML = html;` so any future trailing additions
+    // before the call still match.
+    const startIdx = _src_uxj.indexOf('function renderSessions(');
+    const renderFn = _src_uxj.slice(startIdx, startIdx + 12000);
+    // Must call applySessionTimelineOverflow AFTER el.innerHTML=html.
+    // Verify both pieces are present and order is correct.
+    const innerHTMLIdx = renderFn.lastIndexOf('el.innerHTML = html;');
+    const applyIdx = renderFn.indexOf('applySessionTimelineOverflow();');
+    assert.ok(innerHTMLIdx >= 0, 'renderSessions must contain el.innerHTML = html;');
+    assert.ok(applyIdx >= 0, 'renderSessions must contain applySessionTimelineOverflow();');
+    assert.ok(applyIdx > innerHTMLIdx,
+      'applySessionTimelineOverflow() must run AFTER el.innerHTML = html;');
+  });
+
+  it('UX-S4 — fade indicator and expand button hidden by default (only visible when clipped)', () => {
+    // The fade indicator and expand button must use display:none in
+    // the default state — they only become visible when the parent
+    // .session-card has the .session-timeline-clipped marker class
+    // (or its descendant has it). This avoids visual noise on short
+    // sessions that fit entirely within 500px.
+    assert.match(_src_uxj,
+      /\.session-timeline-fade \{[\s\S]{0,500}display: none;/);
+    assert.match(_src_uxj,
+      /\.session-timeline-expand \{[\s\S]{0,500}display: none;/);
+  });
+
+  it('UX-S4 — session-timeline-clipped triggers the fade + expand button visibility', () => {
+    // The class is applied to the timeline element when it overflows;
+    // the CSS sibling combinator + the parent class trigger visibility
+    // on the fade indicator and the expand button.
+    assert.match(_src_uxj,
+      /\.session-timeline-clipped \+ \.session-timeline-fade,?\s*\.session-timeline-clipped ~ \.session-timeline-expand \{[\s\S]{0,200}display:/);
+  });
+
+  // ── XSS-hardening: text content inside the SVG/buttons must not be
+  //    user-controlled. (The SVG is a fixed icon; the toggle text is
+  //    fixed strings; the only user-controlled piece is `s.id` going
+  //    into the onclick, which is a UUID — but defense-in-depth.)
+  it('UX-S3/UX-S4 — session id in onclick is escaped via the same escaping as the existing toggleSessionCollapse', () => {
+    // The pre-existing toggleSessionCollapse onclick uses two literal
+    // backslashes around the UUID — see the byte-level encoding above.
+    // The new copy/expand onclicks must use the same pattern (no extra
+    // interpolation, no user text in the JS string).
+    assert.match(_src_uxj,
+      /onclick="copyTimeline\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+    assert.match(_src_uxj,
+      /onclick="toggleSessionTimelineExpand\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+  });
+});
