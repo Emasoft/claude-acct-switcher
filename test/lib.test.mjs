@@ -9703,3 +9703,115 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
       /<span class="evt-icon" aria-hidden="true"/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// UX batch G — UX-A6 / UX-A7 source-grep regressions
+//
+// UX-A6: prior `.card.stale { opacity: 0.5 }` greyed out the WHOLE card
+//   including the .stale-msg red error text and the Refresh button. Users
+//   had to hover to read what was wrong. Fix dims only the header chrome
+//   (.card-top: dot + name + badges) — the rate bars, the error message,
+//   and the action buttons stay at full opacity. A small "stale" pill in
+//   the header carries an aria-label for screen-reader announcement
+//   (colour-blind / SR-only users would otherwise have no signal).
+//
+// UX-A7: prior `.card:hover { box-shadow: var(--shadow-lg) }` (12px
+//   diffuse shadow) bled onto the next card given the 0.625rem gap. Fix:
+//   bump `.accounts` gap to 0.875rem AND add a `transform: translateY(-1px)`
+//   lift so the shadow has somewhere to go without overlapping. The hover
+//   border picks up `--primary` so the boundary stays crisp even when the
+//   shadow is reduced.
+// ─────────────────────────────────────────────────
+describe('UX batch G — UX-A6 / UX-A7 account-card stale + hover regressions', () => {
+  const _src_g = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('UX-A6 — .card.stale targets only header chrome, NOT whole card', () => {
+    // The whole-card opacity selector `.card.stale { opacity: 0.5 }` MUST
+    // be gone. Otherwise the red .stale-msg copy and the Refresh button
+    // are still half-faded and demand a hover-to-read interaction the
+    // audit explicitly called out.
+    assert.doesNotMatch(_src_g, /\.card\.stale\s*\{\s*opacity:\s*0\.5\s*;\s*\}/);
+    assert.doesNotMatch(_src_g, /\.card\.stale:hover\s*\{\s*opacity:\s*0\.7\s*;\s*\}/);
+    // Targeted opacity on header chrome ONLY. The selector list pins the
+    // three children that should be dimmed (status dot / name / badges
+    // wrapper), so a future refactor that reverts to whole-card opacity
+    // will trip this test.
+    assert.match(_src_g,
+      /\.card\.stale\s*\.card-top\s*\{[\s\S]{0,200}opacity:\s*0\.55\s*;/);
+  });
+
+  it('UX-A6 — .stale-msg, action buttons, rate-bars stay at FULL opacity', () => {
+    // The error copy + the actionable buttons MUST remain at opacity 1
+    // so the user can read what is wrong without hovering. Pin via an
+    // explicit `.card.stale .stale-msg { opacity: 1 }` block (and the
+    // sibling button selectors).
+    assert.match(_src_g,
+      /\.card\.stale\s*\.stale-msg[\s\S]{0,200}opacity:\s*1\s*;/);
+    assert.match(_src_g,
+      /\.card\.stale\s*\.card-actions[\s\S]{0,200}opacity:\s*1\s*;/);
+  });
+
+  it('UX-A6 — "stale" pill renders inside header for stale cards (visible-text + aria-label)', () => {
+    // The pill MUST be visible text + carry aria-label so SR / colour-
+    // blind users get an explicit signal. The renderer emits the pill
+    // only when isStale is true, in the .card-badges wrapper.
+    assert.match(_src_g,
+      /<span class="badge badge-stale" aria-label="[^"]+">stale<\/span>/);
+    // CSS class is defined with a clear muted-red palette so the pill
+    // reads as a soft warning (NOT just a generic muted badge).
+    assert.match(_src_g,
+      /\.badge-stale\s*\{[\s\S]{0,300}color:\s*var\(--red\)[\s\S]{0,200}border-color:\s*var\(--red-border\)/);
+  });
+
+  it('UX-A6 — pill source is the closed isStale boolean, NOT user-controlled fields (XSS hardening)', () => {
+    // Just like the .badge-active / .badge-excluded source-grep above —
+    // the pill must be emitted from the boolean isStale (computed from
+    // server-side fields), never concatenated from a p.* string field.
+    // If any future refactor builds the pill from `p.<something>` we want
+    // to know.
+    assert.doesNotMatch(_src_g,
+      /badge-stale[^"]*"\s*[^>]*>[\s\S]{0,40}\+\s*p\.[a-zA-Z]/);
+  });
+
+  it('UX-A7 — .accounts gap bumped to 0.875rem (was 0.625rem) so hover shadow has room', () => {
+    // Tight 0.625rem gap was the root cause: shadow-lg extends ~12px
+    // below each card and bled onto the next card visually. Bumping the
+    // gap is the minimum-invasive fix (no JS change required).
+    assert.match(_src_g,
+      /\.accounts\s*\{[\s\S]{0,120}gap:\s*0\.875rem\s*;/);
+  });
+
+  it('UX-A7 — .card:hover lifts via translateY(-1px) so shadow has somewhere to go', () => {
+    // The lift gives the shadow vertical clearance so it sits underneath
+    // the lifted card instead of overlapping the neighbour below. The
+    // transition list MUST include `transform` so the lift animates
+    // (snapping looks like a layout glitch).
+    assert.match(_src_g,
+      /\.card:hover\s*\{[\s\S]{0,300}transform:\s*translateY\(-1px\)\s*;/);
+    assert.match(_src_g,
+      /\.card\s*\{[\s\S]{0,400}transition:\s*[^}]*transform[^}]*0\.2s/);
+  });
+
+  it('UX-A7 — .card:hover picks up --primary border for a crisp boundary', () => {
+    // With the shadow reduced + lift added, the border is now the
+    // primary "selected" affordance. The audit fix recommended exactly
+    // this approach so the hovered card stays visually distinct on
+    // dense lists (the previous fuzzy-shadow boundary was the complaint).
+    assert.match(_src_g,
+      /\.card:hover\s*\{[\s\S]{0,300}border-color:\s*var\(--primary\)\s*;/);
+  });
+
+  it('UX-A7 — .card:hover does NOT use the bigger var(--shadow-lg) anymore', () => {
+    // The hover used `box-shadow: var(--shadow-lg)` — the 12-px diffuse
+    // shadow that bled onto neighbours. The replacement uses the
+    // smaller resting-state `var(--shadow)` token (or no shadow change
+    // at all). This grep pins the absence of the shadow-lg upgrade on
+    // the .card:hover selector specifically.
+    const cardHoverBlock = _src_g.match(/\.card:hover\s*\{[^}]*\}/);
+    assert.ok(cardHoverBlock, 'expected to find .card:hover CSS block');
+    assert.doesNotMatch(cardHoverBlock[0], /box-shadow:\s*var\(--shadow-lg\)/);
+  });
+});
