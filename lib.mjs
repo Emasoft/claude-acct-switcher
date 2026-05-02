@@ -1697,6 +1697,69 @@ export function summarizeCacheMissesBySession(rows, opts = {}) {
 }
 
 /**
+ * Build the "wasted spend due to cache miss" time series.
+ *
+ * For every row that buildCacheMissReport classifies as a cache miss,
+ * the input tokens were billed at the FULL rate when, with a cache
+ * hit, they would have been billed at ~10% (the cache-read rate).
+ * Plotting these per-request gives the operator a direct view of
+ * "tokens I paid full price for that I ideally shouldn't have."
+ *
+ * Notes on what's INCLUDED vs. EXCLUDED:
+ *   - INCLUDED: rows the heuristic flagged as misses (cache existed
+ *     but wasn't read; input >= threshold).
+ *   - EXCLUDED: legitimate first-turn cache builds (no prior cache
+ *     existed → not a miss). We're measuring waste, not cost.
+ *   - EXCLUDED: rows below the input threshold (heuristic ignores
+ *     those — small turns may legitimately not need a cache).
+ *
+ * The y-axis value per point is the raw `inputTokens` count for the
+ * miss. UI can compute the dollar-cost equivalent via
+ * estimateModelCost(model, inputTokens, 0, 0, 0) at render time.
+ *
+ * @param {Array<Object>} rows
+ * @param {Object} [opts]
+ * @param {number} [opts.minInputForMissDetection]
+ * @param {number} [opts.cacheTtlMs]
+ * @param {Set<string>|Array<string>} [opts.repoFilter] include only
+ *   rows whose `repo` is in this set. Empty/missing = include all.
+ * @returns {Array<{ts, inputTokens, model, repo, branch, sessionId,
+ *   reason, costUSD}>}
+ *   Sorted by ts ascending. `costUSD` is computed via
+ *   estimateModelCost so the UI doesn't have to know the pricing.
+ */
+export function buildWastedSpendSeries(rows, opts = {}) {
+  const misses = buildCacheMissReport(rows, opts);
+  if (!misses.length) return [];
+  let allowedRepos = null;
+  if (opts.repoFilter) {
+    if (opts.repoFilter instanceof Set) {
+      allowedRepos = opts.repoFilter.size > 0 ? opts.repoFilter : null;
+    } else if (Array.isArray(opts.repoFilter) && opts.repoFilter.length > 0) {
+      allowedRepos = new Set(opts.repoFilter);
+    }
+  }
+  const out = [];
+  for (const m of misses) {
+    if (allowedRepos && !allowedRepos.has(m.repo || '')) continue;
+    out.push({
+      ts:          m.ts,
+      inputTokens: m.inputTokens,
+      model:       m.model,
+      repo:        m.repo,
+      branch:      m.branch,
+      sessionId:   m.sessionId,
+      reason:      m.reason,
+      costUSD:     estimateModelCost(m.model, m.inputTokens, 0, 0, 0),
+    });
+  }
+  // Already chronological from buildCacheMissReport; explicit sort
+  // here for safety in case that contract changes.
+  out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return out;
+}
+
+/**
  * Promise-chain mutex keyed by account name.
  * Ensures only one refresh runs per account at a time.
  *

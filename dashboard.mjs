@@ -851,6 +851,8 @@ import {
   renderUsageTreeCsv,
   // TRDD-1645134b Phase 5 — per-session cache-miss aggregate
   summarizeCacheMissesBySession,
+  // Phase 6 — wasted-spend (cache-miss cost) time series
+  buildWastedSpendSeries,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -3336,6 +3338,11 @@ async function handleAPI(req, res) {
         // consistent. The summary uses the SAME flat-miss list under
         // the hood so the two views can never disagree.
         response.missSessions = summarizeCacheMissesBySession(missRows, missOpts);
+        // Phase 6 — "tokens fully paid due to cache miss" time series
+        // for the new carousel chart. Sent UNFILTERED-by-repo on
+        // purpose — the UI's multi-select dropdown filters in memory
+        // so changing the dropdown doesn't round-trip to the server.
+        response.wastedSpend = buildWastedSpendSeries(missRows, missOpts);
       }
       json(res, response);
     } catch (e) {
@@ -4765,6 +4772,150 @@ function renderHTML() {
   .chart-carousel-dot.active { background: var(--primary); }
   .chart-carousel-dot:hover { background: var(--muted); }
 
+  /* Phase 6 — Project multi-select filter (chart-scoped). Anchored
+     top-right of the carousel card. Empty selection = aggregate all. */
+  .chart-project-filter {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    z-index: 10;
+  }
+  .cpf-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.25rem 0.6rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground);
+    font-size: 0.72rem;
+    font-family: var(--mono);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    max-width: 220px;
+  }
+  .cpf-toggle:hover { border-color: var(--muted); }
+  .cpf-toggle[aria-expanded="true"] {
+    border-color: var(--primary);
+    background: var(--primary-soft);
+  }
+  .cpf-toggle .cpf-chevron {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    transition: transform 0.15s ease;
+  }
+  .cpf-toggle[aria-expanded="true"] .cpf-chevron { transform: rotate(180deg); }
+  .cpf-panel {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-lg);
+    padding: 0.5rem;
+    min-width: 240px;
+    max-width: 360px;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  .cpf-actions {
+    display: flex;
+    gap: 0.5rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0.4rem;
+  }
+  .cpf-link {
+    background: transparent;
+    border: none;
+    color: var(--primary);
+    font-size: 0.72rem;
+    cursor: pointer;
+    padding: 0.1rem 0.3rem;
+  }
+  .cpf-link:hover { text-decoration: underline; }
+  .cpf-list { display: flex; flex-direction: column; gap: 0.15rem; }
+  .cpf-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 0.3rem;
+    cursor: pointer;
+    font-size: 0.72rem;
+    font-family: var(--mono);
+    color: var(--foreground);
+    border-radius: 4px;
+  }
+  .cpf-item:hover { background: var(--bg); }
+  .cpf-item input[type="checkbox"] {
+    margin: 0;
+    accent-color: var(--primary);
+    flex-shrink: 0;
+  }
+  .cpf-item-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cpf-empty {
+    padding: 0.5rem;
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.75rem;
+  }
+
+  /* Phase 6 — Wasted-spend chart (cache-miss cost over time). */
+  .tok-wasted-wrap {
+    padding: 0.5rem 0;
+  }
+  .tok-wasted-bar-area {
+    height: 140px;
+    display: flex;
+    align-items: flex-end;
+    gap: 1px;
+    padding: 0 0.25rem;
+  }
+  .tok-wasted-bar {
+    flex: 1;
+    min-width: 1px;
+    background: var(--yellow);
+    border-radius: 2px 2px 0 0;
+    transition: opacity 0.15s;
+    position: relative;
+    cursor: default;
+  }
+  .tok-wasted-bar:hover { opacity: 0.75; }
+  .tok-wasted-bar:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: calc(100% + 4px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--foreground);
+    color: var(--card);
+    padding: 0.25rem 0.5rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.7rem;
+    white-space: nowrap;
+    z-index: 30;
+    pointer-events: none;
+  }
+  .tok-wasted-totals {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 0 0.5rem 0.5rem;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+  .tok-wasted-totals .total-cost {
+    color: var(--red);
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+
   /* ── Cost savings chart ── */
   .savings-chart-container {
     position: relative;
@@ -5074,15 +5225,30 @@ function renderHTML() {
     <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
       <div class="usage-card chart-carousel" style="margin-bottom:1rem">
+        <div class="chart-project-filter" id="chart-project-filter">
+          <button type="button" class="cpf-toggle" id="cpf-toggle" onclick="toggleProjectFilter()" aria-haspopup="listbox" aria-expanded="false">
+            <span id="cpf-label">All projects</span>
+            <span class="cpf-chevron">▾</span>
+          </button>
+          <div class="cpf-panel" id="cpf-panel" hidden>
+            <div class="cpf-actions">
+              <button type="button" class="cpf-link" onclick="projectFilterSelectAll(true)">Select all</button>
+              <button type="button" class="cpf-link" onclick="projectFilterSelectAll(false)">Clear</button>
+            </div>
+            <div class="cpf-list" id="cpf-list"></div>
+          </div>
+        </div>
         <div class="chart-carousel-inner">
           <div class="chart-carousel-slides" id="chart-carousel-slides">
             <div class="chart-carousel-slide" id="tok-savings-chart"></div>
             <div class="chart-carousel-slide" id="tok-chart"></div>
+            <div class="chart-carousel-slide" id="tok-wasted-chart"></div>
           </div>
         </div>
         <div class="chart-carousel-dots" id="chart-carousel-dots">
           <button class="chart-carousel-dot active" onclick="chartCarouselGo(0)"></button>
           <button class="chart-carousel-dot" onclick="chartCarouselGo(1)"></button>
+          <button class="chart-carousel-dot" onclick="chartCarouselGo(2)"></button>
         </div>
       </div>
       <div id="tok-stats" class="stat-grid" style="margin-bottom:0.5rem"></div>
@@ -6928,6 +7094,36 @@ var _tok30dData = [];
 var _tokFilteredData = [];
 var _tokFetching = false;
 var _tokNeedsRefresh = false;
+// Phase 6 — wasted-spend series received unfiltered-by-repo from
+// /api/token-usage-tree?includeMisses=1 and filtered client-side
+// using _chartProjectFilter so toggling the filter doesn't refetch.
+var _wastedSpendRaw = [];
+// Phase 6 — chart-scoped project multi-select filter. Empty Set =
+// "all projects" (aggregate, the default). Non-empty = include only
+// rows whose repo field is in the set. localStorage-persisted so the
+// user selection survives a tab reload.
+var _chartProjectFilter = new Set();
+try {
+  var _persistedCpf = localStorage.getItem('vdm.chartProjectFilter');
+  if (_persistedCpf) {
+    var arr = JSON.parse(_persistedCpf);
+    if (Array.isArray(arr)) for (var __cpfI = 0; __cpfI < arr.length; __cpfI++) _chartProjectFilter.add(String(arr[__cpfI]));
+  }
+} catch (e) { /* ignore — clean slate is fine */ }
+function _persistChartProjectFilter() {
+  try {
+    localStorage.setItem('vdm.chartProjectFilter', JSON.stringify(Array.from(_chartProjectFilter)));
+  } catch (e) { /* quota / disabled — non-fatal */ }
+}
+// Apply the multi-select filter to a row array. Empty filter = pass-through.
+function applyChartProjectFilter(rows) {
+  if (!_chartProjectFilter.size) return rows;
+  var out = [];
+  for (var i = 0, n = rows.length; i < n; i++) {
+    if (_chartProjectFilter.has(rows[i].repo || '')) out.push(rows[i]);
+  }
+  return out;
+}
 
 function tokTimeRange() {
   var sel = document.getElementById('tok-time');
@@ -7010,18 +7206,24 @@ async function refreshUsageTree(currentCutoff) {
     var data = await resp.json();
     if (!data || data.ok !== true) throw new Error(data && data.error || 'malformed response');
 
-    // Hash the tree skeleton + miss count + miss-session count so we
-    // don't re-render when nothing visible changed (saves DOM churn on
-    // every 5s poll).
+    // Hash the tree skeleton + miss count + miss-session count + wasted-
+    // spend point count so we don't re-render when nothing visible
+    // changed (saves DOM churn on every 5s poll).
     var hash = (data.totals.requests | 0)
              + ':' + (data.misses ? data.misses.length : 0)
              + ':' + (data.missSessions ? data.missSessions.length : 0)
+             + ':' + (data.wastedSpend ? data.wastedSpend.length : 0)
              + ':' + (data.tree ? data.tree.length : 0);
     if (hash === _lastTreeHash) return;
     _lastTreeHash = hash;
 
     renderUsageTree(data.totals, data.tree || []);
     renderCacheMisses(data.misses || [], data.missSessions || []);
+    // Phase 6 — store the wasted-spend series and re-render the chart.
+    // Stored UNFILTERED-by-repo; the chart applies _chartProjectFilter
+    // at render time so toggling the multi-select doesn't refetch.
+    _wastedSpendRaw = data.wastedSpend || [];
+    renderWastedSpendChart();
   } finally {
     _treeFetching = false;
   }
@@ -7240,15 +7442,25 @@ function applyTokenModelFilter() {
     cancelAnimationFrame(_renderChartsRaf);
     _renderChartsRaf = null;
   }
+  // Phase 6 — project multi-select filter applied AFTER the existing
+  // single-select filters but BEFORE any chart renderer sees the data.
+  // This way the new control composes with everything (model, account,
+  // repo, branch, time, scrubber, tier) without touching renderer code.
+  // _tokensRawData drives the project-options list (populated in
+  // populateProjectFilterOptions), so the filter dropdown reflects the
+  // FULL repo set even when the user has narrowed the selection.
+  var dataForCharts     = applyChartProjectFilter(data);
+  var prevDataForCharts = applyChartProjectFilter(prevData);
   _renderChartsRaf = requestAnimationFrame(function() {
     _renderChartsRaf = null;
-    renderTokenStats(data, prevData);
-    renderDailyChart(data);
+    renderTokenStats(dataForCharts, prevDataForCharts);
+    renderDailyChart(dataForCharts);
     renderCostSavingsChart();
-    renderModelBreakdown(data);
-    renderAccountBreakdown(data);
-    renderRepoBranchBreakdown(data);
-    renderToolBreakdown(data);
+    renderModelBreakdown(dataForCharts);
+    renderAccountBreakdown(dataForCharts);
+    renderRepoBranchBreakdown(dataForCharts);
+    renderToolBreakdown(dataForCharts);
+    renderWastedSpendChart();
   });
 }
 var _renderChartsRaf = null;
@@ -7554,6 +7766,211 @@ function chartCarouselNext() {
   chartCarouselGo((_chartCarouselIdx + 1) % count);
 }
 _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
+
+// ── Phase 6 — chart-scoped project multi-select dropdown ──
+
+function toggleProjectFilter() {
+  var btn = document.getElementById('cpf-toggle');
+  var panel = document.getElementById('cpf-panel');
+  if (!btn || !panel) return;
+  var open = !panel.hidden;
+  if (open) {
+    panel.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  populateProjectFilterOptions();
+  panel.hidden = false;
+  btn.setAttribute('aria-expanded', 'true');
+  // Click-away-to-close: install a one-shot capture handler. Removed
+  // when the panel closes so we don't leak listeners across opens.
+  setTimeout(function() {
+    document.addEventListener('click', _closeProjectFilterOnOutside, true);
+  }, 0);
+}
+function _closeProjectFilterOnOutside(ev) {
+  var root = document.getElementById('chart-project-filter');
+  if (!root) {
+    document.removeEventListener('click', _closeProjectFilterOnOutside, true);
+    return;
+  }
+  if (root.contains(ev.target)) return;
+  var panel = document.getElementById('cpf-panel');
+  var btn = document.getElementById('cpf-toggle');
+  if (panel) panel.hidden = true;
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('click', _closeProjectFilterOnOutside, true);
+}
+
+function populateProjectFilterOptions() {
+  // Source-of-truth = the union of repo strings across the unfiltered
+  // raw dataset AND the unfiltered wasted-spend series, so the
+  // dropdown reflects every project that could appear in any chart.
+  var listEl = document.getElementById('cpf-list');
+  if (!listEl) return;
+  var seen = new Set();
+  for (var i = 0, n = _tokensRawData.length; i < n; i++) {
+    var r = _tokensRawData[i].repo;
+    if (r) seen.add(r);
+  }
+  for (var j = 0, m = _wastedSpendRaw.length; j < m; j++) {
+    var r2 = _wastedSpendRaw[j].repo;
+    if (r2) seen.add(r2);
+  }
+  var sorted = Array.from(seen).sort();
+  if (!sorted.length) {
+    listEl.innerHTML = '<div class="cpf-empty">No projects in current data range.</div>';
+    return;
+  }
+  // Drop selected entries that no longer exist in the dataset (data
+  // window changed, project disappeared) so the saved selection
+  // doesn't pin a stale filter forever.
+  var changed = false;
+  Array.from(_chartProjectFilter).forEach(function(repo) {
+    if (!seen.has(repo)) { _chartProjectFilter.delete(repo); changed = true; }
+  });
+  if (changed) {
+    _persistChartProjectFilter();
+    _refreshProjectFilterLabel();
+  }
+  var html = '';
+  for (var k = 0; k < sorted.length; k++) {
+    var name = sorted[k];
+    var checked = _chartProjectFilter.has(name) ? ' checked' : '';
+    var safeName = escHtml(name);
+    var safeAttr = name.replace(/"/g, '&quot;');
+    html += '<label class="cpf-item">'
+      + '<input type="checkbox" data-repo="' + safeAttr + '"' + checked
+      + ' onchange="toggleProjectInFilter(this)">'
+      + '<span class="cpf-item-label" title="' + safeAttr + '">' + safeName + '</span>'
+      + '</label>';
+  }
+  listEl.innerHTML = html;
+}
+
+function toggleProjectInFilter(cb) {
+  var name = cb.getAttribute('data-repo');
+  if (!name) return;
+  if (cb.checked) _chartProjectFilter.add(name);
+  else _chartProjectFilter.delete(name);
+  _persistChartProjectFilter();
+  _refreshProjectFilterLabel();
+  applyTokenModelFilter();   // re-runs all chart renderers
+}
+
+function projectFilterSelectAll(selectAll) {
+  if (selectAll) {
+    // "Select all" is semantically equivalent to "Clear" for this
+    // filter (empty set = aggregate all). But the user may want to
+    // see every box ticked as a visual cue, so explicitly add each.
+    _chartProjectFilter.clear();
+    var listEl = document.getElementById('cpf-list');
+    if (listEl) {
+      var boxes = listEl.querySelectorAll('input[type="checkbox"]');
+      for (var i = 0; i < boxes.length; i++) {
+        var n = boxes[i].getAttribute('data-repo');
+        if (n) _chartProjectFilter.add(n);
+        boxes[i].checked = true;
+      }
+    }
+  } else {
+    _chartProjectFilter.clear();
+    var listEl2 = document.getElementById('cpf-list');
+    if (listEl2) {
+      var boxes2 = listEl2.querySelectorAll('input[type="checkbox"]');
+      for (var j = 0; j < boxes2.length; j++) boxes2[j].checked = false;
+    }
+  }
+  _persistChartProjectFilter();
+  _refreshProjectFilterLabel();
+  applyTokenModelFilter();
+}
+
+function _refreshProjectFilterLabel() {
+  var labelEl = document.getElementById('cpf-label');
+  if (!labelEl) return;
+  var n = _chartProjectFilter.size;
+  if (n === 0) labelEl.textContent = 'All projects';
+  else if (n === 1) {
+    // Show the single project's basename so the label fits the button
+    var only = Array.from(_chartProjectFilter)[0];
+    var base = only.split('/').filter(Boolean).pop() || only;
+    labelEl.textContent = base;
+  } else labelEl.textContent = n + ' projects';
+}
+
+// ── Phase 6 — wasted-spend chart (cache-miss cost over time) ──
+//
+// Bars are aggregated per day for readability. Y-axis is total
+// inputTokens that were billed at full rate due to a cache miss.
+// Hover shows the per-day breakdown.
+function renderWastedSpendChart() {
+  var el = document.getElementById('tok-wasted-chart');
+  if (!el) return;
+  // Apply the project multi-select filter
+  var filtered = _wastedSpendRaw;
+  if (_chartProjectFilter.size) {
+    filtered = [];
+    for (var i = 0, n = _wastedSpendRaw.length; i < n; i++) {
+      if (_chartProjectFilter.has(_wastedSpendRaw[i].repo || '')) filtered.push(_wastedSpendRaw[i]);
+    }
+  }
+  // Apply the same time range as the rest of the Tokens tab so the
+  // wasted-spend bar area stays in sync with the other charts.
+  var snap = vsSnapshot();
+  if (snap.start != null || snap.end != null) {
+    var fStart = snap.start, fEnd = snap.end;
+    filtered = filtered.filter(function(p) {
+      var ts = p.ts || 0;
+      if (fStart != null && ts < fStart) return false;
+      if (fEnd   != null && ts > fEnd)   return false;
+      return true;
+    });
+  }
+  if (!filtered.length) {
+    el.innerHTML = '<div class="usage-title">Tokens Paid (Cache Misses)</div>'
+      + '<div style="color:var(--muted);font-size:0.8125rem;padding:2rem 0;text-align:center">No cache-miss spend in this time range. Higher cache hit rates = fewer bars.</div>';
+    return;
+  }
+  // Aggregate per local-time day
+  var byDay = new Map();
+  var totalTokens = 0;
+  var totalCost   = 0;
+  for (var p = 0; p < filtered.length; p++) {
+    var pt = filtered[p];
+    var d = new Date(pt.ts);
+    var dayKey = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    var bucket = byDay.get(dayKey);
+    if (!bucket) { bucket = { day: dayKey, tokens: 0, cost: 0, count: 0 }; byDay.set(dayKey, bucket); }
+    bucket.tokens += (pt.inputTokens || 0);
+    bucket.cost   += (pt.costUSD     || 0);
+    bucket.count  += 1;
+    totalTokens += (pt.inputTokens || 0);
+    totalCost   += (pt.costUSD     || 0);
+  }
+  var days = Array.from(byDay.values()).sort(function(a, b) { return a.day < b.day ? -1 : 1; });
+  var maxTokens = 0;
+  for (var di = 0; di < days.length; di++) if (days[di].tokens > maxTokens) maxTokens = days[di].tokens;
+  // Build the bars
+  var bars = '<div class="tok-wasted-bar-area">';
+  for (var dj = 0; dj < days.length; dj++) {
+    var dy = days[dj];
+    var pct = maxTokens > 0 ? Math.max(2, Math.round((dy.tokens / maxTokens) * 100)) : 2;
+    var tooltip = dy.day + ' • ' + formatNum(dy.tokens) + ' tok • $'
+                  + (Math.round(dy.cost * 100) / 100).toFixed(2)
+                  + ' • ' + dy.count + ' miss' + (dy.count === 1 ? '' : 'es');
+    bars += '<div class="tok-wasted-bar" style="height:' + pct + '%" data-tooltip="' + escHtml(tooltip) + '"></div>';
+  }
+  bars += '</div>';
+  var totalsLine = '<div class="tok-wasted-totals">'
+    + '<span>' + formatNum(totalTokens) + ' tokens fully paid across ' + filtered.length
+    + ' miss' + (filtered.length === 1 ? '' : 'es') + '</span>'
+    + '<span class="total-cost">$' + (Math.round(totalCost * 100) / 100).toFixed(2)
+    + ' wasted</span>'
+    + '</div>';
+  el.innerHTML = '<div class="usage-title" title="Input tokens billed at full rate because no prior cache could be re-used. Plotted per day.">Tokens Paid (Cache Misses)</div>'
+    + '<div class="tok-wasted-wrap">' + totalsLine + bars + '</div>';
+}
 
 function getPlanMonthlyCost(subscriptionType, rateLimitTier) {
   var sub = (subscriptionType || '').toLowerCase();
@@ -8067,6 +8484,11 @@ function exportUsageTreeCsv() {
 refresh();
 loadSettingsUI();
 vsBootstrap();
+// Phase 6 — reflect the persisted multi-select filter in the toggle
+// button label as soon as the page paints (so the user sees their
+// existing selection rather than a default "All projects" that flips
+// after the next data fetch).
+_refreshProjectFilterLabel();
 setInterval(refresh, 5000);
 setInterval(tickCountdowns, 1000);
 // Phase C: poll data-range / tier map every 10 s so the scrubber tracks

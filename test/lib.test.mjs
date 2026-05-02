@@ -75,6 +75,8 @@ import {
   // TRDD-1645134b Phase 5 — reason classification + per-session aggregate
   CACHE_TTL_LIKELY_MS,
   summarizeCacheMissesBySession,
+  // Phase 6 — wasted-spend (cache-miss cost) time series
+  buildWastedSpendSeries,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
   vdmAccountNameFromService,
@@ -6627,9 +6629,13 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
   });
 
   it('errors return 500 with { ok: false, error }', () => {
+    // Phase 6 — bumped from 4000 to 5500 to span the wastedSpend
+    // computation that was added inside the includeMisses guard, so
+    // the catch block at the bottom of the handler still falls inside
+    // the slice window.
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 5500,
     );
     // Use [\s\S] so the regex spans newlines (catch blocks are typically
     // multi-line). A single error path that returns 500 with the
@@ -7713,3 +7719,309 @@ describe('Phase 5 — UI: per-session misses card', () => {
     assert.ok(!/var\(--blue\)/.test(cssBlock),     'must not reference undefined --blue token (use --primary)');
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Phase 6 — buildWastedSpendSeries
+// ─────────────────────────────────────────────────────────
+
+describe('Phase 6 — buildWastedSpendSeries', () => {
+  it('returns empty array for empty/non-array/zero-misses input', () => {
+    assert.deepEqual(buildWastedSpendSeries([]),         []);
+    assert.deepEqual(buildWastedSpendSeries(null),       []);
+    assert.deepEqual(buildWastedSpendSeries(undefined),  []);
+    // Rows that produce no misses → empty series
+    const noMisses = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheReadInputTokens: 800, cacheCreationInputTokens: 0 },
+    ];
+    assert.deepEqual(buildWastedSpendSeries(noMisses), []);
+  });
+
+  it('emits one entry per cache miss with all expected fields', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0,
+        repo: '/r', branch: 'main' },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        repo: '/r', branch: 'main' },
+    ];
+    const out = buildWastedSpendSeries(rows);
+    assert.equal(out.length, 1);
+    const p = out[0];
+    assert.equal(p.ts,          1000 + CACHE_TTL_LIKELY_MS + 1);
+    assert.equal(p.inputTokens, 5000);
+    assert.equal(p.model,       'claude-opus-4-7');
+    assert.equal(p.repo,        '/r');
+    assert.equal(p.branch,      'main');
+    assert.equal(p.sessionId,   's1');
+    assert.equal(p.reason,      'TTL-likely');
+    // Cost computed via estimateModelCost (5000 input * $15/M = $0.075)
+    assert.ok(Math.abs(p.costUSD - 0.075) < 1e-9, 'expected $0.075 for 5K opus input, got ' + p.costUSD);
+  });
+
+  it('cost uses each row\'s OWN model (mixed-model series)', () => {
+    const rows = [
+      // Build cache on opus
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      // Miss on sonnet (model-changed reason)
+      { type: 'usage', sessionId: 's1', ts: 1100, model: 'claude-sonnet-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildWastedSpendSeries(rows);
+    assert.equal(out.length, 1);
+    // 5K sonnet input @ $3/M = $0.015 (not opus pricing)
+    assert.ok(Math.abs(out[0].costUSD - 0.015) < 1e-9);
+    assert.equal(out[0].reason, 'model-changed');
+  });
+
+  it('repoFilter (Set) narrows the output', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7', repo: '/a',
+        inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, model: 'claude-opus-4-7', repo: '/a',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's2', ts: 2000, model: 'claude-opus-4-7', repo: '/b',
+        inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's2', ts: 2000 + CACHE_TTL_LIKELY_MS + 1, model: 'claude-opus-4-7', repo: '/b',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const all = buildWastedSpendSeries(rows);
+    assert.equal(all.length, 2);
+    const onlyA = buildWastedSpendSeries(rows, { repoFilter: new Set(['/a']) });
+    assert.equal(onlyA.length, 1);
+    assert.equal(onlyA[0].repo, '/a');
+  });
+
+  it('repoFilter accepts arrays as well as Sets', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, repo: '/a',
+        inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, repo: '/a',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildWastedSpendSeries(rows, { repoFilter: ['/a'] });
+    assert.equal(out.length, 1);
+    const out2 = buildWastedSpendSeries(rows, { repoFilter: ['/nonexistent'] });
+    assert.equal(out2.length, 0);
+  });
+
+  it('empty repoFilter is treated as "no filter" (NOT zero results)', () => {
+    // Phase 6 contract — empty Set / empty array means "include all"
+    // (matches the UI semantics of "no checkboxes ticked = aggregate").
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, repo: '/a',
+        inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, repo: '/a',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    assert.equal(buildWastedSpendSeries(rows, { repoFilter: new Set() }).length, 1);
+    assert.equal(buildWastedSpendSeries(rows, { repoFilter: [] }).length,        1);
+  });
+
+  it('output is chronologically sorted (ascending)', () => {
+    // Construct misses out-of-order in input; assert ascending in output.
+    const rows = [
+      { type: 'usage', sessionId: 'sA', ts: 1000, repo: '/a', inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 'sB', ts: 2000, repo: '/b', inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 'sB', ts: 2000 + CACHE_TTL_LIKELY_MS + 1, repo: '/b', inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 'sA', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, repo: '/a', inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildWastedSpendSeries(rows);
+    assert.equal(out.length, 2);
+    assert.ok(out[0].ts < out[1].ts, 'series must be chronological');
+  });
+
+  it('honors minInputForMissDetection threshold (small misses excluded)', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, inputTokens: 500, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    // Default threshold (1000) → small miss excluded
+    assert.equal(buildWastedSpendSeries(rows).length, 0);
+    // Lower threshold → it shows up
+    assert.equal(buildWastedSpendSeries(rows, { minInputForMissDetection: 100 }).length, 1);
+  });
+});
+
+describe('Phase 6 — endpoint emits wastedSpend when includeMisses=1', () => {
+  const _src_t6 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports buildWastedSpendSeries from lib.mjs', () => {
+    assert.match(_src_t6, /buildWastedSpendSeries,/);
+  });
+
+  it('endpoint computes wastedSpend inside the includeMisses guard', () => {
+    const fn = _src_t6.slice(
+      _src_t6.indexOf("'/api/token-usage-tree'"),
+      _src_t6.indexOf("'/api/token-usage-tree'") + 5500,
+    );
+    assert.match(fn, /response\.wastedSpend = buildWastedSpendSeries/);
+    const guardIdx = fn.indexOf("params.get('includeMisses')");
+    const wsIdx = fn.indexOf('buildWastedSpendSeries');
+    assert.ok(wsIdx > guardIdx, 'wastedSpend computation must be inside includeMisses guard');
+  });
+});
+
+describe('Phase 6 — UI: chart-scoped project multi-select + wasted-spend chart', () => {
+  const _src_t6ui = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('third carousel slide for the wasted-spend chart is present', () => {
+    assert.match(_src_t6ui, /id="tok-wasted-chart"/);
+    // Three slides ⇒ three dots. The class attribute and the onclick
+    // attribute are space-separated, so the regex needs to span the
+    // attribute boundary — use a lazy any-match instead of [^"]* which
+    // stops at the closing quote of the class attribute.
+    const dots = _src_t6ui.match(/chart-carousel-dot[\s\S]*?onclick="chartCarouselGo\(\d\)/g) || [];
+    assert.ok(dots.length >= 3, 'expected at least 3 carousel dots, got ' + dots.length);
+  });
+
+  it('multi-select dropdown is anchored on the carousel', () => {
+    assert.match(_src_t6ui, /<div class="chart-project-filter" id="chart-project-filter">/);
+    assert.match(_src_t6ui, /id="cpf-toggle"/);
+    assert.match(_src_t6ui, /id="cpf-panel"/);
+    assert.match(_src_t6ui, /id="cpf-list"/);
+    // Default label is "All projects" (matches empty-set state)
+    assert.match(_src_t6ui, /<span id="cpf-label">All projects<\/span>/);
+  });
+
+  it('CSS for the multi-select uses defined design tokens only (no raw hex)', () => {
+    const cssBlock = _src_t6ui.slice(
+      _src_t6ui.indexOf('.chart-project-filter {'),
+      _src_t6ui.indexOf('/* Phase 6 — Wasted-spend chart')
+    );
+    assert.ok(cssBlock.length > 200, 'multi-select CSS block must exist');
+    const rawColors = cssBlock.match(/[^a-z]#[0-9a-fA-F]{3,6}\b/g);
+    assert.equal(rawColors, null, 'multi-select CSS must not contain raw hex colors; found: ' + rawColors);
+    assert.match(cssBlock, /var\(--bg\)/);
+    assert.match(cssBlock, /var\(--border\)/);
+    assert.match(cssBlock, /var\(--primary\)/);
+  });
+
+  it('CSS for the wasted-spend chart uses design tokens only', () => {
+    const cssBlock = _src_t6ui.slice(
+      _src_t6ui.indexOf('/* Phase 6 — Wasted-spend chart'),
+      _src_t6ui.indexOf('/* ── Cost savings chart ── */')
+    );
+    assert.ok(cssBlock.length > 200, 'wasted-spend CSS block must exist');
+    const rawColors = cssBlock.match(/[^a-z]#[0-9a-fA-F]{3,6}\b/g);
+    assert.equal(rawColors, null, 'wasted-spend CSS must not contain raw hex colors; found: ' + rawColors);
+    assert.match(cssBlock, /var\(--yellow\)/);
+    assert.match(cssBlock, /var\(--red\)/);
+  });
+
+  it('_chartProjectFilter is a Set, persisted to localStorage', () => {
+    const stateBlock = _src_t6ui.slice(
+      _src_t6ui.indexOf('var _chartProjectFilter ='),
+      _src_t6ui.indexOf('function applyChartProjectFilter('),
+    );
+    assert.match(stateBlock, /var _chartProjectFilter = new Set\(\)/);
+    assert.match(stateBlock, /localStorage\.getItem\('vdm\.chartProjectFilter'\)/);
+    assert.match(stateBlock, /function _persistChartProjectFilter/);
+  });
+
+  it('applyChartProjectFilter passes through when set is empty (aggregate-all)', () => {
+    const fn = _src_t6ui.slice(
+      _src_t6ui.indexOf('function applyChartProjectFilter('),
+      _src_t6ui.indexOf('function applyChartProjectFilter(') + 600,
+    );
+    // The early-return branch is the contract
+    assert.match(fn, /if \(!_chartProjectFilter\.size\) return rows/);
+  });
+
+  it('applyTokenModelFilter feeds project-filtered data into ALL chart renderers', () => {
+    const fn = _src_t6ui.slice(
+      _src_t6ui.indexOf('function applyTokenModelFilter'),
+      _src_t6ui.indexOf('function applyTokenModelFilter') + 4000,
+    );
+    assert.match(fn, /var dataForCharts\s*=\s*applyChartProjectFilter\(data\)/);
+    assert.match(fn, /var prevDataForCharts\s*=\s*applyChartProjectFilter\(prevData\)/);
+    // Every chart renderer in the rAF callback uses the filtered data,
+    // not the unfiltered `data`/`prevData` directly. The signature
+    // check is the contract — anyone adding a NEW chart renderer to
+    // the carousel will trip this test if they forget to use
+    // dataForCharts.
+    assert.match(fn, /renderTokenStats\(dataForCharts, prevDataForCharts\)/);
+    assert.match(fn, /renderDailyChart\(dataForCharts\)/);
+    assert.match(fn, /renderModelBreakdown\(dataForCharts\)/);
+    assert.match(fn, /renderAccountBreakdown\(dataForCharts\)/);
+    assert.match(fn, /renderRepoBranchBreakdown\(dataForCharts\)/);
+    assert.match(fn, /renderToolBreakdown\(dataForCharts\)/);
+    // The new chart is in the same render batch
+    assert.match(fn, /renderWastedSpendChart\(\)/);
+  });
+
+  it('refreshUsageTree stores wastedSpend in _wastedSpendRaw and re-renders', () => {
+    const fn = _src_t6ui.slice(
+      _src_t6ui.indexOf('async function refreshUsageTree'),
+      _src_t6ui.indexOf('async function refreshUsageTree') + 3000,
+    );
+    assert.match(fn, /_wastedSpendRaw = data\.wastedSpend \|\| \[\]/);
+    assert.match(fn, /renderWastedSpendChart\(\)/);
+    // Hash includes wastedSpend length (otherwise stale data wins)
+    assert.match(fn, /wastedSpend \? data\.wastedSpend\.length : 0/);
+  });
+
+  it('toggleProjectFilter / toggleProjectInFilter / projectFilterSelectAll wire to applyTokenModelFilter', () => {
+    // The filter must trigger a re-render of all charts on every toggle
+    // (otherwise the multi-select would silently change state without
+    // visible effect until the next 5s poll).
+    const block = _src_t6ui.slice(
+      _src_t6ui.indexOf('function toggleProjectFilter'),
+      _src_t6ui.indexOf('function _refreshProjectFilterLabel'),
+    );
+    assert.ok(block.length > 1000, 'multi-select handler block must exist');
+    assert.match(block, /function toggleProjectFilter/);
+    assert.match(block, /function toggleProjectInFilter\(cb\)/);
+    assert.match(block, /function projectFilterSelectAll\(selectAll\)/);
+    // Each mutator calls applyTokenModelFilter at least once
+    const matches = (block.match(/applyTokenModelFilter\(\)/g) || []).length;
+    assert.ok(matches >= 2, 'expected applyTokenModelFilter() calls in toggle handlers, got ' + matches);
+  });
+
+  it('renderWastedSpendChart applies project filter + time range, has empty-state', () => {
+    const fn = _src_t6ui.slice(
+      _src_t6ui.indexOf('function renderWastedSpendChart'),
+      _src_t6ui.indexOf('function renderWastedSpendChart') + 4000,
+    );
+    assert.ok(fn.length > 800, 'renderWastedSpendChart body must exist');
+    // Multi-select filter applied
+    assert.match(fn, /_chartProjectFilter\.has/);
+    // Time-range filter via vsSnapshot (matches the rest of the tab)
+    assert.match(fn, /var snap = vsSnapshot\(\)/);
+    // Empty-state message is human-friendly
+    assert.match(fn, /No cache-miss spend in this time range/);
+    // Per-day bars
+    assert.match(fn, /tok-wasted-bar-area/);
+    // Tooltips routed through escHtml (XSS-safe)
+    assert.match(fn, /escHtml\(tooltip\)/);
+  });
+
+  it('multi-select label text reflects selection count', () => {
+    const fn = _src_t6ui.slice(
+      _src_t6ui.indexOf('function _refreshProjectFilterLabel'),
+      _src_t6ui.indexOf('function _refreshProjectFilterLabel') + 800,
+    );
+    assert.match(fn, /All projects/);
+    // Single-selection shows the basename (path tail) for compactness
+    assert.match(fn, /split\('\/'\)/);
+    // Multi shows "<n> projects"
+    assert.match(fn, /n \+ ' projects'/);
+  });
+
+  it('persisted filter restored at boot via _refreshProjectFilterLabel', () => {
+    // The boot block at the end of the file must call the label
+    // refresher so the saved selection is reflected before any data
+    // arrives — otherwise the user sees "All projects" briefly even
+    // when they had previously selected a subset.
+    const tail = _src_t6ui.slice(_src_t6ui.lastIndexOf('refresh();'));
+    assert.match(tail, /_refreshProjectFilterLabel\(\)/);
+  });
+});
+
