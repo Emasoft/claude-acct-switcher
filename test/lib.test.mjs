@@ -65,6 +65,13 @@ import {
   classifyUsageComponent,
   aggregateUsageTree,
   buildCacheMissReport,
+  // TRDD-1645134b Phase 4 — tree-aggregated CSV export
+  MODEL_PRICING,
+  MODEL_PRICING_DEFAULT,
+  estimateModelCost,
+  aggregateUsageForCsvExport,
+  csvField,
+  renderUsageTreeCsv,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
   vdmAccountNameFromService,
@@ -6775,5 +6782,541 @@ describe('Phase 3 — UI tree view (renderHTML + client JS)', () => {
     // git branch names). Both must run through escHtml.
     assert.match(fn, /escHtml\(\(m\.repo \|\| '\?'\) \+ ' \/ ' \+ \(m\.branch \|\| '\?'\)\)/);
     assert.match(fn, /escHtml\(ts\)/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// TRDD-1645134b Phase 4 — tree-aggregated CSV export (lib.mjs helpers)
+// ─────────────────────────────────────────────────────────
+
+describe('Phase 4 — MODEL_PRICING table', () => {
+  it('covers all current Claude generations (opus/sonnet/haiku 4-5..4-7)', () => {
+    // Mirror of dashboard.mjs TOK_PRICING — adding a new model in one
+    // place without the other silently undercounts cost in CSV exports.
+    assert.ok(MODEL_PRICING['claude-opus-4-7'],   'opus 4-7 missing');
+    assert.ok(MODEL_PRICING['claude-opus-4-6'],   'opus 4-6 missing');
+    assert.ok(MODEL_PRICING['claude-opus-4-5'],   'opus 4-5 missing');
+    assert.ok(MODEL_PRICING['claude-sonnet-4-7'], 'sonnet 4-7 missing');
+    assert.ok(MODEL_PRICING['claude-sonnet-4-6'], 'sonnet 4-6 missing');
+    assert.ok(MODEL_PRICING['claude-sonnet-4-5'], 'sonnet 4-5 missing');
+    assert.ok(MODEL_PRICING['claude-haiku-4-6'],  'haiku 4-6 missing');
+    assert.ok(MODEL_PRICING['claude-haiku-4-5'],  'haiku 4-5 missing');
+  });
+
+  it('every entry has the four required rate fields', () => {
+    for (const [name, p] of Object.entries(MODEL_PRICING)) {
+      assert.ok(typeof p.input         === 'number' && p.input         > 0, `${name}.input invalid`);
+      assert.ok(typeof p.output        === 'number' && p.output        > 0, `${name}.output invalid`);
+      assert.ok(typeof p.cacheRead     === 'number' && p.cacheRead    >= 0, `${name}.cacheRead invalid`);
+      assert.ok(typeof p.cacheCreation === 'number' && p.cacheCreation > 0, `${name}.cacheCreation invalid`);
+    }
+  });
+
+  it('cache rates respect Anthropic ratios (cacheRead ~10% of input, cacheCreation ~125%)', () => {
+    // The published ratios are the load-bearing reason these can be
+    // derived. If someone hand-edits a single column out of step, the
+    // CSV export silently misreports cost — the regression catches that.
+    for (const [name, p] of Object.entries(MODEL_PRICING)) {
+      const readRatio   = p.cacheRead     / p.input;
+      const createRatio = p.cacheCreation / p.input;
+      assert.ok(Math.abs(readRatio - 0.10) < 0.005,
+        `${name} cacheRead/input ratio ${readRatio} should be ~0.10`);
+      assert.ok(Math.abs(createRatio - 1.25) < 0.005,
+        `${name} cacheCreation/input ratio ${createRatio} should be ~1.25`);
+    }
+  });
+
+  it('MODEL_PRICING_DEFAULT is non-zero (silent zero would undercount)', () => {
+    // The TRDD specifically calls out: returning 0 for unknown models
+    // would silently undercount. The default rates use Sonnet pricing
+    // as a conservative middle ground.
+    assert.ok(MODEL_PRICING_DEFAULT.input         > 0);
+    assert.ok(MODEL_PRICING_DEFAULT.output        > 0);
+    assert.ok(MODEL_PRICING_DEFAULT.cacheRead     > 0);
+    assert.ok(MODEL_PRICING_DEFAULT.cacheCreation > 0);
+  });
+});
+
+describe('Phase 4 — estimateModelCost', () => {
+  it('exact model match uses that model\'s rates', () => {
+    // claude-opus-4-7: $15/$75/$1.50/$18.75 per 1M tokens
+    // 1M input + 1M output + 1M cache-read + 1M cache-create
+    const cost = estimateModelCost('claude-opus-4-7', 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+    assert.equal(Math.round(cost * 100) / 100, 110.25); // 15+75+1.5+18.75
+  });
+
+  it('prefix match handles date-suffixed model IDs (forward-compat)', () => {
+    // CC sometimes emits date-suffixed model IDs like
+    // claude-opus-4-7-20260315. Without prefix matching the cost falls
+    // back to the default rates — silently misreporting cost for every
+    // turn after a model release.
+    const exact = estimateModelCost('claude-opus-4-7',          1_000_000, 0, 0, 0);
+    const dated = estimateModelCost('claude-opus-4-7-20260315', 1_000_000, 0, 0, 0);
+    assert.equal(exact, dated);
+  });
+
+  it('unknown model uses MODEL_PRICING_DEFAULT (NOT zero)', () => {
+    const cost = estimateModelCost('unknown-future-model-x', 1_000_000, 0, 0, 0);
+    assert.equal(cost, MODEL_PRICING_DEFAULT.input);
+  });
+
+  it('null/empty/non-string model uses default rates', () => {
+    const expected = MODEL_PRICING_DEFAULT.input; // 1M input tokens at default rate
+    assert.equal(estimateModelCost(null,       1_000_000, 0, 0, 0), expected);
+    assert.equal(estimateModelCost(undefined,  1_000_000, 0, 0, 0), expected);
+    assert.equal(estimateModelCost('',         1_000_000, 0, 0, 0), expected);
+    assert.equal(estimateModelCost(42,         1_000_000, 0, 0, 0), expected);
+  });
+
+  it('zero tokens returns zero cost', () => {
+    assert.equal(estimateModelCost('claude-opus-4-7', 0, 0, 0, 0), 0);
+  });
+
+  it('null/undefined token counts treated as zero', () => {
+    // Real CC rows sometimes have nullish cache fields when no cache
+    // activity happened — never throw on those.
+    const cost = estimateModelCost('claude-sonnet-4-7', null, undefined, null, undefined);
+    assert.equal(cost, 0);
+  });
+
+  it('cost is linear in token count', () => {
+    const a = estimateModelCost('claude-haiku-4-5',   500_000, 100_000, 0, 0);
+    const b = estimateModelCost('claude-haiku-4-5', 1_000_000, 200_000, 0, 0);
+    // Within floating-point tolerance, b ≈ 2*a
+    assert.ok(Math.abs(b - 2 * a) < 1e-9, `expected b≈2a, got a=${a}, b=${b}`);
+  });
+});
+
+describe('Phase 4 — csvField (RFC 4180 always-quote)', () => {
+  it('wraps strings in double-quotes', () => {
+    assert.equal(csvField('hello'),    '"hello"');
+    assert.equal(csvField(''),         '""');
+  });
+
+  it('escapes embedded double-quotes by doubling them', () => {
+    // RFC 4180 §2.7: "If double-quotes are used to enclose fields,
+    // then a double-quote appearing inside a field must be escaped by
+    // preceding it with another double quote."
+    assert.equal(csvField('say "hi"'), '"say ""hi"""');
+  });
+
+  it('preserves embedded newlines (RFC 4180 §2.6)', () => {
+    // Newlines inside quoted fields are explicitly allowed.
+    assert.equal(csvField('line1\nline2'), '"line1\nline2"');
+  });
+
+  it('numbers are stringified, finite-only', () => {
+    assert.equal(csvField(42),        '"42"');
+    assert.equal(csvField(0),         '"0"');
+    assert.equal(csvField(-1.5),      '"-1.5"');
+    // NaN / Infinity become empty quoted fields rather than the JS
+    // string "NaN" (which would import as a literal cell value).
+    assert.equal(csvField(NaN),       '""');
+    assert.equal(csvField(Infinity),  '""');
+  });
+
+  it('booleans become "true"/"false" strings', () => {
+    assert.equal(csvField(true),  '"true"');
+    assert.equal(csvField(false), '"false"');
+  });
+
+  it('null / undefined become an empty quoted field', () => {
+    assert.equal(csvField(null),      '""');
+    assert.equal(csvField(undefined), '""');
+  });
+});
+
+describe('Phase 4 — aggregateUsageForCsvExport', () => {
+  function _row(over) {
+    return Object.assign({
+      type: 'usage',
+      ts: 1000,
+      repo: '/repo/a',
+      branch: 'main',
+      model: 'claude-sonnet-4-7',
+      tool: 'Bash',
+      account: 'acct1',
+      inputTokens: 1000,
+      outputTokens: 200,
+      cacheReadInputTokens: 100,
+      cacheCreationInputTokens: 50,
+    }, over || {});
+  }
+
+  it('returns empty array on empty/non-array input', () => {
+    assert.deepEqual(aggregateUsageForCsvExport([]), []);
+    assert.deepEqual(aggregateUsageForCsvExport(null), []);
+    assert.deepEqual(aggregateUsageForCsvExport(undefined), []);
+    assert.deepEqual(aggregateUsageForCsvExport('not-array'), []);
+  });
+
+  it('buckets rows by (repo, branch, component, tool)', () => {
+    const rows = [
+      _row({ repo: '/repo/a', branch: 'main', tool: 'Bash' }),
+      _row({ repo: '/repo/a', branch: 'main', tool: 'Bash' }),
+      _row({ repo: '/repo/a', branch: 'main', tool: 'Read' }),
+      _row({ repo: '/repo/b', branch: 'main', tool: 'Bash' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 3, 'three distinct buckets');
+    const a_main_bash = out.find(r => r.repo === '/repo/a' && r.tool === 'Bash');
+    assert.equal(a_main_bash.requestCount, 2, 'two Bash calls in /repo/a/main collapsed');
+  });
+
+  it('skips non-usage rows (compact-boundary, etc.)', () => {
+    const rows = [
+      _row(),
+      _row({ type: 'compact' }),
+      _row({ type: 'unknown' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].requestCount, 1);
+  });
+
+  it('skips rows with non-finite token counts', () => {
+    const rows = [
+      _row(),
+      _row({ inputTokens: NaN }),
+      _row({ outputTokens: Infinity }),
+      _row({ inputTokens: 'oops' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].requestCount, 1);
+  });
+
+  it('repoFilter, accountFilter, modelFilter narrow the set', () => {
+    const rows = [
+      _row({ repo: '/repo/a', account: 'a1', model: 'claude-opus-4-7' }),
+      _row({ repo: '/repo/b', account: 'a1', model: 'claude-opus-4-7' }),
+      _row({ repo: '/repo/a', account: 'a2', model: 'claude-opus-4-7' }),
+      _row({ repo: '/repo/a', account: 'a1', model: 'claude-sonnet-4-7' }),
+    ];
+    assert.equal(aggregateUsageForCsvExport(rows, { repoFilter: '/repo/a' }).reduce((s, r) => s + r.requestCount, 0), 3);
+    assert.equal(aggregateUsageForCsvExport(rows, { accountFilter: 'a1' }).reduce((s, r) => s + r.requestCount, 0), 3);
+    assert.equal(aggregateUsageForCsvExport(rows, { modelFilter: 'claude-opus-4-7' }).reduce((s, r) => s + r.requestCount, 0), 3);
+  });
+
+  it('from/to time-range filter narrows by ts', () => {
+    const rows = [
+      _row({ ts: 1000 }),
+      _row({ ts: 2000 }),
+      _row({ ts: 3000 }),
+    ];
+    assert.equal(aggregateUsageForCsvExport(rows, { from: 1500 }).reduce((s, r) => s + r.requestCount, 0), 2);
+    assert.equal(aggregateUsageForCsvExport(rows, { to: 1500 }).reduce((s, r) => s + r.requestCount, 0), 1);
+    assert.equal(aggregateUsageForCsvExport(rows, { from: 1500, to: 2500 }).reduce((s, r) => s + r.requestCount, 0), 1);
+  });
+
+  it('isWorktree flag is true for non-main/master branches', () => {
+    const rows = [
+      _row({ branch: 'main' }),
+      _row({ branch: 'master' }),
+      _row({ branch: 'feature/x' }),
+      _row({ branch: '(no git)' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    const byBranch = Object.fromEntries(out.map(r => [r.branch, r.isWorktree]));
+    assert.equal(byBranch['main'],     false);
+    assert.equal(byBranch['master'],   false);
+    assert.equal(byBranch['feature/x'], true);
+    assert.equal(byBranch['(no git)'], false);
+  });
+
+  it('null tool collapses to "<assistant>" key (matches aggregateUsageTree)', () => {
+    // Rows with no `tool` field are the assistant turn itself, before any
+    // tool call. The flat aggregator must match the tree's labeling so
+    // CSV importers can join the two views by the same key.
+    const rows = [
+      _row({ tool: null }),
+      _row({ tool: undefined }),
+      _row({ tool: '' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].tool, '<assistant>');
+    assert.equal(out[0].requestCount, 3);
+  });
+
+  it('totalCostUSD is summed across rows in the same bucket', () => {
+    // Two rows in the same bucket, different costs — the bucket cost
+    // must equal the sum (NOT the cost of a single representative row).
+    const rows = [
+      _row({ inputTokens: 1_000_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+             model: 'claude-sonnet-4-7' }),
+      _row({ inputTokens: 1_000_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+             model: 'claude-sonnet-4-7' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 1);
+    // Sonnet input rate = $3/M, two rows = $6 total
+    assert.ok(Math.abs(out[0].totalCostUSD - 6) < 1e-9);
+  });
+
+  it('cost across mixed models in one bucket sums per-row (not per-bucket)', () => {
+    // The whole reason this aggregator exists vs aggregateUsageTree:
+    // a single bucket can contain rows from multiple models (rare but
+    // possible — same repo/branch/component/tool on different days).
+    // Cost MUST be summed per-row using each row's own model.
+    const rows = [
+      _row({ model: 'claude-opus-4-7',   inputTokens: 1_000_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }),
+      _row({ model: 'claude-haiku-4-5',  inputTokens: 1_000_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 1);
+    // Opus input = $15/M, haiku input = $0.80/M → $15.80 total
+    assert.ok(Math.abs(out[0].totalCostUSD - 15.80) < 1e-9);
+  });
+
+  it('output is sorted heavy-first (input + output tokens descending)', () => {
+    const rows = [
+      _row({ repo: '/light',  inputTokens: 100,    outputTokens: 50  }),
+      _row({ repo: '/heavy',  inputTokens: 10000,  outputTokens: 5000 }),
+      _row({ repo: '/medium', inputTokens: 1000,   outputTokens: 500 }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out[0].repo, '/heavy');
+    assert.equal(out[1].repo, '/medium');
+    assert.equal(out[2].repo, '/light');
+  });
+
+  it('uses NUL byte as bucket-key separator (so paths with | do not collide)', () => {
+    // Path with literal | character — would collide with a different
+    // bucket if the separator were |. With \0, the keys remain distinct.
+    const rows = [
+      _row({ repo: 'a|b',  branch: 'main', tool: 'Bash' }),
+      _row({ repo: 'a',    branch: 'b|main', tool: 'Bash' }),
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 2, 'distinct buckets despite pipe in field');
+  });
+});
+
+describe('Phase 4 — renderUsageTreeCsv', () => {
+  it('emits header even on empty input', () => {
+    const csv = renderUsageTreeCsv([]);
+    assert.equal(csv, 'repo,branch,isWorktree,component,tool,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,totalCostUSD,requestCount\n');
+  });
+
+  it('handles null/non-array input as empty (header only)', () => {
+    assert.equal(renderUsageTreeCsv(null).startsWith('repo,branch,'), true);
+    assert.equal(renderUsageTreeCsv(undefined).startsWith('repo,branch,'), true);
+    assert.equal(renderUsageTreeCsv('not-array').startsWith('repo,branch,'), true);
+  });
+
+  it('header has all 11 columns in documented order (CSV importer contract)', () => {
+    // Reorder = silent breaking change for any downstream importer
+    // (spreadsheets, ETL pipelines). Lock the order in.
+    const csv = renderUsageTreeCsv([]);
+    const header = csv.split('\n')[0];
+    const cols = header.split(',');
+    assert.deepEqual(cols, [
+      'repo', 'branch', 'isWorktree', 'component', 'tool',
+      'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreationTokens',
+      'totalCostUSD', 'requestCount',
+    ]);
+  });
+
+  it('every body row has all 11 fields, all quoted', () => {
+    const rows = [{
+      repo: '/repo/a', branch: 'main', isWorktree: false,
+      component: 'main', tool: 'Bash',
+      inputTokens: 1000, outputTokens: 200,
+      cacheReadTokens: 100, cacheCreationTokens: 50,
+      totalCostUSD: 0.005, requestCount: 1,
+    }];
+    const csv = renderUsageTreeCsv(rows);
+    const bodyLine = csv.split('\n')[1];
+    // Every field is always quoted per the implementation comment
+    const fields = bodyLine.split(',');
+    assert.equal(fields.length, 11);
+    for (const f of fields) {
+      assert.ok(f.startsWith('"') && f.endsWith('"'), `field ${f} should be quoted`);
+    }
+  });
+
+  it('escapes double-quotes in repo / branch fields (RFC 4180)', () => {
+    const rows = [{
+      repo: 'has"quote', branch: 'main', isWorktree: false,
+      component: 'main', tool: 'Bash',
+      inputTokens: 0, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      totalCostUSD: 0, requestCount: 1,
+    }];
+    const csv = renderUsageTreeCsv(rows);
+    assert.match(csv, /"has""quote"/);
+  });
+
+  it('cost rounded to 6 decimals (fractions of a cent are noise)', () => {
+    const rows = [{
+      repo: '/r', branch: 'main', isWorktree: false,
+      component: 'main', tool: 'Bash',
+      inputTokens: 0, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      totalCostUSD: 0.123456789012, requestCount: 1,
+    }];
+    const csv = renderUsageTreeCsv(rows);
+    // Should round to 0.123457 (6 decimal places). The exact serialization
+    // depends on Number→String, so look for the rounded value as a substring.
+    assert.match(csv, /"0\.123457"/);
+  });
+
+  it('terminates with a trailing newline (POSIX text-file convention)', () => {
+    const rows = [{
+      repo: '/r', branch: 'main', isWorktree: false,
+      component: 'main', tool: 'Bash',
+      inputTokens: 1, outputTokens: 1,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      totalCostUSD: 0, requestCount: 1,
+    }];
+    const csv = renderUsageTreeCsv(rows);
+    assert.ok(csv.endsWith('\n'));
+  });
+
+  it('round-trip: aggregator → CSV preserves request counts', () => {
+    // End-to-end shape check: build a known set of rows, aggregate them,
+    // render, and parse the body lines back to confirm the count column
+    // sums to the input row count.
+    const rows = [
+      { type: 'usage', ts: 1000, repo: '/r', branch: 'main', tool: 'Bash',
+        inputTokens: 100, outputTokens: 50, model: 'claude-sonnet-4-7' },
+      { type: 'usage', ts: 1100, repo: '/r', branch: 'main', tool: 'Bash',
+        inputTokens: 200, outputTokens: 100, model: 'claude-sonnet-4-7' },
+      { type: 'usage', ts: 1200, repo: '/r', branch: 'main', tool: 'Read',
+        inputTokens: 50, outputTokens: 10, model: 'claude-sonnet-4-7' },
+    ];
+    const flat = aggregateUsageForCsvExport(rows);
+    const csv  = renderUsageTreeCsv(flat);
+    const lines = csv.split('\n').filter(l => l.length > 0);
+    // header + 2 buckets (Bash×2 collapsed, Read×1)
+    assert.equal(lines.length, 3);
+    // The requestCount column is the last one — re-extract and sum.
+    const total = lines.slice(1).reduce((sum, line) => {
+      const cols = line.split(',');
+      return sum + Number(cols[cols.length - 1].replace(/"/g, ''));
+    }, 0);
+    assert.equal(total, 3);
+  });
+});
+
+describe('Phase 4 — /api/token-usage-tree?format=csv endpoint wiring', () => {
+  const _src_t4 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports aggregateUsageForCsvExport + renderUsageTreeCsv from lib.mjs', () => {
+    assert.match(_src_t4, /aggregateUsageForCsvExport,/);
+    assert.match(_src_t4, /renderUsageTreeCsv,/);
+  });
+
+  it('format=csv branch exists inside the token-usage-tree handler', () => {
+    const fn = _src_t4.slice(
+      _src_t4.indexOf("'/api/token-usage-tree'"),
+      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+    );
+    assert.match(fn, /params\.get\('format'\) === 'csv'/);
+    assert.match(fn, /aggregateUsageForCsvExport\(rows, opts\)/);
+    assert.match(fn, /renderUsageTreeCsv\(/);
+  });
+
+  it('CSV branch sets the right Content-Type and Content-Disposition', () => {
+    const fn = _src_t4.slice(
+      _src_t4.indexOf("'/api/token-usage-tree'"),
+      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+    );
+    assert.match(fn, /'content-type':\s*'text\/csv;\s*charset=utf-8'/);
+    assert.match(fn, /'content-disposition':\s*`attachment;\s*filename="token-usage-tree-/);
+  });
+
+  it('CSV branch returns BEFORE the JSON branch (early return)', () => {
+    // Without the early return, format=csv would run the aggregator AND
+    // also fall through to the JSON response builder — wasting work and
+    // potentially writing two response bodies.
+    const fn = _src_t4.slice(
+      _src_t4.indexOf("'/api/token-usage-tree'"),
+      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+    );
+    const csvIdx  = fn.indexOf("params.get('format') === 'csv'");
+    const treeIdx = fn.indexOf('aggregateUsageTree(rows, opts)');
+    assert.ok(csvIdx > 0 && treeIdx > 0);
+    assert.ok(csvIdx < treeIdx, 'csv branch must precede the JSON tree branch');
+    // And there must be a return inside the CSV branch
+    const csvBlock = fn.slice(csvIdx, treeIdx);
+    assert.match(csvBlock, /return true;/);
+  });
+
+  it('CSV filename uses an ISO-derived stamp (sortable, no colons)', () => {
+    // Colons in filenames are filesystem-unsafe on Windows. The stamp
+    // must replace `:` and `.` from the ISO string with `-`.
+    const fn = _src_t4.slice(
+      _src_t4.indexOf("'/api/token-usage-tree'"),
+      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+    );
+    assert.match(fn, /toISOString\(\)\.replace\(\/\[:\.\]\/g,\s*'-'\)/);
+  });
+});
+
+describe('Phase 4 — UI: Export tree CSV button + handler', () => {
+  const _src_t4ui = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('"Export tree CSV" button is present in the Tokens tab', () => {
+    assert.match(_src_t4ui, /onclick="exportUsageTreeCsv\(\)"/);
+    assert.match(_src_t4ui, />Export tree CSV</);
+  });
+
+  it('button has a tooltip explaining it differs from the flat export', () => {
+    // Without the title attribute, users who already use "Export CSV"
+    // wouldn't know why a second button appeared. Cheap discoverability.
+    const idx = _src_t4ui.indexOf('exportUsageTreeCsv()');
+    const buttonHtml = _src_t4ui.slice(idx - 200, idx + 200);
+    assert.match(buttonHtml, /title="[^"]+"/);
+  });
+
+  it('exportUsageTreeCsv collects the same filters as the rest of the Tokens tab', () => {
+    const fn = _src_t4ui.slice(
+      _src_t4ui.indexOf('function exportUsageTreeCsv'),
+      _src_t4ui.indexOf('function exportUsageTreeCsv') + 2000,
+    );
+    assert.ok(fn.length > 200, 'function body must exist');
+    // Reuses vsSnapshot for the time range (same as exportUsageCsv)
+    assert.match(fn, /vsSnapshot\(\)/);
+    // Pulls model + account + repo from the existing dropdowns
+    assert.match(fn, /getElementById\('tok-model'\)/);
+    assert.match(fn, /getElementById\('tok-account'\)/);
+    assert.match(fn, /getElementById\('tok-repo'\)/);
+  });
+
+  it('exportUsageTreeCsv builds a query string with format=csv', () => {
+    const fn = _src_t4ui.slice(
+      _src_t4ui.indexOf('function exportUsageTreeCsv'),
+      _src_t4ui.indexOf('function exportUsageTreeCsv') + 2000,
+    );
+    assert.match(fn, /'format=csv'/);
+    // Filter values URL-encoded
+    assert.match(fn, /encodeURIComponent\(modelV\)/);
+    assert.match(fn, /encodeURIComponent\(accountV\)/);
+    assert.match(fn, /encodeURIComponent\(repoV\)/);
+    assert.match(fn, /encodeURIComponent\(snap\.start\)/);
+    assert.match(fn, /encodeURIComponent\(snap\.end\)/);
+  });
+
+  it('exportUsageTreeCsv uses an anchor download (lets server set filename)', () => {
+    // Anchor download (without explicit name) honors the server's
+    // Content-Disposition. The flat exporter builds a Blob in memory;
+    // tree CSV streams from disk so we want the browser to do the I/O.
+    const fn = _src_t4ui.slice(
+      _src_t4ui.indexOf('function exportUsageTreeCsv'),
+      _src_t4ui.indexOf('function exportUsageTreeCsv') + 2000,
+    );
+    assert.match(fn, /document\.createElement\('a'\)/);
+    assert.match(fn, /a\.href = '\/api\/token-usage-tree\?'/);
+    assert.match(fn, /a\.click\(\)/);
+    // No Blob — that would defeat the streaming
+    assert.ok(!/new Blob/.test(fn), 'should NOT build a Blob (lets browser stream)');
   });
 });

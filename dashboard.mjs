@@ -846,6 +846,9 @@ import {
   // TRDD-1645134b — usage tree aggregation + cache-miss heuristic
   aggregateUsageTree,
   buildCacheMissReport,
+  // TRDD-1645134b Phase 4 — tree-aggregated CSV export
+  aggregateUsageForCsvExport,
+  renderUsageTreeCsv,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -3278,6 +3281,23 @@ async function handleAPI(req, res) {
         const n = Number(toStr);
         if (Number.isFinite(n)) opts.to = n;
       }
+      // Phase 4 — CSV export branch. Same query-param contract as the
+      // JSON response (repo/account/model/from/to all honored), but emits
+      // the flat tree-aggregated rows from aggregateUsageForCsvExport
+      // instead of the nested tree. Returns text/csv with a download
+      // filename so a browser fetch+blob can save it directly.
+      if (params.get('format') === 'csv') {
+        const flat = aggregateUsageForCsvExport(rows, opts);
+        const csv = renderUsageTreeCsv(flat);
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        res.writeHead(200, {
+          'content-type': 'text/csv; charset=utf-8',
+          'content-disposition': `attachment; filename="token-usage-tree-${stamp}.csv"`,
+          'cache-control': 'no-store',
+        });
+        res.end(csv);
+        return true;
+      }
       const { totals, tree } = aggregateUsageTree(rows, opts);
       const response = { ok: true, totals, tree };
       if (params.get('includeMisses') === '1') {
@@ -4949,6 +4969,7 @@ function renderHTML() {
         <option value="90">90 days</option>
       </select>
       <button class="tok-export-btn" onclick="exportUsageCsv()">Export CSV</button>
+      <button class="tok-export-btn" onclick="exportUsageTreeCsv()" title="Tree-aggregated CSV — one row per repo/branch/component/tool bucket, with USD cost">Export tree CSV</button>
     </div>
     <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
@@ -7834,6 +7855,47 @@ function exportUsageCsv() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// TRDD-1645134b Phase 4 — tree-aggregated CSV export.
+//
+// Unlike exportUsageCsv() (which is one-row-per-API-request and computed
+// client-side from _tokensRawData), this is one-row-per-bucket
+// (repo|branch|component|tool) WITH per-bucket USD cost — and that cost
+// calc lives server-side in lib.mjs (MODEL_PRICING + estimateModelCost).
+// So we hit /api/token-usage-tree?format=csv and let the browser save
+// the response via Content-Disposition.
+//
+// We honor the same dropdown filters as the rest of the Tokens tab
+// (model/account/repo/time) — branch is omitted because the server-side
+// aggregator doesn't take a branch filter (branch is a sub-grouping
+// inside each repo node, not a top-level slicer).
+function exportUsageTreeCsv() {
+  var snap = vsSnapshot();
+  var modelSel   = document.getElementById('tok-model');
+  var accountSel = document.getElementById('tok-account');
+  var repoSel    = document.getElementById('tok-repo');
+  var modelV   = modelSel   ? modelSel.value   : '';
+  var accountV = accountSel ? accountSel.value : '';
+  var repoV    = repoSel    ? repoSel.value    : '';
+  var qs = ['format=csv'];
+  if (snap.start != null) qs.push('from=' + encodeURIComponent(snap.start));
+  if (snap.end   != null) qs.push('to=' + encodeURIComponent(snap.end));
+  if (modelV)   qs.push('model=' + encodeURIComponent(modelV));
+  if (accountV) qs.push('account=' + encodeURIComponent(accountV));
+  if (repoV)    qs.push('repo=' + encodeURIComponent(repoV));
+  // Anchor download trigger — letting the browser save by following the
+  // Content-Disposition header avoids loading a potentially large CSV
+  // into memory as a Blob first.
+  var a = document.createElement('a');
+  a.href = '/api/token-usage-tree?' + qs.join('&');
+  // The href filename is the server-emitted one (Content-Disposition);
+  // setting a.download to '' lets the browser honor it but suppresses the
+  // "Open with" prompt some browsers show when no download attr is set.
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 refresh();

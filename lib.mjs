@@ -1298,6 +1298,206 @@ export function aggregateUsageTree(rows, opts = {}) {
   return { totals: grandTotals, tree };
 }
 
+// Model pricing in USD per million tokens. Mirrors the dashboard.mjs
+// TOK_PRICING table — kept here so server-side CSV export can compute
+// cost without round-tripping to the client. When updating one, update
+// both. Source of truth for rates: https://claude.com/pricing.
+//
+// Cache rates follow Anthropic's published 1.25x (creation) /
+// 0.10x (read) ratios on top of input rate.
+export const MODEL_PRICING = {
+  // Opus generation — $15/$75
+  'claude-opus-4-7':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheCreation: 18.75 },
+  'claude-opus-4-6':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheCreation: 18.75 },
+  'claude-opus-4-5':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheCreation: 18.75 },
+  // Sonnet generation — $3/$15
+  'claude-sonnet-4-7': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheCreation: 3.75 },
+  'claude-sonnet-4-6': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheCreation: 3.75 },
+  'claude-sonnet-4-5': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheCreation: 3.75 },
+  // Haiku generation — $0.80/$4
+  'claude-haiku-4-6':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheCreation: 1.00 },
+  'claude-haiku-4-5':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheCreation: 1.00 },
+};
+// Conservative fallback (Sonnet rates) for any unknown model. Returns a
+// non-zero cost so the operator notices something is unaccounted for —
+// versus returning 0 which would silently undercount.
+export const MODEL_PRICING_DEFAULT = { input: 3, output: 15, cacheRead: 0.30, cacheCreation: 3.75 };
+
+/**
+ * Compute USD cost for a single row's token counts.
+ * @param {string|null} model
+ * @param {number} inTok
+ * @param {number} outTok
+ * @param {number} cacheReadTok
+ * @param {number} cacheCreationTok
+ * @returns {number} cost in USD (may be 0 if all token counts are 0)
+ */
+export function estimateModelCost(model, inTok, outTok, cacheReadTok, cacheCreationTok) {
+  if (!model || typeof model !== 'string') {
+    // Unknown / unset model — apply the default rates so we don't silently
+    // emit $0 for every row that happens to be missing a model field.
+    const p = MODEL_PRICING_DEFAULT;
+    return ((inTok || 0)              * p.input
+          + (outTok || 0)             * p.output
+          + (cacheReadTok || 0)       * p.cacheRead
+          + (cacheCreationTok || 0)   * p.cacheCreation) / 1_000_000;
+  }
+  // Match by prefix so future date-suffixed model IDs (e.g.
+  // claude-opus-4-7-20260315) still resolve to the right base price.
+  let p = null;
+  for (const key of Object.keys(MODEL_PRICING)) {
+    if (model === key || model.startsWith(key + '-')) { p = MODEL_PRICING[key]; break; }
+  }
+  if (!p) p = MODEL_PRICING_DEFAULT;
+  return ((inTok || 0)              * p.input
+        + (outTok || 0)             * p.output
+        + (cacheReadTok || 0)       * p.cacheRead
+        + (cacheCreationTok || 0)   * p.cacheCreation) / 1_000_000;
+}
+
+/**
+ * Aggregate token-usage rows into flat (repo, branch, component, tool)
+ * rows suitable for CSV export. This is the SAME bucketing as
+ * aggregateUsageTree but emits a flat array instead of a nested tree,
+ * AND tracks `totalCostUSD` per bucket (computed per-row using the
+ * row's `model` field, then summed across the bucket — so a single
+ * leaf may include cost from multiple models).
+ *
+ * The cost column is the only reason this can't reuse aggregateUsageTree
+ * verbatim — the tree throws away per-row model info on its way to a
+ * single per-bucket totals object.
+ *
+ * @param {Array<Object>} rows
+ * @param {Object} [opts] same filter shape as aggregateUsageTree
+ * @returns {Array<{repo, branch, isWorktree, component, tool,
+ *   inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+ *   totalCostUSD, requestCount}>}
+ */
+export function aggregateUsageForCsvExport(rows, opts = {}) {
+  const TOOL_NULL_KEY = '<assistant>';
+  if (!Array.isArray(rows)) return [];
+
+  // Map<key, accumulator>  where key = repo|branch|component|tool
+  const buckets = new Map();
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    if ((row.type || 'usage') !== 'usage') continue;
+    if (opts.repoFilter    && row.repo    !== opts.repoFilter)    continue;
+    if (opts.accountFilter && row.account !== opts.accountFilter) continue;
+    if (opts.modelFilter   && row.model   !== opts.modelFilter)   continue;
+    if (opts.from != null && row.ts < opts.from) continue;
+    if (opts.to   != null && row.ts > opts.to)   continue;
+
+    const tokens = [row.inputTokens, row.outputTokens, row.cacheReadInputTokens, row.cacheCreationInputTokens];
+    if (tokens.some(t => t != null && (typeof t !== 'number' || !Number.isFinite(t)))) continue;
+
+    const repoKey      = row.repo   || '(unknown-repo)';
+    const branchKey    = row.branch || '(unknown-branch)';
+    const componentKey = classifyUsageComponent(row);
+    const toolKey      = row.tool ? row.tool : TOOL_NULL_KEY;
+
+    // Use NUL byte as separator so a literal pipe in any field can't
+    // collide with another bucket's key (file paths can contain |
+    // technically; \0 cannot).
+    const key = repoKey + '\0' + branchKey + '\0' + componentKey + '\0' + toolKey;
+    let acc = buckets.get(key);
+    if (!acc) {
+      acc = {
+        repo: repoKey,
+        branch: branchKey,
+        isWorktree: !['main', 'master', '(no git)', '(unknown-branch)'].includes(branchKey),
+        component: componentKey,
+        tool: toolKey,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalCostUSD: 0,
+        requestCount: 0,
+      };
+      buckets.set(key, acc);
+    }
+    const inTok        = row.inputTokens                 || 0;
+    const outTok       = row.outputTokens                || 0;
+    const cacheRead    = row.cacheReadInputTokens        || 0;
+    const cacheCreate  = row.cacheCreationInputTokens    || 0;
+    acc.inputTokens         += inTok;
+    acc.outputTokens        += outTok;
+    acc.cacheReadTokens     += cacheRead;
+    acc.cacheCreationTokens += cacheCreate;
+    acc.totalCostUSD        += estimateModelCost(row.model, inTok, outTok, cacheRead, cacheCreate);
+    acc.requestCount        += 1;
+  }
+
+  // Sort by total tokens desc so the CSV is human-readable (heavy hitters
+  // at the top) without an extra step for spreadsheet importers.
+  const out = Array.from(buckets.values());
+  out.sort((a, b) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens));
+  return out;
+}
+
+/**
+ * Encode a value as a CSV field per RFC 4180:
+ *   - Always wrap in double-quotes
+ *   - Escape internal " by doubling it
+ *   - Strings, numbers, booleans, null/undefined all handled
+ *   - Newlines preserved (RFC 4180 allows \n inside quoted fields)
+ *
+ * Always-quote (vs. quote-only-when-needed) keeps the parser code
+ * trivially simple on the importer side.
+ *
+ * @param {*} v
+ * @returns {string}
+ */
+export function csvField(v) {
+  if (v == null) return '""';
+  let s;
+  if (typeof v === 'boolean') s = v ? 'true' : 'false';
+  else if (typeof v === 'number') s = Number.isFinite(v) ? String(v) : '';
+  else s = String(v);
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+/**
+ * Render the flat aggregated rows from `aggregateUsageForCsvExport`
+ * to a complete CSV string per RFC 4180.
+ *
+ * Header line is always emitted, even when the row array is empty —
+ * importers that auto-detect schema from the header still get
+ * something parseable.
+ *
+ * @param {Array<Object>} rows from aggregateUsageForCsvExport
+ * @returns {string} complete CSV (header + body, lines joined by \n)
+ */
+export function renderUsageTreeCsv(rows) {
+  const header = [
+    'repo', 'branch', 'isWorktree', 'component', 'tool',
+    'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreationTokens',
+    'totalCostUSD', 'requestCount',
+  ].join(',');
+  if (!Array.isArray(rows) || !rows.length) return header + '\n';
+  const lines = [header];
+  for (const r of rows) {
+    lines.push([
+      csvField(r.repo),
+      csvField(r.branch),
+      csvField(r.isWorktree),
+      csvField(r.component),
+      csvField(r.tool),
+      csvField(r.inputTokens),
+      csvField(r.outputTokens),
+      csvField(r.cacheReadTokens),
+      csvField(r.cacheCreationTokens),
+      // Cost rounded to 6 decimals — fractions of a cent are noise but
+      // rounding to 2 decimals would silently zero out small turns.
+      csvField(Math.round((r.totalCostUSD || 0) * 1_000_000) / 1_000_000),
+      csvField(r.requestCount),
+    ].join(','));
+  }
+  return lines.join('\n') + '\n';
+}
+
 /**
  * Cache-miss heuristic per TRDD-1645134b §"Cache-miss detection".
  *
