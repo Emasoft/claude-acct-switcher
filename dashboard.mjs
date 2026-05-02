@@ -3277,13 +3277,20 @@ async function handleAPI(req, res) {
       if (repoFilter)    opts.repoFilter    = repoFilter;
       if (accountFilter) opts.accountFilter = accountFilter;
       if (modelFilter)   opts.modelFilter   = modelFilter;
+      // Audit CC-DASH-008: also reject negative values + reversed ranges.
+      // Without these guards, ?from=-1&to=9999 silently does nothing,
+      // and ?from=BIG&to=0 returns an empty tree without explaining why.
       if (fromStr) {
         const n = Number(fromStr);
-        if (Number.isFinite(n)) opts.from = n;
+        if (Number.isFinite(n) && n >= 0) opts.from = n;
       }
       if (toStr) {
         const n = Number(toStr);
-        if (Number.isFinite(n)) opts.to = n;
+        if (Number.isFinite(n) && n >= 0) opts.to = n;
+      }
+      if (opts.from != null && opts.to != null && opts.from > opts.to) {
+        json(res, { ok: false, error: 'from must be <= to' }, 400);
+        return true;
       }
       // Phase 4 — CSV export branch. Same query-param contract as the
       // JSON response (repo/account/model/from/to all honored), but emits
@@ -3291,12 +3298,27 @@ async function handleAPI(req, res) {
       // instead of the nested tree. Returns text/csv with a download
       // filename so a browser fetch+blob can save it directly.
       if (params.get('format') === 'csv') {
-        const flat = aggregateUsageForCsvExport(rows, opts);
-        const csv = renderUsageTreeCsv(flat);
+        // Audit CC-DASH-013: build the CSV in a sub-try so that an
+        // aggregator/encoder failure routes through the standard 500
+        // path (json()) BEFORE writeHead is called — preventing the
+        // "Cannot set headers after they are sent" double-write.
+        let csv;
+        try {
+          const flat = aggregateUsageForCsvExport(rows, opts);
+          csv = renderUsageTreeCsv(flat);
+        } catch (csvErr) {
+          json(res, { ok: false, error: 'CSV generation failed: ' + (csvErr && csvErr.message || String(csvErr)) }, 500);
+          return true;
+        }
+        // Audit CC-DASH-009: filename is server-derived (ISO timestamp);
+        // no user data here. Strip any non-[A-Za-z0-9_-] chars defensively
+        // so a future change that interpolates request params can't
+        // smuggle quotes / CRLFs into the Content-Disposition header.
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const safeStamp = stamp.replace(/[^A-Za-z0-9_-]/g, '');
         res.writeHead(200, {
           'content-type': 'text/csv; charset=utf-8',
-          'content-disposition': `attachment; filename="token-usage-tree-${stamp}.csv"`,
+          'content-disposition': `attachment; filename="token-usage-tree-${safeStamp}.csv"`,
           'cache-control': 'no-store',
         });
         res.end(csv);
@@ -3317,36 +3339,48 @@ async function handleAPI(req, res) {
         // filter here). Other filters (repo/account/model) are NOT
         // applied to misses on the theory that a user investigating
         // a cache-miss issue may want the full-session view.
-        // NOTE: keep type='compact' rows in missRows even when
-        // pre-filtering — buildCacheMissReport reads them to attribute
-        // miss reasons (compact-boundary). Stripping them here would
-        // silently degrade Phase 5 reason classification to "TTL-likely
-        // or unknown" for every miss in a filtered view.
+        // NOTE: keep type='compact_boundary' rows in missRows even
+        // when pre-filtering — buildCacheMissReport reads them to
+        // attribute miss reasons (compact-boundary). Stripping them
+        // here would silently degrade Phase 5 reason classification
+        // to "TTL-likely or unknown" for every miss in a filtered
+        // view. Audit SR-OP-001: an earlier draft checked for
+        // 'compact' (not 'compact_boundary'), making the entire
+        // compact-boundary branch dead in production.
         let missRows = rows;
         if (opts.from != null || opts.to != null) {
           missRows = rows.filter(r => {
             if (!r) return false;
             const t = r.type || 'usage';
-            if (t !== 'usage' && t !== 'compact') return false;
+            if (t !== 'usage' && t !== 'compact_boundary') return false;
             if (opts.from != null && r.ts < opts.from) return false;
             if (opts.to   != null && r.ts > opts.to)   return false;
             return true;
           });
         }
-        response.misses = buildCacheMissReport(missRows, missOpts);
+        // Audit CC-DASH-016: compute the flat-misses list ONCE and
+        // pass it to both downstream helpers via opts._precomputedMisses.
+        // Without this, every includeMisses=1 request walks the dataset
+        // 3 times (once here, once inside summarizeCacheMissesBySession,
+        // once inside buildWastedSpendSeries). At 12 polls/min × 50K
+        // rows that's 1.8M wasted iterations every minute.
+        const flatMisses = buildCacheMissReport(missRows, missOpts);
+        response.misses = flatMisses;
+        const missOptsWithPrecomp = Object.assign({}, missOpts, { _precomputedMisses: flatMisses });
         // Phase 5 — per-session aggregate. Same opts so the two stay
-        // consistent. The summary uses the SAME flat-miss list under
-        // the hood so the two views can never disagree.
-        response.missSessions = summarizeCacheMissesBySession(missRows, missOpts);
-        // Phase 6 — "tokens fully paid due to cache miss" time series
-        // for the new carousel chart. Sent UNFILTERED-by-repo on
-        // purpose — the UI's multi-select dropdown filters in memory
-        // so changing the dropdown doesn't round-trip to the server.
-        response.wastedSpend = buildWastedSpendSeries(missRows, missOpts);
+        // consistent. Uses the SAME flat-miss list under the hood.
+        response.missSessions = summarizeCacheMissesBySession(missRows, missOptsWithPrecomp);
+        // Phase 6 — "wasted spend due to cache miss" time series for
+        // the new carousel chart. Sent UNFILTERED-by-repo on purpose —
+        // the UI's multi-select dropdown filters in memory so toggling
+        // the dropdown doesn't round-trip to the server.
+        response.wastedSpend = buildWastedSpendSeries(missRows, missOptsWithPrecomp);
       }
       json(res, response);
     } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
+      // Audit CC-DASH-018: defensive against `throw 'string'` style
+      // throws — e.message would be undefined, dropping the field.
+      json(res, { ok: false, error: (e && e.message) || String(e) }, 500);
     }
     return true;
   }
@@ -3527,6 +3561,9 @@ function renderHTML() {
     --red: hsl(0 84% 60%);
     --red-soft: hsl(0 86% 97%);
     --red-border: hsl(0 70% 85%);
+    /* Audit CC-DASH-001: --blue base was missing; .tree-kind-icon.repo
+       referenced var(--blue) and silently fell through to inherit. */
+    --blue: hsl(217 91% 60%);
     --blue-soft: hsl(217 91% 97%);
     --blue-border: hsl(217 60% 85%);
     --purple: hsl(271 81% 56%);
@@ -7102,18 +7139,40 @@ var _wastedSpendRaw = [];
 // "all projects" (aggregate, the default). Non-empty = include only
 // rows whose repo field is in the set. localStorage-persisted so the
 // user selection survives a tab reload.
+// Audit CC-DASH-015 + SC-OPUS-005 — bound the deserialization so a
+// corrupted localStorage entry can't either land junk strings in the
+// filter or DoS the dropdown render with millions of items.
+var _CPF_MAX_ITEMS  = 200;       // far above any realistic project count
+var _CPF_MAX_STRLEN = 1024;      // POSIX path-max-ish; longer = pathological
+var _CPF_MAX_BLOB   = 256 * 1024;// raw localStorage value cap
 var _chartProjectFilter = new Set();
 try {
   var _persistedCpf = localStorage.getItem('vdm.chartProjectFilter');
-  if (_persistedCpf) {
+  if (_persistedCpf && _persistedCpf.length < _CPF_MAX_BLOB) {
     var arr = JSON.parse(_persistedCpf);
-    if (Array.isArray(arr)) for (var __cpfI = 0; __cpfI < arr.length; __cpfI++) _chartProjectFilter.add(String(arr[__cpfI]));
+    if (Array.isArray(arr)) {
+      var _max = Math.min(arr.length, _CPF_MAX_ITEMS);
+      for (var __cpfI = 0; __cpfI < _max; __cpfI++) {
+        var v = arr[__cpfI];
+        if (typeof v === 'string' && v.length > 0 && v.length <= _CPF_MAX_STRLEN) {
+          _chartProjectFilter.add(v);
+        }
+      }
+    }
   }
 } catch (e) { /* ignore — clean slate is fine */ }
+var _persistFilterWarned = false;
 function _persistChartProjectFilter() {
   try {
     localStorage.setItem('vdm.chartProjectFilter', JSON.stringify(Array.from(_chartProjectFilter)));
-  } catch (e) { /* quota / disabled — non-fatal */ }
+  } catch (e) {
+    // Audit CC-DASH-014: surface a one-time warn so the user can
+    // diagnose why their filter selection isn't persisting.
+    if (!_persistFilterWarned) {
+      _persistFilterWarned = true;
+      console.warn('vdm: localStorage write failed (quota/disabled?). Project filter selection will not persist:', e && e.message);
+    }
+  }
 }
 // Apply the multi-select filter to a row array. Empty filter = pass-through.
 function applyChartProjectFilter(rows) {
@@ -7206,14 +7265,18 @@ async function refreshUsageTree(currentCutoff) {
     var data = await resp.json();
     if (!data || data.ok !== true) throw new Error(data && data.error || 'malformed response');
 
-    // Hash the tree skeleton + miss count + miss-session count + wasted-
-    // spend point count so we don't re-render when nothing visible
-    // changed (saves DOM churn on every 5s poll).
+    // Audit CC-DASH-003: include a content-sensitive component
+    // (quickHash on tree + missSessions) so two distributions with
+    // identical lengths but different shapes still trigger a re-render.
+    // E.g. one session with 5 misses vs five sessions with 1 miss each
+    // hash to different values now.
     var hash = (data.totals.requests | 0)
              + ':' + (data.misses ? data.misses.length : 0)
              + ':' + (data.missSessions ? data.missSessions.length : 0)
              + ':' + (data.wastedSpend ? data.wastedSpend.length : 0)
-             + ':' + (data.tree ? data.tree.length : 0);
+             + ':' + (data.tree ? data.tree.length : 0)
+             + ':' + quickHash(data.tree || [])
+             + ':' + quickHash(data.missSessions || []);
     if (hash === _lastTreeHash) return;
     _lastTreeHash = hash;
 
@@ -7224,6 +7287,12 @@ async function refreshUsageTree(currentCutoff) {
     // at render time so toggling the multi-select doesn't refetch.
     _wastedSpendRaw = data.wastedSpend || [];
     renderWastedSpendChart();
+  } catch (e) {
+    // Audit CC-DASH-002: surface fetch errors in the tree pane so the
+    // user sees something went wrong instead of staring at stale data.
+    var treeEl = document.getElementById('tok-tree');
+    if (treeEl) treeEl.innerHTML = '<div class="tree-error">Failed to load tree: ' + escHtml((e && e.message) || String(e)) + '</div>';
+    throw e;
   } finally {
     _treeFetching = false;
   }
@@ -7762,7 +7831,17 @@ function chartCarouselGo(idx) {
 }
 function chartCarouselNext() {
   var dots = document.getElementById('chart-carousel-dots');
-  var count = dots ? dots.querySelectorAll('.chart-carousel-dot').length : 2;
+  var count = dots ? dots.querySelectorAll('.chart-carousel-dot').length : 0;
+  // Audit CC-DASH-004: guard against (a) zero dots (idx % 0 = NaN
+  // would break the slide transform), (b) Tokens tab not active
+  // (silent DOM churn on every 10s tick), (c) project-filter panel
+  // open (SR-OP-006: rotating slides under an open panel is
+  // disorienting).
+  if (count <= 0) return;
+  var tab = document.getElementById('tab-usage');
+  if (!tab || !tab.classList.contains('active')) return;
+  var panel = document.getElementById('cpf-panel');
+  if (panel && !panel.hidden) return;
   chartCarouselGo((_chartCarouselIdx + 1) % count);
 }
 _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
@@ -7774,12 +7853,19 @@ function toggleProjectFilter() {
   var panel = document.getElementById('cpf-panel');
   if (!btn || !panel) return;
   var open = !panel.hidden;
+  // Audit CC-DASH-007: ALWAYS remove any prior listener before deciding
+  // what to do. Without this, populateProjectFilterOptions() throwing
+  // mid-open would leave a stale capture handler installed forever.
+  document.removeEventListener('click', _closeProjectFilterOnOutside, true);
   if (open) {
     panel.hidden = true;
     btn.setAttribute('aria-expanded', 'false');
     return;
   }
-  populateProjectFilterOptions();
+  // populate may throw if the data is corrupt — protect against
+  // installing the close-handler when the panel never actually opened.
+  try { populateProjectFilterOptions(); }
+  catch (e) { console.error('Project filter populate failed:', e); return; }
   panel.hidden = false;
   btn.setAttribute('aria-expanded', 'true');
   // Click-away-to-close: install a one-shot capture handler. Removed
@@ -7822,6 +7908,24 @@ function populateProjectFilterOptions() {
     listEl.innerHTML = '<div class="cpf-empty">No projects in current data range.</div>';
     return;
   }
+  // Audit SR-OP-002: surface the relationship with the single-select
+  // tok-repo dropdown so users don't get caught by the empty-set bug
+  // where both filters narrow to disjoint sets and every chart goes
+  // empty. When the single-select has a value, prepend a hint AND
+  // show only that single repo's row to make the relationship visible.
+  var singleSelectRepo = '';
+  var repoSel = document.getElementById('tok-repo');
+  if (repoSel && repoSel.value) singleSelectRepo = repoSel.value;
+  var hintHtml = '';
+  if (singleSelectRepo) {
+    hintHtml = '<div class="cpf-empty" style="padding:0.25rem 0.3rem;font-style:normal">'
+      + 'Single-repo filter active: <b>' + escHtml(singleSelectRepo) + '</b>. '
+      + 'Multi-select disabled — clear the top-level repo dropdown to use it.'
+      + '</div>';
+    // Render only the active repo so the multi-select can't push the
+    // chart into an empty-intersection state.
+    sorted = [singleSelectRepo];
+  }
   // Drop selected entries that no longer exist in the dataset (data
   // window changed, project disappeared) so the saved selection
   // doesn't pin a stale filter forever.
@@ -7832,17 +7936,34 @@ function populateProjectFilterOptions() {
   if (changed) {
     _persistChartProjectFilter();
     _refreshProjectFilterLabel();
+    // Audit CC-DASH-006: stale entries dropped — the in-memory filter
+    // no longer matches what the charts last rendered. Re-run the
+    // chart pipeline immediately so the user sees the consequence of
+    // the prune, instead of waiting up to 5s for the next poll.
+    if (typeof applyTokenModelFilter === 'function') applyTokenModelFilter();
   }
-  var html = '';
+  var html = hintHtml;
+  // When the single-select narrows to one repo, also disable the
+  // multi-select checkboxes so a stale check from a different repo
+  // can't silently zero out every chart.
+  var disableAttr = singleSelectRepo ? ' disabled' : '';
   for (var k = 0; k < sorted.length; k++) {
     var name = sorted[k];
     var checked = _chartProjectFilter.has(name) ? ' checked' : '';
-    var safeName = escHtml(name);
-    var safeAttr = name.replace(/"/g, '&quot;');
+    // Audit SC-OPUS-004 (CWE-79/CWE-83) — attribute values need full HTML
+    // entity escaping, not just double-quote replacement. & is the start
+    // of an entity reference; the browser decodes it BEFORE attribute
+    // parsing, so a name like evil&quot;onmouseover=alert(1)// would
+    // close the title attribute and inject an event handler. escHtml
+    // covers & < > " quote — safe in BOTH attribute and text contexts.
+    // The same value is read back via cb.getAttribute(data-repo),
+    // which auto-decodes the entities, so the round-trip preserves
+    // the original name.
+    var safe = escHtml(name);
     html += '<label class="cpf-item">'
-      + '<input type="checkbox" data-repo="' + safeAttr + '"' + checked
+      + '<input type="checkbox" data-repo="' + safe + '"' + checked + disableAttr
       + ' onchange="toggleProjectInFilter(this)">'
-      + '<span class="cpf-item-label" title="' + safeAttr + '">' + safeName + '</span>'
+      + '<span class="cpf-item-label" title="' + safe + '">' + safe + '</span>'
       + '</label>';
   }
   listEl.innerHTML = html;
@@ -7902,73 +8023,99 @@ function _refreshProjectFilterLabel() {
 // ── Phase 6 — wasted-spend chart (cache-miss cost over time) ──
 //
 // Bars are aggregated per day for readability. Y-axis is total
-// inputTokens that were billed at full rate due to a cache miss.
-// Hover shows the per-day breakdown.
+// "wasted" USD — the savable differential between paying full input
+// rate and the cache-read rate (~10%). Tooltips also show the gross
+// "fully paid" cost for context.
+//
+// Audit SR-OP-004: also honors the model / account / repo / branch /
+// tier filters that the rest of the Tokens tab applies — without
+// these, the wasted-spend chart would silently disagree with every
+// adjacent chart when those filters are active.
 function renderWastedSpendChart() {
   var el = document.getElementById('tok-wasted-chart');
   if (!el) return;
-  // Apply the project multi-select filter
-  var filtered = _wastedSpendRaw;
-  if (_chartProjectFilter.size) {
-    filtered = [];
-    for (var i = 0, n = _wastedSpendRaw.length; i < n; i++) {
-      if (_chartProjectFilter.has(_wastedSpendRaw[i].repo || '')) filtered.push(_wastedSpendRaw[i]);
-    }
-  }
-  // Apply the same time range as the rest of the Tokens tab so the
-  // wasted-spend bar area stays in sync with the other charts.
+  // Build a "matches the other filters" predicate from the same
+  // dropdowns the main pass() function reads.
+  var modelSel   = document.getElementById('tok-model');
+  var accountSel = document.getElementById('tok-account');
+  var repoSel    = document.getElementById('tok-repo');
+  var branchSel  = document.getElementById('tok-branch');
+  var modelF   = (modelSel   && modelSel.value)   || '';
+  var accountF = (accountSel && accountSel.value) || '';
+  var repoF    = (repoSel    && repoSel.value)    || '';
+  var branchF  = (branchSel  && branchSel.value)  || '';
   var snap = vsSnapshot();
-  if (snap.start != null || snap.end != null) {
-    var fStart = snap.start, fEnd = snap.end;
-    filtered = filtered.filter(function(p) {
+  var hasWindow = !!(snap && snap.start != null && snap.end != null);
+  var hasTier   = !!(snap && Array.isArray(snap.tierFilter) && snap.tierFilter.length && snap.tierFilter[0] !== 'all');
+
+  var filtered = [];
+  for (var i = 0, n = _wastedSpendRaw.length; i < n; i++) {
+    var p = _wastedSpendRaw[i];
+    if (_chartProjectFilter.size && !_chartProjectFilter.has(p.repo || '')) continue;
+    if (modelF   && p.model   !== modelF)   continue;
+    if (accountF && p.account !== accountF) continue;
+    if (repoF    && p.repo    !== repoF)    continue;
+    if (branchF  && p.branch  !== branchF)  continue;
+    if (hasWindow) {
       var ts = p.ts || 0;
-      if (fStart != null && ts < fStart) return false;
-      if (fEnd   != null && ts > fEnd)   return false;
-      return true;
-    });
+      if (ts && (ts < snap.start || ts > snap.end)) continue;
+    }
+    if (hasTier && !vsTierMatchesEntry(p, snap)) continue;
+    filtered.push(p);
   }
   if (!filtered.length) {
-    el.innerHTML = '<div class="usage-title">Tokens Paid (Cache Misses)</div>'
+    el.innerHTML = '<div class="usage-title">Wasted spend (cache misses)</div>'
       + '<div style="color:var(--muted);font-size:0.8125rem;padding:2rem 0;text-align:center">No cache-miss spend in this time range. Higher cache hit rates = fewer bars.</div>';
     return;
   }
-  // Aggregate per local-time day
+  // Aggregate per local-time day. Tooltip shows BOTH the gross
+  // "fully paid" cost (costUSD) AND the savable differential
+  // (wastedUSD) so the operator can see "I paid $X total, $Y of which
+  // I could have avoided." Bar height tracks wastedUSD because that's
+  // the actionable metric.
   var byDay = new Map();
   var totalTokens = 0;
   var totalCost   = 0;
-  for (var p = 0; p < filtered.length; p++) {
-    var pt = filtered[p];
+  var totalWasted = 0;
+  for (var p2 = 0; p2 < filtered.length; p2++) {
+    var pt = filtered[p2];
     var d = new Date(pt.ts);
     var dayKey = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
     var bucket = byDay.get(dayKey);
-    if (!bucket) { bucket = { day: dayKey, tokens: 0, cost: 0, count: 0 }; byDay.set(dayKey, bucket); }
+    if (!bucket) { bucket = { day: dayKey, tokens: 0, cost: 0, wasted: 0, count: 0 }; byDay.set(dayKey, bucket); }
     bucket.tokens += (pt.inputTokens || 0);
     bucket.cost   += (pt.costUSD     || 0);
+    bucket.wasted += (pt.wastedUSD   || 0);
     bucket.count  += 1;
     totalTokens += (pt.inputTokens || 0);
     totalCost   += (pt.costUSD     || 0);
+    totalWasted += (pt.wastedUSD   || 0);
   }
   var days = Array.from(byDay.values()).sort(function(a, b) { return a.day < b.day ? -1 : 1; });
-  var maxTokens = 0;
-  for (var di = 0; di < days.length; di++) if (days[di].tokens > maxTokens) maxTokens = days[di].tokens;
+  var maxWasted = 0;
+  for (var di = 0; di < days.length; di++) if (days[di].wasted > maxWasted) maxWasted = days[di].wasted;
   // Build the bars
   var bars = '<div class="tok-wasted-bar-area">';
   for (var dj = 0; dj < days.length; dj++) {
     var dy = days[dj];
-    var pct = maxTokens > 0 ? Math.max(2, Math.round((dy.tokens / maxTokens) * 100)) : 2;
-    var tooltip = dy.day + ' • ' + formatNum(dy.tokens) + ' tok • $'
-                  + (Math.round(dy.cost * 100) / 100).toFixed(2)
-                  + ' • ' + dy.count + ' miss' + (dy.count === 1 ? '' : 'es');
+    var pct = maxWasted > 0 ? Math.max(2, Math.round((dy.wasted / maxWasted) * 100)) : 2;
+    // Audit CC-DASH-021: reuse the existing formatCost helper for
+    // consistency with the rest of the dashboard's USD rendering.
+    // Tooltip MUST stay through escHtml() — any future addition of
+    // user-controlled fields must remain inside that escape.
+    var tooltip = dy.day + ' • ' + formatNum(dy.tokens) + ' tok • '
+                  + formatCost(dy.wasted) + ' wasted (' + formatCost(dy.cost) + ' billed) • '
+                  + dy.count + ' miss' + (dy.count === 1 ? '' : 'es');
     bars += '<div class="tok-wasted-bar" style="height:' + pct + '%" data-tooltip="' + escHtml(tooltip) + '"></div>';
   }
   bars += '</div>';
   var totalsLine = '<div class="tok-wasted-totals">'
-    + '<span>' + formatNum(totalTokens) + ' tokens fully paid across ' + filtered.length
-    + ' miss' + (filtered.length === 1 ? '' : 'es') + '</span>'
-    + '<span class="total-cost">$' + (Math.round(totalCost * 100) / 100).toFixed(2)
+    + '<span>' + formatNum(totalTokens) + ' tokens billed across ' + filtered.length
+    + ' miss' + (filtered.length === 1 ? '' : 'es') + ' (' + formatCost(totalCost) + ')</span>'
+    + '<span class="total-cost">' + formatCost(totalWasted)
     + ' wasted</span>'
     + '</div>';
-  el.innerHTML = '<div class="usage-title" title="Input tokens billed at full rate because no prior cache could be re-used. Plotted per day.">Tokens Paid (Cache Misses)</div>'
+  el.innerHTML = '<div class="usage-title" title="Wasted spend = full input cost minus what the same tokens would have cost at the cache-read rate (~10%). Plotted per day.">Wasted spend (cache misses)</div>'
     + '<div class="tok-wasted-wrap">' + totalsLine + bars + '</div>';
 }
 
@@ -8461,9 +8608,21 @@ function exportUsageTreeCsv() {
   var modelV   = modelSel   ? modelSel.value   : '';
   var accountV = accountSel ? accountSel.value : '';
   var repoV    = repoSel    ? repoSel.value    : '';
+  // Audit CC-DASH-005: when the scrubber hasn't been touched, fall
+  // back to the tok-time selector window so the user doesn't
+  // accidentally export years of history. Without this, a fresh page
+  // load with snap.{start,end} === null streams the entire usage
+  // file regardless of the visible time range.
   var qs = ['format=csv'];
-  if (snap.start != null) qs.push('from=' + encodeURIComponent(snap.start));
-  if (snap.end   != null) qs.push('to=' + encodeURIComponent(snap.end));
+  var fromTs = snap.start;
+  var toTs   = snap.end;
+  if (fromTs == null) {
+    var days = (typeof tokTimeRange === 'function') ? tokTimeRange() : 7;
+    fromTs = Date.now() - days * 24 * 60 * 60 * 1000;
+  }
+  if (toTs == null) toTs = Date.now();
+  qs.push('from=' + encodeURIComponent(fromTs));
+  qs.push('to='   + encodeURIComponent(toTs));
   if (modelV)   qs.push('model=' + encodeURIComponent(modelV));
   if (accountV) qs.push('account=' + encodeURIComponent(accountV));
   if (repoV)    qs.push('repo=' + encodeURIComponent(repoV));

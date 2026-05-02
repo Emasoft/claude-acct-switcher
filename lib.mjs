@@ -1131,7 +1131,12 @@ export function classifyUsageComponent(row) {
       //   "Skill: foo"           → "foo"
       //   "Skill foo"            → "foo"
       //   "Skill"                → use mcpServer if present, else "unknown"
-      const m = trimmed.match(/^Skill\s*[(:\s]\s*(.+?)\s*\)?$/);
+      // Audit MINOR-5: try paren form first (must close); fall back to
+      // colon/whitespace form. Without the explicit close-paren the
+      // earlier single regex consumed trailing junk into the capture
+      // (e.g. "Skill(foo) extra" → "foo) extra").
+      let m = trimmed.match(/^Skill\s*\(\s*(.+?)\s*\)\s*$/);
+      if (!m) m = trimmed.match(/^Skill\s*[:\s]\s*(.+?)\s*$/);
       if (m && m[1]) return `skill:${m[1].trim()}`;
       const fallback = (row.mcpServer || '').trim();
       return `skill:${fallback || 'unknown'}`;
@@ -1200,13 +1205,20 @@ export function aggregateUsageTree(rows, opts = {}) {
     if (opts.repoFilter    && row.repo    !== opts.repoFilter)    continue;
     if (opts.accountFilter && row.account !== opts.accountFilter) continue;
     if (opts.modelFilter   && row.model   !== opts.modelFilter)   continue;
+    // Audit MINOR-6: when a time bound is set, require the row to have a
+    // finite ts. Without this guard, rows where ts is undefined/null
+    // pass both the < and > checks (undefined comparisons → false) and
+    // get silently INCLUDED in a date-range view.
+    if ((opts.from != null || opts.to != null)
+        && (typeof row.ts !== 'number' || !Number.isFinite(row.ts))) continue;
     if (opts.from != null && row.ts < opts.from) continue;
     if (opts.to   != null && row.ts > opts.to)   continue;
 
-    // Defensive: any non-finite token field skips the row rather than
-    // poisoning the totals with NaN.
+    // Defensive: any non-finite OR NEGATIVE token field skips the row
+    // rather than poisoning the totals with NaN/Infinity (MAJOR-3) or
+    // negatives that would silently subtract from grand totals.
     const tokens = [row.inputTokens, row.outputTokens, row.cacheReadInputTokens, row.cacheCreationInputTokens];
-    if (tokens.some(t => t != null && (typeof t !== 'number' || !Number.isFinite(t)))) {
+    if (tokens.some(t => t != null && (typeof t !== 'number' || !Number.isFinite(t) || t < 0))) {
       continue;
     }
 
@@ -1282,8 +1294,13 @@ export function aggregateUsageTree(rows, opts = {}) {
   // Sort each level by total tokens descending — the heavy hitters
   // surface at the top, so users see the consequential rows first
   // without scrolling.
+  // Audit NIT-2: secondary sort by name keeps tied siblings in
+  // deterministic order so the UI hash-diff cache doesn't flap when
+  // a single new row lands between two ties.
   function sortByInputDesc(a, b) {
-    return (b.totals.input + b.totals.output) - (a.totals.input + a.totals.output);
+    const d = (b.totals.input + b.totals.output) - (a.totals.input + a.totals.output);
+    if (d !== 0) return d;
+    return (a.name || '').localeCompare(b.name || '');
   }
   tree.sort(sortByInputDesc);
   for (const repo of tree) {
@@ -1318,9 +1335,14 @@ export const MODEL_PRICING = {
   'claude-haiku-4-6':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheCreation: 1.00 },
   'claude-haiku-4-5':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheCreation: 1.00 },
 };
-// Conservative fallback (Sonnet rates) for any unknown model. Returns a
-// non-zero cost so the operator notices something is unaccounted for —
-// versus returning 0 which would silently undercount.
+// Median fallback (Sonnet rates) for any unknown model — returns a
+// non-zero cost so the operator notices something is unaccounted for
+// versus returning 0 which would silently undercount. NOTE: this is
+// "median", NOT "conservative" — it UNDER-counts an Opus-generation
+// model (5x cheaper than reality) and OVER-counts a Haiku-generation
+// model (3-4x more expensive). Operators should add new model entries
+// to MODEL_PRICING above as soon as Anthropic ships them rather than
+// relying on this default.
 export const MODEL_PRICING_DEFAULT = { input: 3, output: 15, cacheRead: 0.30, cacheCreation: 3.75 };
 
 /**
@@ -1333,6 +1355,14 @@ export const MODEL_PRICING_DEFAULT = { input: 3, output: 15, cacheRead: 0.30, ca
  * @returns {number} cost in USD (may be 0 if all token counts are 0)
  */
 export function estimateModelCost(model, inTok, outTok, cacheReadTok, cacheCreationTok) {
+  // Audit MAJOR-2: clamp inputs to non-negative finite numbers BEFORE
+  // any arithmetic so downstream sums can't be poisoned by NaN /
+  // Infinity / negative values. The (inTok || 0) further down then
+  // becomes redundant but harmless; left for readability.
+  inTok            = Math.max(0, Number.isFinite(inTok)            ? inTok            : 0);
+  outTok           = Math.max(0, Number.isFinite(outTok)           ? outTok           : 0);
+  cacheReadTok     = Math.max(0, Number.isFinite(cacheReadTok)     ? cacheReadTok     : 0);
+  cacheCreationTok = Math.max(0, Number.isFinite(cacheCreationTok) ? cacheCreationTok : 0);
   if (!model || typeof model !== 'string') {
     // Unknown / unset model — apply the default rates so we don't silently
     // emit $0 for every row that happens to be missing a model field.
@@ -1386,11 +1416,18 @@ export function aggregateUsageForCsvExport(rows, opts = {}) {
     if (opts.repoFilter    && row.repo    !== opts.repoFilter)    continue;
     if (opts.accountFilter && row.account !== opts.accountFilter) continue;
     if (opts.modelFilter   && row.model   !== opts.modelFilter)   continue;
+    // Audit MINOR-6: require finite ts when either bound is set so
+    // un-timestamped rows don't silently pass both comparisons.
+    if ((opts.from != null || opts.to != null)
+        && (typeof row.ts !== 'number' || !Number.isFinite(row.ts))) continue;
     if (opts.from != null && row.ts < opts.from) continue;
     if (opts.to   != null && row.ts > opts.to)   continue;
 
+    // Audit MAJOR-3: also reject negative token fields — the bare
+    // !Number.isFinite check let -500 through and that subtracted
+    // from grand totals.
     const tokens = [row.inputTokens, row.outputTokens, row.cacheReadInputTokens, row.cacheCreationInputTokens];
-    if (tokens.some(t => t != null && (typeof t !== 'number' || !Number.isFinite(t)))) continue;
+    if (tokens.some(t => t != null && (typeof t !== 'number' || !Number.isFinite(t) || t < 0))) continue;
 
     const repoKey      = row.repo   || '(unknown-repo)';
     const branchKey    = row.branch || '(unknown-branch)';
@@ -1453,9 +1490,24 @@ export function aggregateUsageForCsvExport(rows, opts = {}) {
 export function csvField(v) {
   if (v == null) return '""';
   let s;
+  let isUserString = false;
   if (typeof v === 'boolean') s = v ? 'true' : 'false';
   else if (typeof v === 'number') s = Number.isFinite(v) ? String(v) : '';
-  else s = String(v);
+  else { s = String(v); isUserString = true; }
+  // Audit SC-OPUS-001 — CSV formula injection (CWE-1236, OWASP A03:2021).
+  // Cells starting with =, +, -, @, \t, or \r are evaluated as formulas
+  // by Excel / LibreOffice / Sheets / Numbers when the file is opened.
+  // Repo paths, sub-agent names, skill names, and tool names are all
+  // user-controlled (third-party plugins, user-cloned repo dirs), so a
+  // hostile sub-agent name like `=cmd|'/c calc'!A0` would land in a
+  // CSV bucket and fire when the operator opened the export. Prefix
+  // with a single quote so the cell renders as the literal string.
+  //
+  // Only apply to STRING inputs — a legitimate negative number (-1.5)
+  // is produced via String(v) above and isn't an injection vector
+  // (Excel parses it as a numeric cell). Prefixing it with ' would
+  // turn a numeric column into text and break spreadsheet sums.
+  if (isUserString && s.length > 0 && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return '"' + s.replace(/"/g, '""') + '"';
 }
 
@@ -1476,7 +1528,10 @@ export function renderUsageTreeCsv(rows) {
     'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreationTokens',
     'totalCostUSD', 'requestCount',
   ].join(',');
-  if (!Array.isArray(rows) || !rows.length) return header + '\n';
+  // Audit MINOR-2: RFC 4180 §2.1 mandates CRLF between records. Excel
+  // handles both, but Python's csv module strict mode and some JVM
+  // parsers reject LF-only files.
+  if (!Array.isArray(rows) || !rows.length) return header + '\r\n';
   const lines = [header];
   for (const r of rows) {
     lines.push([
@@ -1495,7 +1550,7 @@ export function renderUsageTreeCsv(rows) {
       csvField(r.requestCount),
     ].join(','));
   }
-  return lines.join('\n') + '\n';
+  return lines.join('\r\n') + '\r\n';
 }
 
 /**
@@ -1509,11 +1564,13 @@ export function renderUsageTreeCsv(rows) {
  *   - This row's inputTokens >= minInputForMissDetection (default 1000)
  *
  * Phase 5 — richer reason classification:
- *   - "compact-boundary" — a `compact` row preceded this miss in the
- *     same session. Anthropic invalidates the cache on every compact
- *     (the prefix changes by definition). Not really a "miss" in the
- *     pejorative sense — surfaced so the operator can correlate spend
- *     against compaction frequency.
+ *   - "compact-boundary" — a `compact_boundary` row (written by the
+ *     PreCompact/PostCompact hooks via buildCompactBoundaryEntry —
+ *     that's the canonical schema in token-usage.json) preceded this
+ *     miss in the same session. Anthropic invalidates the cache on
+ *     every compact (the prefix changes by definition). Not really a
+ *     "miss" in the pejorative sense — surfaced so the operator can
+ *     correlate spend against compaction frequency.
  *   - "model-changed" — the prior cache-creation row was on a different
  *     model. Caches are model-scoped; switching from claude-opus-* to
  *     claude-sonnet-* mid-session forces a fresh cache build.
@@ -1547,14 +1604,20 @@ export function buildCacheMissReport(rows, opts = {}) {
   const minInput = (opts.minInputForMissDetection != null) ? opts.minInputForMissDetection : 1000;
   const ttlMs    = (opts.cacheTtlMs                != null) ? opts.cacheTtlMs                : CACHE_TTL_LIKELY_MS;
 
-  // Group rows by session. Include compact-boundary markers (type='compact')
-  // alongside usage rows because we need them for reason inference; we
-  // skip them in the miss-emission step itself.
+  // Group rows by session. Include compact-boundary markers
+  // (type='compact_boundary' — see buildCompactBoundaryEntry in this
+  // file; that's the canonical schema written to token-usage.json by
+  // the PreCompact/PostCompact hooks) alongside usage rows because we
+  // need them for reason inference; we skip them in the miss-emission
+  // step itself. Audit SR-OP-001: an earlier draft of this filter
+  // checked for 'compact' (not 'compact_boundary'), which made the
+  // compact-boundary classifier dead code in production — every miss
+  // after a real /compact was downgraded to TTL-likely or unknown.
   const bySession = new Map();
   for (const row of rows) {
     if (!row || typeof row !== 'object') continue;
     const t = row.type || 'usage';
-    if (t !== 'usage' && t !== 'compact') continue;
+    if (t !== 'usage' && t !== 'compact_boundary') continue;
     const sid = row.sessionId || '_unknown';
     let arr = bySession.get(sid);
     if (!arr) { arr = []; bySession.set(sid, arr); }
@@ -1569,7 +1632,7 @@ export function buildCacheMissReport(rows, opts = {}) {
     let lastCompactAt = 0;          // ts of the most recent compact-boundary marker
     for (const row of sessionRows) {
       const t = row.type || 'usage';
-      if (t === 'compact') {
+      if (t === 'compact_boundary') {
         lastCompactAt = row.ts || 0;
         continue;
       }
@@ -1583,7 +1646,12 @@ export function buildCacheMissReport(rows, opts = {}) {
         // dominates the others (a compact between us and the last cache
         // makes the gap-since-creation moot).
         let reason = 'unknown';
-        if (lastCompactAt > lastCacheCreatedAt && lastCompactAt <= ts) {
+        // Audit MAJOR-1: use >= so a compact at the SAME ts as the cache
+        // creation row (clock-resolution collisions, batched flushes)
+        // still classifies the downstream miss as compact-boundary.
+        // The outer `lastCacheCreatedAt > 0` guard ensures we never
+        // enter this branch with the both-zero sentinel state.
+        if (lastCompactAt >= lastCacheCreatedAt && lastCompactAt <= ts) {
           reason = 'compact-boundary';
         } else if (lastCacheCreatedModel && row.model && row.model !== lastCacheCreatedModel) {
           reason = 'model-changed';
@@ -1639,7 +1707,14 @@ export function summarizeCacheMissesBySession(rows, opts = {}) {
 
   // Re-use the flat miss list as the source of truth for misses so
   // the two views can never disagree about WHICH rows are misses.
-  const flatMisses = buildCacheMissReport(rows, opts);
+  // Audit CC-DASH-016: callers that already have a flat list (e.g.
+  // the /api/token-usage-tree endpoint, which now computes
+  // buildCacheMissReport once and passes it to all three downstream
+  // helpers) can supply it via opts._precomputedMisses to avoid
+  // re-walking the dataset.
+  const flatMisses = Array.isArray(opts._precomputedMisses)
+    ? opts._precomputedMisses
+    : buildCacheMissReport(rows, opts);
   const missesBySession = new Map();
   for (const m of flatMisses) {
     let arr = missesBySession.get(m.sessionId);
@@ -1674,10 +1749,14 @@ export function summarizeCacheMissesBySession(rows, opts = {}) {
     }
     const read  = row.cacheReadInputTokens || 0;
     const input = row.inputTokens          || 0;
-    if (read > 0) acc.hits += 1;
+    // Audit MINOR-4: apply the same input threshold to hits that the
+    // miss heuristic uses, so hit-rate denominators stay symmetric.
+    // Previously a tiny-input row with read=50 counted as a hit while
+    // a tiny-input row with read=0 was excluded from BOTH counts —
+    // skewed the rate high.
+    if (read > 0 && input >= minInput) acc.hits += 1;
     // misses are sourced from the flat report (computed below) so we
     // skip the per-row miss bookkeeping here.
-    void input; void minInput;
   }
 
   const out = [];
@@ -1724,12 +1803,24 @@ export function summarizeCacheMissesBySession(rows, opts = {}) {
  * @param {Set<string>|Array<string>} [opts.repoFilter] include only
  *   rows whose `repo` is in this set. Empty/missing = include all.
  * @returns {Array<{ts, inputTokens, model, repo, branch, sessionId,
- *   reason, costUSD}>}
- *   Sorted by ts ascending. `costUSD` is computed via
- *   estimateModelCost so the UI doesn't have to know the pricing.
+ *   reason, costUSD, wastedUSD}>}
+ *   Sorted by ts ascending.
+ *   - `costUSD` = full input price the user paid for this miss row,
+ *     computed via estimateModelCost(model, inputTokens, 0, 0, 0).
+ *   - `wastedUSD` (Audit MINOR-3) = the SAVABLE differential —
+ *     `costUSD` minus what the same tokens would have cost if billed
+ *     at the cache-read rate (~10% of input rate). This is the actual
+ *     "I could have avoided this" amount; the UI should plot it for
+ *     "wasted spend" labeling. `costUSD` stays as the gross figure
+ *     for users who want to see total exposure.
  */
 export function buildWastedSpendSeries(rows, opts = {}) {
-  const misses = buildCacheMissReport(rows, opts);
+  // Audit CC-DASH-016: accept a pre-computed misses array so the
+  // endpoint can call buildCacheMissReport once and feed all three
+  // downstream consumers from the same flat list.
+  const misses = Array.isArray(opts._precomputedMisses)
+    ? opts._precomputedMisses
+    : buildCacheMissReport(rows, opts);
   if (!misses.length) return [];
   let allowedRepos = null;
   if (opts.repoFilter) {
@@ -1742,6 +1833,9 @@ export function buildWastedSpendSeries(rows, opts = {}) {
   const out = [];
   for (const m of misses) {
     if (allowedRepos && !allowedRepos.has(m.repo || '')) continue;
+    const fullCost  = estimateModelCost(m.model, m.inputTokens, 0, 0, 0);
+    // What it WOULD have cost if read from cache at the read rate.
+    const cacheCost = estimateModelCost(m.model, 0, 0, m.inputTokens, 0);
     out.push({
       ts:          m.ts,
       inputTokens: m.inputTokens,
@@ -1750,7 +1844,8 @@ export function buildWastedSpendSeries(rows, opts = {}) {
       branch:      m.branch,
       sessionId:   m.sessionId,
       reason:      m.reason,
-      costUSD:     estimateModelCost(m.model, m.inputTokens, 0, 0, 0),
+      costUSD:     fullCost,
+      wastedUSD:   Math.max(0, fullCost - cacheCost),
     });
   }
   // Already chronological from buildCacheMissReport; explicit sort

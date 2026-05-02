@@ -99,6 +99,39 @@ Account credentials no longer live as plaintext JSON files — they're keychain 
 
 **Gitignore invariant for this table.** Every filename listed above is gitignored in `.gitignore`. When adding a new runtime state file, add it to `.gitignore` in the same commit — historical drift between this table and `.gitignore` (e.g. `session-history.json` and `account-prefs.json` were documented as runtime state but missing from gitignore until commit a867229) is the bug that lets per-install state leak into PRs. A quick `grep -c '<filename>' .gitignore` before merging is enough.
 
+### TRDD-1645134b — usage tree, cache-miss detection, wasted-spend chart
+
+A 4-level hierarchical breakdown of the Tokens tab plus a heuristic for cache-miss reasons and a wasted-spend chart. All implementation lives in lib.mjs (pure functions) + dashboard.mjs (endpoint + UI).
+
+**Endpoint:** `GET /api/token-usage-tree`. Three response shapes share one URL via query params:
+  - **Default JSON:** `{ ok, totals, tree }` — the 4-level tree (`repo → branch/worktree → component → tool`) computed by `aggregateUsageTree`.
+  - **JSON with cache info:** add `?includeMisses=1` to also get `misses` (flat per-row miss list), `missSessions` (per-session aggregate with hit-rate), and `wastedSpend` (cache-miss cost time series).
+  - **CSV:** add `?format=csv` to stream a tree-aggregated CSV (one row per `(repo, branch, component, tool)` bucket with USD cost). Anchored download via Content-Disposition; filename is sanitised to `[A-Za-z0-9_-]` only.
+
+  Common filters (all optional, all also accepted in the JSON branch): `from`, `to`, `since` (alias for `from`), `repo`, `account`, `model`, `minMissInput`. Rejected: `from > to`, negative numeric values. The `from`/`to` time-range filter when used with `includeMisses=1` preserves rows of `type === 'compact_boundary'` (those drive Phase 5 reason classification — see below).
+
+**`MODEL_PRICING` table** lives in `lib.mjs` and mirrors `TOK_PRICING` in `dashboard.mjs`. **MUST stay in sync** — both list the same 8 generations (opus/sonnet/haiku 4-5..4-7) with the same per-1M-token rates. Cache rates follow Anthropic's 1.25x (creation) / 0.10x (read) ratios; the regression test asserts that ratio so single-column hand-edits trip. Unknown models fall back to `MODEL_PRICING_DEFAULT` (Sonnet rates) which is "median", NOT "conservative" — it under-prices Opus and over-prices Haiku, so add new model entries promptly when Anthropic ships them.
+
+**Cache-miss heuristic** in `buildCacheMissReport`: groups by `sessionId`, classifies each miss into one of four reasons in this priority order:
+  1. `compact-boundary` — a `compact_boundary` row preceded the miss in the same session. **The production type-string is `compact_boundary` (NOT `compact`)** — that's what `buildCompactBoundaryEntry` writes to `token-usage.json`. An earlier draft used `'compact'` and the classifier was dead code (see audit SR-OP-001 in `reports/audit/`).
+  2. `model-changed` — the prior cache-creating row was on a different model (caches are model-scoped).
+  3. `TTL-likely` — gap exceeds `CACHE_TTL_LIKELY_MS` (5 min, matching Anthropic's documented prompt-cache TTL). Configurable via `opts.cacheTtlMs`.
+  4. `unknown` — could be `/clear`, OAuth-rotation gap, or a real prefix change. Heuristic admits ignorance.
+
+`summarizeCacheMissesBySession` builds the per-session UI aggregate (hits/misses/hit-rate). It drops sessions with neither hits nor misses (denominator-symmetric: a hit requires `cacheRead > 0 && input >= minInput`, mirroring the miss threshold). Both functions accept `opts._precomputedMisses` so the endpoint can call `buildCacheMissReport` once and feed all three downstream consumers from the same flat list (perf — see audit CC-DASH-016).
+
+**Wasted-spend chart** (`buildWastedSpendSeries` + `renderWastedSpendChart`): per-miss series with `costUSD` (gross input price) AND `wastedUSD` (savable differential = costUSD − cacheReadCost). Bar heights track `wastedUSD` because that's the actionable metric. Chart honours the same dropdown filters as the rest of the Tokens tab (model/account/repo/branch + scrubber + tier) — without those, the chart would silently disagree with adjacent charts when filters are active (see audit SR-OP-004).
+
+**Two CSV exports** coexist:
+  - **Flat** (`exportUsageCsv` button) — one row per API request, raw fields, computed client-side from `_tokensRawData`. Maximum-certainty audit trail. **Body must NOT change** without explicit user approval (power users diff their CSVs week over week).
+  - **Tree-aggregated** (`exportUsageTreeCsv` button) — one row per `(repo, branch, component, tool)` bucket with summed `totalCostUSD`, computed server-side. Streams via anchor-download. Falls back to the `tok-time` selector window when the scrubber hasn't been touched.
+
+**Chart-scoped project multi-select** at the top-right of the carousel card: independent of the existing `tok-repo` single-select. localStorage key `vdm.chartProjectFilter` persists the selection (bounded: max 200 items × 1024 chars × 256 KB total to defend against quota poisoning). When the single-select narrows to one repo, the multi-select is disabled with an explanatory hint to prevent the "both filters narrow to disjoint sets → every chart empty" UX trap.
+
+**CSV formula-injection guard:** `csvField` prefixes user-string cells starting with `=`, `+`, `-`, `@`, `\t`, `\r` with a single quote (CWE-1236, OWASP A03). Numeric cells are NOT prefixed (`-1.5` stays a numeric cell). Sub-agent / skill / repo names from third-party plugins are user-controlled and a hostile name like `=cmd|'/c calc'!A0` would otherwise execute when the operator opens the CSV in Excel.
+
+**Lazy-loading deferred:** the TRDD spec calls for lazy-loading deeper tree levels on `<details>` toggle. Current implementation eager-renders the full tree (acceptable at the current scale where the aggregated tree is well under 1 MB rendered HTML). Re-evaluate if a single user reports >100 repos × 10 worktrees in their data.
+
 ### OAuth refresh
 
 `OAUTH_TOKEN_URL` defaults to `https://console.anthropic.com/v1/oauth/token` (Anthropic retired the older `platform.claude.com` host during the platform→console migration; the old URL silently 404s and refreshes against it never recover), `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.

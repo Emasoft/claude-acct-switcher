@@ -6553,7 +6553,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
   it('builds opts from query params (repo, account, model, from/since, to)', () => {
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.ok(fn.length > 200, 'endpoint body must exist');
     assert.match(fn, /params\.get\('repo'\)/);
@@ -6571,7 +6571,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
     // because every row's ts comparison would be false against NaN.
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /Number\.isFinite\(n\)/);
   });
@@ -6579,7 +6579,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
   it('calls aggregateUsageTree with the rows and opts', () => {
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /aggregateUsageTree\(rows, opts\)/);
   });
@@ -6587,7 +6587,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
   it('returns the documented response shape { ok, totals, tree }', () => {
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /\bok: true,?\s*totals,?\s*tree\b/);
   });
@@ -6595,7 +6595,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
   it('includeMisses=1 attaches a miss report; default is off', () => {
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     // Guard exists
     assert.match(fn, /params\.get\('includeMisses'\) === '1'/);
@@ -6613,7 +6613,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
     // confusing operators investigating a specific time window.
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /opts\.from != null \|\| opts\.to != null/);
     assert.match(fn, /missRows = rows\.filter/);
@@ -6622,7 +6622,7 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
   it('minMissInput overrides the cache-miss threshold', () => {
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 4000,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /params\.get\('minMissInput'\)/);
     assert.match(fn, /minInputForMissDetection/);
@@ -6635,12 +6635,14 @@ describe('Phase 2 — /api/token-usage-tree endpoint wiring', () => {
     // the slice window.
     const fn = _src_t2.slice(
       _src_t2.indexOf("'/api/token-usage-tree'"),
-      _src_t2.indexOf("'/api/token-usage-tree'") + 5500,
+      _src_t2.indexOf("'/api/token-usage-tree'") + 8500,
     );
     // Use [\s\S] so the regex spans newlines (catch blocks are typically
     // multi-line). A single error path that returns 500 with the
-    // standard {ok:false, error:e.message} shape.
-    assert.match(fn, /catch \(e\)[\s\S]{0,300}ok: false[\s\S]{0,300}error: e\.message[\s\S]{0,300}500/);
+    // standard {ok:false, error: ...} shape. Audit CC-DASH-018:
+    // error is now `(e && e.message) || String(e)` for defense
+    // against `throw 'string'` style throws — match either form.
+    assert.match(fn, /catch \(e\)[\s\S]{0,500}ok: false[\s\S]{0,200}error:[\s\S]{0,200}e\.message[\s\S]{0,200}500/);
   });
 });
 
@@ -6980,7 +6982,10 @@ describe('Phase 4 — aggregateUsageForCsvExport', () => {
   it('skips non-usage rows (compact-boundary, etc.)', () => {
     const rows = [
       _row(),
-      _row({ type: 'compact' }),
+      // Audit SR-OP-001: real production rows use 'compact_boundary'
+      // (see buildCompactBoundaryEntry). Both should still be skipped
+      // by the CSV exporter — only 'usage' counts.
+      _row({ type: 'compact_boundary' }),
       _row({ type: 'unknown' }),
     ];
     const out = aggregateUsageForCsvExport(rows);
@@ -7108,9 +7113,10 @@ describe('Phase 4 — aggregateUsageForCsvExport', () => {
 });
 
 describe('Phase 4 — renderUsageTreeCsv', () => {
-  it('emits header even on empty input', () => {
+  it('emits header even on empty input (CRLF line ending per RFC 4180)', () => {
+    // Audit MINOR-2: RFC 4180 §2.1 mandates CRLF.
     const csv = renderUsageTreeCsv([]);
-    assert.equal(csv, 'repo,branch,isWorktree,component,tool,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,totalCostUSD,requestCount\n');
+    assert.equal(csv, 'repo,branch,isWorktree,component,tool,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,totalCostUSD,requestCount\r\n');
   });
 
   it('handles null/non-array input as empty (header only)', () => {
@@ -7123,7 +7129,8 @@ describe('Phase 4 — renderUsageTreeCsv', () => {
     // Reorder = silent breaking change for any downstream importer
     // (spreadsheets, ETL pipelines). Lock the order in.
     const csv = renderUsageTreeCsv([]);
-    const header = csv.split('\n')[0];
+    // Split on the explicit CRLF that RFC 4180 mandates.
+    const header = csv.split('\r\n')[0];
     const cols = header.split(',');
     assert.deepEqual(cols, [
       'repo', 'branch', 'isWorktree', 'component', 'tool',
@@ -7141,7 +7148,7 @@ describe('Phase 4 — renderUsageTreeCsv', () => {
       totalCostUSD: 0.005, requestCount: 1,
     }];
     const csv = renderUsageTreeCsv(rows);
-    const bodyLine = csv.split('\n')[1];
+    const bodyLine = csv.split('\r\n')[1];
     // Every field is always quoted per the implementation comment
     const fields = bodyLine.split(',');
     assert.equal(fields.length, 11);
@@ -7176,7 +7183,7 @@ describe('Phase 4 — renderUsageTreeCsv', () => {
     assert.match(csv, /"0\.123457"/);
   });
 
-  it('terminates with a trailing newline (POSIX text-file convention)', () => {
+  it('terminates with a trailing CRLF (RFC 4180)', () => {
     const rows = [{
       repo: '/r', branch: 'main', isWorktree: false,
       component: 'main', tool: 'Bash',
@@ -7185,7 +7192,7 @@ describe('Phase 4 — renderUsageTreeCsv', () => {
       totalCostUSD: 0, requestCount: 1,
     }];
     const csv = renderUsageTreeCsv(rows);
-    assert.ok(csv.endsWith('\n'));
+    assert.ok(csv.endsWith('\r\n'));
   });
 
   it('round-trip: aggregator → CSV preserves request counts', () => {
@@ -7202,7 +7209,10 @@ describe('Phase 4 — renderUsageTreeCsv', () => {
     ];
     const flat = aggregateUsageForCsvExport(rows);
     const csv  = renderUsageTreeCsv(flat);
-    const lines = csv.split('\n').filter(l => l.length > 0);
+    // Audit MINOR-2: split on CRLF (RFC 4180 record separator). The
+    // .filter(l.length > 0) drops the trailing empty element from the
+    // final \r\n.
+    const lines = csv.split('\r\n').filter(l => l.length > 0);
     // header + 2 buckets (Bash×2 collapsed, Read×1)
     assert.equal(lines.length, 3);
     // The requestCount column is the last one — re-extract and sum.
@@ -7228,7 +7238,7 @@ describe('Phase 4 — /api/token-usage-tree?format=csv endpoint wiring', () => {
   it('format=csv branch exists inside the token-usage-tree handler', () => {
     const fn = _src_t4.slice(
       _src_t4.indexOf("'/api/token-usage-tree'"),
-      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+      _src_t4.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /params\.get\('format'\) === 'csv'/);
     assert.match(fn, /aggregateUsageForCsvExport\(rows, opts\)/);
@@ -7238,7 +7248,7 @@ describe('Phase 4 — /api/token-usage-tree?format=csv endpoint wiring', () => {
   it('CSV branch sets the right Content-Type and Content-Disposition', () => {
     const fn = _src_t4.slice(
       _src_t4.indexOf("'/api/token-usage-tree'"),
-      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+      _src_t4.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /'content-type':\s*'text\/csv;\s*charset=utf-8'/);
     assert.match(fn, /'content-disposition':\s*`attachment;\s*filename="token-usage-tree-/);
@@ -7250,7 +7260,7 @@ describe('Phase 4 — /api/token-usage-tree?format=csv endpoint wiring', () => {
     // potentially writing two response bodies.
     const fn = _src_t4.slice(
       _src_t4.indexOf("'/api/token-usage-tree'"),
-      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+      _src_t4.indexOf("'/api/token-usage-tree'") + 8500,
     );
     const csvIdx  = fn.indexOf("params.get('format') === 'csv'");
     const treeIdx = fn.indexOf('aggregateUsageTree(rows, opts)');
@@ -7266,7 +7276,7 @@ describe('Phase 4 — /api/token-usage-tree?format=csv endpoint wiring', () => {
     // must replace `:` and `.` from the ISO string with `-`.
     const fn = _src_t4.slice(
       _src_t4.indexOf("'/api/token-usage-tree'"),
-      _src_t4.indexOf("'/api/token-usage-tree'") + 4500,
+      _src_t4.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /toISOString\(\)\.replace\(\/\[:\.\]\/g,\s*'-'\)/);
   });
@@ -7315,8 +7325,14 @@ describe('Phase 4 — UI: Export tree CSV button + handler', () => {
     assert.match(fn, /encodeURIComponent\(modelV\)/);
     assert.match(fn, /encodeURIComponent\(accountV\)/);
     assert.match(fn, /encodeURIComponent\(repoV\)/);
-    assert.match(fn, /encodeURIComponent\(snap\.start\)/);
-    assert.match(fn, /encodeURIComponent\(snap\.end\)/);
+    // Audit CC-DASH-005: from/to are now derived via local fromTs/toTs
+    // variables that fall back to the tok-time selector when the
+    // scrubber hasn't been touched. The encodeURIComponent calls take
+    // those derived values, NOT snap.start/snap.end directly.
+    assert.match(fn, /encodeURIComponent\(fromTs\)/);
+    assert.match(fn, /encodeURIComponent\(toTs\)/);
+    // Fallback to tok-time when snap is null
+    assert.match(fn, /tokTimeRange/);
   });
 
   it('exportUsageTreeCsv uses an anchor download (lets server set filename)', () => {
@@ -7349,10 +7365,15 @@ describe('Phase 5 — buildCacheMissReport reason classification', () => {
     // the miss explains the miss perfectly — the prefix changed by
     // definition. Should NOT be classified as TTL-likely even when
     // the time gap exceeds the TTL.
+    // Audit SR-OP-001: production rows use 'compact_boundary' (see
+    // buildCompactBoundaryEntry in lib.mjs:2340). The earlier draft of
+    // this test used 'compact' and the production code did too — both
+    // wrong in the same way, so the test passed green while the
+    // classifier was dead code in production.
     const rows = [
       { type: 'usage',   sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
         inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
-      { type: 'compact', sessionId: 's1', ts: 1500 },
+      { type: 'compact_boundary', sessionId: 's1', ts: 1500 },
       { type: 'usage',   sessionId: 's1', ts: 2000, model: 'claude-opus-4-7',
         inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
     ];
@@ -7420,9 +7441,10 @@ describe('Phase 5 — buildCacheMissReport reason classification', () => {
     // The compact-boundary marker is a meta-event, not a usage turn.
     // It should drive reason classification of subsequent usage rows
     // but never be reported as a miss in its own right.
+    // Audit SR-OP-001: production type-string is 'compact_boundary'.
     const rows = [
       { type: 'usage',   sessionId: 's1', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 1000 },
-      { type: 'compact', sessionId: 's1', ts: 1500 },
+      { type: 'compact_boundary', sessionId: 's1', ts: 1500 },
       { type: 'usage',   sessionId: 's1', ts: 2000, inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
     ];
     const out = buildCacheMissReport(rows);
@@ -7597,11 +7619,15 @@ describe('Phase 5 — endpoint emits missSessions when includeMisses=1', () => {
   it('endpoint computes summary inside the includeMisses guard', () => {
     const fn = _src_t5.slice(
       _src_t5.indexOf("'/api/token-usage-tree'"),
-      _src_t5.indexOf("'/api/token-usage-tree'") + 4500,
+      _src_t5.indexOf("'/api/token-usage-tree'") + 8500,
     );
     // Inside the guard: both the buildCacheMissReport call AND the
     // new summarizeCacheMissesBySession call.
-    assert.match(fn, /response\.misses = buildCacheMissReport/);
+    // Audit CC-DASH-016: the endpoint now computes flatMisses ONCE
+    // and assigns it directly; both downstream helpers are called
+    // with the precomputed list for performance.
+    assert.match(fn, /const flatMisses = buildCacheMissReport/);
+    assert.match(fn, /response\.misses\s*=\s*flatMisses/);
     assert.match(fn, /response\.missSessions = summarizeCacheMissesBySession/);
     // The summary must be inside the same guard
     const guardIdx = fn.indexOf("params.get('includeMisses')");
@@ -7609,15 +7635,16 @@ describe('Phase 5 — endpoint emits missSessions when includeMisses=1', () => {
     assert.ok(summaryIdx > guardIdx, 'summary call must be inside includeMisses guard');
   });
 
-  it('time-range pre-filter keeps compact rows (Phase 5 reason classification needs them)', () => {
-    // Without keeping compact rows in the pre-filter, every miss in a
+  it('time-range pre-filter keeps compact_boundary rows (Phase 5 reason classification needs them)', () => {
+    // Audit SR-OP-001: production type-string is 'compact_boundary'.
+    // Without keeping these rows in the pre-filter, every miss in a
     // filtered view would lose its compact-boundary classification —
     // silently degrading to TTL-likely or unknown.
     const fn = _src_t5.slice(
       _src_t5.indexOf("'/api/token-usage-tree'"),
-      _src_t5.indexOf("'/api/token-usage-tree'") + 4500,
+      _src_t5.indexOf("'/api/token-usage-tree'") + 8500,
     );
-    assert.match(fn, /t !== 'usage' && t !== 'compact'/);
+    assert.match(fn, /t !== 'usage' && t !== 'compact_boundary'/);
   });
 });
 
@@ -7855,9 +7882,12 @@ describe('Phase 6 — endpoint emits wastedSpend when includeMisses=1', () => {
   });
 
   it('endpoint computes wastedSpend inside the includeMisses guard', () => {
+    // Slice bumped to 8500 to span the Audit CC-DASH-016 refactor
+    // (flatMisses + missOptsWithPrecomp added bytes between the
+    // includeMisses guard and the wastedSpend assignment).
     const fn = _src_t6.slice(
       _src_t6.indexOf("'/api/token-usage-tree'"),
-      _src_t6.indexOf("'/api/token-usage-tree'") + 5500,
+      _src_t6.indexOf("'/api/token-usage-tree'") + 8500,
     );
     assert.match(fn, /response\.wastedSpend = buildWastedSpendSeries/);
     const guardIdx = fn.indexOf("params.get('includeMisses')");
@@ -8024,4 +8054,278 @@ describe('Phase 6 — UI: chart-scoped project multi-select + wasted-spend chart
     assert.match(tail, /_refreshProjectFilterLabel\(\)/);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// TRDD-1645134b Phase 6 — acceptance-criteria checks
+// ─────────────────────────────────────────────────────────
+
+describe('Phase 6 — acceptance criteria', () => {
+  const _src_t6ac = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('flat exportUsageCsv() function body is structurally unchanged', () => {
+    // The TRDD §"Acceptance criteria" mandates "the existing flat CSV
+    // is unchanged" — power users diff their CSV exports week over
+    // week, so any silent change to column order, header text, or
+    // value formatting breaks their pipelines. This test asserts the
+    // load-bearing identity markers of the function are still
+    // present and in the expected positions.
+    const fn = _src_t6ac.slice(
+      _src_t6ac.indexOf('function exportUsageCsv()'),
+      _src_t6ac.indexOf('function exportUsageCsv()') + 3000,
+    );
+    assert.ok(fn.length > 500, 'exportUsageCsv body must exist');
+    // Header line — locked column order
+    assert.match(fn, /'timestamp,repo,branch,model,account,tier,input_tokens,output_tokens'/);
+    // Filename pattern uses the scrubber window
+    assert.match(fn, /'vdm-export-' \+ vsFormatStamp\(snap\.start\) \+ '_to_' \+ vsFormatStamp\(snap\.end\) \+ '\.csv'/);
+    // Filter set still pulled from _tokensRawData (NOT the new
+    // _tokensFiltered or _wastedSpendRaw paths)
+    assert.match(fn, /\(_tokensRawData \|\| \[\]\)\.filter/);
+    // Blob-based download (the new tree CSV uses an anchor stream
+    // instead — the flat one is intentionally still client-buffered)
+    assert.match(fn, /new Blob\(\[lines\.join/);
+  });
+
+  it('endpoint returns the documented JSON shape', () => {
+    const fn = _src_t6ac.slice(
+      _src_t6ac.indexOf("'/api/token-usage-tree'"),
+      _src_t6ac.indexOf("'/api/token-usage-tree'") + 8500,
+    );
+    // Default response (no includeMisses): { ok, totals, tree }
+    assert.match(fn, /\bok: true,?\s*totals,?\s*tree\b/);
+    // Phase 5 / 6 additions when includeMisses=1.
+    // Audit CC-DASH-016: the endpoint now computes the flat-misses
+    // list ONCE and routes via response.misses = flatMisses (rather
+    // than the direct call); the assertion is that the flat list
+    // and both downstream helpers all live inside the includeMisses
+    // guard. A separate test asserts the precomputed-misses path.
+    assert.match(fn, /const flatMisses = buildCacheMissReport/);
+    assert.match(fn, /response\.misses\s*=\s*flatMisses/);
+    assert.match(fn, /response\.missSessions\s*=\s*summarizeCacheMissesBySession/);
+    assert.match(fn, /response\.wastedSpend\s*=\s*buildWastedSpendSeries/);
+    // Both downstream helpers receive the precomputed list to avoid
+    // re-walking the dataset.
+    assert.match(fn, /missOptsWithPrecomp/);
+    assert.match(fn, /_precomputedMisses:\s*flatMisses/);
+  });
+
+  it('tree UI renders correctly with 0 / 1 / many repos', () => {
+    // Empty case must short-circuit to the empty-state message
+    // (covered separately in Phase 3 tests, re-asserted here for the
+    // acceptance-criteria contract).
+    const fn = _src_t6ac.slice(
+      _src_t6ac.indexOf('function renderUsageTree('),
+      _src_t6ac.indexOf('function renderUsageTree(') + 1500,
+    );
+    assert.match(fn, /No usage data in this time range/);
+    // Many-repos case — top-level repos rendered open by default
+    // so users see the breakdown immediately
+    assert.match(fn, /renderTreeNode\(tree\[i\], grandTotals, \/\*depth\*\/0\)/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Audit SR-OP-001 regression — type-string is 'compact_boundary'
+// ─────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────
+// Audit SC-OPUS-001 — CSV formula-injection guard
+// ─────────────────────────────────────────────────────────
+
+describe('Audit SC-OPUS-001 — csvField formula-injection guard', () => {
+  it('prefixes string cells starting with = + - @ \\t \\r with single quote', () => {
+    // Excel / Sheets / Numbers / LibreOffice evaluate cells starting
+    // with these chars as formulas when the file is opened. Repo paths
+    // and sub-agent names are user-controlled — a hostile plugin can
+    // ship a sub-agent named `=cmd|'/c calc'!A0`. RFC 4180 only
+    // mandates DOUBLE quote escaping; single quotes pass through
+    // untouched, so the expected payload below has single single-quotes.
+    assert.equal(csvField('=HYPERLINK("evil")'), `"'=HYPERLINK(""evil"")"`);
+    assert.equal(csvField('=cmd|\'/c calc\'!A0'), `"'=cmd|'/c calc'!A0"`);
+    for (const c of ['+', '-', '@', '\t', '\r']) {
+      const out = csvField(c + 'evil');
+      assert.ok(out.startsWith(`"'${c}`), `expected '"' + c + ... for c=${JSON.stringify(c)}, got ${out}`);
+    }
+  });
+
+  it('does NOT prefix safe string cells', () => {
+    assert.equal(csvField('main'),               '"main"');
+    assert.equal(csvField('/Users/foo/bar'),     '"/Users/foo/bar"');
+    assert.equal(csvField('claude-opus-4-7'),    '"claude-opus-4-7"');
+    assert.equal(csvField('subagent:Explore'),   '"subagent:Explore"');
+  });
+
+  it('does NOT prefix legitimate numeric cells', () => {
+    // A negative number is produced via String(v) above the guard
+    // — Excel parses it as a numeric cell, not a formula. Prefixing
+    // would break spreadsheet sums.
+    assert.equal(csvField(-1.5), '"-1.5"');
+    assert.equal(csvField(-100), '"-100"');
+    assert.equal(csvField(0),    '"0"');
+  });
+
+  it('does NOT prefix booleans (controlled output)', () => {
+    assert.equal(csvField(true),  '"true"');
+    assert.equal(csvField(false), '"false"');
+  });
+
+  it('round-trips formula-prefixed cells through renderUsageTreeCsv', () => {
+    // End-to-end: a malicious row whose `tool` field is a formula
+    // payload must end up CSV-escaped AND formula-quoted.
+    const rows = [{
+      repo: '=cmd|\'/c calc\'!A0', branch: 'main', isWorktree: false,
+      component: 'main', tool: 'Bash',
+      inputTokens: 1, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      totalCostUSD: 0, requestCount: 1,
+    }];
+    const csv = renderUsageTreeCsv(rows);
+    // Should contain the prefixed-and-escaped form (single quotes
+    // don't need RFC 4180 doubling — only double quotes do).
+    assert.match(csv, /"'=cmd\|'\/c calc'!A0"/);
+  });
+});
+
+describe('Audit SR-OP-001 — compact-boundary type-string regression', () => {
+  // Catches the trap where the test fixture used 'compact' AND the
+  // production code did too, so the test passed green while the
+  // classifier was dead code in production.
+  const _libSrcSr = _readFileSync_xss(
+    new URL('../lib.mjs', import.meta.url),
+    'utf8',
+  );
+  const _dashSrcSr = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('lib.mjs buildCacheMissReport filter accepts the production type', () => {
+    // Locate the function body, then assert the filter checks for
+    // 'compact_boundary' (NOT 'compact'). The earlier draft used
+    // the wrong literal; production rows would never reach the
+    // classifier and every miss after a /compact would silently
+    // downgrade.
+    const fn = _libSrcSr.slice(
+      _libSrcSr.indexOf('export function buildCacheMissReport'),
+      _libSrcSr.indexOf('export function buildCacheMissReport') + 4000,
+    );
+    assert.match(fn, /t !== 'usage' && t !== 'compact_boundary'/);
+    assert.match(fn, /t === 'compact_boundary'/);
+    // Defense against accidentally re-introducing the wrong literal.
+    // Only check executable code (drop // and /* ... */ comments
+    // first) so explanatory text in JSDoc/comments doesn't trip us.
+    const stripped = fn
+      .replace(/\/\*[\s\S]*?\*\//g, '')   // block comments
+      .replace(/\/\/[^\n]*/g, '');         // line comments
+    const wrongLit = stripped.match(/'compact'(?!_)/g);
+    assert.equal(wrongLit, null,
+      "buildCacheMissReport executable code must use 'compact_boundary' (production type), not 'compact'");
+  });
+
+  it('dashboard.mjs endpoint pre-filter keeps the production type', () => {
+    const handler = _dashSrcSr.slice(
+      _dashSrcSr.indexOf("'/api/token-usage-tree'"),
+      _dashSrcSr.indexOf("'/api/token-usage-tree'") + 6000,
+    );
+    assert.match(handler, /t !== 'usage' && t !== 'compact_boundary'/);
+  });
+
+  it('an actual buildCompactBoundaryEntry row classifies as compact-boundary', () => {
+    // End-to-end test using the REAL producer instead of a synthetic
+    // row literal. If buildCompactBoundaryEntry's type ever changes,
+    // the classifier must adapt.
+    const compactRow = buildCompactBoundaryEntry({
+      ts: 1500, sessionId: 's1', repo: '/r', branch: 'main',
+      commitHash: 'abc123', trigger: 'auto',
+      preTokens: 50000, postTokens: 10000, account: 'a1',
+    });
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      compactRow,
+      { type: 'usage', sessionId: 's1', ts: 2000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildCacheMissReport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].reason, 'compact-boundary',
+      "production buildCompactBoundaryEntry rows must be recognized by the classifier");
+  });
+});
+
+describe('Audit SC-OPUS-004 — multi-select attribute uses escHtml (not quote-only)', () => {
+  const _src_sc4 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('populateProjectFilterOptions does NOT use the legacy quote-only escape', () => {
+    // The old `name.replace(/"/g, '&quot;')` only escaped " and let &
+    // through, opening attribute-context XSS via &quot; entity decode.
+    // escHtml escapes & < > " ' — safe in BOTH attribute and text.
+    assert.ok(!/safeAttr\s*=\s*name\.replace/.test(_src_sc4),
+      'safeAttr should be derived via escHtml, not quote-only replace');
+    // Positive: the populator uses escHtml(name) for both data-repo
+    // and title attributes. Slice bumped to 5500 to span the
+    // SR-OP-002 hint logic added at the top of the function.
+    const fn = _src_sc4.slice(
+      _src_sc4.indexOf('function populateProjectFilterOptions'),
+      _src_sc4.indexOf('function populateProjectFilterOptions') + 5500,
+    );
+    assert.match(fn, /var safe = escHtml\(name\)/);
+    assert.match(fn, /data-repo="' \+ safe \+ '"/);
+    assert.match(fn, /title="' \+ safe \+ '"/);
+  });
+});
+
+describe('Phase 6 — full-suite + dependency invariants', () => {
+  const _src_t6ac2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+  const _libSrc = _readFileSync_xss(
+    new URL('../lib.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('lib.mjs exports stay in sync with dashboard.mjs imports', () => {
+    // If a function gets renamed or removed from lib.mjs but
+    // dashboard.mjs still imports it, Node will fail at startup
+    // with "named export not found." Check explicitly here so the
+    // failure surfaces as a test failure, not a runtime crash.
+    const wanted = [
+      'aggregateUsageTree',
+      'buildCacheMissReport',
+      'aggregateUsageForCsvExport',
+      'renderUsageTreeCsv',
+      'summarizeCacheMissesBySession',
+      'buildWastedSpendSeries',
+    ];
+    for (const name of wanted) {
+      const exportRe = new RegExp(`export\\s+(function|const)\\s+${name}\\b`);
+      assert.match(_libSrc, exportRe, `lib.mjs should export ${name}`);
+      const importRe = new RegExp(`\\b${name},`);
+      assert.match(_src_t6ac2, importRe, `dashboard.mjs should import ${name}`);
+    }
+  });
+
+  it('no backticks lurk in JS comments inside renderHTML template literal', () => {
+    // CLAUDE.md flags this as the load-bearing trap that breaks the
+    // single-template-literal returned by renderHTML(). The grep
+    // covers lines 3479..8290 (the documented template range).
+    const lines = _src_t6ac2.split('\n');
+    const traps = [];
+    for (let i = 3478; i < Math.min(8290, lines.length); i++) {
+      // Match "// ... ` ..." patterns (a JS line-comment containing a backtick)
+      if (/\/\/[^`]*`/.test(lines[i])) traps.push((i + 1) + ': ' + lines[i].trim());
+    }
+    assert.equal(traps.length, 0,
+      'backticks in JS comments inside renderHTML template will silently break parsing.\n  '
+      + traps.join('\n  '));
+  });
+});
+
 
