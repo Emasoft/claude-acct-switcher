@@ -8763,4 +8763,220 @@ describe('A11y batch 2 — UX-X3 / UX-CPF3 / UX-S2 source-grep regressions', () 
   });
 });
 
+// ─────────────────────────────────────────────────
+// Sparkline + scrubber refresh — UX-X7 / UX-VS2 source-grep regressions
+//
+// These tests guard the dashboard's sparkline render function and the
+// custom scrubber-thumb CSS against the two prior shortcomings called
+// out in the UX audit:
+//   * UX-X7 — sparklines were binary (ON/OFF) so every account looked
+//     identical the moment it had any traffic; no axis labels meant a
+//     reader couldn't tell 5% from 95%.
+//   * UX-VS2 — scrubber thumb pseudo-elements were 16px diameter (smaller
+//     than the WCAG 2.5.5 desktop minimum) and only the .vs-thumb div
+//     was sized — any future native input[type=range] would silently
+//     regress to OS-default 16px.
+//
+// As with the A11y batch 2 block above, these are source-grep tests
+// rather than DOM tests: renderSparkline lives only inside the
+// renderHTML() template literal (it is client JS, not an export), and
+// the established convention here is to grep the source string for the
+// invariants we care about. A separate behavioural test extracts the
+// function via regex slice + new Function() and asserts the produced
+// SVG path coordinates honour the proportional Y-scale rule, so we have
+// both source-shape AND output-shape coverage.
+// ─────────────────────────────────────────────────
+describe('UX-X7 / UX-VS2 — sparkline + scrubber regressions (batch D)', () => {
+  const _src_uxd = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('UX-X7 — renderSparkline computes a per-window observed peak (not binary > 0)', () => {
+    // Binary sparkline used `var on = (pts[pi][key] || 0) > 0` to pick
+    // between two Y values. Proportional version computes maxObserved
+    // and a yFor(val) helper that scales against it. Source-grep both.
+    assert.match(_src_uxd, /var maxObserved = 0;/);
+    assert.match(_src_uxd, /if \(v > maxObserved\) maxObserved = v;/);
+    assert.match(_src_uxd, /var yMax = Math\.max\(maxObserved, 1\.0\);/);
+    assert.match(_src_uxd,
+      /function yFor\(val\) \{\s*var clipped = val < 0 \? 0 : \(val > yMax \? yMax : val\);\s*return padT \+ chartH \* \(1 - clipped \/ yMax\);\s*\}/);
+  });
+
+  it('UX-X7 — Y-scale is anchored at zero (the baseline must be padT + chartH)', () => {
+    // The "30% bar must look like 30% of the chart" property only holds
+    // if the path returns to (padT + chartH) for value=0. Without the
+    // explicit 1.0 floor on yMax, a flat-30% history would fill the
+    // whole chart and recreate the binary-sparkline bug.
+    assert.match(_src_uxd, /var yOff = padT \+ chartH;/);
+    // The closing 'Z' of the area path must come back to yOff so the
+    // fill is anchored at zero (not auto-scaled to the data range).
+    assert.match(_src_uxd,
+      /d \+= ' L' \+ xLast\.toFixed\(1\) \+ ',' \+ yOff\.toFixed\(1\) \+ ' Z';/);
+  });
+
+  it('UX-X7 — SVG carries title= AND aria-label tooltip with min/max range', () => {
+    // The <title> child element provides the native browser hover
+    // tooltip; the role=img + aria-label gives the same string to a
+    // screen reader as the chart's accessible name.
+    assert.match(_src_uxd,
+      /role="img" aria-label="' \+ titleTxt \+ '"><title>' \+ titleTxt \+ '<\/title>/);
+    assert.match(_src_uxd,
+      /titleTxt = 'Min ' \+ minPctInWin \+ '% \/ Max ' \+ maxPctInWin \+ '% over the window';/);
+    // Empty-data path must still emit a title (else the role=img has
+    // an empty accessible name, which trips axe-core).
+    assert.match(_src_uxd, /titleTxt = 'No data in window';/);
+  });
+
+  it('UX-X7 — overlay labels mark peak% (top-left) AND 0% (baseline)', () => {
+    // Two <text> elements drawn on the SVG, both font-size 6 to match
+    // the existing axis-label style. Top-left shows the peak %, baseline
+    // shows literal "0%" so the value range is interpretable without
+    // hovering for the tooltip.
+    assert.match(_src_uxd,
+      /var maxLabelTxt = \(maxPctInWin == null\) \? '--' : \(maxPctInWin \+ '%'\);/);
+    assert.match(_src_uxd,
+      /<text x="2" y="6"[^>]*text-anchor="start">' \+ maxLabelTxt \+ '<\/text>'/);
+    assert.match(_src_uxd,
+      /<text x="2" y="' \+ \(padT \+ chartH\)\.toFixed\(1\) \+ '"[^>]*text-anchor="start">0%<\/text>/);
+  });
+
+  it('UX-X7 — proportional path: behavioural test on extracted renderSparkline', () => {
+    // Pull renderSparkline out of the template literal and exec it. The
+    // function is self-contained (uses only Date.now / Math), so we can
+    // run it in a sandbox built via new Function() and inspect the
+    // returned SVG string. We assert that two histories with different
+    // peaks produce SVGs whose top-edge Y coordinates differ — the
+    // binary-sparkline version returned IDENTICAL SVGs for any history
+    // with at least one nonzero point (both would clamp to yOn).
+    const m = _src_uxd.match(
+      /function renderSparkline\(hist, key, windowMs, mode\) \{[\s\S]*?\n\}/);
+    assert.ok(m, 'renderSparkline source not found in dashboard.mjs');
+    // Wrap as `return function ...` so new Function() yields the fn.
+    // No closures used inside renderSparkline beyond globals (Math, Date).
+    // eslint-disable-next-line no-new-func
+    const renderSparkline = (new Function('return ' + m[0]))();
+    assert.equal(typeof renderSparkline, 'function');
+    const now = Date.now();
+    const W = 24 * 60 * 60 * 1000;
+    // Build two short same-length histories with the same TIMESTAMPS so
+    // any difference in the produced SVG comes from value scaling, not
+    // x-coordinate placement (which depends on now()/windowStart).
+    const lowHist = [
+      { ts: now - 60_000, u5h: 0.10, u7d: 0.10 },
+      { ts: now - 30_000, u5h: 0.10, u7d: 0.10 },
+      { ts: now -  1_000, u5h: 0.10, u7d: 0.10 },
+    ];
+    const highHist = [
+      { ts: now - 60_000, u5h: 0.95, u7d: 0.95 },
+      { ts: now - 30_000, u5h: 0.95, u7d: 0.95 },
+      { ts: now -  1_000, u5h: 0.95, u7d: 0.95 },
+    ];
+    const svgLow  = renderSparkline(lowHist,  'u5h', W, 'hours');
+    const svgHigh = renderSparkline(highHist, 'u5h', W, 'hours');
+    // Sanity: both render an svg.
+    assert.match(svgLow,  /<svg /);
+    assert.match(svgHigh, /<svg /);
+    // Both must carry the title= overlay even with simple data.
+    assert.match(svgLow,  /<title>Min 10% \/ Max 10% over the window<\/title>/);
+    assert.match(svgHigh, /<title>Min 95% \/ Max 95% over the window<\/title>/);
+    // Most important: the two SVGs MUST differ. The binary version
+    // produced identical area paths for any pts with `> 0` values.
+    assert.notEqual(svgLow, svgHigh,
+      'low (10%) and high (95%) sparklines produced identical SVGs — proportional Y-scale is not being applied');
+    // Behavioural extraction of the area-path top Y from each SVG.
+    // The proportional formula is yFor(val) = padT + chartH * (1 - val / yMax)
+    // with padT=1, chartH=31, yMax=1.0 (since both peaks are <1.0).
+    // → yFor(0.10) ≈ 28.9 ; yFor(0.95) ≈ 2.6
+    // The path strings should contain these distinct Y coords.
+    assert.match(svgLow,  /,28\.[0-9]/, 'low-utilization path should contain a Y near 28.9');
+    assert.match(svgHigh, /,2\.[0-9]/,  'high-utilization path should contain a Y near 2.6');
+  });
+
+  it('UX-X7 — proportional path emits a 0% label even when no data is in the window', () => {
+    // Source-grep already covers titleTxt='No data in window' but the
+    // overlay-label "0%" baseline marker should ALSO render so the
+    // empty chart is still self-explanatory (UX-X7 spec line: "axes /
+    // labels — pure decoration"; an empty chart must still tell the
+    // reader what scale they're looking at).
+    const m = _src_uxd.match(
+      /function renderSparkline\(hist, key, windowMs, mode\) \{[\s\S]*?\n\}/);
+    // eslint-disable-next-line no-new-func
+    const renderSparkline = (new Function('return ' + m[0]))();
+    const svg = renderSparkline([], 'u5h', 24 * 60 * 60 * 1000, 'hours');
+    assert.match(svg, /<title>No data in window<\/title>/);
+    assert.match(svg, />0%<\/text>/);
+    // No-data path uses the '--' placeholder for the peak label.
+    assert.match(svg, />--<\/text>/);
+  });
+
+  it('UX-VS2 — .vs-thumb is at least 24px (we ship 28px) on BOTH width AND height', () => {
+    // Source-grep the actual CSS rule. The 28px values must appear in
+    // the SAME .vs-thumb block for both dimensions so a future shrink
+    // of one dimension can't pass this test by lucky alignment.
+    const block = _src_uxd.match(/\.vs-thumb \{[\s\S]{0,400}\}/);
+    assert.ok(block, '.vs-thumb CSS rule not found');
+    // Width and height extraction.
+    const wMatch = block[0].match(/width:\s*(\d+)px/);
+    const hMatch = block[0].match(/height:\s*(\d+)px/);
+    assert.ok(wMatch && hMatch, 'width/height not present inside .vs-thumb');
+    const w = Number(wMatch[1]), h = Number(hMatch[1]);
+    assert.ok(w >= 24, '.vs-thumb width should be ≥ 24px (got ' + w + ')');
+    assert.ok(h >= 24, '.vs-thumb height should be ≥ 24px (got ' + h + ')');
+  });
+
+  it('UX-VS2 — margin-left of .vs-thumb is half the (negative) width so the thumb stays centred', () => {
+    // Defensive: if a future dev bumps width to 32 but forgets margin
+    // -16, the thumb would offset and look broken on resize. Tie the
+    // two together via a regex that asserts the margin matches the
+    // width's expected half.
+    const block = _src_uxd.match(/\.vs-thumb \{[\s\S]{0,400}\}/);
+    const wMatch = block[0].match(/width:\s*(\d+)px/);
+    const mlMatch = block[0].match(/margin-left:\s*(-?\d+)px/);
+    assert.ok(wMatch && mlMatch, 'margin-left missing from .vs-thumb');
+    const w = Number(wMatch[1]);
+    const ml = Number(mlMatch[1]);
+    assert.equal(ml, -Math.floor(w / 2),
+      'margin-left should be -' + Math.floor(w / 2) + 'px to keep the ' + w + 'px thumb centred');
+  });
+
+  it('UX-VS2 — input[type=range]::-webkit-slider-thumb sized at >=24px', () => {
+    // A native <input type="range"> renders an OS-default 16px thumb
+    // unless we override it. Defensive sizing covers the case where
+    // a future feature uses a real range slider instead of the custom
+    // .vs-thumb div.
+    const block = _src_uxd.match(/input\[type="range"\]::-webkit-slider-thumb \{[\s\S]{0,400}\}/);
+    assert.ok(block, '::-webkit-slider-thumb CSS not found');
+    const wMatch = block[0].match(/width:\s*(\d+)px/);
+    const hMatch = block[0].match(/height:\s*(\d+)px/);
+    assert.ok(wMatch && hMatch, 'width/height not present inside ::-webkit-slider-thumb');
+    assert.ok(Number(wMatch[1]) >= 24, '::-webkit-slider-thumb width should be ≥ 24px');
+    assert.ok(Number(hMatch[1]) >= 24, '::-webkit-slider-thumb height should be ≥ 24px');
+  });
+
+  it('UX-VS2 — input[type=range]::-moz-range-thumb sized at >=24px (Firefox parity)', () => {
+    // The Firefox prefix is the one most likely to be forgotten when
+    // a dev tweaks webkit-thumb. Make the source grep enforce both.
+    const block = _src_uxd.match(/input\[type="range"\]::-moz-range-thumb \{[\s\S]{0,400}\}/);
+    assert.ok(block, '::-moz-range-thumb CSS not found');
+    const wMatch = block[0].match(/width:\s*(\d+)px/);
+    const hMatch = block[0].match(/height:\s*(\d+)px/);
+    assert.ok(wMatch && hMatch, 'width/height not present inside ::-moz-range-thumb');
+    assert.ok(Number(wMatch[1]) >= 24, '::-moz-range-thumb width should be ≥ 24px');
+    assert.ok(Number(hMatch[1]) >= 24, '::-moz-range-thumb height should be ≥ 24px');
+  });
+
+  it('UX-VS2 — .vs-track-wrap height bumped to fit the larger thumb + focus ring', () => {
+    // Without the wrapper-height bump, the focus-ring (3px halo on
+    // .vs-thumb:focus) clips at the wrapper edge. The bump must match
+    // or exceed thumb-diameter + 2*focus-ring-width.
+    const block = _src_uxd.match(/\.vs-track-wrap \{[\s\S]{0,500}\}/);
+    assert.ok(block, '.vs-track-wrap CSS not found');
+    const hMatch = block[0].match(/height:\s*(\d+)px/);
+    assert.ok(hMatch, 'height missing from .vs-track-wrap');
+    assert.ok(Number(hMatch[1]) >= 36 + 6,
+      '.vs-track-wrap height should be ≥ 42px to fit a 28px thumb + 6px of focus-ring halo (got ' + hMatch[1] + ')');
+  });
+});
+
 
