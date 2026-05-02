@@ -4010,8 +4010,17 @@ function renderHTML() {
   .session-header b { color: var(--foreground); font-weight: 600; }
   .session-header-left { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .session-header-right { flex-shrink: 0; white-space: nowrap; display: flex; align-items: center; gap: 0.5rem; margin-left: 0.5rem; }
-  .session-collapse-indicator { font-size: 0.625rem; color: var(--muted); transition: transform 0.15s; }
+  .session-collapse-indicator {
+    font-size: 0.625rem;
+    color: var(--muted);
+    transition: transform 0.15s, color 0.15s;
+  }
   .session-card.collapsed .session-collapse-indicator { transform: rotate(-90deg); }
+  /* UX-S2: surface hover/focus on the chevron so the affordance is
+     obviously interactive — was previously invisible because the parent
+     header set cursor:pointer but the indicator itself never reacted. */
+  .session-header:hover .session-collapse-indicator,
+  .session-header:focus-visible .session-collapse-indicator { color: var(--foreground); }
   .session-card.collapsed .session-timeline,
   .session-card.collapsed .session-meta,
   .session-card.collapsed .session-copy-btn { display: none; }
@@ -4525,12 +4534,17 @@ function renderHTML() {
   .tok-repo-chevron {
     font-size: 0.625rem;
     color: var(--muted);
-    transition: transform 0.15s;
+    transition: transform 0.15s, color 0.15s;
     flex-shrink: 0;
     width: 1rem;
     text-align: center;
   }
   .tok-repo-chevron.collapsed { transform: rotate(-90deg); }
+  /* UX-S2: chevron picks up colour on header hover/focus to advertise the
+     toggle. The header's opacity:0.8 on hover dimmed the chevron AWAY
+     from interactivity instead of toward it. */
+  .tok-repo-header:hover .tok-repo-chevron,
+  .tok-repo-header:focus-visible .tok-repo-chevron { color: var(--foreground); }
   .tok-repo-name { font-weight: 600; }
   .tok-repo-inactive { opacity: 0.5; }
   .tok-branch-inactive { opacity: 0.6; }
@@ -5335,7 +5349,7 @@ function renderHTML() {
               <button type="button" class="cpf-link" onclick="projectFilterSelectAll(true)">Select all</button>
               <button type="button" class="cpf-link" onclick="projectFilterSelectAll(false)">Clear</button>
             </div>
-            <div class="cpf-list" id="cpf-list"></div>
+            <div class="cpf-list" id="cpf-list" role="listbox" aria-multiselectable="true" aria-label="Filter charts by project"></div>
           </div>
         </div>
         <div class="chart-carousel-inner">
@@ -8035,6 +8049,55 @@ function _wireRovingArrowKeys(containerSel, itemSel) {
 _wireRovingArrowKeys('.tabs',                '.tab');
 _wireRovingArrowKeys('#chart-carousel-dots', '.chart-carousel-dot');
 
+// UX-CPF3: vertical-axis arrow nav for the project-filter listbox. Unlike
+// _wireRovingArrowKeys (which fires .click() to follow the WAI-ARIA
+// tablist pattern), a listbox option is selected with Space — moving focus
+// alone is correct. The container persists across rerenders so a single
+// listener is enough; items are queried at keydown time. :disabled
+// checkboxes are skipped (single-select-active mode disables every box).
+function _wireListboxArrowKeys(containerSel, itemSel) {
+  var container = document.querySelector(containerSel);
+  if (!container) return;
+  container.addEventListener('keydown', function(ev) {
+    var items = container.querySelectorAll(itemSel);
+    if (!items.length) return;
+    var i = Array.from(items).indexOf(document.activeElement);
+    if (i < 0) {
+      // Focus is in the listbox container but not on any item — Down/End
+      // jump to the first/last item, the rest are no-ops.
+      if (ev.key === 'ArrowDown' || ev.key === 'Home') { items[0].focus(); ev.preventDefault(); }
+      else if (ev.key === 'End')                       { items[items.length - 1].focus(); ev.preventDefault(); }
+      return;
+    }
+    if      (ev.key === 'ArrowUp')   i = (i - 1 + items.length) % items.length;
+    else if (ev.key === 'ArrowDown') i = (i + 1) % items.length;
+    else if (ev.key === 'Home')      i = 0;
+    else if (ev.key === 'End')       i = items.length - 1;
+    else return;
+    items[i].focus();
+    ev.preventDefault();
+  });
+}
+_wireListboxArrowKeys('#cpf-list', 'input[type="checkbox"]:not(:disabled)');
+
+// A11y batch 2 (UX-X3): native <button> elements get Enter/Space-to-click
+// from the browser, but role="button" divs (tok-repo-header, session-header,
+// etc.) do NOT — keyboard-only users can focus them via tabindex but pressing
+// Enter or Space does nothing without this delegation. Single capture-phase
+// listener covers every role=button[tabindex] element on the page.
+document.addEventListener('keydown', function(ev) {
+  if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  var t = ev.target;
+  if (!t || t.getAttribute('role') !== 'button') return;
+  // Skip native <button> (browser handles it natively) and skip elements
+  // that didn't opt in via tabindex (no tabindex = not keyboard-reachable,
+  // so the keydown is incidental — let it through).
+  if (t.tagName === 'BUTTON') return;
+  if (t.getAttribute('tabindex') === null) return;
+  ev.preventDefault();
+  t.click();
+});
+
 // UX audit (UX-CPF2): Esc closes the project-filter panel. The
 // click-away handler already covers outside-click; Esc is the
 // keyboard counterpart that screen-reader / keyboard-only users
@@ -8202,7 +8265,13 @@ function populateProjectFilterOptions() {
     // which auto-decodes the entities, so the round-trip preserves
     // the original name.
     var safe = escHtml(name);
-    html += '<label class="cpf-item' + labelExtraClass + '"' + labelExtraAria + '>'
+    // UX-CPF3: each item is a listbox option. aria-selected mirrors the
+    // checkbox state and is updated on toggle (see toggleProjectInFilter
+    // and projectFilterSelectAll). The native <input> still owns Tab/Space
+    // for activation; arrow-key nav between items is wired by
+    // _wireListboxArrowKeys against the inner inputs.
+    var ariaSel = checked ? ' aria-selected="true"' : ' aria-selected="false"';
+    html += '<label class="cpf-item' + labelExtraClass + '" role="option"' + ariaSel + labelExtraAria + '>'
       + '<input type="checkbox" data-repo="' + safe + '"' + checked + disableAttr
       + ' onchange="toggleProjectInFilter(this)">'
       + '<span class="cpf-item-label" title="' + safe + '">' + safe + '</span>'
@@ -8216,12 +8285,20 @@ function toggleProjectInFilter(cb) {
   if (!name) return;
   if (cb.checked) _chartProjectFilter.add(name);
   else _chartProjectFilter.delete(name);
+  // UX-CPF3: keep aria-selected on the wrapping label in lockstep with
+  // the checkbox so screen readers announce "selected" / "not selected"
+  // immediately after the user presses Space.
+  var lbl = cb.closest('.cpf-item');
+  if (lbl) lbl.setAttribute('aria-selected', cb.checked ? 'true' : 'false');
   _persistChartProjectFilter();
   _refreshProjectFilterLabel();
   applyTokenModelFilter();   // re-runs all chart renderers
 }
 
 function projectFilterSelectAll(selectAll) {
+  // UX-CPF3: bulk toggles must keep aria-selected on each label in
+  // lockstep with the checkbox so a screen reader sees the right state
+  // after Select-all / Clear, not the pre-bulk state.
   if (selectAll) {
     // "Select all" is semantically equivalent to "Clear" for this
     // filter (empty set = aggregate all). But the user may want to
@@ -8234,6 +8311,8 @@ function projectFilterSelectAll(selectAll) {
         var n = boxes[i].getAttribute('data-repo');
         if (n) _chartProjectFilter.add(n);
         boxes[i].checked = true;
+        var lbl = boxes[i].closest('.cpf-item');
+        if (lbl) lbl.setAttribute('aria-selected', 'true');
       }
     }
   } else {
@@ -8241,7 +8320,11 @@ function projectFilterSelectAll(selectAll) {
     var listEl2 = document.getElementById('cpf-list');
     if (listEl2) {
       var boxes2 = listEl2.querySelectorAll('input[type="checkbox"]');
-      for (var j = 0; j < boxes2.length; j++) boxes2[j].checked = false;
+      for (var j = 0; j < boxes2.length; j++) {
+        boxes2[j].checked = false;
+        var lbl2 = boxes2[j].closest('.cpf-item');
+        if (lbl2) lbl2.setAttribute('aria-selected', 'false');
+      }
     }
   }
   _persistChartProjectFilter();
@@ -8607,7 +8690,12 @@ function renderRepoBranchBreakdown(data) {
     var cls = 'tok-repo-group' + (isInactive ? ' tok-repo-inactive' : '');
     var chevCls = 'tok-repo-chevron' + (collapsed ? ' collapsed' : '');
     var h = '<div class="' + cls + '">';
-    h += '<div class="tok-repo-header" onclick="toggleRepoCollapse(this.dataset.key)" data-key="' + escHtml(repo.key) + '">';
+    // UX-X3: role=button + tabindex makes this a keyboard-accessible
+    // control. The global Enter/Space keydown delegate (search for
+    // "A11y batch 2") synthesises a click on key activation.
+    // aria-expanded reflects the open/collapsed state so screen readers
+    // announce "expanded" / "collapsed" as the user toggles.
+    h += '<div class="tok-repo-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleRepoCollapse(this.dataset.key)" data-key="' + escHtml(repo.key) + '">';
     h += '<span class="' + chevCls + '">\u25BC</span>';
     h += '<span class="tok-repo-name">' + escHtml(repo.name) + '</span>';
     h += '<span class="tok-model-detail" style="flex:1">' + formatNum(repo.totalIn) + ' in / ' + formatNum(repo.totalOut) + ' out</span>';
@@ -9079,7 +9167,7 @@ function renderSessions(data) {
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
       html += '<div class="session-card ' + state + collapsed + '" data-sid="' + s.id + '">';
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
-      html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
+      html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
       html += '<span class="session-header-right"><span>' + dur + '</span>';
@@ -9125,7 +9213,7 @@ function renderSessions(data) {
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
       html += '<div class="session-card completed' + collapsed + '" data-sid="' + s.id + '">';
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
-      html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
+      html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
       html += '<span class="session-header-right"><span>' + dur + ' \\u00b7 ~$' + cost + '</span></span>';

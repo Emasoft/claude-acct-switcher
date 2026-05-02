@@ -8642,17 +8642,124 @@ describe('Phase 6 — full-suite + dependency invariants', () => {
 
   it('no backticks lurk in JS comments inside renderHTML template literal', () => {
     // CLAUDE.md flags this as the load-bearing trap that breaks the
-    // single-template-literal returned by renderHTML(). The grep
-    // covers lines 3479..8290 (the documented template range).
+    // single-template-literal returned by renderHTML(). Resolve the
+    // template range from the source dynamically — the explicit numeric
+    // window in earlier revisions silently shrank as renderHTML grew,
+    // letting traps slip through past the old upper bound. We anchor
+    // on the function header and the closing "</html>`;" sentinel.
     const lines = _src_t6ac2.split('\n');
+    const startIdx = lines.findIndex((l) => l.startsWith('function renderHTML()'));
+    assert.ok(startIdx >= 0, 'could not locate renderHTML start');
+    let endIdx = -1;
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      if (/<\/html>`;\s*$/.test(lines[i])) { endIdx = i; break; }
+    }
+    assert.ok(endIdx > startIdx, 'could not locate renderHTML template close');
     const traps = [];
-    for (let i = 3478; i < Math.min(8290, lines.length); i++) {
+    for (let i = startIdx; i <= endIdx; i++) {
       // Match "// ... ` ..." patterns (a JS line-comment containing a backtick)
       if (/\/\/[^`]*`/.test(lines[i])) traps.push((i + 1) + ': ' + lines[i].trim());
     }
     assert.equal(traps.length, 0,
       'backticks in JS comments inside renderHTML template will silently break parsing.\n  '
       + traps.join('\n  '));
+  });
+});
+
+// ─────────────────────────────────────────────────
+// A11y batch 2 — UX-X3 / UX-CPF3 / UX-S2 source-grep regressions
+//
+// These tests guard the keyboard-accessibility attributes on three
+// `onclick`-bearing controls that were not real buttons before this
+// batch (tok-repo-header, session-header, cpf-list listbox). A future
+// refactor that drops role/tabindex/aria-* will fail these greps before
+// it lands in the browser, where the regression would be invisible to
+// sighted-mouse users but would silently lock out keyboard-only and
+// screen-reader users.
+// ─────────────────────────────────────────────────
+describe('A11y batch 2 — UX-X3 / UX-CPF3 / UX-S2 source-grep regressions', () => {
+  const _src_a11y2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('UX-X3 — tok-repo-header div carries role=button + tabindex + aria-expanded', () => {
+    // The repo header used to be just `<div onclick=...>` — keyboard
+    // users couldn't open or close repo branch breakdowns at all.
+    assert.match(_src_a11y2,
+      /<div class="tok-repo-header" role="button" tabindex="0" aria-expanded="' \+ \(collapsed \? 'false' : 'true'\) \+ '"/);
+  });
+
+  it('UX-X3 — session-header divs (active + recent) carry role=button + tabindex + aria-expanded', () => {
+    // Two emit-sites (one for active sessions, one for recent), both
+    // use the same template string. We expect AT LEAST 2 occurrences.
+    const matches = _src_a11y2.match(
+      /<div class="session-header" role="button" tabindex="0" aria-expanded="' \+ \(collapsed \? 'false' : 'true'\) \+ '"/g
+    ) || [];
+    assert.ok(matches.length >= 2,
+      'expected at least 2 session-header role=button emit-sites, found ' + matches.length);
+  });
+
+  it('UX-X3 — global keydown delegate fires Enter/Space on role=button[tabindex] divs', () => {
+    // Without this delegate, role=button divs are tab-focusable but
+    // pressing Enter or Space does nothing — the lonely worst kind of
+    // a11y because the focus ring lies about interactivity.
+    assert.match(_src_a11y2, /if \(ev\.key !== 'Enter' && ev\.key !== ' '\) return;/);
+    assert.match(_src_a11y2, /if \(t\.tagName === 'BUTTON'\) return;/);
+    assert.match(_src_a11y2, /if \(t\.getAttribute\('tabindex'\) === null\) return;/);
+  });
+
+  it('UX-CPF3 — cpf-list container carries role=listbox + aria-multiselectable', () => {
+    assert.match(_src_a11y2,
+      /<div class="cpf-list" id="cpf-list" role="listbox" aria-multiselectable="true" aria-label="[^"]+"><\/div>/);
+  });
+
+  it('UX-CPF3 — each cpf-item label carries role=option + aria-selected mirroring checkbox', () => {
+    // The label is the option (not the inner checkbox) so its
+    // aria-selected reflects the chosen state. The mirror update lives
+    // in toggleProjectInFilter and projectFilterSelectAll.
+    assert.match(_src_a11y2,
+      /<label class="cpf-item' \+ labelExtraClass \+ '" role="option"' \+ ariaSel/);
+    assert.match(_src_a11y2,
+      /lbl\.setAttribute\('aria-selected', cb\.checked \? 'true' : 'false'\)/);
+  });
+
+  it('UX-CPF3 — _wireListboxArrowKeys exists and is wired against #cpf-list', () => {
+    assert.match(_src_a11y2, /function _wireListboxArrowKeys\(containerSel, itemSel\)/);
+    assert.match(_src_a11y2,
+      /_wireListboxArrowKeys\('#cpf-list', 'input\[type="checkbox"\]:not\(:disabled\)'\);/);
+  });
+
+  it('UX-CPF3 — projectFilterSelectAll mirrors aria-selected on bulk toggles', () => {
+    // Without this, after Select-all / Clear the checkboxes flip but
+    // aria-selected on the wrapping labels stays at its old value — a
+    // screen reader walking the list would announce the wrong state.
+    const fn = _src_a11y2.slice(
+      _src_a11y2.indexOf('function projectFilterSelectAll'),
+      _src_a11y2.indexOf('function projectFilterSelectAll') + 1500,
+    );
+    assert.match(fn, /lbl\.setAttribute\('aria-selected', 'true'\)/);
+    assert.match(fn, /lbl2\.setAttribute\('aria-selected', 'false'\)/);
+  });
+
+  it('UX-S2 — chevron CSS picks up colour on header hover/focus', () => {
+    // The header set cursor:pointer but the chevron itself never
+    // reacted, so the affordance was invisible. Both tok-repo and
+    // session variants get the same treatment.
+    assert.match(_src_a11y2,
+      /\.tok-repo-header:hover \.tok-repo-chevron,\s*\.tok-repo-header:focus-visible \.tok-repo-chevron \{ color: var\(--foreground\); \}/);
+    assert.match(_src_a11y2,
+      /\.session-header:hover \.session-collapse-indicator,\s*\.session-header:focus-visible \.session-collapse-indicator \{ color: var\(--foreground\); \}/);
+  });
+
+  it('UX-S2 — chevron transition includes colour (so the hover change is animated)', () => {
+    // Both chevrons used `transition: transform 0.15s` only — flipping
+    // colour without listing it in `transition` makes the change snap
+    // instead of fading, which feels unintentionally jarring.
+    assert.match(_src_a11y2,
+      /\.tok-repo-chevron \{[\s\S]{0,200}transition: transform 0\.15s, color 0\.15s;/);
+    assert.match(_src_a11y2,
+      /\.session-collapse-indicator \{[\s\S]{0,200}transition: transform 0\.15s, color 0\.15s;/);
   });
 });
 

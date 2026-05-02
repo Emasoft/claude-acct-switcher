@@ -4,7 +4,7 @@
 **Filename:** `design/tasks/TRDD-2b0eed81-7035-4829-b88e-b3c800df5df0-ux-audit-followups.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** Not started
+**Status:** In progress (batch 2 of 6 done)
 **Created:** 2026-05-02
 **Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (95 findings, Opus)
 **Owner:** unassigned
@@ -27,6 +27,13 @@ Round 3 of the dashboard.mjs audit was a UX usability audit. Opus flagged 95 fin
 - `.remove-btn` tinted with `var(--red)` border+text at rest so the destructive action is visually distinct (audit-adjacent — was hex `#dc2626` only on hover).
 
 The other 80 findings are catalogued below for follow-up. None are merge-blockers; many are quality-of-life or polish.
+
+## Applied in **A11y batch 2** (3 findings + 1 test-tooling fix)
+
+- **UX-X3** — `tok-repo-header` and `session-header` `<div>`s converted to `role="button" tabindex="0" aria-expanded="…"` controls. A single capture-phase keydown delegate fires Enter/Space → click on every `role="button"[tabindex]` element so keyboard-only users can finally toggle repo and session collapse states.
+- **UX-CPF3** — Project filter checklist becomes a real WAI-ARIA listbox: `<div id="cpf-list" role="listbox" aria-multiselectable="true">`, each `<label class="cpf-item" role="option" aria-selected="…">`, mirror-state on toggle and bulk-select. New `_wireListboxArrowKeys` helper does Up/Down/Home/End nav over the items (Tab + Space still work natively for activation).
+- **UX-S2** — Session card and repo chevrons now pick up `color: var(--foreground)` on header hover/focus and animate the colour change alongside the existing rotation transition. The cursor:pointer hint on the parent header was previously the only signal.
+- **Test infra fix** — The "no backticks in JS comments inside renderHTML template literal" regression test was using a hard-coded line range (3479–8290) that no longer covered the full template (which now spans 3528–9292). Replaced with dynamic anchoring on `function renderHTML()` and the closing `</html>\`;` sentinel so the trap detector can't silently shrink again.
 
 ## Deferred MAJOR findings (51)
 
@@ -54,7 +61,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 
 ### Usage tab — project filter
 - **UX-CPF1** — Multi-select dropdown overlaps carousel controls.
-- **UX-CPF3** — Multi-select panel checkboxes lack `role="listbox"` + arrow-key nav.
+- ~~UX-CPF3~~ — *(addressed by listbox semantics + arrow-key nav, A11y batch 2)*
 
 ### Usage tab — wasted-spend
 - **UX-WS2** — Bars use fixed yellow regardless of severity (no gradient by spend level).
@@ -74,7 +81,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - **UX-VS3** — Fallback `<input type="datetime-local">` only shown at <600px.
 
 ### Sessions tab
-- **UX-S2** — Session-card collapse arrow doesn't visually indicate state on hover.
+- ~~UX-S2~~ — *(addressed by chevron hover/focus colour transition, A11y batch 2)*
 - **UX-S3** — Copy button uses 📋 emoji that won't render on all platforms.
 - **UX-S4** — Session timeline `max-height: 500px` clips long sessions silently.
 
@@ -89,7 +96,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - **UX-L2** — Logs tab has no filter or search.
 
 ### Cross-cutting
-- **UX-X3** — Several `<div>` elements use `onclick` without role/tabindex (a11y).
+- ~~UX-X3~~ — *(addressed by role=button + global Enter/Space keydown delegate on tok-repo-header and session-header, A11y batch 2)*
 - **UX-X7** — Sparklines have no axes / labels — pure decoration.
 - **UX-X8** — Multiple data formats for time across the UI.
 - **UX-X9** — `formatNum(1234567)` returns `1.2M` — truncates 234K silently. Add `title=` with exact value.
@@ -101,7 +108,7 @@ See the original report for the full list. Prioritisation rule: pick up MAJORs f
 
 ## Suggested batching (when work resumes)
 
-1. **A11y batch 2** (UX-X3 + UX-CPF3 + UX-S2): clickable divs → role="button"+tabindex+keydown, multi-select listbox semantics, session-card chevron rotation.
+1. ~~**A11y batch 2**~~ ✅ done — see "Applied in A11y batch 2" above.
 2. **Visual hierarchy batch** (UX-A2/A3/A4 + UX-CO2 + UX-AC2): account-card layout polish, BETA badge consolidation, activity dot icon redesign.
 3. **Time formatting batch** (UX-X8 + UX-X9): single `fmtDuration()` + `fmtTokenCount()` utility used everywhere.
 4. **Empty + error state pass** (UX-AC3 + UX-A5 + UX-BR3 + UX-S1): every empty state suggests a next action.
@@ -110,7 +117,7 @@ See the original report for the full list. Prioritisation rule: pick up MAJORs f
 
 ## What to do next session
 
-Start with **A11y batch 2** — UX-X3 (clickable divs) is the largest remaining a11y gap. The others can land in parallel branches if multiple contributors pick them up.
+Pick any of batches 2–6 above. **Visual hierarchy batch** is the highest-impact remaining batch — it fixes the most-visible "this looks rough" complaints (account-card noise, BETA badge spam, undifferentiated activity feed). The others can land in parallel branches if multiple contributors pick them up.
 
 ## Acceptance criteria (per batch)
 
