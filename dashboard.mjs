@@ -3634,7 +3634,8 @@ function renderHTML() {
     border-radius: 9px;
     cursor: pointer;
     transition: background 0.2s;
-    outline: none;
+    /* UX audit: keyboard focus relies on the global *:focus-visible
+       rule above (was outline:none with no replacement). */
     border: none;
   }
   .sw::before {
@@ -3754,12 +3755,16 @@ function renderHTML() {
     padding: 0.25rem;
     box-shadow: var(--shadow);
   }
+  /* UX audit (UX-X4/UX-X5/global a11y): a11y + contrast for tabs.
+     Inactive tabs use --foreground at 65% via hsl() for AA contrast on
+     --card; keyboard-only users get a clear focus ring via the global
+     :focus-visible rule below. */
   .tab {
     flex: 1;
     padding: 0.5rem 0;
     font-size: 0.9375rem;
     font-weight: 500;
-    color: var(--muted);
+    color: hsl(220 9% 35%);
     cursor: pointer;
     border: none;
     border-radius: 8px;
@@ -3768,6 +3773,18 @@ function renderHTML() {
     font-family: inherit;
   }
   .tab:hover { color: var(--foreground); }
+  /* Global a11y: visible focus ring on every keyboard-focused
+     interactive element. Audit found .tab / .sw / .cpf-toggle /
+     .chart-carousel-dot / .tok-export-btn / button etc. all stripped
+     focus rings via outline:none with no replacement. */
+  *:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+  /* Strip the default UA outline for mouse focus only (focus-visible
+     keeps it for keyboard). */
+  *:focus:not(:focus-visible) { outline: none; }
   .tab.active {
     background: var(--primary);
     color: #fff;
@@ -3935,10 +3952,14 @@ function renderHTML() {
     transition: all 0.2s;
     font-family: inherit;
   }
+  /* UX audit: route through the design tokens instead of raw hex.
+     Also bump the resting border to var(--red) at 30% opacity so the
+     destructive action is visually distinguished even before hover. */
+  .remove-btn { border-color: hsl(0 84% 60% / 0.3); color: var(--red); }
   .remove-btn:hover {
-    background: #dc2626;
+    background: var(--red);
     color: #fff;
-    border-color: #dc2626;
+    border-color: var(--red);
   }
 
   .refresh-btn {
@@ -4259,11 +4280,14 @@ function renderHTML() {
   }
 
   /* ── Toast ── */
+  /* UX audit (UX-X2): top-right placement avoids collision with iOS
+     Safari URL bar, mobile keyboards, the bottom Logs container, and
+     the sticky scrubber. Slides in from the right, NOT bottom-centre. */
   .toast {
     position: fixed;
-    bottom: 1.5rem;
-    left: 50%;
-    transform: translateX(-50%) translateY(80px);
+    top: 1.5rem;
+    right: 1.5rem;
+    transform: translateX(120%);
     background: var(--foreground);
     color: #fff;
     padding: 0.625rem 1.25rem;
@@ -4273,9 +4297,13 @@ function renderHTML() {
     opacity: 0;
     transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
     z-index: 100;
+    max-width: min(420px, calc(100vw - 3rem));
     box-shadow: 0 8px 20px rgba(0,0,0,0.15);
   }
-  .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+  .toast.show { transform: translateX(0); opacity: 1; }
+  @media (max-width: 480px) {
+    .toast { top: 1rem; right: 1rem; left: 1rem; max-width: calc(100vw - 2rem); }
+  }
 
   .empty-state {
     text-align: center;
@@ -5147,6 +5175,27 @@ function renderHTML() {
     .vs-track-wrap { display: none; }
     .vs-fallback-inputs { display: flex; }
   }
+  /* UX audit (UX-X1, CRITICAL): proper responsive breakpoints. The
+     dashboard previously had only the 600px scrubber-swap query, so
+     phone / split-screen users got a broken UI. */
+  @media (max-width: 720px) {
+    body { padding: 1rem 0.75rem; }
+    .container { max-width: 100%; }
+    .tabs { overflow-x: auto; flex-wrap: nowrap; }
+    .tab { white-space: nowrap; flex: 0 0 auto; padding: 0.5rem 0.75rem; }
+    .tok-filters { flex-direction: column; align-items: stretch; }
+    .tok-filters .config-select,
+    .tok-filters .tok-export-btn { width: 100%; }
+    .rate-bars { grid-template-columns: 1fr; gap: 1rem; }
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+    #tok-stats.stat-grid { grid-template-columns: repeat(2, 1fr); }
+    .header { flex-direction: column; gap: 1rem; align-items: stretch; }
+  }
+  @media (max-width: 480px) {
+    .stat-grid,
+    #tok-stats.stat-grid { grid-template-columns: 1fr; }
+    body { padding: 0.5rem; }
+  }
   /* Tier chips */
   .vs-tier-chips {
     display: flex;
@@ -5296,10 +5345,12 @@ function renderHTML() {
             <div class="chart-carousel-slide" id="tok-wasted-chart"></div>
           </div>
         </div>
+        <!-- UX audit (UX-CA2): aria-label per dot so keyboard /
+             screen-reader users know which slide each dot opens. -->
         <div class="chart-carousel-dots" id="chart-carousel-dots">
-          <button class="chart-carousel-dot active" onclick="chartCarouselGo(0)"></button>
-          <button class="chart-carousel-dot" onclick="chartCarouselGo(1)"></button>
-          <button class="chart-carousel-dot" onclick="chartCarouselGo(2)"></button>
+          <button class="chart-carousel-dot active" onclick="chartCarouselGo(0)" aria-label="Slide 1: Cost Savings"></button>
+          <button class="chart-carousel-dot" onclick="chartCarouselGo(1)" aria-label="Slide 2: Daily Token Usage"></button>
+          <button class="chart-carousel-dot" onclick="chartCarouselGo(2)" aria-label="Slide 3: Wasted Spend"></button>
         </div>
       </div>
       <div id="tok-stats" class="stat-grid" style="margin-bottom:0.5rem"></div>
@@ -5504,7 +5555,9 @@ function renderHTML() {
 
 </div>
 
-<div id="toast" class="toast"></div>
+<!-- UX audit: role=status + aria-live=polite makes screen readers
+     announce errors/confirmations. -->
+<div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script>
 function switchTab(id) {
@@ -6072,7 +6125,15 @@ function showToast(msg, opts) {
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '×';
   closeBtn.setAttribute('aria-label', 'Dismiss notification');
-  closeBtn.style.cssText = 'background:none;border:none;color:inherit;font-size:1.25rem;line-height:1;margin-left:0.75rem;cursor:pointer;padding:0 0.25rem;opacity:0.7';
+  // UX audit (UX-X6): bigger hit-target + visible hover/focus states
+  // so the button is reachable by touch + screen readers.
+  closeBtn.style.cssText = 'background:none;border:none;color:inherit;font-size:1.5rem;line-height:1;margin-left:0.75rem;cursor:pointer;padding:0.25rem 0.5rem;border-radius:4px;opacity:0.7;transition:opacity 0.15s,background 0.15s';
+  const _hover = () => { closeBtn.style.opacity = '1'; closeBtn.style.background = 'rgba(255,255,255,0.1)'; };
+  const _unhover = () => { closeBtn.style.opacity = '0.7'; closeBtn.style.background = ''; };
+  closeBtn.onmouseover = _hover;
+  closeBtn.onmouseout = _unhover;
+  closeBtn.onfocus = _hover;
+  closeBtn.onblur = _unhover;
   closeBtn.onclick = () => {
     t.classList.remove('show');
     clearTimeout(t._tid);
@@ -6668,7 +6729,7 @@ function renderAccounts(profiles, animate) {
     if (!active) {
       buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
         '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
-        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)">Switch to this account</button>') +
+        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)" title="Switch to this account">Switch</button>') +
       '</div>';
     }
     var safeId = 'acct-card-' + _safeIdForName(p.name);
@@ -7515,11 +7576,20 @@ function renderCacheMisses(misses, missSessions) {
       var KNOWN_MISS_REASONS = { 'compact-boundary': 1, 'model-changed': 1, 'TTL-likely': 1, 'unknown': 1 };
       var reasonKey   = KNOWN_MISS_REASONS[reasonText] ? reasonText : 'unknown';
       var reasonClass = 'reason-' + reasonKey;
+      // UX audit (UX-CM2): tooltip explaining what each reason means
+      // for first-time users. Without it the badges are mystery jargon.
+      var REASON_TOOLTIPS = {
+        'compact-boundary': 'A /compact event invalidated the cache prefix — expected after a compact, not a problem.',
+        'model-changed':    'The previous cached prefix was on a different model. Caches are model-scoped; switching models forces a fresh build.',
+        'TTL-likely':       'Anthropic prompt-cache TTL is ~5 min. The gap since the last cache build exceeded that.',
+        'unknown':          'No clear cause — could be /clear, OAuth-rotation gap, or a real prefix change.'
+      };
+      var reasonTip = REASON_TOOLTIPS[reasonKey] || '';
       html += '<div class="miss-row">'
         + '<span class="miss-ts">' + escHtml(ts2) + '</span>'
         + '<span class="miss-model">' + escHtml(modelText) + '</span>'
         + '<span class="miss-tokens">' + formatNum(m2.inputTokens || 0) + ' input</span>'
-        + '<span class="miss-reason ' + reasonClass + '">' + escHtml(reasonText) + '</span>'
+        + '<span class="miss-reason ' + reasonClass + '" title="' + escHtml(reasonTip) + '">' + escHtml(reasonText) + '</span>'
         + '</div>';
     }
     if ((sess.missDetails || []).length > ROWS_PER_SESSION_CAP) {
@@ -7911,22 +7981,78 @@ function chartCarouselGo(idx) {
   clearInterval(_chartCarouselTimer);
   _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
 }
+// UX audit (UX-CA1, CRITICAL): pause auto-advance whenever the user
+// is reading or interacting with the carousel — hover, keyboard
+// focus, an open chart-bar tooltip, the project filter panel, or
+// a system-level reduced-motion preference. Without this the slide
+// rotates out from under the user mid-tooltip-read every 10s.
+function _carouselPaused() {
+  var carousel = document.querySelector('.chart-carousel');
+  if (!carousel) return false;
+  if (carousel.matches(':hover')) return true;
+  if (carousel.contains(document.activeElement)) return true;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return true;
+  var panel = document.getElementById('cpf-panel');
+  if (panel && !panel.hidden) return true;
+  if (carousel.querySelector('.tok-chart-seg:hover, .tok-wasted-bar:hover, .chart-bar:hover')) return true;
+  return false;
+}
 function chartCarouselNext() {
   var dots = document.getElementById('chart-carousel-dots');
   var count = dots ? dots.querySelectorAll('.chart-carousel-dot').length : 0;
   // Audit CC-DASH-004: guard against (a) zero dots (idx % 0 = NaN
   // would break the slide transform), (b) Tokens tab not active
-  // (silent DOM churn on every 10s tick), (c) project-filter panel
-  // open (SR-OP-006: rotating slides under an open panel is
-  // disorienting).
+  // (silent DOM churn on every 10s tick).
   if (count <= 0) return;
   var tab = document.getElementById('tab-usage');
   if (!tab || !tab.classList.contains('active')) return;
-  var panel = document.getElementById('cpf-panel');
-  if (panel && !panel.hidden) return;
+  if (_carouselPaused()) return;
   chartCarouselGo((_chartCarouselIdx + 1) % count);
 }
 _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
+
+// UX audit (UX-X4 + UX-CA3): WAI-ARIA Authoring Practices for tablist
+// requires Left/Right arrow keys to move between tabs and dots.
+// Without this, keyboard-only users have to Tab through every tab in
+// sequence (verbose) and Tab can't move between carousel dots at all.
+function _wireRovingArrowKeys(containerSel, itemSel) {
+  var container = document.querySelector(containerSel);
+  if (!container) return;
+  container.addEventListener('keydown', function(ev) {
+    var items = container.querySelectorAll(itemSel);
+    var i = Array.from(items).indexOf(document.activeElement);
+    if (i < 0) return;
+    if      (ev.key === 'ArrowLeft')  i = (i - 1 + items.length) % items.length;
+    else if (ev.key === 'ArrowRight') i = (i + 1) % items.length;
+    else if (ev.key === 'Home')       i = 0;
+    else if (ev.key === 'End')        i = items.length - 1;
+    else return;
+    items[i].focus();
+    items[i].click();
+    ev.preventDefault();
+  });
+}
+_wireRovingArrowKeys('.tabs',                '.tab');
+_wireRovingArrowKeys('#chart-carousel-dots', '.chart-carousel-dot');
+
+// UX audit (UX-CPF2): Esc closes the project-filter panel. The
+// click-away handler already covers outside-click; Esc is the
+// keyboard counterpart that screen-reader / keyboard-only users
+// expect from any popover.
+document.addEventListener('keydown', function(ev) {
+  if (ev.key !== 'Escape') return;
+  var panel = document.getElementById('cpf-panel');
+  var btn = document.getElementById('cpf-toggle');
+  if (panel && !panel.hidden) {
+    panel.hidden = true;
+    if (btn) {
+      btn.setAttribute('aria-expanded', 'false');
+      btn.focus();   // return focus to the trigger
+    }
+    document.removeEventListener('click', _closeProjectFilterOnOutside, true);
+    ev.preventDefault();
+  }
+});
 
 // ── Phase 6 — chart-scoped project multi-select dropdown ──
 
@@ -8184,7 +8310,7 @@ function renderWastedSpendChart() {
     filtered.push(p);
   }
   if (!filtered.length) {
-    el.innerHTML = '<div class="usage-title">Wasted spend (cache misses)</div>'
+    el.innerHTML = '<div class="usage-title">Wasted Spend (Cache Misses)</div>'
       + '<div style="color:var(--muted);font-size:0.8125rem;padding:2rem 0;text-align:center">No cache-miss spend in this time range. Higher cache hit rates = fewer bars.</div>';
     return;
   }
@@ -8235,7 +8361,7 @@ function renderWastedSpendChart() {
     + '<span class="total-cost">' + formatCost(totalWasted)
     + ' wasted</span>'
     + '</div>';
-  el.innerHTML = '<div class="usage-title" title="Wasted spend = full input cost minus what the same tokens would have cost at the cache-read rate (~10%). Plotted per day.">Wasted spend (cache misses)</div>'
+  el.innerHTML = '<div class="usage-title" title="Wasted spend = full input cost minus what the same tokens would have cost at the cache-read rate (~10%). Plotted per day.">Wasted Spend (Cache Misses)</div>'
     + '<div class="tok-wasted-wrap">' + totalsLine + bars + '</div>';
 }
 
