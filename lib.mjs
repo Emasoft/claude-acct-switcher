@@ -3391,3 +3391,136 @@ export function createUsageExtractor({ logger = null } = {}) {
 
   return extractor;
 }
+
+// ─────────────────────────────────────────────────
+// UX-X8 / UX-X9 — unified time + token-count formatters
+// ─────────────────────────────────────────────────
+// One canonical place to convert raw numbers into human-readable
+// strings, plus their unabbreviated counterparts for hover tooltips.
+// dashboard.mjs ships browser-side mirrors of these (fmtTokenCountShort
+// / fmtTokenCountExact / fmtDurationShort / fmtDurationExact) inside
+// renderHTML(), but the algorithm is defined HERE so a single fix
+// propagates to every site.
+//
+// Why dual-output {short, exact}:
+//   - UX-X9: formatNum(1234567) returned "1.2M" — silently truncating
+//     234,567 tokens. Power users couldn't tell "1.2M vs 1.2M" apart
+//     (could be 1.2M and 1.7M in raw counts). Returning BOTH the
+//     compact form AND the exact form lets the caller render the
+//     compact in the cell and the exact in title="..." for hover.
+//   - UX-X8: rotation interval said "15 min", scrubber said "Last hour",
+//     ETA said "1:30", session duration said "5m 23s" — five spellings
+//     for the same concept. fmtDuration emits ONE compact form ("5m
+//     12s" / "2h 30m" / "3d 5h") used everywhere a duration is shown.
+
+/**
+ * Compact + exact dual-output for token/integer counts.
+ *
+ *   fmtTokenCount(0)       → { short: '0',     exact: '0' }
+ *   fmtTokenCount(15500)   → { short: '15.5K', exact: '15,500' }
+ *   fmtTokenCount(1234567) → { short: '1.2M',  exact: '1,234,567' }
+ *   fmtTokenCount(2.5e9)   → { short: '2.5B',  exact: '2,500,000,000' }
+ *
+ * Defensive: null / undefined / NaN / negative / Infinity / non-numeric
+ * all fall back to {short:'0', exact:'0'} — token counts cannot be
+ * negative and the UI must never show NaN. Floating-point inputs are
+ * floored (token counts are integral).
+ *
+ * Pure: no DOM, no time-of-day, no global state.
+ */
+export function fmtTokenCount(n) {
+  // Defensive normalisation. Anything that isn't a finite, non-negative
+  // number collapses to 0 — this is the single chokepoint that prevents
+  // "NaN tokens" or "-1.7M tokens" from ever reaching the UI.
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+    return { short: '0', exact: '0' };
+  }
+  const v = Math.floor(n);
+  let short;
+  if (v >= 1e9) short = (v / 1e9).toFixed(1) + 'B';
+  else if (v >= 1e6) short = (v / 1e6).toFixed(1) + 'M';
+  else if (v >= 1e3) short = (v / 1e3).toFixed(1) + 'K';
+  else short = String(v);
+  // Exact form uses en-US grouping (1,234,567) — universally recognised
+  // even by non-en locales because the comma is conventional in
+  // monospace-readable contexts (JSON, CSV, log output, dev tools).
+  // Hard-coding the locale keeps the regression tests deterministic.
+  const exact = v.toLocaleString('en-US');
+  return { short, exact };
+}
+
+/**
+ * Compact + verbose dual-output for time durations expressed in
+ * milliseconds.
+ *
+ *   fmtDuration(0)            → { short: '0s',      exact: '0 milliseconds' }
+ *   fmtDuration(750)          → { short: '0s',      exact: '750 milliseconds' }
+ *   fmtDuration(45_000)       → { short: '45s',     exact: '45 seconds' }
+ *   fmtDuration(312_000)      → { short: '5m 12s',  exact: '5 minutes 12 seconds' }
+ *   fmtDuration(9_000_000)    → { short: '2h 30m',  exact: '2 hours 30 minutes' }
+ *   fmtDuration(277_200_000)  → { short: '3d 5h',   exact: '3 days 5 hours' }
+ *
+ * Defensive: null / undefined / NaN / negative / Infinity / non-numeric
+ * all fall back to {short:'0s', exact:'0 milliseconds'}. Durations
+ * cannot be negative; sub-second values keep the millisecond resolution
+ * in `exact` (so a 750 ms "0s" cell still has a useful hover tooltip).
+ *
+ * Pure: no Date.now, no DOM, no global state. Inputs are absolute ms.
+ */
+export function fmtDuration(ms) {
+  // Defensive normalisation — same chokepoint pattern as fmtTokenCount.
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) {
+    return { short: '0s', exact: '0 milliseconds' };
+  }
+  const v = Math.floor(ms);
+  if (v === 0) return { short: '0s', exact: '0 milliseconds' };
+  // Sub-second: short rounds DOWN to "0s" (matches the existing
+  // sessionDuration behaviour — sub-1s deltas are visually "instant"
+  // and don't deserve a busy "0.7s" cell), but exact keeps the raw ms
+  // so the hover still tells the truth.
+  if (v < 1000) {
+    return { short: '0s', exact: v + ' milliseconds' };
+  }
+  const sec  = Math.floor(v / 1000);
+  const min  = Math.floor(sec / 60);
+  const hr   = Math.floor(min / 60);
+  const day  = Math.floor(hr / 24);
+  const remS = sec % 60;
+  const remM = min % 60;
+  const remH = hr % 24;
+  // Compact form — ONE spelling everywhere (UX-X8). Two-segment cap so
+  // "3d 5h 17m 22s" never appears: every duration in the UI is either
+  // an estimate or a rounded display, and three-segment forms make the
+  // dashboard feel like a stopwatch app.
+  let short;
+  if (day >= 1)      short = day + 'd ' + remH + 'h';
+  else if (hr  >= 1) short = hr  + 'h ' + remM + 'm';
+  else if (min >= 1) short = min + 'm ' + remS + 's';
+  else               short = sec + 's';
+  // Verbose form — singular/plural correct, no segment shown when its
+  // value is zero. Used in title="..." tooltips and screen-reader text.
+  const parts = [];
+  if (day > 0) parts.push(day + (day === 1 ? ' day'    : ' days'));
+  if (day > 0 || hr > 0) {
+    if (remH > 0 || day > 0)  parts.push(remH + (remH === 1 ? ' hour'   : ' hours'));
+  }
+  if (day === 0 && hr === 0 && min > 0) {
+    parts.push(min + (min === 1 ? ' minute' : ' minutes'));
+    if (remS > 0) parts.push(remS + (remS === 1 ? ' second' : ' seconds'));
+  } else if (day === 0 && hr > 0) {
+    // Already pushed hours; add minutes if non-zero (skip seconds —
+    // matches the two-segment short form's semantics).
+    if (remM > 0) parts.push(remM + (remM === 1 ? ' minute' : ' minutes'));
+  } else if (day > 0) {
+    // Already pushed day + hour; nothing else to add.
+  } else if (sec > 0) {
+    parts.push(sec + (sec === 1 ? ' second' : ' seconds'));
+  }
+  // Special-cases for the "exactly N units, no remainder" forms
+  // (1 hour, 1 day, etc.) — the loop above pushes "1 hour 0 minutes"
+  // which reads worse than "1 hour". Trim the trailing zero unit.
+  let exact = parts.join(' ');
+  exact = exact.replace(/ 0 (minute|minutes|hour|hours|second|seconds)$/, '');
+  if (!exact) exact = sec + (sec === 1 ? ' second' : ' seconds');
+  return { short, exact };
+}

@@ -81,6 +81,9 @@ import {
   vdmAccountServiceName,
   vdmAccountNameFromService,
   VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
+  // UX-X8 / UX-X9 — unified time + token-count formatters with hover-exact
+  fmtTokenCount,
+  fmtDuration,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -8760,6 +8763,284 @@ describe('A11y batch 2 — UX-X3 / UX-CPF3 / UX-S2 source-grep regressions', () 
       /\.tok-repo-chevron \{[\s\S]{0,200}transition: transform 0\.15s, color 0\.15s;/);
     assert.match(_src_a11y2,
       /\.session-collapse-indicator \{[\s\S]{0,200}transition: transform 0\.15s, color 0\.15s;/);
+  });
+});
+
+
+// ─────────────────────────────────────────────────
+// Time formatting batch — UX-X8 + UX-X9
+//
+// fmtTokenCount(n) — compact "1.2M" + exact "1,234,567"
+// fmtDuration(ms)  — compact "5m 12s" / "2h 30m" + verbose "5 minutes 12 seconds"
+//
+// Both helpers MUST be pure (no DOM, no Date.now), MUST handle
+// null/undefined/negative gracefully, and MUST be the single source of
+// truth that compact-display sites mirror to (with title= carrying the
+// exact form so power users can hover to see the precise value).
+// ─────────────────────────────────────────────────
+describe('fmtTokenCount — compact + exact dual-output', () => {
+  it('returns short + exact for typical values', () => {
+    const r = fmtTokenCount(1234567);
+    assert.equal(r.short, '1.2M');
+    assert.equal(r.exact, '1,234,567');
+  });
+  it('null returns 0 / 0', () => {
+    const r = fmtTokenCount(null);
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+  it('undefined returns 0 / 0', () => {
+    const r = fmtTokenCount(undefined);
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+  it('NaN returns 0 / 0 (no NaN leak into the UI)', () => {
+    const r = fmtTokenCount(NaN);
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+  it('negative values clamp to 0 (token counts are never negative)', () => {
+    const r = fmtTokenCount(-42);
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+  it('zero is rendered as "0" (not "0.0K" or similar)', () => {
+    const r = fmtTokenCount(0);
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+  it('sub-1k stays in raw integer form', () => {
+    const r = fmtTokenCount(999);
+    assert.equal(r.short, '999');
+    assert.equal(r.exact, '999');
+  });
+  it('exactly 1000 crosses the K threshold', () => {
+    const r = fmtTokenCount(1000);
+    assert.equal(r.short, '1.0K');
+    assert.equal(r.exact, '1,000');
+  });
+  it('sub-1M renders as a fractional K', () => {
+    const r = fmtTokenCount(15500);
+    assert.equal(r.short, '15.5K');
+    assert.equal(r.exact, '15,500');
+  });
+  it('exactly 1M crosses the M threshold', () => {
+    const r = fmtTokenCount(1000000);
+    assert.equal(r.short, '1.0M');
+    assert.equal(r.exact, '1,000,000');
+  });
+  it('sub-1B renders as a fractional M (the silently-truncated case from UX-X9)', () => {
+    const r = fmtTokenCount(1234567);
+    assert.equal(r.short, '1.2M');
+    assert.equal(r.exact, '1,234,567');
+  });
+  it('billions render as a fractional B', () => {
+    const r = fmtTokenCount(2_500_000_000);
+    assert.equal(r.short, '2.5B');
+    assert.equal(r.exact, '2,500,000,000');
+  });
+  it('extreme billions stay readable', () => {
+    const r = fmtTokenCount(987_654_321_000);
+    assert.equal(r.short, '987.7B');
+    assert.equal(r.exact, '987,654,321,000');
+  });
+  it('floating-point input is floored to integer (token counts are integral)', () => {
+    const r = fmtTokenCount(1500.7);
+    assert.equal(r.short, '1.5K');
+    assert.equal(r.exact, '1,500');
+  });
+  it('Infinity is treated as out-of-domain (returns 0)', () => {
+    const r = fmtTokenCount(Infinity);
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+  it('non-numeric input returns 0 / 0 (defensive)', () => {
+    const r = fmtTokenCount('abc');
+    assert.equal(r.short, '0');
+    assert.equal(r.exact, '0');
+  });
+});
+
+describe('fmtDuration — compact + verbose dual-output', () => {
+  it('null returns 0s / 0 milliseconds', () => {
+    const r = fmtDuration(null);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+  it('undefined returns 0s / 0 milliseconds', () => {
+    const r = fmtDuration(undefined);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+  it('NaN returns 0s / 0 milliseconds', () => {
+    const r = fmtDuration(NaN);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+  it('negative ms clamps to 0 (durations are never negative)', () => {
+    const r = fmtDuration(-1234);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+  it('zero ms renders as 0s', () => {
+    const r = fmtDuration(0);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+  it('fractional seconds (sub-1s) round down to 0s for short, ms for exact', () => {
+    const r = fmtDuration(750);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '750 milliseconds');
+  });
+  it('exactly 1 second', () => {
+    const r = fmtDuration(1000);
+    assert.equal(r.short, '1s');
+    assert.equal(r.exact, '1 second');
+  });
+  it('multi-second under a minute', () => {
+    const r = fmtDuration(45_000);
+    assert.equal(r.short, '45s');
+    assert.equal(r.exact, '45 seconds');
+  });
+  it('exactly 1 minute', () => {
+    const r = fmtDuration(60_000);
+    assert.equal(r.short, '1m 0s');
+    assert.equal(r.exact, '1 minute');
+  });
+  it('minutes + seconds compose correctly', () => {
+    const r = fmtDuration(5 * 60_000 + 12_000);
+    assert.equal(r.short, '5m 12s');
+    assert.equal(r.exact, '5 minutes 12 seconds');
+  });
+  it('hours + minutes compose (sessionDuration parity)', () => {
+    const r = fmtDuration(2 * 3600_000 + 30 * 60_000);
+    assert.equal(r.short, '2h 30m');
+    assert.equal(r.exact, '2 hours 30 minutes');
+  });
+  it('days + hours compose', () => {
+    const r = fmtDuration(3 * 86400_000 + 5 * 3600_000);
+    assert.equal(r.short, '3d 5h');
+    assert.equal(r.exact, '3 days 5 hours');
+  });
+  it('exactly 1 hour with no remainder', () => {
+    const r = fmtDuration(3600_000);
+    assert.equal(r.short, '1h 0m');
+    assert.equal(r.exact, '1 hour');
+  });
+  it('exactly 1 day with no remainder', () => {
+    const r = fmtDuration(86400_000);
+    assert.equal(r.short, '1d 0h');
+    assert.equal(r.exact, '1 day');
+  });
+  it('non-numeric input returns 0 / 0 milliseconds', () => {
+    const r = fmtDuration('abc');
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+  it('Infinity is out-of-domain (returns 0)', () => {
+    const r = fmtDuration(Infinity);
+    assert.equal(r.short, '0s');
+    assert.equal(r.exact, '0 milliseconds');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Time formatting batch — UX-X8 + UX-X9 source-grep regressions
+//
+// dashboard.mjs's renderHTML() template literal carries browser-side JS,
+// so the helpers cannot be `import`-ed; they must be DEFINED inside the
+// template (mirroring the lib.mjs canonical implementation). These
+// regressions enforce two things:
+//   1. The lib.mjs side actually exports the new helpers (and dashboard
+//      imports them on the Node side for any non-renderHTML use).
+//   2. Compact-display sites carry a `title=` with the exact value so
+//      power users can hover to see precise numbers (the UX-X9 fix).
+// ─────────────────────────────────────────────────
+describe('Time formatting batch — UX-X8 / UX-X9 source-grep regressions', () => {
+  const _src_tfmt_lib = _readFileSync_xss(
+    new URL('../lib.mjs', import.meta.url),
+    'utf8',
+  );
+  const _src_tfmt_dash = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('UX-X8/X9 — fmtTokenCount is exported from lib.mjs', () => {
+    assert.match(_src_tfmt_lib, /export function fmtTokenCount\(/);
+  });
+
+  it('UX-X8/X9 — fmtDuration is exported from lib.mjs', () => {
+    assert.match(_src_tfmt_lib, /export function fmtDuration\(/);
+  });
+
+  it('UX-X8/X9 — dashboard.mjs imports both helpers from lib.mjs', () => {
+    // The Node-side import block (line ~790) must surface both new
+    // helpers; without this the dashboard's CLI / hook handlers cannot
+    // emit the shared compact form on stderr / log strings.
+    assert.match(_src_tfmt_dash, /fmtTokenCount/);
+    assert.match(_src_tfmt_dash, /fmtDuration/);
+  });
+
+  it('UX-X9 — at least 5 token-count display sites carry a title= with the exact form', () => {
+    // The fix is to wrap every formatNum() callsite in a span carrying
+    // title="<exact>". The browser-side helper is fmtTokenCountExact()
+    // (defined inside the renderHTML template, mirrors lib.mjs). Any
+    // compact-display site that drops the title would re-introduce the
+    // UX-X9 silent truncation regression.
+    //
+    // The regex matches both `title="' + fmtTokenCountExact(...)` (no
+    // prefix text — direct interpolation) and `title="prefix ' +
+    // fmtTokenCountExact(...)` (prefix text before the interpolation).
+    // Both spellings are valid; the audit only requires the title=
+    // attribute carry the exact value somewhere in its value string.
+    const titleSites = _src_tfmt_dash.match(
+      /title="[^"]*' \+ fmtTokenCountExact\(/g,
+    ) || [];
+    assert.ok(titleSites.length >= 5,
+      'expected at least 5 title="..."+fmtTokenCountExact callsites, found ' + titleSites.length);
+  });
+
+  it('UX-X9 — at least 3 duration display sites carry a title= with the exact form', () => {
+    // Same matcher shape as the token-count grep above — accepts an
+    // optional prefix string between title=" and the interpolation.
+    const titleSites = _src_tfmt_dash.match(
+      /title="[^"]*' \+ fmtDurationExact\(/g,
+    ) || [];
+    assert.ok(titleSites.length >= 3,
+      'expected at least 3 title="..."+fmtDurationExact callsites, found ' + titleSites.length);
+  });
+
+  it('UX-X9 — fmtTokenCountExact helper exists inside renderHTML template (browser-side)', () => {
+    // Browser-side mirror of lib.mjs.fmtTokenCount().exact — kept inside
+    // the template literal because the browser cannot ES-import lib.mjs.
+    assert.match(_src_tfmt_dash, /function fmtTokenCountExact\(/);
+  });
+
+  it('UX-X9 — fmtDurationExact helper exists inside renderHTML template (browser-side)', () => {
+    assert.match(_src_tfmt_dash, /function fmtDurationExact\(/);
+  });
+
+  it('UX-X8 — formatNum delegates to the canonical compact form (no drift)', () => {
+    // formatNum stays as a thin wrapper so existing browser-side
+    // call-sites keep working, but its body must reduce to a single
+    // expression that goes through fmtTokenCountShort (no inline
+    // toFixed math that could drift from the lib.mjs canonical).
+    // Slice generous (1200 chars) to cover the explanatory comment
+    // block above the return statement.
+    const fnBody = _src_tfmt_dash.slice(
+      _src_tfmt_dash.indexOf('function formatNum(n) {'),
+      _src_tfmt_dash.indexOf('function formatNum(n) {') + 1200,
+    );
+    assert.match(fnBody, /return fmtTokenCountShort\(n\);/);
+  });
+
+  it('UX-X8 — sessionDuration delegates to the canonical compact form (no drift)', () => {
+    const fnBody = _src_tfmt_dash.slice(
+      _src_tfmt_dash.indexOf('function sessionDuration(ms) {'),
+      _src_tfmt_dash.indexOf('function sessionDuration(ms) {') + 1200,
+    );
+    assert.match(fnBody, /return fmtDurationShort\(ms\);/);
   });
 });
 
