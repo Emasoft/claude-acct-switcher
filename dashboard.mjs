@@ -3632,6 +3632,61 @@ function renderHTML() {
     font-size: 0.9375rem;
     color: var(--muted);
   }
+  /* UX-H1: header right-side action chrome.
+     - .header-right is a small flex group hosting the status pills
+       and the icon buttons. Aligned to start so the pills sit on the
+       baseline of the heading, not its top.
+     - .header-pill is a chip style: rounded, bordered, low-key colour
+       so the pill reads as supplementary status, not a control.
+     - .header-icon-btn is the universal style for every icon-sized
+       button (and anchors masquerading as one) in the header. Hover
+       lifts the border to var(--primary) so the affordance is
+       discoverable without flooding the page with colour. */
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+  }
+  .header-pill {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.1875rem 0.5rem;
+    line-height: 1.3;
+    white-space: nowrap;
+  }
+  .header-pill[hidden] { display: none; }
+  .header-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--muted);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    text-decoration: none;
+    font-family: inherit;
+    /* Reset native button defaults so this rule wins. */
+    padding: 0;
+    line-height: 1;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .header-icon-btn:hover {
+    color: var(--primary);
+    border-color: var(--primary);
+    background: var(--bg);
+  }
   .ctrl {
     display: flex;
     align-items: center;
@@ -3984,6 +4039,69 @@ function renderHTML() {
     vertical-align: middle;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+  }
+
+  /* UX-CO1: jump-nav at the top of the Config tab. Sits above the
+     config-card and lists every section as a chip-style anchor link.
+     Sticky positioning keeps the nav visible while the user scrolls
+     through the long card so they can jump to another section without
+     scrolling back to the top. The chip style matches the look of
+     the .header-pill so the visual language stays consistent. */
+  .config-toc {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+    box-shadow: var(--shadow);
+  }
+  .config-toc a {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.1875rem 0.625rem;
+    text-decoration: none;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .config-toc a:hover {
+    color: var(--primary);
+    border-color: var(--primary);
+    background: var(--card);
+  }
+
+  /* UX-CO3: standalone privacy/warning callout for settings whose
+     side-effects are non-obvious or destructive. The block sits ABOVE
+     the toggle row so the warning is read before the user can click.
+     The yellow-soft palette matches the .beta-badge family so warning
+     and "BETA" share the same visual register. role="note" carries the
+     announcement semantics for screen readers. */
+  .config-warning {
+    background: var(--yellow-soft);
+    border: 1px solid var(--yellow-border);
+    border-radius: var(--radius-sm);
+    padding: 0.5rem 0.75rem;
+    margin: 0.375rem 0 0.75rem;
+    font-size: 0.8125rem;
+    color: var(--foreground);
+    line-height: 1.45;
+  }
+  .config-warning code {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.0625rem 0.25rem;
+    font-size: 0.75rem;
   }
 
   .card-token.tok-bad { color: var(--red); }
@@ -4636,10 +4754,17 @@ function renderHTML() {
   ::-webkit-scrollbar-thumb { background: hsl(220 9% 46% / 0.25); border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: hsl(220 9% 46% / 0.4); }
 
-  /* ── Exhausted banner ── */
+  /* ── Exhausted banner ──
+     UX-H2: tonally aligned with the rest of the dashboard. The
+     pre-batch palette (raw dark-red HSL fill + 2s pulse animation)
+     read as if from a different app and the pulsing border kept
+     drawing the eye even after the user had read the message. The
+     soft-red token ramp matches every other red surface (remove
+     button, .pct-high, .fill-high) and the static border alone
+     conveys severity without visual churn. */
   .exhausted-banner {
-    background: hsl(0 60% 15%);
-    border: 1px solid hsl(0 50% 30%);
+    background: var(--red-soft);
+    border: 1px solid var(--red-border);
     border-radius: var(--radius-sm);
     padding: 0.625rem 1rem;
     margin-bottom: 0.75rem;
@@ -4647,17 +4772,12 @@ function renderHTML() {
     align-items: center;
     gap: 0.625rem;
     font-size: 0.875rem;
-    color: hsl(0 80% 80%);
-    animation: pulse-border 2s ease-in-out infinite;
-  }
-  @keyframes pulse-border {
-    0%, 100% { border-color: hsl(0 50% 30%); }
-    50% { border-color: hsl(0 70% 50%); }
+    color: var(--red);
   }
   .exhausted-icon {
     width: 22px; height: 22px;
     border-radius: 50%;
-    background: hsl(0 60% 40%);
+    background: var(--red);
     color: #fff;
     display: flex; align-items: center; justify-content: center;
     font-weight: 700; font-size: 0.8125rem;
@@ -5573,6 +5693,11 @@ function renderHTML() {
     .stat-grid { grid-template-columns: repeat(2, 1fr); }
     #tok-stats.stat-grid { grid-template-columns: repeat(2, 1fr); }
     .header { flex-direction: column; gap: 1rem; align-items: stretch; }
+    /* UX-H1: at narrow widths we stack the header vertically (left
+       block above the action group) and let the action group wrap so
+       the pills slip to a new line if the icon buttons would
+       otherwise overflow. flex-wrap is what makes this graceful. */
+    .header-right { flex-wrap: wrap; justify-content: flex-end; }
   }
   @media (max-width: 480px) {
     .stat-grid,
@@ -5608,10 +5733,29 @@ function renderHTML() {
 </head>
 <body>
 <div class="container">
+  <!-- UX-H1: header right-side action chrome. Pre-batch the
+       header was { header-left only, empty right column } so the
+       flex space-between reserved an empty gap that just looked
+       broken. The status pills (current-strategy, probe-stats)
+       were also crammed into the subtitle as freeform text,
+       visually competing with the account count rather than
+       reading as discrete badges. The new layout splits them out
+       into header-right as proper .header-pill chips and adds
+       two .header-icon-btn affordances (Config gear + Help "?").
+       The pills carry the hidden attribute on first paint so
+       no empty separators render before the data loads — the
+       refresh and probe-stats callsites that populate the
+       pills MUST drop the hidden attribute when they set text. -->
   <div class="header">
     <div class="header-left">
       <h1>Van Damme-o-Matic</h1>
-      <div class="header-sub"><span id="account-count">0</span> accounts connected<span id="current-strategy"></span><span id="probe-stats"></span></div>
+      <div class="header-sub"><span id="account-count">0</span> accounts connected</div>
+    </div>
+    <div class="header-right">
+      <span class="header-pill" id="current-strategy" hidden></span>
+      <span class="header-pill" id="probe-stats" hidden></span>
+      <button class="header-icon-btn" type="button" title="Open Config" aria-label="Open Config tab" onclick="switchTab('config')">&#9881;</button>
+      <a class="header-icon-btn" href="https://github.com/Emasoft/claude-acct-switcher#readme" target="_blank" rel="noopener noreferrer" title="Help (opens README in new tab)" aria-label="Help: open README in new tab">?</a>
     </div>
   </div>
 
@@ -5798,8 +5942,24 @@ function renderHTML() {
   </div>
 
   <div id="tab-config" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-config">
+    <!-- UX-CO1: small jump-nav so power users who change a setting
+         frequently can land directly on its section instead of
+         scrolling through the long config card. Each link is an
+         anchor href="#config-*" that pairs with the matching
+         id="config-*" on the corresponding .config-section below.
+         The nav is a real <nav> element with aria-label so screen
+         readers can skip past it AND announce it as navigation. -->
+    <nav class="config-toc" aria-label="Config sections">
+      <a href="#config-proxy">Proxy</a>
+      <a href="#config-strategy">Strategy</a>
+      <a href="#config-notifications">Notifications</a>
+      <a href="#config-serialization">Serialization</a>
+      <a href="#config-commit-tokens">Commit Tokens</a>
+      <a href="#config-session-monitor">Session Monitor</a>
+      <a href="#config-per-tool">Per-Tool</a>
+    </nav>
     <div class="config-card">
-      <div class="config-section">
+      <div class="config-section" id="config-proxy">
         <div class="config-section-title">Proxy</div>
         <div class="config-row">
           <div class="config-info">
@@ -5817,12 +5977,18 @@ function renderHTML() {
         </div>
       </div>
 
-      <div class="config-section">
+      <div class="config-section" id="config-strategy">
         <div class="config-section-title">Rotation Strategy</div>
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Strategy</div>
-            <div class="config-desc" id="strategy-hint"></div>
+            <!-- UX-CO4: the inline hint slot now carries ONLY a
+                 "Currently active: <name>" line. The full per-strategy
+                 descriptions live below in the strategy-list (one
+                 source of truth). Pre-batch, STRATEGY_HINTS duplicated
+                 the descriptions and the wording had drifted between
+                 the two sources ("Stays" vs "Stay"). -->
+            <div class="config-desc" id="strategy-hint">Currently active: -</div>
           </div>
           <select class="config-select" id="sel-strategy" onchange="changeStrategy(this.value)">
             <option value="sticky">Sticky</option>
@@ -5847,7 +6013,7 @@ function renderHTML() {
         <div id="strategy-list" class="strategy-list"></div>
       </div>
 
-      <div class="config-section">
+      <div class="config-section" id="config-notifications">
         <div class="config-section-title">Notifications</div>
         <div class="config-row">
           <div class="config-info">
@@ -5858,7 +6024,7 @@ function renderHTML() {
         </div>
       </div>
 
-      <div class="config-section">
+      <div class="config-section" id="config-serialization">
         <div class="config-section-title">Request Serialization <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
@@ -5899,7 +6065,7 @@ function renderHTML() {
         <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
       </div>
 
-      <div class="config-section">
+      <div class="config-section" id="config-commit-tokens">
         <div class="config-section-title">Commit Tokens <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
@@ -5910,8 +6076,20 @@ function renderHTML() {
         </div>
       </div>
 
-      <div class="config-section">
+      <div class="config-section" id="config-session-monitor">
         <div class="config-section-title">Session Monitor <span class="beta-badge">BETA</span></div>
+        <!-- UX-CO3: dedicated privacy callout block. Pre-batch the
+             warning was a strong-tag with inline yellow color inside
+             the description paragraph — same font, same line height, no
+             border. Many users skip multi-line grey description text
+             and the inline yellow bold blends in. The new block has
+             role="note" + aria-label so screen readers announce it as
+             a note, the .config-warning palette gives it visible weight,
+             and the warning sits ABOVE the toggle so it cannot be
+             missed by anyone scanning down to flip the switch. -->
+        <div class="config-warning" role="note" aria-label="Privacy warning">
+          <strong>&#9888; Privacy:</strong> Sends excerpts of your prompts to Anthropic Claude Haiku for AI summarization. Summaries are stored on disk in <code>session-history.json</code> (mode 0o600). Token usage is billed to the active account. Off by default; enable only on machines where you accept the extra outbound traffic and the on-disk summary trail.
+        </div>
         <div class="config-row">
           <div class="config-info">
             <!-- UX-CO2: removed the duplicate BETA badge that used to sit
@@ -5919,13 +6097,7 @@ function renderHTML() {
                  header above already carries the BETA marker — repeating
                  it on every toggle just trains the eye to ignore it. -->
             <div class="config-label">Enable session monitor</div>
-            <div class="config-desc">
-              Track active Claude Code sessions with AI-summarized timelines.
-              <strong style="color:var(--yellow)">Sends excerpts of your prompts to Anthropic Claude Haiku for summarization</strong>
-              (billed against the active account). Summaries persist to <code>session-history.json</code>
-              (mode 0o600). Off by default; enable only on machines where you accept the extra
-              outbound traffic and the on-disk summary trail.
-            </div>
+            <div class="config-desc">Track active Claude Code sessions with AI-summarized timelines.</div>
           </div>
           <label class="sr-only" for="toggle-session-monitor">Enable session monitor (sends prompts to Claude Haiku)</label>
           <input type="checkbox" class="sw" id="toggle-session-monitor" onchange="toggleSetting('sessionMonitor', this.checked)">
@@ -5938,7 +6110,7 @@ function renderHTML() {
            /api/settings POST with key perToolAttribution and a boolean
            value, mirroring the commit-tokens / session-monitor pattern.
            Server-side handler already exists at line 1873. -->
-      <div class="config-section">
+      <div class="config-section" id="config-per-tool">
         <div class="config-section-title">Per-Tool Attribution <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
@@ -6740,13 +6912,26 @@ async function doToggleExcludeFromAuto(name, checked) {
 
 function renderProbeStats(ps) {
   const el = document.getElementById('probe-stats');
-  if (!ps || !ps.probeCount7d) { el.textContent = ''; return; }
+  if (!ps || !ps.probeCount7d) {
+    // UX-H1: pills carry the hidden attribute by default and are
+    // shown only when populated, so an empty data state never renders
+    // an empty separator dot in the header.
+    el.textContent = '';
+    el.setAttribute('hidden', '');
+    return;
+  }
   const totalTok = ps.inputTokens + ps.outputTokens;
-  // UX-X9: hover-exact for both compact-formatted counts.
-  el.innerHTML = ' · <span title="' + fmtTokenCountExact(ps.probeCount7d) + ' probes in the last 7 days">'
+  // UX-X9: hover-exact for both compact-formatted counts. The pill
+  // collapses both stats into a single "N probes (7d) · ~M tok"
+  // chip so the header-right group reads as ONE pill instead of two
+  // run-on text fragments. The dot-space prefix that previously
+  // joined the pill to the subtitle text is gone — the pill is its
+  // own block now.
+  el.innerHTML = '<span title="' + fmtTokenCountExact(ps.probeCount7d) + ' probes in the last 7 days">'
     + formatNum(ps.probeCount7d) + ' probes (7d)</span>'
     + ' · <span title="' + fmtTokenCountExact(totalTok) + ' tokens of probe overhead">~'
-    + formatNum(totalTok) + ' tokens overhead</span>';
+    + formatNum(totalTok) + ' tok overhead</span>';
+  el.removeAttribute('hidden');
 }
 
 /**
@@ -7126,7 +7311,13 @@ async function refresh() {
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
       const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first' };
-      document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
+      // UX-H1: the strategy span moved from the subtitle (where it
+      // was a freeform "· Sticky" suffix) into a dedicated header-pill
+      // chip. Drop the leading separator (the chip is its own block)
+      // and lift the hidden attribute now that we have a value.
+      const csEl = document.getElementById('current-strategy');
+      csEl.textContent = strategyNames[rotationStrategy] || rotationStrategy;
+      csEl.removeAttribute('hidden');
     }
     if (probeStats) renderProbeStats(probeStats);
     // Queue stats
@@ -7651,13 +7842,12 @@ function tickCountdowns() {
   });
 }
 
-const STRATEGY_HINTS = {
-  sticky: 'Stays on current account. Only switches when rate-limited (429/401).',
-  conserve: 'Drains active accounts first (weekly limit primary). Untouched accounts stay dormant  - their windows never start.',
-  'round-robin': 'Rotates to the least-used account on a timer. Good balance of safety and efficiency.',
-  spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
-  'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
-};
+// UX-CO4: STRATEGY_HINTS removed (single source of truth = STRATEGY_DETAILS).
+// The pre-batch pair STRATEGY_HINTS / STRATEGY_DETAILS held the same
+// information twice with slightly drifted wording ("Stays" vs "Stay").
+// updateStrategyUI now reads STRATEGY_DETAILS[strategy].name for the
+// inline "Currently active" line and renders the per-strategy
+// descriptions ONLY in the list below — never in two places at once.
 
 async function loadSettingsUI() {
   try {
@@ -7694,7 +7884,15 @@ const STRATEGY_DETAILS = {
 
 function updateStrategyUI(strategy) {
   document.getElementById('interval-ctrl').style.display = strategy === 'round-robin' ? '' : 'none';
-  document.getElementById('strategy-hint').textContent = STRATEGY_HINTS[strategy] || '';
+  // UX-CO4: read .name (NOT .desc) from STRATEGY_DETAILS so the inline
+  // hint is a single short "Currently active: <name>" line. The full
+  // multi-sentence description for that strategy is then only rendered
+  // ONCE — inside the strategy-list below this row, where every
+  // strategy is shown with its description and the active one is
+  // highlighted via .strategy-item.active.
+  const details = STRATEGY_DETAILS[strategy];
+  const activeName = details ? details.name : strategy;
+  document.getElementById('strategy-hint').textContent = 'Currently active: ' + activeName;
   const list = document.getElementById('strategy-list');
   list.innerHTML = Object.entries(STRATEGY_DETAILS).map(([key, s]) =>
     '<div class="strategy-item' + (key === strategy ? ' active' : '') + '">' +

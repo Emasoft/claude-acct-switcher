@@ -9706,21 +9706,6 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
 
 // ─────────────────────────────────────────────────
 // UX batch G — UX-A6 / UX-A7 source-grep regressions
-//
-// UX-A6: prior `.card.stale { opacity: 0.5 }` greyed out the WHOLE card
-//   including the .stale-msg red error text and the Refresh button. Users
-//   had to hover to read what was wrong. Fix dims only the header chrome
-//   (.card-top: dot + name + badges) — the rate bars, the error message,
-//   and the action buttons stay at full opacity. A small "stale" pill in
-//   the header carries an aria-label for screen-reader announcement
-//   (colour-blind / SR-only users would otherwise have no signal).
-//
-// UX-A7: prior `.card:hover { box-shadow: var(--shadow-lg) }` (12px
-//   diffuse shadow) bled onto the next card given the 0.625rem gap. Fix:
-//   bump `.accounts` gap to 0.875rem AND add a `transform: translateY(-1px)`
-//   lift so the shadow has somewhere to go without overlapping. The hover
-//   border picks up `--primary` so the boundary stays crisp even when the
-//   shadow is reduced.
 // ─────────────────────────────────────────────────
 describe('UX batch G — UX-A6 / UX-A7 account-card stale + hover regressions', () => {
   const _src_g = _readFileSync_xss(
@@ -10230,5 +10215,277 @@ describe("UX batch K — UX-L1 / UX-X10 logs theme + muted-active regressions", 
     const muted = _src_K.match(/var\(--muted\)/g) || [];
     assert.ok(muted.length >= 60,
       "expected >=60 var(--muted) uses preserved (surgical change), found " + muted.length);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// UX batch F — UX-H1 / UX-H2 / UX-CO1 / UX-CO3 / UX-CO4 source-grep regressions
+// ─────────────────────────────────────────────────
+describe('UX batch F — UX-H1 / UX-H2 / UX-CO1 / UX-CO3 / UX-CO4 source-grep regressions', () => {
+  const _src_uxf = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-H1 — header right-side affordance ──
+  it('UX-H1 — header carries a header-right action group with settings + help icons', () => {
+    // The header used to be { header-left only, empty right column }.
+    // Now it MUST emit a .header-right wrapper that hosts the status
+    // pills + the settings (gear) and help (?) icon buttons. Without
+    // this wrapper, the flex space-between on .header reserves an empty
+    // column for nothing.
+    assert.match(_src_uxf, /<div class="header-right">/);
+  });
+
+  it('UX-H1 — header settings icon switches to the Config tab', () => {
+    // Gear icon MUST call switchTab('config') so a first-time user
+    // looking for "where do I change anything" has an obvious affordance.
+    assert.match(_src_uxf,
+      /<button class="header-icon-btn"[^>]*onclick="switchTab\('config'\)"[^>]*>/);
+  });
+
+  it('UX-H1 — header help link points to the README and opens in a new tab', () => {
+    // Help "?" icon is a passive link, not a JS action — opens the
+    // upstream README in a new tab so the dashboard tab keeps state.
+    assert.match(_src_uxf,
+      /<a class="header-icon-btn"[^>]*href="https:\/\/github\.com\/Emasoft\/claude-acct-switcher#readme"[^>]*target="_blank"[^>]*>/);
+  });
+
+  it('UX-H1 — current-strategy and probe-stats spans live INSIDE header-right (not the subtitle)', () => {
+    // Pre-batch, both pills were crammed into the header-sub line as
+    // freeform text. They MUST move to the header-right group with a
+    // distinct .header-pill CSS class so they read as status badges.
+    const headerBlock = _src_uxf.slice(
+      _src_uxf.indexOf('<div class="header-right">'),
+      _src_uxf.indexOf('<div class="header-right">') + 800,
+    );
+    assert.match(headerBlock, /id="current-strategy"/);
+    assert.match(headerBlock, /id="probe-stats"/);
+  });
+
+  it('UX-H1 — header-sub no longer carries the strategy/probe pills', () => {
+    // Source-grep regression: the subtitle MUST contain only the
+    // account-count, not the two pills. Catches the case where the
+    // pills were copy-pasted into header-right but never removed from
+    // header-sub.
+    const subMatch = _src_uxf.match(
+      /<div class="header-sub">[\s\S]*?<\/div>/,
+    );
+    assert.ok(subMatch, 'header-sub block must exist');
+    assert.doesNotMatch(subMatch[0], /id="current-strategy"/);
+    assert.doesNotMatch(subMatch[0], /id="probe-stats"/);
+  });
+
+  it('UX-H1 — .header-pill CSS class is defined for the status badges', () => {
+    // The pill class is what makes the strategy + probe spans look like
+    // chips instead of run-on text.
+    assert.match(_src_uxf, /\.header-pill\s*\{[^}]*border-radius/);
+    assert.match(_src_uxf, /\.header-pill\s*\{[^}]*var\(--border\)/);
+  });
+
+  it('UX-H1 — .header-icon-btn CSS class defined with hover affordance', () => {
+    assert.match(_src_uxf, /\.header-icon-btn\s*\{/);
+    assert.match(_src_uxf, /\.header-icon-btn:hover\s*\{/);
+  });
+
+  it('UX-H1 — header-right gets a responsive treatment at the 720px breakpoint', () => {
+    // The .header at 720px stacks vertically; the icon row would
+    // otherwise float weirdly underneath the title. Source-grep that
+    // the responsive block touches header-right.
+    const responsiveStart = _src_uxf.indexOf('@media (max-width: 720px)');
+    assert.ok(responsiveStart >= 0, 'expected a 720px media query');
+    // Slice generously so the .header-right rule (which lives several
+    // declarations down inside the same @media block) is included.
+    const responsiveBlock = _src_uxf.slice(responsiveStart, responsiveStart + 2000);
+    assert.match(responsiveBlock, /\.header-right/);
+  });
+
+  // ── UX-H2 — exhausted banner palette + animation ──
+  it('UX-H2 — .exhausted-banner uses the soft-red palette tokens, not raw HSL', () => {
+    // Pre-batch, the banner used hsl(0 60% 15%) (dark red filled),
+    // hsl(0 50% 30%) (border), hsl(0 80% 80%) (text). Replace with
+    // the project's standard --red-soft / --red-border / --red token
+    // ramp so it tonally matches every other red surface.
+    const bannerRule = _src_uxf.slice(
+      _src_uxf.indexOf('.exhausted-banner {'),
+      _src_uxf.indexOf('.exhausted-banner {') + 600,
+    );
+    assert.match(bannerRule, /background:\s*var\(--red-soft\)/);
+    assert.match(bannerRule, /border:\s*1px solid var\(--red-border\)/);
+    assert.match(bannerRule, /color:\s*var\(--red\)/);
+    // Confirm the dark-red HSL values are gone.
+    assert.doesNotMatch(bannerRule, /hsl\(0 60% 15%\)/);
+    assert.doesNotMatch(bannerRule, /hsl\(0 50% 30%\)/);
+    assert.doesNotMatch(bannerRule, /hsl\(0 80% 80%\)/);
+  });
+
+  it('UX-H2 — pulse-border animation removed from the banner (border conveys severity)', () => {
+    // The 2s pulse animation kept drawing the eye even after the user
+    // had read the message. Bold border alone is enough.
+    const bannerRule = _src_uxf.slice(
+      _src_uxf.indexOf('.exhausted-banner {'),
+      _src_uxf.indexOf('.exhausted-banner {') + 600,
+    );
+    assert.doesNotMatch(bannerRule, /animation:\s*pulse-border/);
+  });
+
+  it('UX-H2 — .exhausted-icon picks up var(--red) background', () => {
+    const iconRule = _src_uxf.slice(
+      _src_uxf.indexOf('.exhausted-icon {'),
+      _src_uxf.indexOf('.exhausted-icon {') + 400,
+    );
+    assert.match(iconRule, /background:\s*var\(--red\)/);
+  });
+
+  // ── UX-CO1 — Config tab anchors + TOC ──
+  it('UX-CO1 — every config-section carries a stable id= for deep linking', () => {
+    // Anchors enable bookmark-style links to specific settings (e.g.
+    // hand a URL to a co-worker that opens directly on Serialization).
+    // We expect IDs for: proxy, strategy, notifications, serialization,
+    // commit-tokens, session-monitor, per-tool.
+    const expected = [
+      'config-proxy',
+      'config-strategy',
+      'config-notifications',
+      'config-serialization',
+      'config-commit-tokens',
+      'config-session-monitor',
+      'config-per-tool',
+    ];
+    for (const id of expected) {
+      assert.match(_src_uxf, new RegExp('<div class="config-section" id="' + id + '"'),
+        'expected config-section id="' + id + '"');
+    }
+  });
+
+  it('UX-CO1 — Config tab opens with a small TOC referencing every section', () => {
+    // The TOC sits at the top of the tab content so users can jump.
+    // It MUST live INSIDE tab-config (not above it) and reference each
+    // anchor via #config-* hrefs.
+    const tabConfigBlock = _src_uxf.slice(
+      _src_uxf.indexOf('<div id="tab-config"'),
+      _src_uxf.indexOf('<div id="tab-config"') + 4000,
+    );
+    assert.match(tabConfigBlock, /<nav class="config-toc"/);
+    assert.match(tabConfigBlock, /href="#config-proxy"/);
+    assert.match(tabConfigBlock, /href="#config-strategy"/);
+    assert.match(tabConfigBlock, /href="#config-session-monitor"/);
+  });
+
+  it('UX-CO1 — .config-toc CSS class defined with sticky positioning under the toolbar', () => {
+    // Sticky so it stays visible as the user scrolls through the long
+    // config card.
+    assert.match(_src_uxf, /\.config-toc\s*\{/);
+  });
+
+  it('UX-CO1 — config-toc uses aria-label="Config sections" for screen readers', () => {
+    const tabConfigBlock = _src_uxf.slice(
+      _src_uxf.indexOf('<div id="tab-config"'),
+      _src_uxf.indexOf('<div id="tab-config"') + 4000,
+    );
+    assert.match(tabConfigBlock, /<nav class="config-toc" aria-label="[^"]+"/);
+  });
+
+  // ── UX-CO3 — Session Monitor explicit privacy callout ──
+  it('UX-CO3 — Session Monitor has an explicit .config-warning block (not just inline yellow text)', () => {
+    // Pre-batch, the privacy warning was a `<strong style="color:..."`
+    // inside the description paragraph. Many users skip multi-line
+    // grey description text. The new layout MUST emit a separate
+    // .config-warning element with a warning-symbol prefix and a
+    // contrast-meeting palette so the block reads as "stop, read this".
+    const sessionMonitorBlock = _src_uxf.slice(
+      _src_uxf.indexOf('id="config-session-monitor"'),
+      _src_uxf.indexOf('id="config-session-monitor"') + 2000,
+    );
+    assert.match(sessionMonitorBlock, /<div class="config-warning"/);
+    // Critical privacy facts MUST appear inside the warning block.
+    assert.match(sessionMonitorBlock, /Privacy/);
+    assert.match(sessionMonitorBlock, /Anthropic Claude Haiku/);
+  });
+
+  it('UX-CO3 — .config-warning CSS class is defined with the yellow-soft palette', () => {
+    assert.match(_src_uxf, /\.config-warning\s*\{/);
+    const warningRule = _src_uxf.slice(
+      _src_uxf.indexOf('.config-warning {'),
+      _src_uxf.indexOf('.config-warning {') + 500,
+    );
+    assert.match(warningRule, /background:\s*var\(--yellow-soft\)/);
+    assert.match(warningRule, /border:\s*1px solid var\(--yellow-border\)/);
+  });
+
+  it('UX-CO3 — Session Monitor warning carries a role=note + aria-label so it is announced', () => {
+    // Plain visual styling is invisible to screen readers — the
+    // privacy warning MUST be programmatically identifiable.
+    const sessionMonitorBlock = _src_uxf.slice(
+      _src_uxf.indexOf('id="config-session-monitor"'),
+      _src_uxf.indexOf('id="config-session-monitor"') + 2000,
+    );
+    assert.match(sessionMonitorBlock,
+      /<div class="config-warning" role="note" aria-label="Privacy warning"/);
+  });
+
+  it('UX-CO3 — Session Monitor description no longer carries a load-bearing inline yellow <strong> wrap on the privacy sentence', () => {
+    // The inline `style="color:var(--yellow)"` was the smoking gun:
+    // moving the privacy info into the dedicated .config-warning block
+    // means the description paragraph should not need to highlight any
+    // single sentence with inline yellow text. We assert against the
+    // actual element form ("Sends excerpts" used to be the wrapped
+    // sentence) rather than a bare substring so the load-bearing
+    // <strong> wrap is what we catch — explanatory comments quoting
+    // the old shape are allowed.
+    const sessionMonitorBlock = _src_uxf.slice(
+      _src_uxf.indexOf('id="config-session-monitor"'),
+      _src_uxf.indexOf('id="config-session-monitor"') + 2000,
+    );
+    assert.doesNotMatch(sessionMonitorBlock,
+      /<strong style="color:var\(--yellow\)">Sends/);
+  });
+
+  // ── UX-CO4 — Strategy hint vs strategy list deduplication ──
+  it('UX-CO4 — STRATEGY_HINTS map is removed (single source of truth = STRATEGY_DETAILS)', () => {
+    // The two parallel description sources had drifted ("Stays" vs
+    // "Stay"). Eliminating STRATEGY_HINTS forces every consumer to
+    // pull from STRATEGY_DETAILS.
+    assert.doesNotMatch(_src_uxf, /const STRATEGY_HINTS = \{/);
+  });
+
+  it('UX-CO4 — strategy-hint span replaced with single-line "currently active" pill', () => {
+    // The new contract: keep the inline hint slot (so the strategy
+    // dropdown row still has an explanatory line under the label) but
+    // populate it ONLY with the active-strategy name (e.g.
+    // "Currently active: Conserve"), with the full descriptions
+    // available below in the strategy-list. No more duplicating the
+    // multi-sentence description in two places.
+    assert.match(_src_uxf,
+      /id="strategy-hint"[^>]*>Currently active:/);
+  });
+
+  it('UX-CO4 — updateStrategyUI rebuilds strategy-hint as "Currently active: <name>" only', () => {
+    // The function MUST source the active-strategy NAME (not its
+    // description) from STRATEGY_DETAILS and prepend the literal
+    // "Currently active: " prefix. We grep for the prefix string and
+    // a STRATEGY_DETAILS read that picks up `.name` (either direct
+    // `STRATEGY_DETAILS[strategy].name` OR via an intermediate
+    // variable like `const details = STRATEGY_DETAILS[strategy];
+    // details.name`). Both shapes are acceptable; the invariant is
+    // "the .name field is what feeds the hint, not .desc".
+    const fn = _src_uxf.slice(
+      _src_uxf.indexOf('function updateStrategyUI'),
+      _src_uxf.indexOf('function updateStrategyUI') + 1500,
+    );
+    assert.match(fn, /'Currently active: ' \+/);
+    // Source-grep that .name is read from STRATEGY_DETAILS (either
+    // form). The prior STRATEGY_HINTS lookup would have failed both.
+    assert.ok(
+      /STRATEGY_DETAILS\[strategy\]\.name/.test(fn) ||
+        /STRATEGY_DETAILS\[strategy\][\s\S]{0,200}\.name/.test(fn),
+      'expected STRATEGY_DETAILS[strategy].name to be read in updateStrategyUI',
+    );
+    // Critically: the full multi-sentence description from
+    // STRATEGY_DETAILS[strategy].desc is NOT injected back into the
+    // strategy-hint slot (that would just rename the duplication).
+    assert.doesNotMatch(fn, /strategy-hint[\s\S]{0,200}STRATEGY_DETAILS\[strategy\]\.desc/);
+    // Source-grep that the removed STRATEGY_HINTS map is not referenced.
+    assert.doesNotMatch(fn, /STRATEGY_HINTS\[strategy\]/);
   });
 });
