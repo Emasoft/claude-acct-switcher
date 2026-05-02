@@ -4192,6 +4192,64 @@ function renderHTML() {
   .evt-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
   .evt-msg { flex: 1; color: var(--muted); line-height: 1.4; }
   .evt-msg b { color: var(--foreground); font-weight: 600; }
+  /* UX-L2 / UX-AC1: hide non-matching entries via class so the DOM
+     stays stable. Clearing the filter restores visibility without a
+     re-fetch. The class names are part of the public regression
+     test contract; do not rename without updating the source-grep. */
+  .evt-hidden { display: none; }
+  .log-line-hidden { display: none; }
+  /* Filter bar shared between Logs (UX-L2) and Activity (UX-AC1) tabs. */
+  .vdm-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .vdm-filter-bar input[type="text"] {
+    flex: 1;
+    min-width: 180px;
+    padding: 0.375rem 0.625rem;
+    background: var(--card);
+    color: var(--foreground);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 0.8125rem;
+    font-family: inherit;
+  }
+  .vdm-filter-bar input[type="text"]:focus { outline: 2px solid var(--primary); outline-offset: -1px; }
+  .vdm-filter-bar input[type="text"].invalid { border-color: #f85149; outline-color: #f85149; }
+  .vdm-filter-bar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .vdm-filter-bar label input[type="checkbox"] { cursor: pointer; }
+  .vdm-filter-bar button {
+    background: var(--surface);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.25rem 0.625rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .vdm-filter-bar button:hover { color: var(--foreground); }
+  .vdm-filter-count {
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .vdm-filter-count.error { color: #f85149; }
 
   /* ── Usage ── */
   .usage-card {
@@ -5313,6 +5371,17 @@ function renderHTML() {
   </div>
 
   <div id="tab-activity" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-activity">
+    <!-- UX-AC1: filter bar over the activity feed.
+         Substring match by default; checkbox enables regex with try/catch
+         so an invalid pattern surfaces inline instead of throwing. The
+         filter input value is read straight from the input.value attribute
+         (DOM-escaped) and never interpolated into innerHTML. -->
+    <div class="vdm-filter-bar" role="group" aria-label="Filter activity feed">
+      <input type="text" id="activity-filter-input" maxlength="256" placeholder="Filter activity..." autocomplete="off" spellcheck="false" aria-label="Filter activity feed">
+      <label><input type="checkbox" id="activity-filter-regex"> Regex</label>
+      <button type="button" id="activity-filter-clear" aria-label="Clear filter">Clear</button>
+      <span class="vdm-filter-count" id="activity-filter-count" aria-live="polite"></span>
+    </div>
     <div id="activity-wrap" class="activity-card">
       <div id="activity-log" style="color:var(--muted);padding:2rem 0">No activity yet</div>
     </div>
@@ -5602,6 +5671,16 @@ function renderHTML() {
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
       <div style="font-size:0.8125rem;color:var(--muted)" id="log-status">Disconnected</div>
       <button onclick="clearLogs()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">Clear</button>
+    </div>
+    <!-- UX-L2: filter bar over the log stream. Same UX as the activity
+         filter (UX-AC1): substring by default, regex toggle with try/catch,
+         clear, count. The filter applies to live-streamed lines as they
+         arrive AND to existing lines so the user can search history. -->
+    <div class="vdm-filter-bar" role="group" aria-label="Filter logs">
+      <input type="text" id="logs-filter-input" maxlength="256" placeholder="Filter logs..." autocomplete="off" spellcheck="false" aria-label="Filter logs">
+      <label><input type="checkbox" id="logs-filter-regex"> Regex</label>
+      <button type="button" id="logs-filter-clear" aria-label="Clear filter">Clear</button>
+      <span class="vdm-filter-count" id="logs-filter-count" aria-live="polite"></span>
     </div>
     <div id="log-container" style="background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.75rem;line-height:1.5;height:calc(100vh - 220px);overflow-y:auto;color:#c9d1d9"></div>
   </div>
@@ -7074,7 +7153,14 @@ function evtTime(ts) {
 
 function renderActivity(log) {
   const el = document.getElementById('activity-log');
-  if (!log.length) { el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity yet</div>'; return; }
+  // UX-AC1: ensure the filter controls are wired even on the very first
+  // render (before any switchTab call). Idempotent — see _vdmWireFilterControls.
+  _vdmWireFilterControls();
+  if (!log.length) {
+    el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity yet</div>';
+    _vdmApplyActivityFilter();
+    return;
+  }
   // Phase C: filter by scrubber window + tier. The activity log entries
   // carry the source account in e.account (or e.from / e.to for switch
   // events); for tier filtering we resolve the tier through
@@ -7101,6 +7187,7 @@ function renderActivity(log) {
   }
   if (!filtered.length) {
     el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity in selected window</div>';
+    _vdmApplyActivityFilter();
     return;
   }
   el.innerHTML = filtered.map(e => {
@@ -7111,6 +7198,9 @@ function renderActivity(log) {
       '<span class="evt-msg">' + evtMsg(e) + '</span>' +
     '</div>';
   }).join('');
+  // UX-AC1: re-apply the filter after the DOM rebuild — innerHTML wiped
+  // any prior .evt-hidden classes.
+  _vdmApplyActivityFilter();
 }
 
 function formatChartDate(iso) {
@@ -9240,11 +9330,274 @@ const LOG_TAG_COLORS = {
   info: '#8b949e', system: '#8b949e',
 };
 
+// UX-L2 / UX-AC1 — shared filter state for Logs and Activity tabs.
+//
+// _VDM_FILTER_MAX_LEN caps the input length at 256 characters before we
+// either persist it to localStorage or compile it as a regex. CWE-1333
+// ReDoS is not realistic at this UI scale but the cap also defends
+// localStorage against quota poisoning (the chartProjectFilter pattern).
+//
+// State variables hold the live pattern + regex toggle for each tab.
+// The pattern is read straight from input.value (DOM-escaped by the
+// browser) and is NEVER concatenated into innerHTML, so there is no
+// XSS sink for this user input.
+const _VDM_FILTER_MAX_LEN = 256;
+var _vdmFilterLogsPattern = "";
+var _vdmFilterLogsRegex = false;
+var _vdmFilterActivityPattern = "";
+var _vdmFilterActivityRegex = false;
+
+// Compile a filter pattern as a RegExp. Returns null on syntax error so
+// the caller can render the inline "Invalid regex" feedback. The 256-char
+// cap is enforced again here as defense-in-depth (e.g. if someone calls
+// the helper from a future call-site that did not validate).
+function _vdmCompileFilterRegex(pattern) {
+  if (typeof pattern !== 'string') return null;
+  if (pattern.length === 0) return null;
+  if (pattern.length > _VDM_FILTER_MAX_LEN) return null;
+  try {
+    return new RegExp(pattern, 'i');
+  } catch (_e) {
+    return null;
+  }
+}
+
+// Substring/regex match helper. Empty pattern matches everything (the
+// filter is "off"). Substring is case-insensitive to match the regex
+// default flag and to be useful for log/activity browsing.
+function _vdmMatchesFilter(text, pattern, isRegex) {
+  if (!pattern) return true;
+  if (typeof text !== 'string') return true;
+  if (isRegex) {
+    var re = _vdmCompileFilterRegex(pattern);
+    if (!re) return true; // Invalid regex - show everything until user fixes.
+    return re.test(text);
+  }
+  return text.toLowerCase().indexOf(pattern.toLowerCase()) !== -1;
+}
+
+// Persist a filter value (truncated to the cap) to localStorage. Failures
+// are swallowed silently because Safari Private mode + quota-exceeded both
+// raise here and there's nothing actionable to do other than keep the UI
+// working. Mirrors the chartProjectFilter pattern at line ~7237.
+function _vdmPersistFilter(key, value) {
+  try {
+    var v = (typeof value === 'string') ? value.slice(0, _VDM_FILTER_MAX_LEN) : '';
+    localStorage.setItem(key, v);
+  } catch (_e) { /* ignore */ }
+}
+
+function _vdmPersistRegexToggle(key, on) {
+  try { localStorage.setItem(key, on ? '1' : '0'); } catch (_e) { /* ignore */ }
+}
+
+// Apply the current logs filter to every line in #log-container. Lines
+// keep their position in the DOM; only the .log-line-hidden class is
+// toggled. The "N of M" count badge is updated in the same pass.
+function _vdmApplyLogsFilter() {
+  var container = document.getElementById('log-container');
+  if (!container) return;
+  var input = document.getElementById('logs-filter-input');
+  var regCb = document.getElementById('logs-filter-regex');
+  var countEl = document.getElementById('logs-filter-count');
+  if (!input || !countEl) return;
+  var pattern = (input.value || '').slice(0, _VDM_FILTER_MAX_LEN);
+  var isRegex = !!(regCb && regCb.checked);
+  // Inline regex validation feedback. Empty pattern is always valid.
+  var invalid = false;
+  if (isRegex && pattern.length > 0) {
+    invalid = (_vdmCompileFilterRegex(pattern) === null);
+  }
+  if (invalid) {
+    input.classList.add('invalid');
+    countEl.classList.add('error');
+    countEl.textContent = 'Invalid regex';
+    // Show all lines while the regex is invalid so the user is not left
+    // staring at an empty pane wondering what happened.
+    var allLines = container.querySelectorAll('div');
+    for (var i = 0; i < allLines.length; i++) {
+      allLines[i].classList.remove('log-line-hidden');
+    }
+    return;
+  } else {
+    input.classList.remove('invalid');
+    countEl.classList.remove('error');
+  }
+  var lines = container.querySelectorAll('div');
+  var total = lines.length;
+  var matched = 0;
+  for (var j = 0; j < lines.length; j++) {
+    var text = lines[j].textContent || '';
+    if (_vdmMatchesFilter(text, pattern, isRegex)) {
+      lines[j].classList.remove('log-line-hidden');
+      matched++;
+    } else {
+      lines[j].classList.add('log-line-hidden');
+    }
+  }
+  if (!pattern) {
+    countEl.textContent = total > 0 ? (total + ' entries') : '';
+  } else {
+    countEl.textContent = matched + ' of ' + total + ' match';
+  }
+}
+
+// Apply the current activity filter to every event row in #activity-log.
+// Mirrors _vdmApplyLogsFilter but targets .evt children and toggles
+// .evt-hidden. Re-run this from renderActivity after a DOM rebuild.
+function _vdmApplyActivityFilter() {
+  var wrap = document.getElementById('activity-log');
+  if (!wrap) return;
+  var input = document.getElementById('activity-filter-input');
+  var regCb = document.getElementById('activity-filter-regex');
+  var countEl = document.getElementById('activity-filter-count');
+  if (!input || !countEl) return;
+  var pattern = (input.value || '').slice(0, _VDM_FILTER_MAX_LEN);
+  var isRegex = !!(regCb && regCb.checked);
+  var invalid = false;
+  if (isRegex && pattern.length > 0) {
+    invalid = (_vdmCompileFilterRegex(pattern) === null);
+  }
+  if (invalid) {
+    input.classList.add('invalid');
+    countEl.classList.add('error');
+    countEl.textContent = 'Invalid regex';
+    var allEvts = wrap.querySelectorAll('.evt');
+    for (var i = 0; i < allEvts.length; i++) {
+      allEvts[i].classList.remove('evt-hidden');
+    }
+    return;
+  } else {
+    input.classList.remove('invalid');
+    countEl.classList.remove('error');
+  }
+  var evts = wrap.querySelectorAll('.evt');
+  var total = evts.length;
+  var matched = 0;
+  for (var j = 0; j < evts.length; j++) {
+    var text = evts[j].textContent || '';
+    if (_vdmMatchesFilter(text, pattern, isRegex)) {
+      evts[j].classList.remove('evt-hidden');
+      matched++;
+    } else {
+      evts[j].classList.add('evt-hidden');
+    }
+  }
+  if (!pattern) {
+    countEl.textContent = total > 0 ? (total + ' entries') : '';
+  } else {
+    countEl.textContent = matched + ' of ' + total + ' match';
+  }
+}
+
+// Restore filter state from localStorage and wire the input/checkbox/clear
+// listeners. Idempotent — guarded by a "wired" flag on each input so that
+// repeated calls (e.g. after switchTab fires connectLogStream) do not
+// double-bind handlers.
+function _vdmWireFilterControls() {
+  // Logs tab.
+  var logsInput = document.getElementById('logs-filter-input');
+  var logsReg = document.getElementById('logs-filter-regex');
+  var logsClear = document.getElementById('logs-filter-clear');
+  if (logsInput && !logsInput.dataset.vdmWired) {
+    logsInput.dataset.vdmWired = '1';
+    try {
+      var savedLogsPat = localStorage.getItem('vdm.logsFilter') || '';
+      logsInput.value = savedLogsPat.slice(0, _VDM_FILTER_MAX_LEN);
+      _vdmFilterLogsPattern = logsInput.value;
+    } catch (_e) {}
+    try {
+      var savedLogsReg = localStorage.getItem('vdm.logsRegex');
+      if (savedLogsReg === '1' && logsReg) { logsReg.checked = true; _vdmFilterLogsRegex = true; }
+    } catch (_e) {}
+    logsInput.addEventListener('input', function() {
+      // Hard cap: trim if the browser allowed past the maxlength (e.g. paste).
+      if (logsInput.value.length > _VDM_FILTER_MAX_LEN) {
+        logsInput.value = logsInput.value.slice(0, _VDM_FILTER_MAX_LEN);
+      }
+      _vdmFilterLogsPattern = logsInput.value;
+      _vdmPersistFilter('vdm.logsFilter', _vdmFilterLogsPattern);
+      _vdmApplyLogsFilter();
+    });
+    if (logsReg) {
+      logsReg.addEventListener('change', function() {
+        _vdmFilterLogsRegex = !!logsReg.checked;
+        _vdmPersistRegexToggle('vdm.logsRegex', _vdmFilterLogsRegex);
+        _vdmApplyLogsFilter();
+      });
+    }
+    if (logsClear) {
+      logsClear.addEventListener('click', function() {
+        logsInput.value = '';
+        _vdmFilterLogsPattern = '';
+        _vdmPersistFilter('vdm.logsFilter', '');
+        _vdmApplyLogsFilter();
+        logsInput.focus();
+      });
+    }
+  }
+
+  // Activity tab.
+  var actInput = document.getElementById('activity-filter-input');
+  var actReg = document.getElementById('activity-filter-regex');
+  var actClear = document.getElementById('activity-filter-clear');
+  if (actInput && !actInput.dataset.vdmWired) {
+    actInput.dataset.vdmWired = '1';
+    try {
+      var savedActPat = localStorage.getItem('vdm.activityFilter') || '';
+      actInput.value = savedActPat.slice(0, _VDM_FILTER_MAX_LEN);
+      _vdmFilterActivityPattern = actInput.value;
+    } catch (_e) {}
+    try {
+      var savedActReg = localStorage.getItem('vdm.activityRegex');
+      if (savedActReg === '1' && actReg) { actReg.checked = true; _vdmFilterActivityRegex = true; }
+    } catch (_e) {}
+    actInput.addEventListener('input', function() {
+      if (actInput.value.length > _VDM_FILTER_MAX_LEN) {
+        actInput.value = actInput.value.slice(0, _VDM_FILTER_MAX_LEN);
+      }
+      _vdmFilterActivityPattern = actInput.value;
+      _vdmPersistFilter('vdm.activityFilter', _vdmFilterActivityPattern);
+      _vdmApplyActivityFilter();
+    });
+    if (actReg) {
+      actReg.addEventListener('change', function() {
+        _vdmFilterActivityRegex = !!actReg.checked;
+        _vdmPersistRegexToggle('vdm.activityRegex', _vdmFilterActivityRegex);
+        _vdmApplyActivityFilter();
+      });
+    }
+    if (actClear) {
+      actClear.addEventListener('click', function() {
+        actInput.value = '';
+        _vdmFilterActivityPattern = '';
+        _vdmPersistFilter('vdm.activityFilter', '');
+        _vdmApplyActivityFilter();
+        actInput.focus();
+      });
+    }
+  }
+}
+
+// Wire filters when the DOM is ready (the script tag in renderHTML runs
+// at the end of body, so this is effectively immediate). Idempotency
+// inside _vdmWireFilterControls makes any re-entry (re-render, switchTab)
+// safe.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _vdmWireFilterControls);
+} else {
+  _vdmWireFilterControls();
+}
+
 function connectLogStream() {
   if (_logES) return; // already connected
   const container = document.getElementById('log-container');
   const status = document.getElementById('log-status');
   status.textContent = 'Connecting...';
+  // Wire filter controls and apply the persisted filter to any pre-existing
+  // lines (the user may have switched away and come back).
+  _vdmWireFilterControls();
+  _vdmApplyLogsFilter();
   _logES = new EventSource('/api/logs/stream');
   _logES.onopen = () => { status.textContent = 'Connected'; status.style.color = '#3fb950'; };
   _logES.onerror = () => { status.textContent = 'Reconnecting...'; status.style.color = '#f85149'; };
@@ -9262,6 +9615,18 @@ function connectLogStream() {
       // because the whole function body is one big template literal and any
       // stray backtick terminates it (see CLAUDE.md backtick-in-comment trap).
       line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + escHtml(tag.toUpperCase()) + ']</span> ' + escHtml(data.msg || data.line || '');
+      // UX-L2: apply the active filter to the new line BEFORE appending so
+      // there is no flicker. Mirrors what _vdmApplyLogsFilter does on the
+      // whole list, just for one element.
+      var _lf_in = document.getElementById('logs-filter-input');
+      var _lf_rg = document.getElementById('logs-filter-regex');
+      if (_lf_in && _lf_in.value) {
+        var _lf_pat = (_lf_in.value || '').slice(0, _VDM_FILTER_MAX_LEN);
+        var _lf_reg = !!(_lf_rg && _lf_rg.checked);
+        if (!_vdmMatchesFilter(line.textContent || '', _lf_pat, _lf_reg)) {
+          line.classList.add('log-line-hidden');
+        }
+      }
       // Check scroll position before DOM changes
       const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
       container.appendChild(line);
@@ -9278,6 +9643,8 @@ function connectLogStream() {
         while (container.childElementCount > LOG_MAX_LINES) container.removeChild(container.firstChild);
       }
       if (atBottom) container.scrollTop = container.scrollHeight;
+      // Update the count badge to reflect the new line.
+      _vdmApplyLogsFilter();
     } catch {}
   };
 }
