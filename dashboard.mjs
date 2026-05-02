@@ -4128,9 +4128,17 @@ function renderHTML() {
      header set cursor:pointer but the indicator itself never reacted. */
   .session-header:hover .session-collapse-indicator,
   .session-header:focus-visible .session-collapse-indicator { color: var(--foreground); }
+  /* UX-S4: when the parent session-card is collapsed, hide the
+     timeline AND its overflow controls (fade + expand button) so the
+     collapsed view stays clean. The fade/expand are normally hidden
+     by default (see .session-timeline-fade / .session-timeline-expand
+     rules below) but the .clipped class would otherwise surface
+     them under a collapsed card. Override here. */
   .session-card.collapsed .session-timeline,
   .session-card.collapsed .session-meta,
-  .session-card.collapsed .session-copy-btn { display: none; }
+  .session-card.collapsed .session-copy-btn,
+  .session-card.collapsed .session-timeline-fade,
+  .session-card.collapsed .session-timeline-expand { display: none; }
   .session-collapsed-activity {
     display: none;
     font-size: 0.75rem;
@@ -4194,6 +4202,11 @@ function renderHTML() {
     font-size: 0.8125rem;
     color: #f85149;
   }
+  /* UX-S3: copy button styling. Replaces the previous emoji-only
+     button (📋 = U+1F4CB) with an inline SVG icon that renders
+     identically across every platform. Sized + padded to provide a
+     comfortable click target (>= 24x24 once you include the padding +
+     border) so it satisfies WCAG 2.5.5 minimum target size. */
   .session-copy-btn {
     position: absolute;
     bottom: 0.5rem;
@@ -4203,13 +4216,90 @@ function renderHTML() {
     border-radius: 4px;
     cursor: pointer;
     font-size: 0.75rem;
-    padding: 0.125rem 0.375rem;
+    padding: 0.25rem 0.5rem;
     color: var(--muted);
     opacity: 0;
-    transition: opacity 0.15s;
+    transition: opacity 0.15s, background 0.15s, color 0.15s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
   }
-  .session-card:hover .session-copy-btn { opacity: 1; }
-  .session-copy-btn:hover { background: var(--surface); }
+  .session-card:hover .session-copy-btn,
+  .session-copy-btn:focus-visible { opacity: 1; }
+  .session-copy-btn:hover,
+  .session-copy-btn:focus-visible {
+    background: var(--surface);
+    color: var(--foreground);
+  }
+  /* UX-S3: pointer-events: none on the inner SVG so clicks always
+     resolve to the parent <button> regardless of where inside the
+     button they land. Without this, an event-target check on the
+     handler could see the <svg> or one of its children instead of
+     the button. */
+  .session-copy-btn svg {
+    width: 0.875rem;
+    height: 0.875rem;
+    pointer-events: none;
+    display: block;
+  }
+  /* UX-S4: timeline overflow controls. The 500px max-height cap is
+     the default; long sessions (> ~25 timeline rows) get clipped and
+     a JS measurement (applySessionTimelineOverflow) toggles the
+     .session-timeline-clipped class on the timeline element when
+     scrollHeight > clientHeight. The class triggers (a) the bottom
+     fade-out gradient and (b) the "Show all" button — both hidden
+     by default so short sessions stay clean. */
+  .session-timeline.session-timeline-expanded {
+    max-height: none;
+  }
+  /* UX-S4: fade-out gradient at the bottom of an overflowing
+     timeline. position:relative + negative margin-top pulls the
+     gradient back UP over the last visible row of the timeline so
+     the user sees a soft fade where the content gets clipped — not
+     a hard truncation. pointer-events:none lets the user still
+     scroll the timeline by mouse-wheeling over the fade region. */
+  .session-timeline-fade {
+    display: none;
+    position: relative;
+    height: 1.75rem;
+    margin-top: -1.75rem;
+    pointer-events: none;
+    background: linear-gradient(to bottom,
+      rgba(0,0,0,0) 0%,
+      var(--card) 100%);
+  }
+  .session-timeline-expand {
+    display: none;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.6875rem;
+    padding: 0.1875rem 0.5rem;
+    color: var(--muted);
+    margin: 0.25rem 0 0.375rem;
+    transition: background 0.15s, color 0.15s;
+  }
+  .session-timeline-expand:hover,
+  .session-timeline-expand:focus-visible {
+    background: var(--surface);
+    color: var(--foreground);
+  }
+  /* When the timeline is marked clipped, surface both the fade and
+     the expand toggle. Both adjacent and general sibling combinators
+     because the rendered order is timeline → fade → expand button. */
+  .session-timeline-clipped + .session-timeline-fade,
+  .session-timeline-clipped ~ .session-timeline-expand {
+    display: block;
+  }
+  /* When the user expands the timeline, hide the now-irrelevant
+     fade-out indicator (the "scroll to see more" hint is moot once
+     all content is visible). */
+  .session-timeline.session-timeline-expanded + .session-timeline-fade,
+  .session-timeline.session-timeline-expanded ~ .session-timeline-fade {
+    display: none;
+  }
   .tab-badge {
     display: inline-flex;
     align-items: center;
@@ -9956,11 +10046,89 @@ function sessionEstCost(inTok, outTok, model) {
 
 var _lastBadgeRefresh = 0;
 var _collapsedSessions = new Set();
+// UX-S3: Inline SVG clipboard icon. Replaces the previous \\uD83D\\uDCCB
+// (📋 emoji) which depends on a system emoji font and shows as □ on
+// platforms without one (servers, older Linux, some embedded contexts).
+// SVG is statically defined here (not user-controlled) so it ships
+// identically with every render — no <script> tags inside, no
+// user-text interpolation, no XSS surface. Uses currentColor so the
+// icon honours the button's color rule (which CSS flips on hover/focus).
+// 16x16 viewbox, sized to 0.875rem in CSS so it sits comfortably in
+// the button's 0.25rem padding.
+var SESSION_COPY_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="4" y="3" width="9" height="11" rx="1.5"/><path d="M11 3V2.5A1.5 1.5 0 0 0 9.5 1h-2A1.5 1.5 0 0 0 6 2.5V3"/></svg>';
+// Session timeline expand-toggle labels. Constants (not user-controlled)
+// so the toggle handler can swap them without re-deriving them from
+// strings sprinkled across the source.
+var SESSION_TIMELINE_LABEL_SHOW_ALL  = 'Show all';
+var SESSION_TIMELINE_LABEL_SHOW_LESS = 'Show less';
 function toggleSessionCollapse(id) {
   if (_collapsedSessions.has(id)) _collapsedSessions.delete(id);
   else _collapsedSessions.add(id);
   var card = document.querySelector('.session-card[data-sid="' + id + '"]');
   if (card) card.classList.toggle('collapsed');
+}
+// UX-S4: per-session expand/collapse for the timeline overflow. The
+// timeline element keeps a max-height: 500px CSS cap by default; this
+// toggle flips the .session-timeline-expanded class to lift the cap.
+// The button label, aria-expanded, and the .session-timeline-fade
+// visibility all flip together. Tracks expanded state in a Set so
+// re-renders preserve the user's choice across polling refreshes.
+// Note: do NOT use backticks for inline code in comments here — the
+// whole renderHTML body is a backtick template literal and a stray
+// backtick terminates it early (see CLAUDE.md backtick-trap rule).
+var _expandedSessionTimelines = new Set();
+function toggleSessionTimelineExpand(id, ev) {
+  if (ev && ev.stopPropagation) ev.stopPropagation();
+  var card = document.querySelector('.session-card[data-sid="' + id + '"]');
+  if (!card) return;
+  var timeline = card.querySelector('.session-timeline');
+  var btn = card.querySelector('.session-timeline-expand');
+  if (!timeline || !btn) return;
+  var nowExpanded = timeline.classList.toggle('session-timeline-expanded');
+  if (nowExpanded) _expandedSessionTimelines.add(id);
+  else _expandedSessionTimelines.delete(id);
+  btn.textContent = nowExpanded ? SESSION_TIMELINE_LABEL_SHOW_LESS : SESSION_TIMELINE_LABEL_SHOW_ALL;
+  btn.setAttribute('aria-expanded', nowExpanded ? 'true' : 'false');
+  // Re-measure overflow after expanding/collapsing — the .clipped
+  // marker only matters when the timeline is in capped state; once
+  // expanded it's irrelevant (and the CSS hides the fade anyway).
+  applySessionTimelineOverflow();
+}
+// UX-S4: measure each .session-timeline after render and toggle the
+// .session-timeline-clipped class when scrollHeight > clientHeight.
+// The class triggers (a) the bottom fade-out gradient and (b) the
+// "Show all" button via CSS sibling combinators. Also restores any
+// previously-expanded timelines from _expandedSessionTimelines so
+// poll-refresh doesn't snap them shut. Idempotent — safe to call
+// multiple times after a single render.
+function applySessionTimelineOverflow() {
+  var cards = document.querySelectorAll('.session-card[data-sid]');
+  for (var i = 0; i < cards.length; i++) {
+    var card = cards[i];
+    var sid = card.getAttribute('data-sid');
+    var timeline = card.querySelector('.session-timeline');
+    var btn = card.querySelector('.session-timeline-expand');
+    if (!timeline || !btn) continue;
+    // Restore previously-expanded state before measuring (otherwise
+    // expanded timelines would be measured as not-clipped and the
+    // toggle would disappear).
+    var wasExpanded = sid && _expandedSessionTimelines.has(sid);
+    if (wasExpanded) {
+      timeline.classList.add('session-timeline-expanded');
+      btn.textContent = SESSION_TIMELINE_LABEL_SHOW_LESS;
+      btn.setAttribute('aria-expanded', 'true');
+    } else {
+      timeline.classList.remove('session-timeline-expanded');
+      btn.textContent = SESSION_TIMELINE_LABEL_SHOW_ALL;
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    // Temporarily strip .clipped to get the natural overflow read.
+    timeline.classList.remove('session-timeline-clipped');
+    var overflows = timeline.scrollHeight > timeline.clientHeight + 1;
+    if (overflows && !wasExpanded) {
+      timeline.classList.add('session-timeline-clipped');
+    }
+  }
 }
 function refreshSessionsBadgeOnly() {
   // Throttle badge-only fetches to once per 10s
@@ -10022,7 +10190,14 @@ function renderSessions(data) {
       var totalTok = (s.totalInputTokens || 0) + (s.totalOutputTokens || 0);
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
       html += '<div class="session-card ' + state + collapsed + '" data-sid="' + s.id + '">';
-      html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
+      // UX-S3: clipboard SVG (Heroicons-style, 16x16 viewbox) replaces
+      // the prior 📋 emoji that wouldn't render on platforms missing
+      // emoji fonts. aria-label provides the screen-reader name; title
+      // provides the sighted-mouse tooltip; pointer-events:none on the
+      // SVG (CSS) routes clicks to the button. The event arg is passed
+      // through so copyTimeline can stopPropagation (defense-in-depth
+      // in case a future refactor moves the button INSIDE the header).
+      html += '<button class="session-copy-btn" aria-label="Copy session timeline as Markdown" title="Copy session timeline as Markdown" onclick="copyTimeline(\\'' + s.id + '\\', event)">' + SESSION_COPY_ICON_SVG + '</button>';
       html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
@@ -10051,6 +10226,14 @@ function renderSessions(data) {
         html += '<div class="tl-current"><span class="' + brailleClass + '"></span>' + escHtml(s.currentActivity) + '</div>';
       }
       html += '</div>';
+      // UX-S4: fade-out gradient + Show all button. Both hidden by
+      // default; applySessionTimelineOverflow toggles
+      // .session-timeline-clipped on the timeline element after render
+      // when scrollHeight > clientHeight, which the CSS sibling
+      // combinator picks up to surface them. The button is a real
+      // <button> so Enter/Space activate natively.
+      html += '<div class="session-timeline-fade" aria-hidden="true"></div>';
+      html += '<button class="session-timeline-expand" aria-expanded="false" onclick="toggleSessionTimelineExpand(\\'' + s.id + '\\', event)">Show all</button>';
       // Meta
       html += '<div class="session-meta">';
       html += '<span>' + s.requestCount + ' req</span>';
@@ -10073,7 +10256,8 @@ function renderSessions(data) {
       var totalTok = (s.totalInputTokens || 0) + (s.totalOutputTokens || 0);
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
       html += '<div class="session-card completed' + collapsed + '" data-sid="' + s.id + '">';
-      html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
+      // UX-S3: see active-sessions emit-site above for the rationale.
+      html += '<button class="session-copy-btn" aria-label="Copy session timeline as Markdown" title="Copy session timeline as Markdown" onclick="copyTimeline(\\'' + s.id + '\\', event)">' + SESSION_COPY_ICON_SVG + '</button>';
       html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
@@ -10086,6 +10270,9 @@ function renderSessions(data) {
         else html += '<div class="tl-action">' + escHtml(e.text) + '</div>';
       });
       html += '</div>';
+      // UX-S4: see active-sessions emit-site above for the rationale.
+      html += '<div class="session-timeline-fade" aria-hidden="true"></div>';
+      html += '<button class="session-timeline-expand" aria-expanded="false" onclick="toggleSessionTimelineExpand(\\'' + s.id + '\\', event)">Show all</button>';
       html += '<div class="session-meta">';
       html += '<span>' + (s.requestCount || 0) + ' req</span>';
       // UX-X9: hover-exact for the compact tok count.
@@ -10105,6 +10292,14 @@ function renderSessions(data) {
   }
 
   el.innerHTML = html;
+  // UX-S4: After painting, measure each timeline against its scroll
+  // height and toggle .session-timeline-clipped on the ones that
+  // overflow. The CSS sibling combinator picks up the class to
+  // surface the fade gradient and the "Show all" button. Also
+  // restores any expanded-state preserved across re-renders so the
+  // user's choice survives polling refreshes. Must run AFTER innerHTML
+  // assignment so the elements exist in the DOM.
+  applySessionTimelineOverflow();
 }
 
 function updateSessionsBadge(count) {
@@ -10126,7 +10321,15 @@ function sessionProj(s) {
   }
   return s.repo || s.cwd || 'unknown';
 }
-function copyTimeline(sessionId) {
+function copyTimeline(sessionId, ev) {
+  // UX-S3: stopPropagation on the event so the click never bubbles
+  // up to the session-header collapse handler. The button is a
+  // sibling of session-header today (so bubbling isn't an issue
+  // structurally), but defense-in-depth — a future refactor that
+  // moves the button INSIDE the header would otherwise toggle the
+  // collapse on every Copy click. The event arg is optional because
+  // keyboard-triggered .click() calls don't pass an event.
+  if (ev && ev.stopPropagation) ev.stopPropagation();
   // Find session data from last render
   fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
     var s = (data.active || []).find(function(a) { return a.id === sessionId; })
