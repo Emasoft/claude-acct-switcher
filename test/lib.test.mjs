@@ -9703,3 +9703,151 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
       /<span class="evt-icon" aria-hidden="true"/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// UX batch K — UX-L1 / UX-X10 source-grep regressions.
+//
+// UX-L1: the Logs tab container used GitHub-style dark theme
+// (background:#0d1117, color:#c9d1d9) inside a light dashboard. Visually
+// jarring; hardcoded hex colours bypass the design tokens. Replace with
+// CSS variables so the surface fits the surrounding palette and a future
+// dark-mode theme can re-skin via `--card` / `--foreground` rebinding.
+//
+// UX-X10: `var(--muted)` was used for both inactive and active text on
+// some controls — most clearly the .vdm-filter-bar regex toggle label,
+// where the "Regex" text never visibly changed colour when the user
+// turned regex on. Add a `--muted-active` token for the readable-active
+// case, plus a `:has(input:checked)` selector that swaps the label colour
+// when its inner checkbox is on. Keep the change SURGICAL — only the
+// ambiguous active/inactive pairings, NOT every var(--muted) use-site.
+// ─────────────────────────────────────────────────
+describe("UX batch K — UX-L1 / UX-X10 logs theme + muted-active regressions", () => {
+  const _src_K = _readFileSync_xss(
+    new URL("../dashboard.mjs", import.meta.url),
+    "utf8",
+  );
+
+  // UX-L1 — light-theme log container -----------------------------
+
+  it("UX-L1 — log-container no longer hardcodes the GitHub dark hex #0d1117", () => {
+    // The audit complaint: dark-on-light surface inside an otherwise light
+    // dashboard. Inline style on #log-container must NOT contain the dark
+    // hex any more.
+    const containerLine = _src_K.match(
+      /<div id="log-container"[^>]*>/,
+    );
+    assert.ok(containerLine, "expected #log-container element");
+    assert.doesNotMatch(containerLine[0], /#0d1117/i);
+    assert.doesNotMatch(containerLine[0], /#c9d1d9/i);
+  });
+
+  it("UX-L1 — log-container surface uses var(--card) + var(--foreground) tokens", () => {
+    const containerLine = _src_K.match(
+      /<div id="log-container"[^>]*>/,
+    );
+    assert.ok(containerLine, "expected #log-container element");
+    assert.match(containerLine[0], /background:\s*var\(--card\)/);
+    assert.match(containerLine[0], /color:\s*var\(--foreground\)/);
+    // Border still preserved (was var(--border) before, must stay so a future
+    // theme rebind picks the right divider).
+    assert.match(containerLine[0], /border:\s*1px solid var\(--border\)/);
+    // Monospace stays — the LOG container is still a code surface.
+    assert.match(containerLine[0],
+      /font-family:'SF Mono',Monaco,Consolas,monospace/);
+  });
+
+  it("UX-L1 — LOG_TAG_COLORS use design tokens, not bypassed hex literals", () => {
+    // Pin the colour map shape: every tag entry routes through a
+    // var(--…) reference instead of the historical GitHub hexes
+    // (#f85149 / #d29922 / #58a6ff / #8b949e). That way a future
+    // theme rebind changes log tags too.
+    const mapMatch = _src_K.match(
+      /const LOG_TAG_COLORS\s*=\s*\{[\s\S]*?\};/,
+    );
+    assert.ok(mapMatch, "expected LOG_TAG_COLORS map");
+    const mapBlock = mapMatch[0];
+    // No hardcoded GitHub hex values in the map.
+    assert.doesNotMatch(mapBlock, /#f85149/i);
+    assert.doesNotMatch(mapBlock, /#d29922/i);
+    assert.doesNotMatch(mapBlock, /#58a6ff/i);
+    assert.doesNotMatch(mapBlock, /#8b949e/i);
+    // Every tag entry maps to a var(--…) — at minimum red, yellow,
+    // blue, muted are referenced via tokens.
+    assert.match(mapBlock, /var\(--red\)/);
+    assert.match(mapBlock, /var\(--yellow\)/);
+    assert.match(mapBlock, /var\(--blue\)/);
+    assert.match(mapBlock, /var\(--muted\)/);
+  });
+
+  it("UX-L1 — log-status connect/error colours use design tokens", () => {
+    // The log-status text was hardcoded to '#3fb950' on connect and
+    // '#f85149' on error. Replace with var(--green) and var(--red) so
+    // both tones move with the rest of the palette.
+    const onopenSlice = _src_K.match(
+      /_logES\.onopen\s*=\s*\(\)\s*=>\s*\{[^}]+\};/,
+    );
+    assert.ok(onopenSlice, "expected _logES.onopen handler");
+    assert.match(onopenSlice[0], /var\(--green\)/);
+    assert.doesNotMatch(onopenSlice[0], /#3fb950/i);
+    const onerrorSlice = _src_K.match(
+      /_logES\.onerror\s*=\s*\(\)\s*=>\s*\{[^}]+\};/,
+    );
+    assert.ok(onerrorSlice, "expected _logES.onerror handler");
+    assert.match(onerrorSlice[0], /var\(--red\)/);
+    assert.doesNotMatch(onerrorSlice[0], /#f85149/i);
+  });
+
+  it("UX-L1 — fallback log line colour is a design token, not the GitHub neutral hex", () => {
+    // The "tag not in LOG_TAG_COLORS" fallback colour was '#8b949e'
+    // (a GitHub neutral grey). Move to var(--muted) so the same colour
+    // appears in the legend if a future caller renders one.
+    const fallbackLine = _src_K.match(
+      /const color = LOG_TAG_COLORS\[tag\] \|\| ([^;]+);/,
+    );
+    assert.ok(fallbackLine, "expected LOG_TAG_COLORS fallback");
+    assert.doesNotMatch(fallbackLine[1], /#8b949e/i);
+    assert.match(fallbackLine[1], /var\(--muted\)/);
+  });
+
+  // UX-X10 — muted-active token + label colour swap -----------------
+
+  it("UX-X10 — :root defines a --muted-active token for active-state readable text", () => {
+    // The audit's fix: introduce a higher-contrast variant of --muted so
+    // active controls can stay in the muted tone family but still read as
+    // "on". The token MUST be declared in the :root block alongside the
+    // existing --muted.
+    assert.match(_src_K,
+      /:root \{[\s\S]+?--muted-active:\s*hsl\([^)]+\)[\s\S]+?\}/);
+  });
+
+  it("UX-X10 — .vdm-filter-bar label uses --muted-active when its inner checkbox is checked", () => {
+    // The Regex toggle label was visually identical whether the checkbox
+    // was on or off. Swap the label colour via :has(input:checked) so the
+    // active state is unmistakable. Modern browsers (Chromium 105+,
+    // Firefox 121+, Safari 15.4+) all support :has() — the dashboard is
+    // already JS-required.
+    assert.match(_src_K,
+      /\.vdm-filter-bar label:has\(input:checked\)\s*\{[^}]*color:\s*var\(--muted-active\)/);
+  });
+
+  it("UX-X10 — .vdm-filter-bar label inactive vs active state visibly differ via font-weight", () => {
+    // Defense-in-depth: not every browser will pick up the :has() rule on
+    // older WebKit forks (e.g. some embedded surfaces). The label's
+    // checked-state rule MUST also bump font-weight so the active state is
+    // visible WITHOUT relying on colour alone.
+    assert.match(_src_K,
+      /\.vdm-filter-bar label:has\(input:checked\)\s*\{[^}]*font-weight:\s*(?:600|bold)/);
+  });
+
+  it("UX-X10 — UX batch K change is surgical: still many var(--muted) use-sites remain", () => {
+    // The K batch is a colour-token + ONE active-state pairing fix, NOT a
+    // wholesale replacement of every var(--muted). The surrounding palette
+    // (config-desc, header-sub, stat-label, etc.) stays muted. Pin a
+    // generous lower bound so a future "let me clean up muted" refactor
+    // trips this and is forced to update the K-batch invariants in
+    // CLAUDE.md too.
+    const muted = _src_K.match(/var\(--muted\)/g) || [];
+    assert.ok(muted.length >= 60,
+      "expected >=60 var(--muted) uses preserved (surgical change), found " + muted.length);
+  });
+});
