@@ -853,6 +853,13 @@ import {
   summarizeCacheMissesBySession,
   // Phase 6 — wasted-spend (cache-miss cost) time series
   buildWastedSpendSeries,
+  // UX-X8 / UX-X9 — unified time + token-count formatters with hover-exact.
+  // dashboard.mjs ships a browser-side mirror of these inside the
+  // renderHTML template literal (fmtTokenCountShort / fmtTokenCountExact /
+  // fmtDurationShort / fmtDurationExact); the Node-side import is for
+  // any non-renderHTML callers (CLI command output, hook log strings).
+  fmtTokenCount,
+  fmtDuration,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -6064,10 +6071,88 @@ async function vsRefreshDataRange() {
   } catch {}
 }
 
+// UX-X8 / UX-X9 — unified time + token-count formatters (browser-side).
+//
+// These are the browser-side mirrors of lib.mjs.fmtTokenCount and
+// lib.mjs.fmtDuration. They CANNOT import from lib.mjs because the
+// renderHTML template literal is shipped as a string and runs inside
+// the dashboard tab, where ES module imports are not available.
+//
+// CONTRACT: keep the algorithm in lock-step with lib.mjs. The
+// regression tests in test/lib.test.mjs source-grep for these function
+// names and will fail if the wrappers are renamed or removed.
+//
+// Why split into Short and Exact (not the {short, exact} object form
+// the lib.mjs version returns):
+//   - Browser-side, every site needs EITHER the short form (cell text)
+//     OR the exact form (title= attribute), never both at once.
+//   - String-concatenation JS reads cleaner with two named helpers
+//     than with .short / .exact field-pulls on every line.
+function fmtTokenCountShort(n) {
+  if (typeof n !== 'number' || !isFinite(n) || n < 0) return '0';
+  var v = Math.floor(n);
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return String(v);
+}
+function fmtTokenCountExact(n) {
+  if (typeof n !== 'number' || !isFinite(n) || n < 0) return '0';
+  return Math.floor(n).toLocaleString('en-US');
+}
+function fmtDurationShort(ms) {
+  if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '0s';
+  var v = Math.floor(ms);
+  if (v === 0) return '0s';
+  if (v < 1000) return '0s';
+  var sec = Math.floor(v / 1000);
+  var min = Math.floor(sec / 60);
+  var hr  = Math.floor(min / 60);
+  var day = Math.floor(hr / 24);
+  if (day >= 1) return day + 'd ' + (hr % 24) + 'h';
+  if (hr  >= 1) return hr  + 'h ' + (min % 60) + 'm';
+  if (min >= 1) return min + 'm ' + (sec % 60) + 's';
+  return sec + 's';
+}
+function fmtDurationExact(ms) {
+  if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '0 milliseconds';
+  var v = Math.floor(ms);
+  if (v === 0) return '0 milliseconds';
+  if (v < 1000) return v + ' milliseconds';
+  var sec = Math.floor(v / 1000);
+  var min = Math.floor(sec / 60);
+  var hr  = Math.floor(min / 60);
+  var day = Math.floor(hr / 24);
+  var remH = hr  % 24;
+  var remM = min % 60;
+  var parts = [];
+  if (day > 0) parts.push(day + (day === 1 ? ' day'    : ' days'));
+  if (day > 0 || hr > 0) {
+    if (remH > 0 || day > 0) parts.push(remH + (remH === 1 ? ' hour' : ' hours'));
+  }
+  if (day === 0 && hr === 0 && min > 0) {
+    parts.push(min + (min === 1 ? ' minute' : ' minutes'));
+    var remS = sec % 60;
+    if (remS > 0) parts.push(remS + (remS === 1 ? ' second' : ' seconds'));
+  } else if (day === 0 && hr > 0) {
+    if (remM > 0) parts.push(remM + (remM === 1 ? ' minute' : ' minutes'));
+  } else if (day > 0) {
+    // already pushed day + hour
+  } else if (sec > 0) {
+    parts.push(sec + (sec === 1 ? ' second' : ' seconds'));
+  }
+  var out = parts.join(' ');
+  out = out.replace(/ 0 (minute|minutes|hour|hours|second|seconds)$/, '');
+  if (!out) out = sec + (sec === 1 ? ' second' : ' seconds');
+  return out;
+}
 function formatNum(n) {
-  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
-  return String(n);
+  // Thin wrapper kept for back-compat with every existing call-site.
+  // The actual rendering algorithm lives in fmtTokenCountShort so
+  // changes propagate to every site that uses formatNum and to every
+  // site that emits a title= via fmtTokenCountExact (the two MUST stay
+  // consistent — see UX-X9).
+  return fmtTokenCountShort(n);
 }
 
 function fillClass(pct) {
@@ -6256,7 +6341,11 @@ function renderProbeStats(ps) {
   const el = document.getElementById('probe-stats');
   if (!ps || !ps.probeCount7d) { el.textContent = ''; return; }
   const totalTok = ps.inputTokens + ps.outputTokens;
-  el.innerHTML = ' · ' + formatNum(ps.probeCount7d) + ' probes (7d) · ~' + formatNum(totalTok) + ' tokens overhead';
+  // UX-X9: hover-exact for both compact-formatted counts.
+  el.innerHTML = ' · <span title="' + fmtTokenCountExact(ps.probeCount7d) + ' probes in the last 7 days">'
+    + formatNum(ps.probeCount7d) + ' probes (7d)</span>'
+    + ' · <span title="' + fmtTokenCountExact(totalTok) + ' tokens of probe overhead">~'
+    + formatNum(totalTok) + ' tokens overhead</span>';
 }
 
 /**
@@ -6693,17 +6782,23 @@ function renderAccounts(profiles, animate) {
         renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days') +
         '</div>';
 
+      // UX-X9: hover-exact for the rate-reset countdowns. The countdown
+      // text shows compact "1h 23m left"; the title= surfaces the
+      // unabbreviated form "1 hour 23 minutes 7 seconds until reset".
+      // tickCountdowns() refreshes both every second.
+      var fiveHMs  = rl.fiveH.reset  ? Math.max(0, rl.fiveH.reset  * 1000 - Date.now()) : 0;
+      var sevenDMs = rl.sevenD.reset ? Math.max(0, rl.sevenD.reset * 1000 - Date.now()) : 0;
       barsHtml = '<div class="rate-bars">' +
         '<div class="rate-group">' +
           '<div class="rate-head"><span class="rate-label">5h window</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
           '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.fiveH.utilization) + '" style="width:' + Math.min(f,100) + '%"></div></div>' +
-          '<div class="rate-reset" data-reset="' + rl.fiveH.reset + '">' + formatTimeLeft(rl.fiveH.reset) + '</div>' +
+          '<div class="rate-reset" data-reset="' + rl.fiveH.reset + '" title="' + fmtDurationExact(fiveHMs) + ' until 5h window resets">' + formatTimeLeft(rl.fiveH.reset) + '</div>' +
           spark5h +
         '</div>' +
         '<div class="rate-group">' +
           '<div class="rate-head"><span class="rate-label">Weekly</span><span class="rate-pct ' + pctClass(s) + '">' + s + '%</span></div>' +
           '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.sevenD.utilization) + '" style="width:' + Math.min(s,100) + '%"></div></div>' +
-          '<div class="rate-reset" data-reset="' + rl.sevenD.reset + '">' + formatTimeLeft(rl.sevenD.reset) + '</div>' +
+          '<div class="rate-reset" data-reset="' + rl.sevenD.reset + '" title="' + fmtDurationExact(sevenDMs) + ' until 7d window resets">' + formatTimeLeft(rl.sevenD.reset) + '</div>' +
           spark7d +
         '</div>' +
       '</div>';
@@ -6947,12 +7042,16 @@ function renderStats(stats) {
   const grid = document.getElementById('stats-grid');
   const totalTokens = Object.values(stats.modelUsage||{}).reduce((s,m) => s + (m.inputTokens||0) + (m.outputTokens||0), 0);
   const totalCache = Object.values(stats.modelUsage||{}).reduce((s,m) => s + (m.cacheReadInputTokens||0), 0);
+  // UX-X9: each compact-formatted stat carries a title="<exact>" so the
+  // power user can hover to see the unabbreviated count (the audit
+  // example was 1.2M silently truncating 234K — title= surfaces it).
+  // The exact form is locale-grouped via fmtTokenCountExact.
   grid.innerHTML = [
-    { v: formatNum(stats.totalSessions||0), l: 'Sessions' },
-    { v: formatNum(stats.totalMessages||0), l: 'Messages' },
-    { v: formatNum(totalTokens), l: 'Tokens' },
-    { v: formatNum(totalCache), l: 'Cache Reads' },
-  ].map(s => '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div></div>').join('');
+    { n: stats.totalSessions||0, l: 'Sessions' },
+    { n: stats.totalMessages||0, l: 'Messages' },
+    { n: totalTokens,            l: 'Tokens' },
+    { n: totalCache,             l: 'Cache Reads' },
+  ].map(s => '<div class="stat-item" title="' + fmtTokenCountExact(s.n) + ' ' + s.l.toLowerCase() + '"><div class="stat-val">' + formatNum(s.n) + '</div><div class="stat-label">' + s.l + '</div></div>').join('');
 
   const tokenMap = {};
   (stats.dailyModelTokens||[]).forEach(d => {
@@ -6970,16 +7069,23 @@ function renderStats(stats) {
       const hT = Math.max(3, (toks/maxTok)*H);
       const lbl = formatChartDate(d.date);
       return '<div class="chart-day"><div class="chart-bars">' +
-        '<div class="chart-bar msg-bar" style="height:'+hM+'px" data-tooltip="'+lbl+': '+formatNum(msgs)+' msgs"></div>' +
-        '<div class="chart-bar tok-bar" style="height:'+hT+'px" data-tooltip="'+lbl+': '+formatNum(toks)+' tokens"></div>' +
+        '<div class="chart-bar msg-bar" style="height:'+hM+'px" data-tooltip="'+lbl+': '+formatNum(msgs)+' msgs" title="' + fmtTokenCountExact(msgs) + ' messages on ' + lbl + '"></div>' +
+        '<div class="chart-bar tok-bar" style="height:'+hT+'px" data-tooltip="'+lbl+': '+formatNum(toks)+' tokens" title="' + fmtTokenCountExact(toks) + ' tokens on ' + lbl + '"></div>' +
       '</div><div class="chart-label">'+lbl+'</div></div>';
     }).join('');
   }
 }
 
 function tickCountdowns() {
+  // UX-X9: refresh BOTH the compact text AND the title= so hover-exact
+  // values stay in sync with the live countdown. Without the title=
+  // refresh, the tooltip would freeze at the value snapshotted when
+  // the cell was first rendered.
   document.querySelectorAll('[data-reset]').forEach(el => {
-    el.textContent = formatTimeLeft(Number(el.dataset.reset));
+    var resetUnix = Number(el.dataset.reset);
+    el.textContent = formatTimeLeft(resetUnix);
+    var leftMs = resetUnix ? Math.max(0, resetUnix * 1000 - Date.now()) : 0;
+    el.setAttribute('title', fmtDurationExact(leftMs) + ' until window resets');
   });
 }
 
@@ -7543,10 +7649,11 @@ function renderCacheMisses(misses, missSessions) {
     for (var i = 0; i < shown.length; i++) {
       var m = shown[i];
       var ts = m.ts ? new Date(m.ts).toLocaleString() : '?';
+      // UX-X9: hover-exact for the input-token cell.
       fallbackHtml += '<div class="miss-row">'
         + '<span class="miss-ts">' + escHtml(ts) + '</span>'
         + '<span class="miss-account">' + escHtml((m.repo || '?') + ' / ' + (m.branch || '?')) + '</span>'
-        + '<span class="miss-tokens">' + formatNum(m.inputTokens || 0) + ' input</span>'
+        + '<span class="miss-tokens" title="' + fmtTokenCountExact(m.inputTokens || 0) + ' input tokens">' + formatNum(m.inputTokens || 0) + ' input</span>'
         + '</div>';
     }
     if (misses.length > 50) {
@@ -7599,10 +7706,12 @@ function renderCacheMisses(misses, missSessions) {
         'unknown':          'No clear cause — could be /clear, OAuth-rotation gap, or a real prefix change.'
       };
       var reasonTip = REASON_TOOLTIPS[reasonKey] || '';
+      // UX-X9: hover-exact for the input-token cell. (The reason badge
+      // already carries its own tooltip — keep them on separate spans.)
       html += '<div class="miss-row">'
         + '<span class="miss-ts">' + escHtml(ts2) + '</span>'
         + '<span class="miss-model">' + escHtml(modelText) + '</span>'
-        + '<span class="miss-tokens">' + formatNum(m2.inputTokens || 0) + ' input</span>'
+        + '<span class="miss-tokens" title="' + fmtTokenCountExact(m2.inputTokens || 0) + ' input tokens">' + formatNum(m2.inputTokens || 0) + ' input</span>'
         + '<span class="miss-reason ' + reasonClass + '" title="' + escHtml(reasonTip) + '">' + escHtml(reasonText) + '</span>'
         + '</div>';
     }
@@ -7790,14 +7899,20 @@ function renderTokenStats(data, prevData) {
     }
   }
   var statsEl = document.getElementById('tok-stats');
+  // UX-X9: each compact-formatted stat carries a title="<exact>" so the
+  // power user can hover to see the unabbreviated count. The cost cell
+  // already shows full precision (formatCost is not lossy) so it gets
+  // no title= override (the title attribute below is only added when n
+  // is a real numeric count).
   if (statsEl) statsEl.innerHTML = [
-    { v: formatNum(totalIn + totalOut), l: 'Total Tokens', extra: trendHtml },
-    { v: formatNum(totalIn), l: 'Input' },
-    { v: formatNum(totalOut), l: 'Output' },
-    { v: formatNum(requests), l: 'Requests' },
-    { v: formatCost(totalCost), l: 'API Equiv.', sub: 'at API rates' },
+    { v: formatNum(totalIn + totalOut), n: totalIn + totalOut, l: 'Total Tokens', extra: trendHtml },
+    { v: formatNum(totalIn),            n: totalIn,            l: 'Input' },
+    { v: formatNum(totalOut),           n: totalOut,           l: 'Output' },
+    { v: formatNum(requests),           n: requests,           l: 'Requests' },
+    { v: formatCost(totalCost),         n: null,               l: 'API Equiv.', sub: 'at API rates' },
   ].map(function(s) {
-    var h = '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>';
+    var titleAttr = s.n != null ? ' title="' + fmtTokenCountExact(s.n) + ' ' + s.l.toLowerCase() + '"' : '';
+    var h = '<div class="stat-item"' + titleAttr + '><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>';
     if (s.sub) h += '<div class="tok-stat-sub">' + s.sub + '</div>';
     if (s.extra) h += s.extra;
     return h + '</div>';
@@ -7871,11 +7986,16 @@ function renderModelBreakdown(data) {
     var md = modelMap[sortedModels[r]];
     var pctR = Math.round((md.total / grandTotal) * 100);
     var mdCost = estimateCost(sortedModels[r], md.input, md.output, md.cacheRead, md.cacheCreation);
+    // UX-X9: each compact-formatted token count gets a hover-exact title.
+    // Two side-by-side counts in tok-model-detail share one parent span
+    // because hover-targeting a sub-span inside a sibling div would
+    // mean the user has to be pixel-precise about which "in" or "out"
+    // to hover over — easier to expose the full breakdown on the row.
     rows += '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:'+getModelColor(sortedModels[r], sortedModels)+'"></div>' +
       '<div class="tok-model-name">'+escHtml(shortModel(sortedModels[r]))+'</div>' +
-      '<div class="tok-model-detail">'+formatNum(md.input)+' in / '+formatNum(md.output)+' out</div>' +
-      '<div class="tok-model-total">'+formatNum(md.total)+'</div>' +
+      '<div class="tok-model-detail" title="' + fmtTokenCountExact(md.input) + ' input / ' + fmtTokenCountExact(md.output) + ' output">'+formatNum(md.input)+' in / '+formatNum(md.output)+' out</div>' +
+      '<div class="tok-model-total" title="' + fmtTokenCountExact(md.total) + ' total tokens">'+formatNum(md.total)+'</div>' +
       '<div class="tok-model-cost">'+formatCost(mdCost)+'</div>' +
       '<div class="tok-model-pct">'+pctR+'%</div>' +
     '</div>';
@@ -8438,8 +8558,11 @@ function renderWastedSpendChart() {
     bars += '<div class="tok-wasted-bar" style="height:' + pct + '%" data-tooltip="' + escHtml(tooltip) + '"></div>';
   }
   bars += '</div>';
+  // UX-X9: hover-exact for the totals span — miss-tokens often cross
+  // the 1M threshold and the compact 1.2M form is the worst-case
+  // truncation example from the audit.
   var totalsLine = '<div class="tok-wasted-totals">'
-    + '<span>' + formatNum(totalTokens) + ' tokens billed across ' + filtered.length
+    + '<span title="' + fmtTokenCountExact(totalTokens) + ' tokens billed across these misses">' + formatNum(totalTokens) + ' tokens billed across ' + filtered.length
     + ' miss' + (filtered.length === 1 ? '' : 'es') + ' (' + formatCost(totalCost) + ')</span>'
     + '<span class="total-cost">' + formatCost(totalWasted)
     + ' wasted</span>'
@@ -8619,11 +8742,13 @@ function renderAccountBreakdown(data) {
     var ad = accountMap[sortedAccounts[r]];
     var pctR = Math.round((ad.total / grandTotal) * 100);
     var cost = ad.cost;
+    // UX-X9: hover-exact for the per-account totals so two accounts
+    // displayed at "1.2M" can be distinguished by hover.
     rows += '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
       '<div class="tok-model-name">' + escHtml(sortedAccounts[r]) + '</div>' +
-      '<div class="tok-model-detail">' + formatNum(ad.input) + ' in / ' + formatNum(ad.output) + ' out</div>' +
-      '<div class="tok-model-total">' + formatNum(ad.total) + '</div>' +
+      '<div class="tok-model-detail" title="' + fmtTokenCountExact(ad.input) + ' input / ' + fmtTokenCountExact(ad.output) + ' output">' + formatNum(ad.input) + ' in / ' + formatNum(ad.output) + ' out</div>' +
+      '<div class="tok-model-total" title="' + fmtTokenCountExact(ad.total) + ' total tokens">' + formatNum(ad.total) + '</div>' +
       '<div class="tok-model-cost">' + formatCost(cost) + '</div>' +
       '<div class="tok-model-pct">' + pctR + '%</div>' +
     '</div>';
@@ -8698,7 +8823,8 @@ function renderRepoBranchBreakdown(data) {
     h += '<div class="tok-repo-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleRepoCollapse(this.dataset.key)" data-key="' + escHtml(repo.key) + '">';
     h += '<span class="' + chevCls + '">\u25BC</span>';
     h += '<span class="tok-repo-name">' + escHtml(repo.name) + '</span>';
-    h += '<span class="tok-model-detail" style="flex:1">' + formatNum(repo.totalIn) + ' in / ' + formatNum(repo.totalOut) + ' out</span>';
+    // UX-X9: hover-exact for the per-repo totals.
+    h += '<span class="tok-model-detail" style="flex:1" title="' + fmtTokenCountExact(repo.totalIn) + ' input / ' + fmtTokenCountExact(repo.totalOut) + ' output">' + formatNum(repo.totalIn) + ' in / ' + formatNum(repo.totalOut) + ' out</span>';
     h += '<span class="tok-model-cost">' + formatCost(cost) + '</span>';
     h += '<span class="tok-model-pct">' + pct + '%</span>';
     h += '</div>';
@@ -8739,7 +8865,8 @@ function renderRepoBranchBreakdown(data) {
         h += '<div class="' + brCls + '" style="padding-left:1.5rem">';
         h += '<div class="tok-branch-name"><span class="tok-branch-badge">' + escHtml(branchKeys[bi]) + '</span></div>';
         h += '<div class="tok-branch-stats">';
-        h += '<span class="tok-branch-total">' + formatNum(br.totalIn) + ' / ' + formatNum(br.totalOut) + '</span>';
+        // UX-X9: hover-exact for the per-branch in/out token totals.
+        h += '<span class="tok-branch-total" title="' + fmtTokenCountExact(br.totalIn) + ' input / ' + fmtTokenCountExact(br.totalOut) + ' output">' + formatNum(br.totalIn) + ' / ' + formatNum(br.totalOut) + '</span>';
         h += '<span class="tok-branch-pct">' + brPct + '%</span>';
         h += '</div>';
         h += '<div class="tok-branch-detail">' + modelDetail + '</div>';
@@ -8753,7 +8880,8 @@ function renderRepoBranchBreakdown(data) {
         h += '<div class="tok-branch-row tok-branch-inactive" style="padding-left:1.5rem;font-style:italic;opacity:0.75">';
         h += '<div class="tok-branch-name">… and ' + hiddenBranchCount + ' more branch' + (hiddenBranchCount === 1 ? '' : 'es') + '</div>';
         h += '<div class="tok-branch-stats">';
-        h += '<span class="tok-branch-total">' + formatNum(hiddenBranchTotalIn) + ' / ' + formatNum(hiddenBranchTotalOut) + '</span>';
+        // UX-X9: hover-exact for the hidden-branches summary totals.
+        h += '<span class="tok-branch-total" title="' + fmtTokenCountExact(hiddenBranchTotalIn) + ' input / ' + fmtTokenCountExact(hiddenBranchTotalOut) + ' output across hidden branches">' + formatNum(hiddenBranchTotalIn) + ' / ' + formatNum(hiddenBranchTotalOut) + '</span>';
         h += '<span class="tok-branch-pct">' + hiddenPct + '%</span>';
         h += '</div>';
         h += '</div>';
@@ -8823,11 +8951,12 @@ function renderToolBreakdown(data) {
     var b = buckets[keys[r]];
     var pctR = Math.round((b.total / grandTotal) * 100);
     var label = b.mcp ? b.mcp + '/' + b.tool : b.tool;
+    // UX-X9: hover-exact for the per-tool token totals.
     rows += '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
       '<div class="tok-model-name">' + escHtml(label) + '</div>' +
-      '<div class="tok-model-detail">' + formatNum(b.input) + ' in / ' + formatNum(b.output) + ' out · ' + b.count + ' calls</div>' +
-      '<div class="tok-model-total">' + formatNum(b.total) + '</div>' +
+      '<div class="tok-model-detail" title="' + fmtTokenCountExact(b.input) + ' input / ' + fmtTokenCountExact(b.output) + ' output across ' + b.count + ' calls">' + formatNum(b.input) + ' in / ' + formatNum(b.output) + ' out · ' + b.count + ' calls</div>' +
+      '<div class="tok-model-total" title="' + fmtTokenCountExact(b.total) + ' total tokens">' + formatNum(b.total) + '</div>' +
       '<div class="tok-model-pct">' + pctR + '%</div>' +
     '</div>';
   }
@@ -9080,9 +9209,12 @@ function clearLogs() {
 // ── Session Monitor ──
 
 function sessionDuration(ms) {
-  if (ms < 60000) return Math.floor(ms / 1000) + 's';
-  if (ms < 3600000) return Math.floor(ms / 60000) + 'm ' + Math.floor((ms % 60000) / 1000) + 's';
-  return Math.floor(ms / 3600000) + 'h ' + Math.floor((ms % 3600000) / 60000) + 'm';
+  // UX-X8: thin wrapper over the canonical fmtDurationShort so the
+  // session display picks up the SAME compact form as every other
+  // duration in the UI ("5m 12s" / "2h 30m" / "3d 5h"). The hover
+  // tooltip should pair with fmtDurationExact at the call-site to
+  // expose the unabbreviated form.
+  return fmtDurationShort(ms);
 }
 
 function sessionTimeAgo(ts) {
@@ -9161,18 +9293,22 @@ function renderSessions(data) {
     active.forEach(function(s) {
       var idleMs = Date.now() - s.lastActiveAt;
       var state = idleMs < ${SESSION_AWAITING_THRESHOLD} ? 'processing' : 'awaiting';
-      var dur = sessionDuration(Date.now() - s.startedAt);
+      var durMs = Date.now() - s.startedAt;
+      var dur = sessionDuration(durMs);
       var idle = state === 'awaiting' ? sessionDuration(idleMs) : '';
       var proj = sessionProj(s);
+      var totalTok = (s.totalInputTokens || 0) + (s.totalOutputTokens || 0);
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
       html += '<div class="session-card ' + state + collapsed + '" data-sid="' + s.id + '">';
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
       html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
-      html += '<span class="session-header-right"><span>' + dur + '</span>';
+      // UX-X9: hover-exact for the compact "5m 12s" duration display.
+      html += '<span class="session-header-right"><span title="' + fmtDurationExact(durMs) + ' since session start">' + dur + '</span>';
       if (state === 'awaiting') {
-        html += '<span class="session-awaiting">\\u23F8 input ' + idle + '</span>';
+        // UX-X9: hover-exact for the awaiting-input idle counter.
+        html += '<span class="session-awaiting" title="awaiting input for ' + fmtDurationExact(idleMs) + '">\\u23F8 input ' + idle + '</span>';
       }
       html += '</span>';
       html += '</div>';
@@ -9196,7 +9332,8 @@ function renderSessions(data) {
       // Meta
       html += '<div class="session-meta">';
       html += '<span>' + s.requestCount + ' req</span>';
-      html += '<span>' + formatNum(s.totalInputTokens + s.totalOutputTokens) + ' tok</span>';
+      // UX-X9: hover-exact for the compact tok count.
+      html += '<span title="' + fmtTokenCountExact(totalTok) + ' total tokens">' + formatNum(totalTok) + ' tok</span>';
       html += '</div>';
       html += '</div>';
     });
@@ -9207,16 +9344,19 @@ function renderSessions(data) {
     html += '<div class="session-section-title">RECENT</div>';
     recent.forEach(function(s) {
       var ago = sessionTimeAgo(s.completedAt || s.startedAt);
-      var dur = sessionDuration(s.duration || 0);
+      var durMs = s.duration || 0;
+      var dur = sessionDuration(durMs);
       var cost = sessionEstCost(s.totalInputTokens || 0, s.totalOutputTokens || 0, s.model);
       var proj = sessionProj(s);
+      var totalTok = (s.totalInputTokens || 0) + (s.totalOutputTokens || 0);
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
       html += '<div class="session-card completed' + collapsed + '" data-sid="' + s.id + '">';
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
       html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
-      html += '<span class="session-header-right"><span>' + dur + ' \\u00b7 ~$' + cost + '</span></span>';
+      // UX-X9: hover-exact for the compact "5m 12s" duration display.
+      html += '<span class="session-header-right"><span title="' + fmtDurationExact(durMs) + ' total session duration">' + dur + ' \\u00b7 ~$' + cost + '</span></span>';
       html += '</div>';
       html += '<div class="session-timeline">';
       (s.timeline || []).forEach(function(e) {
@@ -9226,7 +9366,8 @@ function renderSessions(data) {
       html += '</div>';
       html += '<div class="session-meta">';
       html += '<span>' + (s.requestCount || 0) + ' req</span>';
-      html += '<span>' + formatNum((s.totalInputTokens || 0) + (s.totalOutputTokens || 0)) + ' tok</span>';
+      // UX-X9: hover-exact for the compact tok count.
+      html += '<span title="' + fmtTokenCountExact(totalTok) + ' total tokens">' + formatNum(totalTok) + ' tok</span>';
       html += '</div>';
       html += '</div>';
     });
@@ -9236,7 +9377,8 @@ function renderSessions(data) {
   if (data.overhead) {
     var oh = data.overhead.inputTokens + data.overhead.outputTokens;
     if (oh > 0) {
-      html += '<div class="session-overhead">Summarizer overhead: ' + formatNum(oh) + ' tokens (Haiku)</div>';
+      // UX-X9: hover-exact for the compact tok count in the footer.
+      html += '<div class="session-overhead" title="' + fmtTokenCountExact(oh) + ' tokens of summarizer overhead (Haiku)">Summarizer overhead: ' + formatNum(oh) + ' tokens (Haiku)</div>';
     }
   }
 
