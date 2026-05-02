@@ -5123,7 +5123,9 @@ function renderHTML() {
     flex: 1;
     min-width: 200px;
     position: relative;
-    height: 36px;
+    /* UX-VS2: bumped from 36px to 44px to give the larger 28px thumbs
+       headroom for the focus ring without clipping at the wrapper edge. */
+    height: 44px;
     user-select: none;
     touch-action: none;
   }
@@ -5144,12 +5146,21 @@ function renderHTML() {
      own; if a fill is ever wanted, restore it as a 4-6px-tall element ON
      the track (top: 50%; height: 6px; transform: translateY(-50%)), NOT
      full-height. The element is also no longer rendered in the markup. */
+  /* UX-VS2: thumbs were 16px diameter — too small to grab with a stylus,
+     touch, or imprecise mouse. Bumped to 28px (WCAG 2.5.5 AAA recommends
+     44px for touch; 28px is the desktop-primary-surface compromise that
+     keeps the thumbs distinct against the 6px track without dominating
+     the strip). margin-left moves to -14px so the thumb still centres
+     on its track point. The native HTML <input type="range"> renders
+     ::-webkit-slider-thumb / ::-moz-range-thumb pseudo-elements that the
+     vdm scrubber does NOT use — vdm composes <div class="vs-thumb"> +
+     mousedown drag, so the .vs-thumb rule below IS the slider thumb. */
   .vs-thumb {
     position: absolute;
     top: 50%;
-    width: 16px;
-    height: 16px;
-    margin-left: -8px;
+    width: 28px;
+    height: 28px;
+    margin-left: -14px;
     background: var(--primary);
     border: 2px solid var(--card);
     border-radius: 50%;
@@ -5157,6 +5168,27 @@ function renderHTML() {
     cursor: grab;
     box-shadow: var(--shadow);
     outline: none;
+  }
+  /* UX-VS2: any future native-range-slider use should match the bigger
+     thumb sizing in BOTH webkit and moz prefixes. Defensive defaults so
+     a stray input[type=range] does not regress to the OS default 16px. */
+  input[type="range"]::-webkit-slider-thumb {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--primary);
+    border: 2px solid var(--card);
+    cursor: grab;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--primary);
+    border: 2px solid var(--card);
+    cursor: grab;
   }
   .vs-thumb:focus { box-shadow: 0 0 0 3px var(--blue-soft); }
   .vs-thumb:active { cursor: grabbing; }
@@ -6311,13 +6343,26 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
   }
 
-  // Binary activity area: ON (utilization > 0) vs OFF, with shaded fill.
+  // UX-X7 (UX audit): proportional area chart with zero-anchored Y-axis.
+  // Previously the area was binary (ON / OFF), which made every account
+  // with any traffic look identical. Now bar height is proportional to
+  // utilization: a steady 30% is visibly half the height of a 60% peak
+  // and a flat-zero account stays flat against the baseline.
+  //
+  // Y-scale: anchored at 0 (always the baseline) and capped at MAX(peak,
+  // 1.0). The 1.0 floor matters because utilization is a 0..1 fraction
+  // and "30% peak" should look like 30% of the chart, not 100% of the
+  // chart; without the floor a flat-30% history would visually equal a
+  // flat-100% history because both would scale to fill.
+  //
   // hist is monotonically non-decreasing in ts (it is appended to in
   // chronological order by createUtilizationHistory). For a 7-day
   // sparkline against a 30-day history that's ~80% wasted iterations
   // when using filter(). Binary-search to find the first index >=
   // windowStart, then linear scan until ts > windowEnd. O(log n + k)
   // instead of O(n) per render.
+  var minPctInWin = null;
+  var maxPctInWin = null;
   if (hist && hist.length >= 1) {
     var pts;
     var first = hist[0];
@@ -6344,8 +6389,10 @@ function renderSparkline(hist, key, windowMs, mode) {
       while (endIdx < hist.length && hist[endIdx].ts <= windowEnd) endIdx++;
       pts = hist.slice(startIdx, endIdx);
     }
-    // Insert synthetic OFF points when gap between consecutive points > 10 min
-    // This prevents the step function from holding ON state across long idle periods
+    // Insert synthetic zero-points when gap between consecutive points > 10 min
+    // This prevents the step function from holding the previous value across
+    // long idle periods (so 100% at hour 0 + nothing for 5h does NOT keep
+    // showing as 100% — it drops to zero where the data actually went silent).
     var GAP_THRESHOLD = 10 * 60 * 1000; // 10 minutes
     var filled = [];
     for (var gi = 0; gi < pts.length; gi++) {
@@ -6356,38 +6403,72 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
     pts = filled;
     if (pts.length) {
-      var yOn = padT, yOff = padT + chartH;
-      var d = 'M' + (padL + ((pts[0].ts - windowStart) / windowMs) * chartW).toFixed(1) + ',' + yOff;
+      // Compute observed min / max for THIS window so the title= and
+      // overlay labels honour the same data the chart paints.
+      var maxObserved = 0;
+      var minObserved = Infinity;
+      for (var mi = 0; mi < pts.length; mi++) {
+        var v = pts[mi][key] || 0;
+        if (v > maxObserved) maxObserved = v;
+        if (v < minObserved) minObserved = v;
+      }
+      if (!isFinite(minObserved)) minObserved = 0;
+      // Y-scale floor: 1.0 (=100%) so partial utilization renders as a
+      // partial fill, not a full fill. Never less than the observed peak
+      // (handles outlier headers that report >100% utilization).
+      var yMax = Math.max(maxObserved, 1.0);
+      var yOff = padT + chartH; // baseline (zero)
+      function yFor(val) {
+        var clipped = val < 0 ? 0 : (val > yMax ? yMax : val);
+        return padT + chartH * (1 - clipped / yMax);
+      }
+      // Step area path: x0 -> first point; for each pair, hold value
+      // until next timestamp (step function), then close back to baseline.
+      var d = 'M' + (padL + ((pts[0].ts - windowStart) / windowMs) * chartW).toFixed(1) + ',' + yOff.toFixed(1);
       for (var pi = 0; pi < pts.length; pi++) {
         var x = padL + ((pts[pi].ts - windowStart) / windowMs) * chartW;
-        var on = (pts[pi][key] || 0) > 0;
-        d += ' L' + x.toFixed(1) + ',' + (on ? yOn : yOff).toFixed(1);
-        // Step to next point (hold value until next timestamp)
+        var y = yFor(pts[pi][key] || 0);
+        d += ' L' + x.toFixed(1) + ',' + y.toFixed(1);
         if (pi < pts.length - 1) {
           var xNext = padL + ((pts[pi + 1].ts - windowStart) / windowMs) * chartW;
-          d += ' L' + xNext.toFixed(1) + ',' + (on ? yOn : yOff).toFixed(1);
+          d += ' L' + xNext.toFixed(1) + ',' + y.toFixed(1);
         }
       }
-      // Close path back to baseline
       var xLast = padL + ((pts[pts.length - 1].ts - windowStart) / windowMs) * chartW;
-      d += ' L' + xLast.toFixed(1) + ',' + yOff + ' Z';
+      d += ' L' + xLast.toFixed(1) + ',' + yOff.toFixed(1) + ' Z';
       svg += '<path d="' + d + '" fill="var(--primary)" opacity="0.25" />';
-      // Top edge line for clarity
+      // Top-edge line for clarity (same step shape, but stroked, no fill).
       var edge = '';
       for (var ei = 0; ei < pts.length; ei++) {
         var ex = padL + ((pts[ei].ts - windowStart) / windowMs) * chartW;
-        var eOn = (pts[ei][key] || 0) > 0;
-        edge += (ei === 0 ? 'M' : ' L') + ex.toFixed(1) + ',' + (eOn ? yOn : yOff).toFixed(1);
+        var ey = yFor(pts[ei][key] || 0);
+        edge += (ei === 0 ? 'M' : ' L') + ex.toFixed(1) + ',' + ey.toFixed(1);
         if (ei < pts.length - 1) {
           var exNext = padL + ((pts[ei + 1].ts - windowStart) / windowMs) * chartW;
-          edge += ' L' + exNext.toFixed(1) + ',' + (eOn ? yOn : yOff).toFixed(1);
+          edge += ' L' + exNext.toFixed(1) + ',' + ey.toFixed(1);
         }
       }
       svg += '<path d="' + edge + '" fill="none" stroke="var(--primary)" stroke-width="1" />';
+      // Stash min/max for the title= tooltip + on-chart overlay labels.
+      minPctInWin = Math.round(minObserved * 100);
+      maxPctInWin = Math.round(maxObserved * 100);
     }
   }
 
-  return '<svg class="sparkline-svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' + svg + '</svg>';
+  // UX-X7: overlay labels so a sparkline communicates a value range,
+  // not just shape. Label at top-left = peak %, bottom-left = 0% baseline.
+  // SVG <title> provides a native tooltip on hover (and is read by
+  // screen readers as the accessible name of the chart).
+  var titleTxt;
+  if (minPctInWin == null || maxPctInWin == null) {
+    titleTxt = 'No data in window';
+  } else {
+    titleTxt = 'Min ' + minPctInWin + '% / Max ' + maxPctInWin + '% over the window';
+  }
+  var maxLabelTxt = (maxPctInWin == null) ? '--' : (maxPctInWin + '%');
+  var labelOverlay = '<text x="2" y="6" fill="var(--muted)" font-size="6" font-family="inherit" text-anchor="start">' + maxLabelTxt + '</text>' +
+                     '<text x="2" y="' + (padT + chartH).toFixed(1) + '" fill="var(--muted)" font-size="6" font-family="inherit" text-anchor="start">0%</text>';
+  return '<svg class="sparkline-svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + titleTxt + '"><title>' + titleTxt + '</title>' + svg + labelOverlay + '</svg>';
 }
 
 function formatEta(minutes) {
