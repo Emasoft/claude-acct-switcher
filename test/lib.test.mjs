@@ -84,6 +84,11 @@ import {
   // UX-X8 / UX-X9 — unified time + token-count formatters with hover-exact
   fmtTokenCount,
   fmtDuration,
+  // UX-WS2 — severity gradient for wasted-spend bars
+  wastedSeverity,
+  WASTED_SEVERITY_LOW,
+  WASTED_SEVERITY_MED,
+  WASTED_SEVERITY_HIGH,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -8030,9 +8035,12 @@ describe('Phase 6 — UI: chart-scoped project multi-select + wasted-spend chart
     // Slice bumped from 4000 → 5000 to span the SR-OP-004 multi-
     // filter logic added in round-2 (model/account/repo/branch +
     // tier filters that were not previously honored).
+    // Bumped again from 5000 → 6000 in batch I to span the UX-WS2
+    // severity-gradient block (~120 chars of comment + helper call
+    // before the bar template).
     const fn = _src_t6ui.slice(
       _src_t6ui.indexOf('function renderWastedSpendChart'),
-      _src_t6ui.indexOf('function renderWastedSpendChart') + 5000,
+      _src_t6ui.indexOf('function renderWastedSpendChart') + 6000,
     );
     assert.ok(fn.length > 800, 'renderWastedSpendChart body must exist');
     // Multi-select filter applied (Round-2 QR4: gated on multiSelectActive)
@@ -9701,5 +9709,308 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
     // redundant visual cue, not a label.
     assert.match(_src_vh,
       /<span class="evt-icon" aria-hidden="true"/);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Batch I — UX-CPF1 / UX-WS2 / UX-VS1 / UX-VS3
+//
+// UX-CPF1 — Multi-select dropdown (cpf-panel) overlapped the carousel
+//   slide content. Fix: move the .chart-project-filter OUT of the
+//   carousel into a sibling row above it, so the panel pushes the
+//   carousel down rather than floating over the chart.
+//
+// UX-WS2 — Wasted-spend bars used a single yellow regardless of value.
+//   Fix: percentile-based severity gradient (≤50th = yellow-soft,
+//   ≤90th = yellow, >90th = red). Helper is a pure function in lib.mjs
+//   for unit-testability and so the dashboard's render code is a thin
+//   loop over the helper output.
+//
+// UX-VS1 — Scrubber + tok-time dropdown both filter time; users get
+//   confused. Fix: add an inline hint near the scrubber explaining the
+//   composition rule ("scrubber narrows within the selected window
+//   from the dropdown above").
+//
+// UX-VS3 — Fallback datetime-local inputs were only shown <600px so
+//   wider viewports had no way to type exact times. Fix: keep the
+//   600px swap (small viewports drop the slider, get fallback inputs)
+//   but add an "Edit dates" toggle that lets desktop users SHOW the
+//   inputs alongside the slider on demand.
+// ─────────────────────────────────────────────────
+describe('UX-WS2 — wastedSeverity (pure function)', () => {
+  it('exports the three CSS-variable severity tokens as named exports', () => {
+    // The dashboard renderer interpolates these into inline-style
+    // background, so they must be string CSS values (not just keys).
+    assert.equal(typeof WASTED_SEVERITY_LOW,  'string');
+    assert.equal(typeof WASTED_SEVERITY_MED,  'string');
+    assert.equal(typeof WASTED_SEVERITY_HIGH, 'string');
+    // All three must be CSS variable references — keeps theming
+    // single-source-of-truth in the :root palette.
+    assert.match(WASTED_SEVERITY_LOW,  /^var\(--/);
+    assert.match(WASTED_SEVERITY_MED,  /^var\(--/);
+    assert.match(WASTED_SEVERITY_HIGH, /^var\(--/);
+    // Spec: low = soft yellow, med = saturated yellow, high = red.
+    assert.equal(WASTED_SEVERITY_LOW,  'var(--yellow-soft)');
+    assert.equal(WASTED_SEVERITY_MED,  'var(--yellow)');
+    assert.equal(WASTED_SEVERITY_HIGH, 'var(--red)');
+  });
+
+  it('returns LOW for the smallest values (≤ 50th percentile)', () => {
+    const all = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    // 5 is exactly the 50th percentile of [1..10] (interpolated).
+    assert.equal(wastedSeverity(1, all),  WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(2, all),  WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(5, all),  WASTED_SEVERITY_LOW);
+  });
+
+  it('returns MED for values between 50th and 90th percentile', () => {
+    const all = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert.equal(wastedSeverity(6, all),  WASTED_SEVERITY_MED);
+    assert.equal(wastedSeverity(7, all),  WASTED_SEVERITY_MED);
+    assert.equal(wastedSeverity(8, all),  WASTED_SEVERITY_MED);
+    assert.equal(wastedSeverity(9, all),  WASTED_SEVERITY_MED);
+  });
+
+  it('returns HIGH for values strictly above 90th percentile', () => {
+    const all = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    // 10 is the only outlier above the 90th percentile threshold.
+    assert.equal(wastedSeverity(10, all), WASTED_SEVERITY_HIGH);
+  });
+
+  it('handles a single-value dataset (every value is at the max → LOW)', () => {
+    // With one value the 50/90 percentiles collapse to the same number;
+    // the lone bar is "the only bar" and shouldn't visually scream
+    // catastrophe — the relative-severity rule is meaningless without a
+    // distribution. Spec: single-bar = LOW (visual default, calm).
+    const all = [42];
+    assert.equal(wastedSeverity(42, all), WASTED_SEVERITY_LOW);
+  });
+
+  it('handles a flat dataset (all equal → LOW for every bar)', () => {
+    // No variance means no severity gradient exists; every bar gets
+    // the calm default. Without this branch the entire chart would be
+    // red whenever the user has uniform spending.
+    const all = [7, 7, 7, 7, 7];
+    for (const v of all) {
+      assert.equal(wastedSeverity(v, all), WASTED_SEVERITY_LOW);
+    }
+  });
+
+  it('treats null / undefined / empty allValues as LOW', () => {
+    // Defensive — buildWastedSpendSeries can hand back empty arrays
+    // when the heuristic finds no misses. The render path must not
+    // throw; it just shows whatever calm default the helper picks.
+    assert.equal(wastedSeverity(5, []),         WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(5, null),       WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(5, undefined),  WASTED_SEVERITY_LOW);
+  });
+
+  it('treats null / NaN / negative input as LOW (no crash, no red)', () => {
+    // Defensive — if a future row has a missing wasted field, render
+    // must not throw and must not promote the bar to "catastrophic".
+    const all = [1, 2, 3, 4, 5];
+    assert.equal(wastedSeverity(null,      all), WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(undefined, all), WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(NaN,       all), WASTED_SEVERITY_LOW);
+    assert.equal(wastedSeverity(-1,        all), WASTED_SEVERITY_LOW);
+  });
+
+  it('returns the CORRECT tier for a realistic skewed dataset', () => {
+    // Real wasted-spend chart looks like: most days near zero, a few
+    // medium days, one catastrophic day. Verify the gradient picks out
+    // exactly that outlier.
+    const all = [0.01, 0.02, 0.03, 0.05, 0.04, 0.10, 0.15, 0.20, 1.00, 5.00];
+    // 5.00 is the lone catastrophic outlier.
+    assert.equal(wastedSeverity(5.00, all), WASTED_SEVERITY_HIGH);
+    // 1.00 should be MED (between 50th and 90th of the distribution).
+    assert.equal(wastedSeverity(1.00, all), WASTED_SEVERITY_MED);
+    // 0.01 is calm.
+    assert.equal(wastedSeverity(0.01, all), WASTED_SEVERITY_LOW);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Batch I — source-grep regressions for the dashboard.mjs side
+// (CPF1 layout, WS2 severity wiring, VS1 hint copy, VS3 toggle button).
+// ─────────────────────────────────────────────────
+describe('Batch I — UX-CPF1 / UX-WS2 / UX-VS1 / UX-VS3 source-grep regressions', () => {
+  const _src_bi = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-CPF1 ──────────────────────────────────────
+  it('UX-CPF1 — .chart-project-filter is repositioned in CSS as a flow container, not absolutely on top of the carousel', () => {
+    // The original CSS had `position: absolute; top: 0.5rem; right:
+    // 0.5rem;` which made the cpf-panel float over the carousel slide
+    // content. The new layout puts the filter in its own row, so the
+    // .chart-project-filter rule must NOT contain `position: absolute`
+    // any more (or, if it does, it must be paired with a guard class
+    // that disables that on the wider container).
+    const block = _src_bi.match(/\.chart-project-filter \{[\s\S]{0,400}\}/);
+    assert.ok(block, '.chart-project-filter CSS not found');
+    // Must NOT use absolute positioning that overlays the carousel.
+    assert.doesNotMatch(block[0], /position:\s*absolute/,
+      '.chart-project-filter must not be absolutely positioned (it overlaid carousel content — UX-CPF1)');
+    // The filter must align right (its own row). Justify or text-align
+    // to the right is acceptable; check the wrapper class for the
+    // expected layout.
+    assert.match(_src_bi, /\.chart-controls \{[\s\S]{0,400}justify-content:\s*flex-end/,
+      '.chart-controls wrapper should justify the filter to the right');
+  });
+
+  it('UX-CPF1 — HTML places .chart-project-filter in a .chart-controls row OUTSIDE .chart-carousel', () => {
+    // Source-grep that the project filter is now wrapped in a
+    // .chart-controls div placed BEFORE the .chart-carousel container
+    // (so the panel pushes the carousel down rather than floating
+    // over it).
+    const layoutMatch = _src_bi.match(
+      /<div class="chart-controls"[^>]*>\s*<div class="chart-project-filter" id="chart-project-filter">/);
+    assert.ok(layoutMatch,
+      'chart-project-filter should be wrapped in a chart-controls row (UX-CPF1)');
+    // Defensive: there must NOT be a chart-project-filter INSIDE the
+    // .chart-carousel any more (would re-introduce the overlap bug).
+    assert.doesNotMatch(_src_bi,
+      /<div class="usage-card chart-carousel"[^>]*>\s*<div class="chart-project-filter"/,
+      'chart-project-filter must not be the first child of .chart-carousel — would re-overlay the carousel');
+  });
+
+  // ── UX-WS2 ──────────────────────────────────────
+  it('UX-WS2 — renderWastedSpendChart applies severity gradient via wastedSeverity()', () => {
+    // Source-grep that the renderer calls wastedSeverity (the lib.mjs
+    // helper exposed on the global as `wastedSeverity` — see
+    // `_VDM_TEST_EXPORTS` set near the top of renderHTML's <script>).
+    // The renderer must build an array of all wasted values FIRST so
+    // the percentile compare has the full distribution to work with.
+    assert.match(_src_bi,
+      /var\s+wastedValues\s*=\s*days\.map\(/);
+    // The bar-color comes from wastedSeverity(), interpolated into
+    // the inline style. The exact background-color value MUST come
+    // from the lib.mjs export so the CSS variable used stays single-
+    // source-of-truth.
+    assert.match(_src_bi,
+      /var\s+barColor\s*=\s*wastedSeverity\(/);
+    // The severity color goes into inline style background, which
+    // overrides the now-removed CSS default. Check the bar template
+    // includes the inline override.
+    assert.match(_src_bi,
+      /style="height:'\s*\+\s*pct\s*\+\s*'%;background:'\s*\+\s*barColor\s*\+/);
+  });
+
+  it('UX-WS2 — .tok-wasted-bar CSS no longer hardcodes background: var(--yellow)', () => {
+    // The CSS background declaration was removed so the JS-supplied
+    // inline severity color wins (the inline style would lose to the
+    // CSS rule via specificity if both were set — wait, inline always
+    // wins over a class. But removing the CSS rule means a "default
+    // bar with no inline color" can't accidentally be hardcoded to
+    // yellow. Defensive cleanup.)
+    // Match window must accommodate the explanatory comment that
+    // documents WHY the background is unset (the comment text is
+    // load-bearing for the next reader).
+    const block = _src_bi.match(/\.tok-wasted-bar \{[\s\S]{0,1200}?\n\s*\}/);
+    assert.ok(block, '.tok-wasted-bar CSS rule not found');
+    // No hardcoded color — color must come from inline severity.
+    // The comment may MENTION var(--yellow) (explaining what was
+    // removed) but the actual `background:` declaration must NOT
+    // resolve to var(--yellow). Match only declarations.
+    assert.doesNotMatch(block[0], /^\s*background:\s*var\(--yellow\)/m,
+      '.tok-wasted-bar must not declare background:var(--yellow) (UX-WS2 — let inline severity win)');
+  });
+
+  it('UX-WS2 — export wastedSeverity() is exposed on the page-script global so renderHTML can use it', () => {
+    // The lib.mjs helpers are inlined into the renderHTML script at
+    // build-time. Because there's no bundler, the dashboard inlines
+    // a copy of the function. Look for the helper definition (or the
+    // import from lib via the top-of-script evaluator if that's the
+    // pattern). At minimum, the named function must exist in the
+    // emitted page script.
+    assert.match(_src_bi,
+      /function\s+wastedSeverity\s*\(/);
+    // The CSS-variable constants must also be inline so the function
+    // returns a value the browser understands without a separate
+    // round-trip to fetch lib.mjs.
+    assert.match(_src_bi, /var\s+WASTED_SEVERITY_LOW\s*=\s*'var\(--yellow-soft\)'/);
+    assert.match(_src_bi, /var\s+WASTED_SEVERITY_MED\s*=\s*'var\(--yellow\)'/);
+    assert.match(_src_bi, /var\s+WASTED_SEVERITY_HIGH\s*=\s*'var\(--red\)'/);
+  });
+
+  // ── UX-VS1 ──────────────────────────────────────
+  it('UX-VS1 — scrubber bar carries an explanatory hint about the tok-time dropdown', () => {
+    // The hint MUST mention BOTH "scrubber" (or "narrows") and the
+    // dropdown so the user understands the composition rule. Use a
+    // class hook so the hint can be styled / hidden later without
+    // touching the copy.
+    assert.match(_src_bi, /class="vs-hint"/);
+    // Spec text: "Scrubber narrows within the selected time window
+    // from the dropdown above" (or the dropdown's exact name).
+    assert.match(_src_bi,
+      /Scrubber narrows within/i);
+    // The hint must reference the tok-time dropdown in plain language
+    // so the user can orient themselves.
+    assert.match(_src_bi,
+      /(time window|range|dropdown)/i);
+  });
+
+  it('UX-VS1 — .vs-hint CSS exists with muted styling so the hint is informational, not loud', () => {
+    const block = _src_bi.match(/\.vs-hint \{[\s\S]{0,400}\}/);
+    assert.ok(block, '.vs-hint CSS rule must be defined');
+    // Hint must not look like an error or a primary control — use
+    // muted text color and a small font.
+    assert.match(block[0], /color:\s*var\(--muted\)/);
+    assert.match(block[0], /font-size:\s*0\.6\d+rem/);
+  });
+
+  // ── UX-VS3 ──────────────────────────────────────
+  it('UX-VS3 — there is a button to toggle the datetime fallback inputs on wider viewports', () => {
+    // The button-class hook lets users on >600px viewports SHOW the
+    // type=datetime-local inputs alongside the slider when they need
+    // to type an exact timestamp. The original CSS only revealed the
+    // inputs at <600px.
+    assert.match(_src_bi, /class="vs-fallback-toggle"/);
+    // Source-grep an aria-label or visible text that describes the
+    // toggle's purpose.
+    assert.match(_src_bi, /(Edit dates|Type exact|Edit time|Edit time range)/i);
+    // The toggle must wire to a function (onclick attribute) so the
+    // visibility flip is implemented.
+    assert.match(_src_bi,
+      /class="vs-fallback-toggle"[^>]*onclick="[a-zA-Z_]+\(/);
+  });
+
+  it('UX-VS3 — JS toggle helper toggles a CSS class on the .vs-fallback-inputs container', () => {
+    // The helper function must exist with a recognizable name and
+    // toggle either a class or a hidden attribute on the fallback
+    // input container. Source-grep both patterns to keep the test
+    // resilient to small refactors.
+    assert.match(_src_bi,
+      /function\s+toggleFallbackInputs\s*\(/);
+    // Helper must reach for the .vs-fallback-inputs container.
+    assert.match(_src_bi,
+      /toggleFallbackInputs[\s\S]{0,500}vs-fallback-inputs/);
+  });
+
+  it('UX-VS3 — fallback inputs are still auto-shown on <600px (existing rule preserved)', () => {
+    // Mobile users already get the inputs because the slider hides
+    // there. The "edit dates" toggle MUST NOT delete that media query
+    // (would regress the small-viewport experience).
+    assert.match(_src_bi,
+      /@media \(max-width:\s*600px\)\s*\{[\s\S]{0,200}\.vs-fallback-inputs\s*\{\s*display:\s*flex/);
+  });
+
+  it('UX-VS3 — the .vs-fallback-inputs container has a visible class hook (.is-open) for the toggle button', () => {
+    // Use a class hook (not direct style mutation) so future a11y
+    // states can hang off the same selector.
+    assert.match(_src_bi,
+      /\.vs-fallback-inputs\.is-open\s*\{\s*display:\s*flex/);
+  });
+
+  // ── UX honors existing batch D invariants (defensive) ──
+  it('Defensive — UX-VS2 thumb sizing is preserved (we did not regress to tiny thumbs)', () => {
+    // Batch I touches the scrubber but must NOT shrink the thumbs.
+    const block = _src_bi.match(/\.vs-thumb \{[\s\S]{0,400}\}/);
+    assert.ok(block, '.vs-thumb CSS rule still required');
+    const wMatch = block[0].match(/width:\s*(\d+)px/);
+    const hMatch = block[0].match(/height:\s*(\d+)px/);
+    assert.ok(Number(wMatch[1]) >= 24, '.vs-thumb width must stay >= 24px');
+    assert.ok(Number(hMatch[1]) >= 24, '.vs-thumb height must stay >= 24px');
   });
 });

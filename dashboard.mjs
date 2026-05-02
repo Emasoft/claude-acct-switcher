@@ -5024,13 +5024,28 @@ function renderHTML() {
   .chart-carousel-dot.active { background: var(--primary); }
   .chart-carousel-dot:hover { background: var(--muted); }
 
-  /* Phase 6 — Project multi-select filter (chart-scoped). Anchored
-     top-right of the carousel card. Empty selection = aggregate all. */
+  /* Phase 6 — Project multi-select filter (chart-scoped). Empty
+     selection = aggregate all.
+     UX-CPF1: previously anchored absolute top-right INSIDE .chart-
+     carousel; the open panel floated over the carousel slides and on
+     800-1024px viewports the toggle button itself sat on top of the
+     slide title text. Moved into a sibling .chart-controls row above
+     the carousel — the panel now extends downward into normal flow,
+     pushing the carousel down rather than overlaying it. The toggle
+     button keeps its compact appearance via .cpf-toggle below; only
+     the absolute positioning here was the load-bearing overlap bug. */
   .chart-project-filter {
-    position: absolute;
-    top: 0.5rem;
-    right: 0.5rem;
+    position: relative;
     z-index: 10;
+  }
+  /* UX-CPF1: row that hosts the project filter outside the carousel.
+     Right-aligned so the visual anchor matches the previous top-right
+     placement, but lives ABOVE the carousel where the open panel can
+     extend downward without occluding chart bars. */
+  .chart-controls {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.5rem;
   }
   .cpf-toggle {
     display: inline-flex;
@@ -5137,7 +5152,14 @@ function renderHTML() {
   .tok-wasted-bar {
     flex: 1;
     min-width: 1px;
-    background: var(--yellow);
+    /* UX-WS2: bar background is set inline by renderWastedSpendChart
+       via wastedSeverity() — one of var(--yellow-soft) / var(--yellow)
+       / var(--red) depending on percentile within the visible window.
+       The hardcoded var(--yellow) that lived here previously caused
+       every bar to look identical regardless of severity. We now leave
+       it unset so the inline severity colour always wins (inline beats
+       class-rule specificity in any CSS engine, but removing the rule
+       eliminates the dead-code path entirely). */
     border-radius: 2px 2px 0 0;
     transition: opacity 0.15s;
     position: relative;
@@ -5372,6 +5394,17 @@ function renderHTML() {
     gap: 0.5rem;
     flex-wrap: wrap;
   }
+  /* UX-VS3: explicit class hook so the toggle button can SHOW the
+     fallback inputs on viewports >600px. The base rule keeps display:
+     none (the slider is the primary control there), .is-open promotes
+     to display: flex, and the <600px media query below keeps its own
+     auto-show for small screens. The button toggles `.is-open` so the
+     state is observable both visually and programmatically (a future
+     test or a11y attribute can grep for the class instead of inspecting
+     computed style). */
+  .vs-fallback-inputs.is-open {
+    display: flex;
+  }
   .vs-fallback-input {
     background: var(--card);
     border: 1px solid var(--border);
@@ -5381,9 +5414,43 @@ function renderHTML() {
     padding: 0.25rem 0.5rem;
     font-family: inherit;
   }
+  /* UX-VS3: small subtle button. Shape mirrors .vs-preset-btn so the
+     row reads as one cohesive control set rather than a stranded
+     "Edit dates" link. The toggled state turns it into a primary
+     button so the user sees the inputs are open. */
+  .vs-fallback-toggle {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    font-size: 0.6875rem;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .vs-fallback-toggle:hover { background: var(--bg); border-color: var(--muted); color: var(--foreground); }
+  .vs-fallback-toggle[aria-expanded="true"] {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+  /* UX-VS1: hint paragraph explaining the scrubber × dropdown
+     composition. Muted and small so it sits below the primary slider
+     row as a non-loud note. .vs-hint-row keeps the row alignment
+     identical to the primary controls row. */
+  .vs-hint-row { margin-top: 0.5rem; }
+  .vs-hint {
+    color: var(--muted);
+    font-size: 0.6875rem;
+    font-style: italic;
+  }
   @media (max-width: 600px) {
     .vs-track-wrap { display: none; }
     .vs-fallback-inputs { display: flex; }
+    /* On small viewports the slider is hidden and the inputs are the
+       only control — the toggle button is irrelevant noise. Hide it
+       so the row stays clean. */
+    .vs-fallback-toggle { display: none; }
   }
   /* UX audit (UX-X1, CRITICAL): proper responsive breakpoints. The
      dashboard previously had only the 600px scrubber-swap query, so
@@ -5525,11 +5592,34 @@ function renderHTML() {
             <div class="vs-thumb-label" id="vs-label-end"></div>
           </div>
         </div>
-        <div class="vs-fallback-inputs">
+        <!-- UX-VS3: button to toggle the datetime-local fallback inputs
+             on viewports >600px. Below 600px the slider is hidden by
+             a media query and the inputs are auto-shown; above 600px
+             power users can click "Edit dates" to type exact times
+             alongside the slider for precision queries (the slider's
+             pixel-to-ms math is too coarse for "show me 09:00-18:00
+             on a specific day" when the visible range is 90 days). -->
+        <button type="button" class="vs-fallback-toggle" id="vs-fallback-toggle"
+                onclick="toggleFallbackInputs()" aria-controls="vs-fallback-inputs"
+                aria-expanded="false" title="Show / hide datetime inputs to type an exact time range">
+          Edit dates
+        </button>
+        <div class="vs-fallback-inputs" id="vs-fallback-inputs">
           <label style="font-size:0.6875rem;color:var(--muted)">From <input type="datetime-local" class="vs-fallback-input" id="vs-input-start"></label>
           <label style="font-size:0.6875rem;color:var(--muted)">To <input type="datetime-local" class="vs-fallback-input" id="vs-input-end"></label>
         </div>
         <div class="vs-window-info"><b id="vs-window-text">--</b></div>
+      </div>
+      <!-- UX-VS1: hint clarifying the relationship between the
+           scrubber and the tok-time dropdown below. Both controls
+           filter time, and applying both narrows from the dropdown's
+           outer window down to the scrubber's inner range. Without
+           this hint users wonder whether the scrubber overrides or
+           composes with the dropdown. -->
+      <div class="vs-bar-row vs-hint-row">
+        <div class="vs-hint" id="vs-hint">
+          Scrubber narrows within the selected time window from the dropdown below.
+        </div>
       </div>
     </div>
     <div class="tok-filters">
@@ -5548,7 +5638,16 @@ function renderHTML() {
     </div>
     <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
-      <div class="usage-card chart-carousel" style="margin-bottom:1rem">
+      <!-- UX-CPF1: chart-project-filter lifted out of .chart-carousel
+           into its own row above the carousel. The previous inline
+           top-right placement caused the open panel to overlay the
+           carousel slides (worst on 800-1024px viewports where the
+           toggle button itself overlapped the slide title text and
+           the dropdown panel hid bar tooltips). The filter is now a
+           normal-flow control above the carousel; the panel extends
+           downward, pushing the carousel down rather than floating
+           over it. -->
+      <div class="chart-controls">
         <div class="chart-project-filter" id="chart-project-filter">
           <button type="button" class="cpf-toggle" id="cpf-toggle" onclick="toggleProjectFilter()" aria-haspopup="listbox" aria-expanded="false">
             <span id="cpf-label">All projects</span>
@@ -5562,6 +5661,8 @@ function renderHTML() {
             <div class="cpf-list" id="cpf-list" role="listbox" aria-multiselectable="true" aria-label="Filter charts by project"></div>
           </div>
         </div>
+      </div>
+      <div class="usage-card chart-carousel" style="margin-bottom:1rem">
         <div class="chart-carousel-inner">
           <div class="chart-carousel-slides" id="chart-carousel-slides">
             <div class="chart-carousel-slide" id="tok-savings-chart"></div>
@@ -5865,6 +5966,28 @@ function vsSnapshot() {
     end: _vsState.end,
     tierFilter: (_vsState.tierFilter || ['all']).slice(),
   };
+}
+
+// UX-VS3: toggle the datetime-local fallback inputs on viewports
+// where the slider is the primary control (>600px). The inputs are
+// hidden by default at this breakpoint; clicking the toggle adds
+// the is-open class so they appear alongside the slider for precise
+// typed timestamp entry. Below 600px the slider hides via media query
+// and the inputs are auto-shown — the toggle button itself is also
+// hidden via the same media query so the row stays clean.
+//
+// Why a class hook (not direct style mutation):
+//   - One source of truth for visibility state — a future
+//     persistence step or a11y attribute can grep the class.
+//   - Symmetric pairing: aria-expanded on the button mirrors the
+//     class on the inputs container, so screen readers announce
+//     the state correctly.
+function toggleFallbackInputs() {
+  var btn = document.getElementById('vs-fallback-toggle');
+  var box = document.getElementById('vs-fallback-inputs');
+  if (!btn || !box) return;
+  var open = box.classList.toggle('is-open');
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
 function vsTierForAccount(name) {
@@ -6375,6 +6498,65 @@ function formatNum(n) {
   // site that emits a title= via fmtTokenCountExact (the two MUST stay
   // consistent — see UX-X9).
   return fmtTokenCountShort(n);
+}
+
+// UX-WS2: Wasted-spend severity gradient. The dashboard inlines this
+// helper into the page script; the source-of-truth lives in lib.mjs
+// (function wastedSeverity, exported alongside the WASTED_SEVERITY_*
+// constants — unit-tested in test/lib.test.mjs). Keep the algorithm
+// algorithm-locked between the two copies. Percentile-based gradient
+// stays meaningful regardless of overall traffic volume; a "bad day"
+// stands out against the user own baseline rather than against an
+// absolute dollar threshold that drifts with Anthropic pricing.
+var WASTED_SEVERITY_LOW  = 'var(--yellow-soft)';
+var WASTED_SEVERITY_MED  = 'var(--yellow)';
+var WASTED_SEVERITY_HIGH = 'var(--red)';
+function wastedSeverity(value, allValues) {
+  // Defensive input gates — null / NaN / negative input MUST NOT crash
+  // and MUST NOT promote the bar to "catastrophic" (would scream red
+  // for missing data).
+  if (typeof value !== 'number' || !isFinite(value) || value < 0) {
+    return WASTED_SEVERITY_LOW;
+  }
+  if (!Array.isArray(allValues) || allValues.length === 0) {
+    return WASTED_SEVERITY_LOW;
+  }
+  // Filter to finite non-negative entries so percentiles are not
+  // skewed by NaN / null / negative items in a malformed dataset.
+  var cleaned = [];
+  for (var i = 0; i < allValues.length; i++) {
+    var v = allValues[i];
+    if (typeof v === 'number' && isFinite(v) && v >= 0) cleaned.push(v);
+  }
+  if (cleaned.length === 0) return WASTED_SEVERITY_LOW;
+  // Flat / single-value distributions have no meaningful gradient.
+  // Without this short-circuit a flat dataset would still pick a
+  // "calm default" via the strict-inequality compare below, but the
+  // explicit early-return is cheaper and self-documenting.
+  var allEqual = true;
+  for (var j = 1; j < cleaned.length; j++) {
+    if (cleaned[j] !== cleaned[0]) { allEqual = false; break; }
+  }
+  if (allEqual) return WASTED_SEVERITY_LOW;
+  var sorted = cleaned.slice().sort(function(a, b) { return a - b; });
+  var p50 = _wastedPercentile(sorted, 0.50);
+  var p90 = _wastedPercentile(sorted, 0.90);
+  // Strict inequality: HIGH only when bar exceeds the 90th. A bar
+  // sitting exactly on the 50th (median) is still LOW.
+  if (value > p90) return WASTED_SEVERITY_HIGH;
+  if (value > p50) return WASTED_SEVERITY_MED;
+  return WASTED_SEVERITY_LOW;
+}
+function _wastedPercentile(sorted, p) {
+  var n = sorted.length;
+  if (n === 0) return 0;
+  if (n === 1) return sorted[0];
+  var rank = p * (n - 1);
+  var lo = Math.floor(rank);
+  var hi = Math.ceil(rank);
+  if (lo === hi) return sorted[lo];
+  var frac = rank - lo;
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
 }
 
 function fillClass(pct) {
@@ -8913,11 +9095,25 @@ function renderWastedSpendChart() {
   var days = Array.from(byDay.values()).sort(function(a, b) { return a.day < b.day ? -1 : 1; });
   var maxWasted = 0;
   for (var di = 0; di < days.length; di++) if (days[di].wasted > maxWasted) maxWasted = days[di].wasted;
+  // UX-WS2: severity gradient. Build a flat array of all wasted
+  // dollar amounts so wastedSeverity() can score each bar against
+  // the full distribution. Percentile-of-current-dataset means the
+  // gradient stays meaningful regardless of overall traffic volume —
+  // a "bad day" stands out against the user's own baseline.
+  var wastedValues = days.map(function(d) { return d.wasted; });
   // Build the bars
   var bars = '<div class="tok-wasted-bar-area">';
   for (var dj = 0; dj < days.length; dj++) {
     var dy = days[dj];
     var pct = maxWasted > 0 ? Math.max(2, Math.round((dy.wasted / maxWasted) * 100)) : 2;
+    // UX-WS2: severity colour comes from the lib.mjs-mirrored
+    // wastedSeverity() helper, returning one of the three CSS-
+    // variable tokens (yellow-soft / yellow / red) based on where
+    // this bar sits in the visible distribution. Inline style wins
+    // over .tok-wasted-bar's CSS background so removing the CSS
+    // default below was strictly defensive — no path can reach the
+    // bar without going through this loop.
+    var barColor = wastedSeverity(dy.wasted, wastedValues);
     // Audit CC-DASH-021: reuse the existing formatCost helper for
     // consistency with the rest of the dashboard's USD rendering.
     // Tooltip MUST stay through escHtml() — any future addition of
@@ -8925,7 +9121,7 @@ function renderWastedSpendChart() {
     var tooltip = dy.day + ' • ' + formatNum(dy.tokens) + ' tok • '
                   + formatCost(dy.wasted) + ' wasted (' + formatCost(dy.cost) + ' billed) • '
                   + dy.count + ' miss' + (dy.count === 1 ? '' : 'es');
-    bars += '<div class="tok-wasted-bar" style="height:' + pct + '%" data-tooltip="' + escHtml(tooltip) + '"></div>';
+    bars += '<div class="tok-wasted-bar" style="height:' + pct + '%;background:' + barColor + '" data-tooltip="' + escHtml(tooltip) + '"></div>';
   }
   bars += '</div>';
   // UX-X9: hover-exact for the totals span — miss-tokens often cross
