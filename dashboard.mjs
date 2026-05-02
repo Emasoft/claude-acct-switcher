@@ -3565,6 +3565,17 @@ function renderHTML() {
     --card: #fff;
     --foreground: hsl(224 71% 4%);
     --muted: hsl(220 9% 46%);
+    /* UX-X10 — readable-active variant of --muted. Use this on controls
+       whose ACTIVE state would otherwise be visually identical to their
+       inactive state when both painted with var(--muted). Specifically
+       paired with the .vdm-filter-bar regex toggle label, where the
+       checkbox alone was the only signal that "Regex" was on. Apply
+       SURGICALLY — the intent is a semantic distinction, not a wholesale
+       rebrand of every muted call-site (config-desc, header-sub, stat-
+       label etc. correctly stay muted). Darker than --muted (HSL L 25%
+       vs 46%) so the contrast jump is clearly visible while keeping the
+       muted hue family. */
+    --muted-active: hsl(220 9% 25%);
     --border: hsl(220 13% 91%);
     --primary: hsl(217 91% 60%);
     --primary-soft: hsl(217 91% 97%);
@@ -4437,6 +4448,23 @@ function renderHTML() {
     color: var(--muted);
     cursor: pointer;
     user-select: none;
+    /* UX-X10: prepare for the colour swap below — keep the transition on
+       both colour and font-weight so the active-state flip animates
+       instead of snapping. */
+    transition: color 0.15s, font-weight 0.15s;
+  }
+  /* UX-X10 — Regex toggle label: when its inner checkbox is checked, swap
+     to var(--muted-active) AND bump font-weight so the on/off state is
+     unmistakable. Two redundant signals (colour + weight) so the active
+     state survives a colour-blind viewer or a future browser without
+     :has() (font-weight degrades gracefully — the colour rule simply
+     never matches and the label stays muted, but the regex checkbox is
+     still visible).
+     :has() is supported in Chromium 105+, Firefox 121+, and Safari 15.4+;
+     the dashboard already requires JS so the floor is well within range. */
+  .vdm-filter-bar label:has(input:checked) {
+    color: var(--muted-active);
+    font-weight: 600;
   }
   .vdm-filter-bar label input[type="checkbox"] { cursor: pointer; }
   .vdm-filter-bar button {
@@ -5938,7 +5966,13 @@ function renderHTML() {
       <button type="button" id="logs-filter-clear" aria-label="Clear filter">Clear</button>
       <span class="vdm-filter-count" id="logs-filter-count" aria-live="polite"></span>
     </div>
-    <div id="log-container" style="background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.75rem;line-height:1.5;height:calc(100vh - 220px);overflow-y:auto;color:#c9d1d9"></div>
+    <!-- UX-L1: replaced the GitHub-dark surface (background:#0d1117 + color:#c9d1d9)
+         with the dashboard's existing light-on-near-white tokens so the panel
+         no longer reads as a dark inset inside an otherwise light layout.
+         Keeps monospace for the code feel; LOG_TAG_COLORS now route through
+         var(--…) tokens so a future dark-mode rebind moves the tag colours
+         in lockstep. -->
+    <div id="log-container" style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.75rem;line-height:1.5;height:calc(100vh - 220px);overflow-y:auto;color:var(--foreground)"></div>
   </div>
 
 </div>
@@ -9687,11 +9721,17 @@ try {
 // ── Log stream ──
 let _logES = null;
 const LOG_MAX_LINES = 5000;
+// UX-L1: route log tag colours through the same design tokens the rest of
+// the dashboard uses so the Logs tab fits the surrounding palette and can
+// be re-skinned by changing :root. The historical hexes were lifted from
+// GitHub's dark theme — they read harshly inside a light dashboard, and a
+// future dark-mode rollout would have to update them by hand. With var(--…)
+// references, retoning is automatic.
 const LOG_TAG_COLORS = {
-  error: '#f85149', warn: '#f85149',
-  switch: '#d29922', proactive: '#d29922',
-  refresh: '#58a6ff', circuit: '#58a6ff', fallback: '#58a6ff',
-  info: '#8b949e', system: '#8b949e',
+  error: 'var(--red)', warn: 'var(--red)',
+  switch: 'var(--yellow)', proactive: 'var(--yellow)',
+  refresh: 'var(--blue)', circuit: 'var(--blue)', fallback: 'var(--blue)',
+  info: 'var(--muted)', system: 'var(--muted)',
 };
 
 // UX-L2 / UX-AC1 — shared filter state for Logs and Activity tabs.
@@ -9963,14 +10003,18 @@ function connectLogStream() {
   _vdmWireFilterControls();
   _vdmApplyLogsFilter();
   _logES = new EventSource('/api/logs/stream');
-  _logES.onopen = () => { status.textContent = 'Connected'; status.style.color = '#3fb950'; };
-  _logES.onerror = () => { status.textContent = 'Reconnecting...'; status.style.color = '#f85149'; };
+  // UX-L1: status colours route through design tokens (was '#3fb950' /
+  // '#f85149' GitHub greens/reds). var(--green) and var(--red) follow the
+  // dashboard palette and rebind cleanly under any future theme.
+  _logES.onopen = () => { status.textContent = 'Connected'; status.style.color = 'var(--green)'; };
+  _logES.onerror = () => { status.textContent = 'Reconnecting...'; status.style.color = 'var(--red)'; };
   _logES.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
       const line = document.createElement('div');
       const tag = (data.tag || 'info').toLowerCase();
-      const color = LOG_TAG_COLORS[tag] || '#8b949e';
+      // UX-L1: tag-not-in-map fallback is the muted token (was '#8b949e').
+      const color = LOG_TAG_COLORS[tag] || 'var(--muted)';
       // H7 fix — escape the tag identifier before HTML interpolation.
       // Currently every log() caller passes a programmer-set string, but a
       // future regression (or an attacker-controlled tag via OTLP payload
