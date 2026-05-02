@@ -1125,6 +1125,13 @@ export function classifyUsageComponent(row) {
   // or just `Skill` with mcpServer field carrying the plugin name.
   if (typeof row.tool === 'string') {
     const trimmed = row.tool.trim();
+    // Audit SC-OPUS-007 (CWE-1333) — defensive length cap. The
+    // /^Skill[\s(:]/ test is linear-time and ReDoS-safe, but a
+    // pathological 1MB tool name from a hostile sub-agent would still
+    // consume CPU. Tool names have no legitimate use case beyond
+    // a few hundred chars; treat anything over 256 as "main" so
+    // the regex never sees it.
+    if (trimmed.length > 256) return 'main';
     if (trimmed === 'Skill' || /^Skill[\s(:]/.test(trimmed)) {
       // Try to extract the skill name. Patterns observed:
       //   "Skill(plugin:skill)"  → "plugin:skill"
@@ -1137,7 +1144,16 @@ export function classifyUsageComponent(row) {
       // (e.g. "Skill(foo) extra" → "foo) extra").
       let m = trimmed.match(/^Skill\s*\(\s*(.+?)\s*\)\s*$/);
       if (!m) m = trimmed.match(/^Skill\s*[:\s]\s*(.+?)\s*$/);
-      if (m && m[1]) return `skill:${m[1].trim()}`;
+      // Audit Round-2 R2-MINOR-1: `m[1].trim()` can be empty when the
+      // user wrote "Skill( )" (whitespace-only inside parens) —
+      // `(.+?)` requires at least one char which whitespace satisfies,
+      // but trim() collapses to ''. Treat empty-after-trim as no match
+      // so we fall through to the mcpServer fallback rather than
+      // emitting `skill:` (an unhelpful UI label).
+      if (m && m[1]) {
+        const skillName = m[1].trim();
+        if (skillName) return `skill:${skillName}`;
+      }
       const fallback = (row.mcpServer || '').trim();
       return `skill:${fallback || 'unknown'}`;
     }
@@ -1507,7 +1523,11 @@ export function csvField(v) {
   // is produced via String(v) above and isn't an injection vector
   // (Excel parses it as a numeric cell). Prefixing it with ' would
   // turn a numeric column into text and break spreadsheet sums.
-  if (isUserString && s.length > 0 && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  // Audit Round-2 R2-MINOR-2: include \n in the trigger set. Excel
+  // ignores leading whitespace in formulas, so a cell starting with
+  // \n=cmd would still execute. \r is already covered; without \n
+  // a multi-line cell payload would slip past.
+  if (isUserString && s.length > 0 && /^[=+\-@\t\r\n]/.test(s)) s = "'" + s;
   return '"' + s.replace(/"/g, '""') + '"';
 }
 
@@ -1591,9 +1611,12 @@ export function renderUsageTreeCsv(rows) {
  * @param {Object} [opts]
  * @param {number} [opts.minInputForMissDetection] default 1000
  * @param {number} [opts.cacheTtlMs] default 300000 (5 minutes)
- * @returns {Array<{sessionId, ts, model, inputTokens, repo, branch, reason}>}
- *   Same flat shape as before — Phase 5 enriches `reason` but does NOT
- *   change the array's element type, so existing UI consumers still work.
+ * @returns {Array<{sessionId, ts, model, inputTokens, repo, branch,
+ *   account, reason}>}
+ *   Phase 5 enriches `reason`; Round-2 audit added `account` so the
+ *   wasted-spend chart can apply its account-dropdown filter without
+ *   re-joining against the source rows. Existing UI consumers ignoring
+ *   the extra field still work.
  *   Per-session aggregates are exposed via the SEPARATE
  *   `summarizeCacheMissesBySession()` function below.
  */
@@ -1665,6 +1688,12 @@ export function buildCacheMissReport(rows, opts = {}) {
           inputTokens: input,
           repo: row.repo || null,
           branch: row.branch || null,
+          // Audit Round-2 QR5: include account so the wasted-spend
+          // chart's account-filter check (in renderWastedSpendChart)
+          // has a field to compare against. Without this the filter
+          // was a no-op (every row's p.account === undefined → never
+          // matched the dropdown's value).
+          account: row.account || null,
           reason,
         });
       }
@@ -1696,7 +1725,12 @@ export function buildCacheMissReport(rows, opts = {}) {
  *     a cache outcome was possible," not "all turns."
  *
  * @param {Array<Object>} rows
- * @param {Object} [opts] same shape as buildCacheMissReport
+ * @param {Object} [opts] same shape as buildCacheMissReport, plus:
+ * @param {Array<Object>} [opts._precomputedMisses] callers that
+ *   already invoked buildCacheMissReport(rows, opts) can pass the
+ *   result here to avoid the second walk. Trusted-input contract:
+ *   the leading underscore signals "internal API"; never accept
+ *   this from a request body without re-validating the shape.
  * @returns {Array<{sessionId, repo, branch, hits, misses, hitRate, lastTs, missDetails}>}
  *   Sorted by lastTs descending so the UI's "recently active first"
  *   order is the natural one.
@@ -1802,8 +1836,11 @@ export function summarizeCacheMissesBySession(rows, opts = {}) {
  * @param {number} [opts.cacheTtlMs]
  * @param {Set<string>|Array<string>} [opts.repoFilter] include only
  *   rows whose `repo` is in this set. Empty/missing = include all.
+ * @param {Array<Object>} [opts._precomputedMisses] callers that
+ *   already invoked buildCacheMissReport(rows, opts) can pass the
+ *   result here to avoid the second walk. Trusted-input contract.
  * @returns {Array<{ts, inputTokens, model, repo, branch, sessionId,
- *   reason, costUSD, wastedUSD}>}
+ *   account, reason, costUSD, wastedUSD}>}
  *   Sorted by ts ascending.
  *   - `costUSD` = full input price the user paid for this miss row,
  *     computed via estimateModelCost(model, inputTokens, 0, 0, 0).
@@ -1843,6 +1880,9 @@ export function buildWastedSpendSeries(rows, opts = {}) {
       repo:        m.repo,
       branch:      m.branch,
       sessionId:   m.sessionId,
+      // Audit Round-2 QR5: pass account through so the chart's
+      // account-filter check has a value to compare.
+      account:     m.account || null,
       reason:      m.reason,
       costUSD:     fullCost,
       wastedUSD:   Math.max(0, fullCost - cacheCost),
@@ -2485,7 +2525,15 @@ export function parsePostToolBatchPayload(data) {
   for (const t of arr) {
     if (!t || typeof t !== 'object') continue;
     const toolName = t.tool_name;
+    // Audit Round-2 SR-P2-005 (CWE-79 / CWE-117 defense-in-depth):
+    // reject tool names containing CR, LF, or NUL — they would
+    // round-trip through token-usage.json into downstream consumers
+    // (jq, awk, naive CSV importers) that don't handle embedded
+    // line-breaks. Also cap length at 256 chars to bound memory and
+    // ReDoS exposure (matches classifyUsageComponent's guard).
     if (typeof toolName !== 'string' || toolName.length === 0) continue;
+    if (toolName.length > 256) continue;
+    if (/[\r\n\x00]/.test(toolName)) continue;
     if (seen.has(toolName)) continue;
     seen.add(toolName);
     tools.push({ toolName, mcpServer: inferMcpServerFromToolName(toolName) });

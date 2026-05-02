@@ -6725,9 +6725,11 @@ describe('Phase 3 — UI tree view (renderHTML + client JS)', () => {
   it('refreshUsageTree caches by hash to avoid DOM churn on identical data', () => {
     // Without the hash gate, the 5s poll re-renders the entire tree
     // every tick — wasting render time and causing visual flicker.
+    // Slice bumped from 2000 → 3000 to span the round-2 R2-DASH-102
+    // shape guard + R2-DASH-111 _treeHash addition.
     const fn = _src_t3.slice(
       _src_t3.indexOf('async function refreshUsageTree'),
-      _src_t3.indexOf('async function refreshUsageTree') + 2000,
+      _src_t3.indexOf('async function refreshUsageTree') + 3000,
     );
     assert.match(fn, /_lastTreeHash/);
     assert.match(fn, /if \(hash === _lastTreeHash\) return/);
@@ -7686,24 +7688,30 @@ describe('Phase 5 — UI: per-session misses card', () => {
   });
 
   it('per-row miss line shows model + reason columns (XSS-safe)', () => {
+    // Slice bumped from 4500 → 6000 to span the SC-OPUS-002
+    // KNOWN_MISS_REASONS allow-list block added in round-2.
     const fn = _src_t5ui.slice(
       _src_t5ui.indexOf('function renderCacheMisses'),
-      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+      _src_t5ui.indexOf('function renderCacheMisses') + 6000,
     );
     assert.match(fn, /miss-model/);
     assert.match(fn, /miss-reason/);
     // Both model and reason routed through escHtml for XSS safety
     assert.match(fn, /escHtml\(modelText\)/);
     assert.match(fn, /escHtml\(reasonText\)/);
-    // Reason class derived by stripping non-alphanumerics so the CSS
-    // class selector matches reason-TTL-likely / reason-compact-boundary
-    assert.match(fn, /reason-' \+ reasonText\.replace/);
+    // Audit SC-OPUS-002: reason class is derived from a strict
+    // allow-list, NOT a regex strip. The previous fragile-by-design
+    // pattern would silently open an XSS sink under any future
+    // refactor that broadened the reason set.
+    assert.match(fn, /var reasonKey\s*=\s*KNOWN_MISS_REASONS\[reasonText\] \? reasonText : 'unknown'/);
+    assert.match(fn, /var reasonClass = 'reason-' \+ reasonKey/);
   });
 
   it('caps DOM at 5 sessions x 10 rows-per-session, footer reports overflow', () => {
+    // Slice bumped from 4500 → 6000 (see XSS test above).
     const fn = _src_t5ui.slice(
       _src_t5ui.indexOf('function renderCacheMisses'),
-      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+      _src_t5ui.indexOf('function renderCacheMisses') + 6000,
     );
     assert.match(fn, /SESSION_CAP = 5/);
     assert.match(fn, /ROWS_PER_SESSION_CAP = 10/);
@@ -8016,12 +8024,15 @@ describe('Phase 6 — UI: chart-scoped project multi-select + wasted-spend chart
   });
 
   it('renderWastedSpendChart applies project filter + time range, has empty-state', () => {
+    // Slice bumped from 4000 → 5000 to span the SR-OP-004 multi-
+    // filter logic added in round-2 (model/account/repo/branch +
+    // tier filters that were not previously honored).
     const fn = _src_t6ui.slice(
       _src_t6ui.indexOf('function renderWastedSpendChart'),
-      _src_t6ui.indexOf('function renderWastedSpendChart') + 4000,
+      _src_t6ui.indexOf('function renderWastedSpendChart') + 5000,
     );
     assert.ok(fn.length > 800, 'renderWastedSpendChart body must exist');
-    // Multi-select filter applied
+    // Multi-select filter applied (Round-2 QR4: gated on multiSelectActive)
     assert.match(fn, /_chartProjectFilter\.has/);
     // Time-range filter via vsSnapshot (matches the rest of the tab)
     assert.match(fn, /var snap = vsSnapshot\(\)/);
@@ -8172,6 +8183,13 @@ describe('Audit SC-OPUS-001 — csvField formula-injection guard', () => {
     assert.equal(csvField(false), '"false"');
   });
 
+  it('also prefixes leading newline (R2-MINOR-2 — newer LibreOffice/Sheets evaluate)', () => {
+    // Round-2 finding: \n was missing from the trigger set. Newer
+    // LibreOffice and Sheets versions evaluate cells starting with
+    // bare \n as formulas in some import paths.
+    assert.equal(csvField('\n=cmd|/c calc'), `"'\n=cmd|/c calc"`);
+  });
+
   it('round-trips formula-prefixed cells through renderUsageTreeCsv', () => {
     // End-to-end: a malicious row whose `tool` field is a formula
     // payload must end up CSV-escaped AND formula-quoted.
@@ -8186,6 +8204,105 @@ describe('Audit SC-OPUS-001 — csvField formula-injection guard', () => {
     // Should contain the prefixed-and-escaped form (single quotes
     // don't need RFC 4180 doubling — only double quotes do).
     assert.match(csv, /"'=cmd\|'\/c calc'!A0"/);
+  });
+});
+
+describe('Audit Round-2 R2-MINOR-1 — Skill regex empty-parens edge case', () => {
+  it('Skill(  ) with whitespace-only inside parens falls through to mcpServer/unknown', () => {
+    // Round-2 finding: paren regex `(.+?)` matched whitespace, then
+    // .trim() collapsed to '' → emitted skill: with empty label.
+    // After fix, the empty-after-trim path falls through to the
+    // documented mcpServer/unknown fallback.
+    const r1 = classifyUsageComponent({ tool: 'Skill(  )', mcpServer: 'foo' });
+    assert.equal(r1, 'skill:foo');
+    const r2 = classifyUsageComponent({ tool: 'Skill( )' });
+    assert.equal(r2, 'skill:unknown');
+  });
+});
+
+describe('Audit Round-2 — additional regression coverage', () => {
+  it('aggregateUsageTree skips rows with negative token fields (MAJOR-3)', () => {
+    // Defensive: -100 inputTokens would have been added to the running
+    // total before the round-1 fix (typeof number, isFinite true,
+    // pre-check missing the < 0 branch). Now skipped.
+    const rows = [
+      { type: 'usage', sessionId: 's', ts: 1000, repo: '/r', branch: 'main',
+        model: 'claude-sonnet-4-7', tool: 'Bash',
+        inputTokens: -100, outputTokens: 50,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      { type: 'usage', sessionId: 's', ts: 2000, repo: '/r', branch: 'main',
+        model: 'claude-sonnet-4-7', tool: 'Bash',
+        inputTokens:  100, outputTokens: 50,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ];
+    const out = aggregateUsageTree(rows);
+    assert.equal(out.totals.input, 100, 'negative-input row must be excluded; total=100 not -100 not 0');
+    assert.equal(out.totals.output, 50, 'only the positive row contributes');
+  });
+
+  it('aggregateUsageForCsvExport skips rows with negative token fields (MAJOR-3)', () => {
+    const rows = [
+      { type: 'usage', ts: 1000, repo: '/r', branch: 'main', tool: 'Bash',
+        model: 'claude-sonnet-4-7',
+        inputTokens: -500, outputTokens: 0,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      { type: 'usage', ts: 2000, repo: '/r', branch: 'main', tool: 'Bash',
+        model: 'claude-sonnet-4-7',
+        inputTokens:  500, outputTokens: 0,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ];
+    const out = aggregateUsageForCsvExport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].inputTokens, 500);
+    assert.equal(out[0].requestCount, 1, 'only the positive-input row counted');
+  });
+
+  it('estimateModelCost clamps negative token counts to zero (MAJOR-2)', () => {
+    // Without the clamp, -1000 input @ $3/M → -$0.003 negative cost.
+    assert.equal(estimateModelCost('claude-sonnet-4-7', -1000, 0, 0, 0), 0);
+    assert.equal(estimateModelCost('claude-sonnet-4-7',  Infinity, 0, 0, 0), 0);
+    assert.equal(estimateModelCost('claude-sonnet-4-7',  NaN, 0, 0, 0), 0);
+  });
+
+  it('buildWastedSpendSeries emits wastedUSD = costUSD - cacheCost (MINOR-3)', () => {
+    // Sonnet rates: input $3/M, cacheRead $0.30/M.
+    // 1M tokens fully paid → $3.00; same as cache → $0.30; wasted = $2.70.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-sonnet-4-7',
+        repo: '/r', branch: 'main',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, model: 'claude-sonnet-4-7',
+        repo: '/r', branch: 'main',
+        inputTokens: 1_000_000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildWastedSpendSeries(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].costUSD,   3);
+    // Floating-point tolerance for 3 - 0.3 = 2.7
+    assert.ok(Math.abs(out[0].wastedUSD - 2.7) < 1e-9,
+      `expected wastedUSD ≈ 2.7, got ${out[0].wastedUSD}`);
+  });
+
+  it('buildWastedSpendSeries propagates account through to output (Round-2 QR5)', () => {
+    // The wasted-spend chart's account-filter check needs the field
+    // to compare. Without it the filter was dead.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-sonnet-4-7',
+        repo: '/r', branch: 'main', account: 'alice',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, model: 'claude-sonnet-4-7',
+        repo: '/r', branch: 'main', account: 'alice',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildWastedSpendSeries(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].account, 'alice', 'account must round-trip from row → miss → wasted');
+  });
+
+  it('classifyUsageComponent caps at 256 chars (SC-OPUS-007 ReDoS hardening)', () => {
+    const huge = 'Skill(' + 'a'.repeat(1000) + ')';
+    assert.equal(classifyUsageComponent({ tool: huge }), 'main',
+      '> 256 chars must short-circuit to "main" before the regex sees it');
   });
 });
 
@@ -8256,6 +8373,61 @@ describe('Audit SR-OP-001 — compact-boundary type-string regression', () => {
   });
 });
 
+describe('Audit SC-OPUS-002 — reason → CSS class uses allow-list (XSS hardening)', () => {
+  const _src_sc2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('renderCacheMisses uses KNOWN_MISS_REASONS allow-list, not regex strip', () => {
+    // The previous `'reason-' + reasonText.replace(/[^a-z0-9]/gi, '-')`
+    // was safe TODAY (4 fixed reasons) but fragile-by-design. A future
+    // refactor that allows colons in reason strings, or derives reason
+    // from a row field, would silently open an XSS sink. Allow-list
+    // closes the footgun.
+    const fn = _src_sc2.slice(
+      _src_sc2.indexOf('function renderCacheMisses'),
+      _src_sc2.indexOf('function renderCacheMisses') + 5500,
+    );
+    assert.match(fn, /var KNOWN_MISS_REASONS\s*=\s*\{ 'compact-boundary': 1, 'model-changed': 1, 'TTL-likely': 1, 'unknown': 1 \}/);
+    assert.match(fn, /var reasonKey\s*=\s*KNOWN_MISS_REASONS\[reasonText\] \? reasonText : 'unknown'/);
+    // Defense: the old regex-strip pattern must not return.
+    assert.ok(!/reason-' \+ reasonText\.replace/.test(fn),
+      'the legacy regex-strip pattern must be removed');
+  });
+
+  it('buildCacheMissReport only emits the 4 known reasons (the allow-list contract)', () => {
+    // Worst-case set of synthetic rows that triggers each branch of
+    // the classifier. The test confirms the producer never emits a
+    // 5th string the consumer (UI) wouldn't recognise.
+    const KNOWN = new Set(['compact-boundary', 'model-changed', 'TTL-likely', 'unknown']);
+    const rows = [
+      // creates cache @ ts=1000
+      { type: 'usage', sessionId: 's', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      // miss within TTL, same model — 'unknown'
+      { type: 'usage', sessionId: 's', ts: 1100, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      // model-changed
+      { type: 'usage', sessionId: 's', ts: 1200, model: 'claude-sonnet-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      // compact_boundary then miss
+      { type: 'compact_boundary', sessionId: 's', ts: 1300 },
+      { type: 'usage', sessionId: 's', ts: 1400, model: 'claude-sonnet-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      // TTL miss
+      { type: 'usage', sessionId: 's', ts: 1400 + CACHE_TTL_LIKELY_MS + 1,
+        model: 'claude-sonnet-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const misses = buildCacheMissReport(rows);
+    for (const m of misses) {
+      assert.ok(KNOWN.has(m.reason),
+        `reason "${m.reason}" must be in the documented set (UI allow-list relies on this)`);
+    }
+  });
+});
+
 describe('Audit SC-OPUS-004 — multi-select attribute uses escHtml (not quote-only)', () => {
   const _src_sc4 = _readFileSync_xss(
     new URL('../dashboard.mjs', import.meta.url),
@@ -8278,6 +8450,162 @@ describe('Audit SC-OPUS-004 — multi-select attribute uses escHtml (not quote-o
     assert.match(fn, /var safe = escHtml\(name\)/);
     assert.match(fn, /data-repo="' \+ safe \+ '"/);
     assert.match(fn, /title="' \+ safe \+ '"/);
+  });
+});
+
+describe('Audit Round-2 — additional fix coverage (R2-DASH-102/103/104/105/106/107/108/109/111, SR-P2-005)', () => {
+  const _src_r2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('R2-DASH-102 — refreshUsageTree validates data.totals before deref', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('async function refreshUsageTree'),
+      _src_r2.indexOf('async function refreshUsageTree') + 3000,
+    );
+    assert.match(fn, /if \(!data\.totals \|\| typeof data\.totals !== 'object'\)/);
+    assert.match(fn, /'malformed response: missing totals'/);
+  });
+
+  it('R2-DASH-103 — chartCarouselGo clamps idx to valid range', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('function chartCarouselGo'),
+      _src_r2.indexOf('function chartCarouselGo') + 1500,
+    );
+    assert.match(fn, /if \(btns\.length > 0 && _chartCarouselIdx >= btns\.length\)/);
+    assert.match(fn, /_chartCarouselIdx = 0;\s*\n\s*idx = 0;/);
+  });
+
+  it('R2-DASH-104 — endpoint returns 400 (not silent drop) for negative from/to', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf("'/api/token-usage-tree'"),
+      _src_r2.indexOf("'/api/token-usage-tree'") + 8500,
+    );
+    assert.match(fn, /'from must be a non-negative number'/);
+    assert.match(fn, /'to must be a non-negative number'/);
+    // Must reject with 400, not silent fall-through
+    assert.match(fn, /!Number\.isFinite\(n\) \|\| n < 0/);
+  });
+
+  it('R2-DASH-105 — CSV time fallback treats either-null as both-null', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('function exportUsageTreeCsv'),
+      _src_r2.indexOf('function exportUsageTreeCsv') + 2500,
+    );
+    assert.match(fn, /if \(fromTs == null \|\| toTs == null\)/);
+    // Both bounds derived together inside the same block
+    assert.match(fn, /fromTs = Date\.now\(\) - days[\s\S]{0,200}toTs\s*=\s*Date\.now\(\)/);
+  });
+
+  it('R2-DASH-106 — stale-prune also kicks tree refresh', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('function populateProjectFilterOptions'),
+      _src_r2.indexOf('function populateProjectFilterOptions') + 6000,
+    );
+    assert.match(fn, /if \(typeof refreshUsageTree === 'function'\)/);
+    assert.match(fn, /_lastTreeHash = '';/);
+    assert.match(fn, /refreshUsageTree\(_refreshCutoff\)/);
+  });
+
+  it('R2-DASH-107 — disabled multi-select label has visual/aria affordance', () => {
+    // Label gets the cpf-item-disabled class AND aria-disabled="true"
+    // when single-select narrows the dropdown.
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('function populateProjectFilterOptions'),
+      _src_r2.indexOf('function populateProjectFilterOptions') + 6000,
+    );
+    assert.match(fn, /var labelExtraClass = singleSelectRepo \? ' cpf-item-disabled' : ''/);
+    assert.match(fn, /var labelExtraAria  = singleSelectRepo \? ' aria-disabled="true"' : ''/);
+    // CSS class definition
+    assert.match(_src_r2, /\.cpf-item-disabled \{ opacity: 0\.5; cursor: not-allowed; \}/);
+  });
+
+  it('R2-DASH-108 — single-select repo not in dataset renders zero rows + hint', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('function populateProjectFilterOptions'),
+      _src_r2.indexOf('function populateProjectFilterOptions') + 6000,
+    );
+    assert.match(fn, /if \(seen\.has\(singleSelectRepo\)\)/);
+    assert.match(fn, /no recent data for this repo in the current time window/);
+  });
+
+  it('R2-DASH-109 — populateProjectFilterOptions failure shows visible label feedback', () => {
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('function toggleProjectFilter'),
+      _src_r2.indexOf('function toggleProjectFilter') + 2500,
+    );
+    assert.match(fn, /'Filter unavailable'/);
+    assert.match(fn, /setTimeout\(function\(\)[\s\S]{0,200}_refreshProjectFilterLabel\(\)/);
+  });
+
+  it('R2-DASH-111 — _treeHash is structural (not JSON.stringify fallback)', () => {
+    // The point of replacing quickHash(data.tree) was to stop the
+    // schema-detect fallback that called JSON.stringify on the entire
+    // tree every 5s poll. _treeHash must be present and used in
+    // refreshUsageTree's hash construction.
+    assert.match(_src_r2, /function _treeHash\(nodes\)/);
+    const fn = _src_r2.slice(
+      _src_r2.indexOf('async function refreshUsageTree'),
+      _src_r2.indexOf('async function refreshUsageTree') + 3000,
+    );
+    assert.match(fn, /_treeHash\(data\.tree \|\| \[\]\)/);
+    // The previous quickHash call on data.tree must be gone in
+    // EXECUTABLE code — strip line comments first so the explanatory
+    // mention in the audit comment doesn't false-positive.
+    const stripped = fn
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '');
+    assert.ok(!/quickHash\(data\.tree/.test(stripped),
+      'quickHash(data.tree) executable call must be removed (was the JSON.stringify fallback)');
+  });
+
+  it('SR-P2-005 — parsePostToolBatchPayload rejects CRLF/NUL/oversized tool names', () => {
+    // Audit Round-2 SR-P2-005: defense-in-depth rejection of tool
+    // names that would round-trip through token-usage.json into
+    // downstream consumers (jq, awk, naive parsers) that don't
+    // handle embedded line-breaks.
+    const out = parsePostToolBatchPayload({
+      session_id: 's1',
+      tool_calls: [
+        { tool_name: 'Bash' },                              // OK
+        { tool_name: 'Bad\rname' },                         // rejected — \r
+        { tool_name: 'Bad\nname' },                         // rejected — \n
+        { tool_name: 'Bad\x00name' },                       // rejected — NUL
+        { tool_name: 'a'.repeat(257) },                     // rejected — > 256
+        { tool_name: 'Read' },                              // OK
+      ],
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.tools.length, 2, 'only Bash + Read should pass the filter');
+    assert.deepEqual(out.tools.map(t => t.toolName), ['Bash', 'Read']);
+  });
+});
+
+describe('Audit Round-2 QR4 — multi-select defers to single-select to prevent empty-cascade', () => {
+  const _src_qr4 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('applyChartProjectFilter returns rows pass-through when single-select tok-repo is set', () => {
+    // Without this guard, a saved multi-select selection that doesn't
+    // include the single-select repo would zero out every chart.
+    const fn = _src_qr4.slice(
+      _src_qr4.indexOf('function applyChartProjectFilter'),
+      _src_qr4.indexOf('function applyChartProjectFilter') + 1500,
+    );
+    assert.match(fn, /var repoSel = document\.getElementById\('tok-repo'\)/);
+    assert.match(fn, /if \(repoSel && repoSel\.value\) return rows/);
+  });
+
+  it('renderWastedSpendChart applies the same single-select-wins rule', () => {
+    const fn = _src_qr4.slice(
+      _src_qr4.indexOf('function renderWastedSpendChart'),
+      _src_qr4.indexOf('function renderWastedSpendChart') + 4500,
+    );
+    assert.match(fn, /var multiSelectActive = _chartProjectFilter\.size > 0 && !repoF/);
+    assert.match(fn, /if \(multiSelectActive && !_chartProjectFilter\.has/);
   });
 });
 

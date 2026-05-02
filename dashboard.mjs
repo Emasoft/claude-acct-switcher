@@ -3277,16 +3277,25 @@ async function handleAPI(req, res) {
       if (repoFilter)    opts.repoFilter    = repoFilter;
       if (accountFilter) opts.accountFilter = accountFilter;
       if (modelFilter)   opts.modelFilter   = modelFilter;
-      // Audit CC-DASH-008: also reject negative values + reversed ranges.
-      // Without these guards, ?from=-1&to=9999 silently does nothing,
-      // and ?from=BIG&to=0 returns an empty tree without explaining why.
+      // Audit CC-DASH-008 + Round-2 R2-DASH-104: reject negative
+      // values + reversed ranges with a 400 instead of silently
+      // dropping the parameter (which would silently widen the
+      // result set and confuse external scripts).
       if (fromStr) {
         const n = Number(fromStr);
-        if (Number.isFinite(n) && n >= 0) opts.from = n;
+        if (!Number.isFinite(n) || n < 0) {
+          json(res, { ok: false, error: 'from must be a non-negative number' }, 400);
+          return true;
+        }
+        opts.from = n;
       }
       if (toStr) {
         const n = Number(toStr);
-        if (Number.isFinite(n) && n >= 0) opts.to = n;
+        if (!Number.isFinite(n) || n < 0) {
+          json(res, { ok: false, error: 'to must be a non-negative number' }, 400);
+          return true;
+        }
+        opts.to = n;
       }
       if (opts.from != null && opts.to != null && opts.from > opts.to) {
         json(res, { ok: false, error: 'from must be <= to' }, 400);
@@ -4886,6 +4895,11 @@ function renderHTML() {
     border-radius: 4px;
   }
   .cpf-item:hover { background: var(--bg); }
+  /* Audit Round-2 R2-DASH-107: visual disabled state for the label
+     so the user sees the multi-select is locked, not just that the
+     checkboxes look unchecked. */
+  .cpf-item-disabled { opacity: 0.5; cursor: not-allowed; }
+  .cpf-item-disabled input { cursor: not-allowed; }
   .cpf-item input[type="checkbox"] {
     margin: 0;
     accent-color: var(--primary);
@@ -7175,8 +7189,18 @@ function _persistChartProjectFilter() {
   }
 }
 // Apply the multi-select filter to a row array. Empty filter = pass-through.
+//
+// Audit Round-2 QR4: when the single-select tok-repo dropdown is set,
+// the data is ALREADY narrowed at the source (the server-side ?repo
+// query). Layering the multi-select on top would silently zero out
+// every chart if the user's saved multi-select doesn't include the
+// single-select repo. Defer to the single-select in that case — the
+// populator (populateProjectFilterOptions) already disables the
+// checkboxes and shows an explanatory hint, so the user knows why.
 function applyChartProjectFilter(rows) {
   if (!_chartProjectFilter.size) return rows;
+  var repoSel = document.getElementById('tok-repo');
+  if (repoSel && repoSel.value) return rows;   // single-select wins
   var out = [];
   for (var i = 0, n = rows.length; i < n; i++) {
     if (_chartProjectFilter.has(rows[i].repo || '')) out.push(rows[i]);
@@ -7251,6 +7275,41 @@ async function refreshTokens() {
 // XSS-safe: every dynamic field flows through escHtml().
 var _lastTreeHash = '';
 var _treeFetching = false;
+
+// Audit Round-2 R2-DASH-111: cheap structural FNV-1a fingerprint of
+// the tree. Replaces a quickHash(...) fallback that walked through to
+// JSON.stringify on the entire tree (no marker fields → schema-detect
+// failed) and allocated multi-MB strings on every 5s poll.
+// Folds (kind + name + totals + childCount) per node — captures every
+// change that should trigger a re-render without serialising.
+function _treeHash(nodes) {
+  if (!Array.isArray(nodes) || !nodes.length) return '0';
+  var lo = 0x811c9dc5 | 0;
+  function fold(s) {
+    s = String(s == null ? '' : s);
+    for (var i = 0, n = s.length; i < n; i++) {
+      lo ^= s.charCodeAt(i);
+      lo = Math.imul(lo, 0x01000193);
+    }
+  }
+  function walk(n) {
+    if (!n) return;
+    fold(n.kind || ''); fold('|');
+    fold(n.name || ''); fold('|');
+    var t = n.totals || {};
+    fold(t.input       || 0); fold(',');
+    fold(t.output      || 0); fold(',');
+    fold(t.cacheRead   || 0); fold(',');
+    fold(t.cacheCreate || 0); fold(';');
+    if (n.children && n.children.length) {
+      fold(n.children.length); fold('[');
+      for (var j = 0; j < n.children.length; j++) walk(n.children[j]);
+      fold(']');
+    }
+  }
+  for (var i = 0; i < nodes.length; i++) walk(nodes[i]);
+  return ('00000000' + (lo >>> 0).toString(16)).slice(-8);
+}
 async function refreshUsageTree(currentCutoff) {
   if (_treeFetching) return;
   _treeFetching = true;
@@ -7264,19 +7323,29 @@ async function refreshUsageTree(currentCutoff) {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
     if (!data || data.ok !== true) throw new Error(data && data.error || 'malformed response');
+    // Audit Round-2 R2-DASH-102: explicit shape guard. The earlier
+    // data.ok !== true check accepts any object with ok=true; the
+    // very next line dereferences data.totals.requests and would
+    // throw a cryptic TypeError if a regression returned a malformed
+    // success response. Surface the failure mode explicitly instead.
+    if (!data.totals || typeof data.totals !== 'object') {
+      throw new Error('malformed response: missing totals');
+    }
 
-    // Audit CC-DASH-003: include a content-sensitive component
-    // (quickHash on tree + missSessions) so two distributions with
-    // identical lengths but different shapes still trigger a re-render.
-    // E.g. one session with 5 misses vs five sessions with 1 miss each
-    // hash to different values now.
+    // Audit CC-DASH-003 + Round-2 R2-DASH-111: include a content-
+    // sensitive component so two distributions with identical lengths
+    // but different shapes still trigger a re-render. The earlier
+    // quickHash(data.tree) call fell through to JSON.stringify on
+    // the entire tree (no marker fields → schema-detect failed),
+    // allocating multi-MB strings on every 5s poll. _treeHash is a
+    // cheap structural FNV-1a fingerprint that walks the tree once
+    // without serialising it.
     var hash = (data.totals.requests | 0)
              + ':' + (data.misses ? data.misses.length : 0)
              + ':' + (data.missSessions ? data.missSessions.length : 0)
              + ':' + (data.wastedSpend ? data.wastedSpend.length : 0)
              + ':' + (data.tree ? data.tree.length : 0)
-             + ':' + quickHash(data.tree || [])
-             + ':' + quickHash(data.missSessions || []);
+             + ':' + _treeHash(data.tree || []);
     if (hash === _lastTreeHash) return;
     _lastTreeHash = hash;
 
@@ -7437,7 +7506,15 @@ function renderCacheMisses(misses, missSessions) {
       var ts2 = m2.ts ? new Date(m2.ts).toLocaleString() : '?';
       var modelText = m2.model || '?';
       var reasonText = m2.reason || 'unknown';
-      var reasonClass = 'reason-' + reasonText.replace(/[^a-z0-9]/gi, '-');
+      // Audit SC-OPUS-002 (CWE-79 hardening) — strict allow-list for
+      // the CSS class derivation. The previous regex-strip approach
+      // was safe TODAY (4 fixed reason strings) but fragile-by-design:
+      // a future refactor (allow colons in reason strings, use the
+      // model name as a reason suffix) would silently open an XSS
+      // sink. Allow-list closes that footgun.
+      var KNOWN_MISS_REASONS = { 'compact-boundary': 1, 'model-changed': 1, 'TTL-likely': 1, 'unknown': 1 };
+      var reasonKey   = KNOWN_MISS_REASONS[reasonText] ? reasonText : 'unknown';
+      var reasonClass = 'reason-' + reasonKey;
       html += '<div class="miss-row">'
         + '<span class="miss-ts">' + escHtml(ts2) + '</span>'
         + '<span class="miss-model">' + escHtml(modelText) + '</span>'
@@ -7819,12 +7896,17 @@ function chartCarouselGo(idx) {
   _chartCarouselIdx = idx;
   var slides = document.getElementById('chart-carousel-slides');
   var dots = document.getElementById('chart-carousel-dots');
+  var btns = dots ? dots.querySelectorAll('.chart-carousel-dot') : [];
+  // Audit Round-2 R2-DASH-103: clamp idx defensively in case the dot
+  // count shrank since the last tick (e.g. dynamic slide removal).
+  // Without this, idx >= btns.length renders no active dot.
+  if (btns.length > 0 && _chartCarouselIdx >= btns.length) {
+    _chartCarouselIdx = 0;
+    idx = 0;
+  }
   if (slides) slides.style.transform = 'translateX(-' + (idx * 100) + '%)';
-  if (dots) {
-    var btns = dots.querySelectorAll('.chart-carousel-dot');
-    for (var i = 0; i < btns.length; i++) {
-      btns[i].classList.toggle('active', i === idx);
-    }
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].classList.toggle('active', i === idx);
   }
   clearInterval(_chartCarouselTimer);
   _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
@@ -7864,8 +7946,22 @@ function toggleProjectFilter() {
   }
   // populate may throw if the data is corrupt — protect against
   // installing the close-handler when the panel never actually opened.
+  // Audit Round-2 R2-DASH-109: also surface a brief inline error on
+  // the toggle button so the user has visible feedback (the previous
+  // version only logged to console, leaving the click feel like a
+  // dead button to anyone without devtools open).
   try { populateProjectFilterOptions(); }
-  catch (e) { console.error('Project filter populate failed:', e); return; }
+  catch (e) {
+    console.error('Project filter populate failed:', e);
+    var labelEl = document.getElementById('cpf-label');
+    if (labelEl) {
+      labelEl.textContent = 'Filter unavailable';
+      setTimeout(function() {
+        if (typeof _refreshProjectFilterLabel === 'function') _refreshProjectFilterLabel();
+      }, 2000);
+    }
+    return;
+  }
   panel.hidden = false;
   btn.setAttribute('aria-expanded', 'true');
   // Click-away-to-close: install a one-shot capture handler. Removed
@@ -7924,7 +8020,16 @@ function populateProjectFilterOptions() {
       + '</div>';
     // Render only the active repo so the multi-select can't push the
     // chart into an empty-intersection state.
-    sorted = [singleSelectRepo];
+    // Audit Round-2 R2-DASH-108: only render if the repo is actually
+    // in the current dataset. Otherwise the user sees a checkbox for
+    // a repo with no data — render zero rows + an explanatory hint.
+    if (seen.has(singleSelectRepo)) {
+      sorted = [singleSelectRepo];
+    } else {
+      sorted = [];
+      hintHtml += '<div class="cpf-empty" style="padding:0.25rem 0.3rem">'
+        + '(no recent data for this repo in the current time window)</div>';
+    }
   }
   // Drop selected entries that no longer exist in the dataset (data
   // window changed, project disappeared) so the saved selection
@@ -7936,17 +8041,28 @@ function populateProjectFilterOptions() {
   if (changed) {
     _persistChartProjectFilter();
     _refreshProjectFilterLabel();
-    // Audit CC-DASH-006: stale entries dropped — the in-memory filter
-    // no longer matches what the charts last rendered. Re-run the
-    // chart pipeline immediately so the user sees the consequence of
-    // the prune, instead of waiting up to 5s for the next poll.
+    // Audit CC-DASH-006 + Round-2 R2-DASH-106: stale entries dropped.
+    // applyTokenModelFilter re-renders the carousel charts, but the
+    // wasted-spend chart reads _wastedSpendRaw which is owned by
+    // refreshUsageTree — kick the tree refresh too so a stale repo
+    // gets purged from BOTH data sources, not just the dropdown.
     if (typeof applyTokenModelFilter === 'function') applyTokenModelFilter();
+    if (typeof refreshUsageTree === 'function') {
+      var _refreshDays = (typeof tokTimeRange === 'function') ? tokTimeRange() : 7;
+      var _refreshCutoff = Date.now() - _refreshDays * 24 * 60 * 60 * 1000;
+      _lastTreeHash = '';
+      refreshUsageTree(_refreshCutoff).catch(function() { /* non-fatal */ });
+    }
   }
   var html = hintHtml;
   // When the single-select narrows to one repo, also disable the
   // multi-select checkboxes so a stale check from a different repo
   // can't silently zero out every chart.
-  var disableAttr = singleSelectRepo ? ' disabled' : '';
+  // Audit Round-2 R2-DASH-107: also tag the label with cpf-item-disabled
+  // and aria-disabled so the locked state is VISIBLE, not just behavioural.
+  var disableAttr     = singleSelectRepo ? ' disabled' : '';
+  var labelExtraClass = singleSelectRepo ? ' cpf-item-disabled' : '';
+  var labelExtraAria  = singleSelectRepo ? ' aria-disabled="true"' : '';
   for (var k = 0; k < sorted.length; k++) {
     var name = sorted[k];
     var checked = _chartProjectFilter.has(name) ? ' checked' : '';
@@ -7960,7 +8076,7 @@ function populateProjectFilterOptions() {
     // which auto-decodes the entities, so the round-trip preserves
     // the original name.
     var safe = escHtml(name);
-    html += '<label class="cpf-item">'
+    html += '<label class="cpf-item' + labelExtraClass + '"' + labelExtraAria + '>'
       + '<input type="checkbox" data-repo="' + safe + '"' + checked + disableAttr
       + ' onchange="toggleProjectInFilter(this)">'
       + '<span class="cpf-item-label" title="' + safe + '">' + safe + '</span>'
@@ -8048,10 +8164,14 @@ function renderWastedSpendChart() {
   var hasWindow = !!(snap && snap.start != null && snap.end != null);
   var hasTier   = !!(snap && Array.isArray(snap.tierFilter) && snap.tierFilter.length && snap.tierFilter[0] !== 'all');
 
+  // Audit Round-2 QR4: same defer-to-single-select rule as
+  // applyChartProjectFilter — when repoF is set, ignore the multi-
+  // select to prevent the empty-intersection bug.
+  var multiSelectActive = _chartProjectFilter.size > 0 && !repoF;
   var filtered = [];
   for (var i = 0, n = _wastedSpendRaw.length; i < n; i++) {
     var p = _wastedSpendRaw[i];
-    if (_chartProjectFilter.size && !_chartProjectFilter.has(p.repo || '')) continue;
+    if (multiSelectActive && !_chartProjectFilter.has(p.repo || '')) continue;
     if (modelF   && p.model   !== modelF)   continue;
     if (accountF && p.account !== accountF) continue;
     if (repoF    && p.repo    !== repoF)    continue;
@@ -8608,19 +8728,19 @@ function exportUsageTreeCsv() {
   var modelV   = modelSel   ? modelSel.value   : '';
   var accountV = accountSel ? accountSel.value : '';
   var repoV    = repoSel    ? repoSel.value    : '';
-  // Audit CC-DASH-005: when the scrubber hasn't been touched, fall
-  // back to the tok-time selector window so the user doesn't
-  // accidentally export years of history. Without this, a fresh page
-  // load with snap.{start,end} === null streams the entire usage
-  // file regardless of the visible time range.
+  // Audit CC-DASH-005 + Round-2 R2-DASH-105: when the scrubber
+  // hasn't been fully populated, fall back to the tok-time selector
+  // window. If EITHER end is unset, treat both as unset so the
+  // export window matches what the user is currently viewing
+  // (asymmetric fallback would silently widen one bound to "now").
   var qs = ['format=csv'];
   var fromTs = snap.start;
   var toTs   = snap.end;
-  if (fromTs == null) {
+  if (fromTs == null || toTs == null) {
     var days = (typeof tokTimeRange === 'function') ? tokTimeRange() : 7;
     fromTs = Date.now() - days * 24 * 60 * 60 * 1000;
+    toTs   = Date.now();
   }
-  if (toTs == null) toTs = Date.now();
   qs.push('from=' + encodeURIComponent(fromTs));
   qs.push('to='   + encodeURIComponent(toTs));
   if (modelV)   qs.push('model=' + encodeURIComponent(modelV));

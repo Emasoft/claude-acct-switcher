@@ -132,6 +132,24 @@ A 4-level hierarchical breakdown of the Tokens tab plus a heuristic for cache-mi
 
 **Lazy-loading deferred:** the TRDD spec calls for lazy-loading deeper tree levels on `<details>` toggle. Current implementation eager-renders the full tree (acceptable at the current scale where the aggregated tree is well under 1 MB rendered HTML). Re-evaluate if a single user reports >100 repos × 10 worktrees in their data.
 
+**Round-2 audit defenses** (commit on top of the Phase 6 series):
+- Tree-refresh hash uses a custom `_treeHash` FNV-1a structural fingerprint instead of `quickHash` (which fell through to `JSON.stringify` on the entire tree because tree nodes lack the FNV schema-marker fields — that allocated multi-MB strings every 5s poll).
+- `refreshUsageTree` checks `data.totals` shape before dereferencing `.requests`, so a malformed but `ok:true` response surfaces "missing totals" instead of a cryptic TypeError.
+- `chartCarouselGo` defensively clamps `_chartCarouselIdx` against `btns.length` so a shrinking dot count never leaves the carousel with no active dot.
+- `parsePostToolBatchPayload` rejects tool names containing `\r`, `\n`, `\x00`, or longer than 256 chars — defense-in-depth against hostile sub-agent metadata that would round-trip through `token-usage.json` into naive line-splitting consumers.
+- The endpoint returns `400 Bad Request` for negative `from`/`to` and reversed ranges instead of silently widening the result set.
+- `exportUsageTreeCsv` treats either-end-null in the scrubber as both-null (uses the `tok-time` window for both bounds) so the export window matches what the user is currently viewing.
+- The multi-select dropdown's stale-prune now also kicks `refreshUsageTree` so the wasted-spend chart's `_wastedSpendRaw` data source gets purged of the gone repo, not just the dropdown options.
+- Disabled multi-select labels carry `cpf-item-disabled` class + `aria-disabled="true"` so the locked state is visible (not just behavioural).
+- Single-select repo not in the current dataset shows zero rows + an explanatory "no recent data" hint.
+- `populateProjectFilterOptions` failure surfaces "Filter unavailable" on the toggle button for 2s (was console.error only).
+- `applyChartProjectFilter` and `renderWastedSpendChart` defer to single-select tok-repo when set — without this, a saved multi-select selection that doesn't include the single-select repo silently zeros every chart.
+- `buildCacheMissReport` and `buildWastedSpendSeries` propagate `account` through their output rows so the wasted-spend chart's account-filter actually filters (it was a dead predicate before — the field was never produced).
+- `csvField` formula-injection trigger set extended to include `\n` (newer LibreOffice/Sheets evaluate cells starting with bare `\n` as formulas in some import paths).
+- `classifyUsageComponent` length-caps tool names at 256 chars before regex (CWE-1333 hardening — the regex is linear-time but a pathological 1MB tool name would still consume CPU).
+- `renderCacheMisses` derives the reason CSS class via a strict allow-list (`KNOWN_MISS_REASONS`) instead of a regex strip — closes the "fragile by design" XSS sink that would have opened if a future refactor broadened the reason set.
+- The `Skill( )` whitespace-only edge case correctly falls through to the mcpServer/`unknown` fallback instead of emitting `skill:` (empty label).
+
 ### OAuth refresh
 
 `OAUTH_TOKEN_URL` defaults to `https://console.anthropic.com/v1/oauth/token` (Anthropic retired the older `platform.claude.com` host during the platform→console migration; the old URL silently 404s and refreshes against it never recover), `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.
