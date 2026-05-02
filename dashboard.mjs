@@ -3874,6 +3874,39 @@ function renderHTML() {
   .badge-pro { color: var(--primary); background: var(--blue-soft); border-color: var(--blue-border); }
   .badge-free { color: var(--muted); background: var(--bg); border-color: var(--border); }
   .badge-active { color: var(--green); background: var(--green-soft); border-color: var(--green-border); }
+  /* UX-A3: palette-consistent excluded badge. Replaces the prior inline-
+     style version that overrode background to var(--muted) with foreground
+     var(--bg) — grey-on-near-white text that failed WCAG AA. The new
+     ramp matches the soft+border idiom of every other .badge-* and
+     uses var(--card) as the background so the badge itself reads on
+     both .card-active (primary-soft tint) and inactive cards. */
+  .badge-excluded {
+    color: var(--muted);
+    background: var(--card);
+    border-color: var(--border);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.6875rem;
+  }
+  /* UX-CO2: single class replaces the four inline-style BETA badge spans
+     in the Config tab. Same visual rules every time — a future BETA
+     section just writes a span with class beta-badge. */
+  .beta-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.625rem;
+    font-weight: 500;
+    color: var(--yellow);
+    background: var(--yellow-soft);
+    border: 1px solid var(--yellow-border);
+    border-radius: 4px;
+    padding: 0.125rem 0.375rem;
+    margin-left: 0.375rem;
+    vertical-align: middle;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
 
   .card-token.tok-bad { color: var(--red); }
 
@@ -4190,6 +4223,22 @@ function renderHTML() {
     font-variant-numeric: tabular-nums;
   }
   .evt-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  /* UX-AC2: per-event icon glyph paired with the dot's colour so colour-
+     blind users (deuteranopia ~5% of male users) can scan severity at a
+     glance. The icon is a real character (single-char unicode literal,
+     NOT inside a JS comment to avoid the renderHTML backtick-trap),
+     coloured to match the dot, sized at 0.75rem so it does not
+     overpower the message text, and aria-hidden so screen readers do
+     not double-announce category (evt-msg already names it). */
+  .evt-icon {
+    flex-shrink: 0;
+    width: 0.875rem;
+    text-align: center;
+    font-size: 0.75rem;
+    line-height: 1;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
   .evt-msg { flex: 1; color: var(--muted); line-height: 1.4; }
   .evt-msg b { color: var(--foreground); font-weight: 600; }
   /* UX-L2 / UX-AC1: hide non-matching entries via class so the DOM
@@ -4450,6 +4499,44 @@ function renderHTML() {
   .velocity-badge.velocity-ok { color: var(--green); border-color: var(--green-border); background: var(--green-soft); }
   .velocity-badge.velocity-warn { color: var(--yellow); border-color: var(--yellow-border); background: var(--yellow-soft); }
   .velocity-badge.velocity-crit { color: var(--red); border-color: var(--red-border); background: var(--red-soft); }
+
+  /* UX-A2: replace the buried "Exclude from auto-switch" label that sat
+     beneath the rate bars in muted text. The new layout pulls the
+     toggle into the buttons row at the bottom of the card so it sits
+     next to Switch / Refresh / Remove — the place a user already
+     looks for account actions. The control is rendered as a pill
+     with a clear label, hover affordance, and visible state when
+     checked (the inner switch flips colour). */
+  .acct-pref-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8125rem;
+    color: var(--foreground);
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card);
+    user-select: none;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .acct-pref-toggle:hover { background: var(--bg); border-color: var(--muted); }
+  .acct-pref-toggle:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+  .acct-pref-toggle input { cursor: pointer; }
+  .acct-pref-toggle.is-on {
+    color: var(--yellow);
+    border-color: var(--yellow-border);
+    background: var(--yellow-soft);
+  }
+  .card-actions {
+    margin-top: 0.875rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .card-actions .acct-pref-toggle { margin-right: auto; }
 
   /* ── Animations ── */
   @keyframes fadeInUp {
@@ -5579,7 +5666,7 @@ function renderHTML() {
       </div>
 
       <div class="config-section">
-        <div class="config-section-title">Request Serialization <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-section-title">Request Serialization <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Serialize requests</div>
@@ -5620,7 +5707,7 @@ function renderHTML() {
       </div>
 
       <div class="config-section">
-        <div class="config-section-title">Commit Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-section-title">Commit Tokens <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Token-Usage commit trailer</div>
@@ -5631,10 +5718,14 @@ function renderHTML() {
       </div>
 
       <div class="config-section">
-        <div class="config-section-title">Session Monitor <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-section-title">Session Monitor <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
-            <div class="config-label">Enable session monitor <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+            <!-- UX-CO2: removed the duplicate BETA badge that used to sit
+                 next to the "Enable session monitor" label. The section
+                 header above already carries the BETA marker — repeating
+                 it on every toggle just trains the eye to ignore it. -->
+            <div class="config-label">Enable session monitor</div>
             <div class="config-desc">
               Track active Claude Code sessions with AI-summarized timelines.
               <strong style="color:var(--yellow)">Sends excerpts of your prompts to Anthropic Claude Haiku for summarization</strong>
@@ -5655,7 +5746,7 @@ function renderHTML() {
            value, mirroring the commit-tokens / session-monitor pattern.
            Server-side handler already exists at line 1873. -->
       <div class="config-section">
-        <div class="config-section-title">Per-Tool Attribution <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-section-title">Per-Tool Attribution <span class="beta-badge">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Track tokens per tool call</div>
@@ -6650,36 +6741,54 @@ function formatEta(minutes) {
 }
 
 function renderVelocityInline(p) {
-  // 5h ETA badge — existing behavior unchanged.
-  let html = '';
-  if (p.minutesToLimit != null) {
-    const min = p.minutesToLimit;
-    let cls = 'velocity-badge';
-    let text;
-    if (min <= 0) { cls += ' velocity-crit'; text = 'at limit'; }
-    else if (min < 300) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
+  // UX-A4: previous version stacked TWO ETA badges (5h + 7d) on the
+  // identity row, leading to "[ • ] account · Est. 02:30 to limit · 7d
+  // ETA: 14:00" — three middle-dot separators next to a name became
+  // unreadable, and the user could not scan "what hits first?" at a
+  // glance. We now render only the BINDING constraint (the soonest
+  // limit) and stash the other ETA in the title= tooltip so a hover
+  // recovers the full picture. Colour thresholds keep the same
+  // semantics: 5h-window red < 5hr, 7d-window red < 4h, yellow < 24h,
+  // green otherwise.
+  const min5 = p.minutesToLimit;
+  const min7 = p.minutesToLimit7d;
+  if (min5 == null && min7 == null) return '';
+  // Pick the binding constraint. "min5/min7 == null" is treated as
+  // "infinitely far away" so the other one wins automatically. A
+  // negative or zero value (already at limit) always wins because no
+  // ETA can be sooner than "now".
+  function _eff(v) { return v == null ? Number.POSITIVE_INFINITY : v; }
+  const binding5h = _eff(min5) <= _eff(min7);
+  const min  = binding5h ? min5 : min7;
+  const other = binding5h ? min7 : min5;
+  const kind  = binding5h ? '5h' : '7d';
+  // Threshold ramp depends on the binding window. The 5h window is
+  // shorter so its "crit" threshold (300 min ≈ 5 hours) is higher
+  // relative to the window itself than 7d (240 min = 4 hours).
+  let cls = 'velocity-badge';
+  let text;
+  if (binding5h) {
+    if (min <= 0) { cls += ' velocity-crit'; text = '5h: at limit'; }
+    else if (min < 300) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to 5h limit'; }
     else { cls += ' velocity-ok'; text = '>5hr to limit'; }
-    html += '<span class="card-token-sep">&middot;</span>' +
-      '<span class="' + cls + '" title="Estimated time until 5h rate limit is reached, based on current usage velocity">' + text + '</span>';
+  } else {
+    if (min <= 0) { cls += ' velocity-crit'; text = '7d: at limit'; }
+    else if (min < 240) { cls += ' velocity-crit'; text = '7d ETA: ' + formatEta(min); }
+    else if (min < 1440) { cls += ' velocity-warn'; text = '7d ETA: ' + formatEta(min); }
+    else { cls += ' velocity-ok'; text = '7d ETA: ' + formatEta(min); }
   }
-  // Phase 6 (Item 9): parallel 7d ETA badge using minutesToLimit7d (already
-  // emitted by /api/profiles via weeklyHistory.predictMinutesToLimit).
-  // Color thresholds: green > 24h (1440 min), yellow 4-24h (240-1440), red < 4h.
-  // The 7d window is independent of the 5h window — drain-first / spread
-  // strategies need both numbers visible to decide whether to keep the
-  // current account or rotate.
-  if (p.minutesToLimit7d != null) {
-    const min7 = p.minutesToLimit7d;
-    let cls7 = 'velocity-badge';
-    let text7;
-    if (min7 <= 0) { cls7 += ' velocity-crit'; text7 = '7d: at limit'; }
-    else if (min7 < 240) { cls7 += ' velocity-crit'; text7 = '7d ETA: ' + formatEta(min7); }
-    else if (min7 < 1440) { cls7 += ' velocity-warn'; text7 = '7d ETA: ' + formatEta(min7); }
-    else { cls7 += ' velocity-ok'; text7 = '7d ETA: ' + formatEta(min7); }
-    html += '<span class="card-token-sep">&middot;</span>' +
-      '<span class="' + cls7 + '" title="Estimated time until 7-day rate limit is reached, based on weekly usage velocity">' + text7 + '</span>';
+  // Build the title= so a hover recovers the OTHER ETA. If the other
+  // is null, just narrate the binding one in full.
+  let title = (kind === '5h')
+    ? 'Estimated time until 5h rate limit is reached, based on current usage velocity'
+    : 'Estimated time until 7-day rate limit is reached, based on weekly usage velocity';
+  if (other != null) {
+    const otherKind = (kind === '5h') ? '7d' : '5h';
+    const otherText = (other <= 0) ? 'at limit' : formatEta(other);
+    title += '. ' + otherKind + ' ETA: ' + otherText;
   }
-  return html;
+  return '<span class="card-token-sep">&middot;</span>' +
+    '<span class="' + cls + '" title="' + title + '">' + text + '</span>';
 }
 
 let _lastProfilesHash = '';
@@ -6980,27 +7089,36 @@ function renderAccounts(profiles, animate) {
     }
     var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '') +
       (p.excludeFromAuto ? ' excluded-from-auto' : '');
-    // Per-account "Exclude from auto-switch" toggle. Visible on every
-    // card (active OR inactive) because users may want to opt OUT the
-    // currently-active account too — the flag prevents AUTO selection
-    // but doesn't force a rotation now (the active account stays
-    // active until manually switched or rate-limited).
+    // UX-A3: badge-excluded uses the soft+border palette ramp so it
+    // reads on both .card.active (primary tint) and inactive cards.
+    // The title= surfaces the meaning to anyone hovering the badge —
+    // most users never read CLAUDE.md but they will read a tooltip.
     var excludedBadge = p.excludeFromAuto
-      ? '<span class="badge" style="background:var(--muted);color:var(--bg);font-size:0.65rem">excluded</span>'
+      ? '<span class="badge badge-excluded" title="This account is excluded from auto-switch — only manual switches will reach it">excluded</span>'
       : '';
+    // UX-A2: pull the "Exclude from auto-switch" toggle out of the
+    // muted-text label that used to hide between the rate bars and
+    // the buttons row. It now sits inside .card-actions on the same
+    // row as Switch / Refresh / Remove. The is-on class flips the
+    // pill colour so the active state is visible without reading the
+    // checkbox itself.
     var prefsHtml =
-      '<label class="acct-pref-toggle" style="display:flex;align-items:center;gap:0.4rem;font-size:0.75rem;color:var(--muted);margin-top:0.5rem;cursor:pointer">' +
+      '<label class="acct-pref-toggle' + (p.excludeFromAuto ? ' is-on' : '') + '"' +
+        ' title="When checked, this account will be skipped by auto-switch and rotation. Manual switches still reach it.">' +
         '<input type="checkbox" onchange="doToggleExcludeFromAuto(\\''+eName+'\\',this.checked)"' +
           (p.excludeFromAuto ? ' checked' : '') + ' />' +
         'Exclude from auto-switch' +
       '</label>';
-    var buttonsHtml = '';
-    if (!active) {
-      buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
-        '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
-        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)" title="Switch to this account">Switch</button>') +
-      '</div>';
-    }
+    // UX-A2: every card (active OR inactive) gets a card-actions row.
+    // Active cards previously had no buttons row at all — the toggle
+    // hung loose at the bottom — so the toggle is the only control
+    // the user can exercise on the currently-active account.
+    var buttonsHtml = '<div class="card-actions">' +
+      prefsHtml +
+      (!active ? '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' : '') +
+      (!active && isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '') +
+      (!active && !isStale ? '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)" title="Switch to this account">Switch</button>' : '') +
+    '</div>';
     var safeId = 'acct-card-' + _safeIdForName(p.name);
     var inner =
       '<div class="card-top">' +
@@ -7017,7 +7135,6 @@ function renderAccounts(profiles, animate) {
       '</div>' +
       barsHtml +
       staleMsg +
-      prefsHtml +
       buttonsHtml;
     var h = _cardHash(cardClass + '|' + animStyle + '|' + inner);
     newHashes.set(p.name, h);
@@ -7079,6 +7196,52 @@ const evtColors = {
   'settings-changed': 'var(--muted)',
   'upgrade': 'var(--green)',
   'refresh-failed': 'var(--red)', 'token-refreshed': 'var(--green)',
+};
+// UX-AC2: per-event glyph paired with the dot colour so colour-blind
+// users (deuteranopia ~5% of male users) get a redundant signal of
+// severity. Pure unicode (no backticks anywhere — this map is INSIDE
+// the renderHTML template literal so a stray backtick would terminate
+// the template). Fallback is the small bullet for unknown event types.
+//   triangle  = warning / rate-limited
+//   X / no-entry = error / exhausted / bypass
+//   right-left arrow = rotation / switches
+//   right arrow = manual switch
+//   check     = success
+//   plus      = discovery / addition
+//   pause/play = serialize toggles
+//   gear      = config / prefs / settings / drain / renames
+//   info      = informational fallback (anything not classified)
+const evtIcons = {
+  'rate-limited': '▲',
+  'auth-expired': '✖',
+  'refresh-failed': '✖',
+  'all-exhausted': '⛔',
+  'oauth-bypass-enabled': '⛔',
+  'oauth-bypass-disabled': '✓',
+  'auto-switch': '⇄',
+  'proactive-switch': '⇄',
+  'manual-switch': '→',
+  'token-refreshed': '✓',
+  'auth_success': '✓',
+  'account-discovered': '+',
+  'account-removed': '✖',
+  'account-renamed': '⚙',
+  'settings-changed': '⚙',
+  'config_change': '⚙',
+  'account-prefs-changed': '⚙',
+  'upgrade': '↑',
+  'serialize-auto-enabled': '⏸',
+  'serialize-auto-disabled': '▶',
+  'serialize-auto-reverted': '▶',
+  'serialize-progressive-drain-start': '⚙',
+  'serialize-progressive-drain-end': '⚙',
+  'queue-depth-alert': '▲',
+  'worktree_create': '+',
+  'worktree_remove': '✖',
+  'task_created': '+',
+  'task_completed': '✓',
+  'account-organization-disabled': '⛔',
+  'account-post-refresh-expired': '⛔',
 };
 
 function evtMsg(e) {
@@ -7192,8 +7355,16 @@ function renderActivity(log) {
   }
   el.innerHTML = filtered.map(e => {
     const c = evtColors[e.type] || 'var(--muted)';
+    // UX-AC2: glyph BEFORE the dot so the icon and the colour both sit
+    // in the same scan zone. The icon is sourced from a closed map
+    // (evtIcons) — never from event.* fields — so there is no XSS
+    // surface. aria-hidden because the message text already names the
+    // category for screen readers (rate-limited / token-refreshed
+    // / etc.) and an extra "warning warning" would just be noise.
+    const icon = evtIcons[e.type] || '•';
     return '<div class="evt">' +
       '<span class="evt-time">' + evtTime(e.ts) + '</span>' +
+      '<span class="evt-icon" aria-hidden="true" style="color:' + c + '">' + icon + '</span>' +
       '<span class="evt-dot" style="background:' + c + '"></span>' +
       '<span class="evt-msg">' + evtMsg(e) + '</span>' +
     '</div>';

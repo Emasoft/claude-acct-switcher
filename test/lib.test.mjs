@@ -9340,3 +9340,218 @@ describe("UX batch E — UX-L2 / UX-AC1 logs/activity filter regressions", () =>
     assert.match(_src_filterE, /\.log-line-hidden\s*\{\s*display:\s*none/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// Visual hierarchy batch — UX-A2 / UX-A3 / UX-A4 / UX-CO2 / UX-AC2
+// source-grep regressions
+//
+// These tests guard the load-bearing markup and CSS introduced by the
+// visual hierarchy batch:
+//   * UX-A2 — "Exclude from auto-switch" toggle moved into the
+//     .card-actions row (no longer buried under the rate bars in
+//     muted-text). Active cards now also get a card-actions row so
+//     the toggle is reachable on the active account.
+//   * UX-A3 — `excluded` badge replaces the inline-style
+//     grey-on-near-white form with a palette-consistent .badge-excluded
+//     class.
+//   * UX-A4 — renderVelocityInline shows ONLY the binding ETA (the
+//     soonest constraint) and stashes the other in title=.
+//   * UX-CO2 — All four BETA badges in the Config tab use the .beta-badge
+//     class. The duplicate "Enable session monitor" toggle-label BETA is
+//     removed (one badge per section).
+//   * UX-AC2 — Activity feed entries carry an evt-icon glyph paired with
+//     the dot's colour for colour-blind accessibility.
+//
+// As with every other source-grep block, these are regression nets:
+// the runtime behaviour is browser-only, but a future edit that drops
+// the markup/CSS would silently undo the audit fix without these tests
+// catching it.
+// ─────────────────────────────────────────────────
+describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep regressions', () => {
+  const _src_vh = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-A3 — palette-consistent .badge-excluded class
+  it('UX-A3 — .badge-excluded CSS class is defined (replaces inline-style)', () => {
+    // The class must use var(--*) tokens (not hardcoded colours) so it
+    // tracks the dashboard theme. The audit's example asked for muted
+    // text on the bg layer; we use card so the badge reads on both
+    // .card.active (primary tint) and inactive cards.
+    assert.match(_src_vh,
+      /\.badge-excluded\s*\{[\s\S]{0,400}color:\s*var\(--muted\);[\s\S]{0,400}border-color:\s*var\(--border\);/);
+  });
+
+  it('UX-A3 — excluded badge uses badge-excluded class (no inline-style override)', () => {
+    // The pre-fix shape was:
+    //   <span class="badge" style="background:var(--muted);color:var(--bg);font-size:0.65rem">excluded</span>
+    // — failed WCAG AA (grey-on-near-white). The new shape MUST use the
+    // class, NOT inline style.
+    assert.match(_src_vh,
+      /<span class="badge badge-excluded" title="[^"]+">excluded<\/span>/);
+    // And the legacy inline-style form must be GONE (regression guard).
+    assert.doesNotMatch(_src_vh,
+      /'<span class="badge" style="background:var\(--muted\);color:var\(--bg\)/);
+  });
+
+  it('UX-A3 — excluded badge carries an explanatory title= tooltip', () => {
+    // The badge is a 7-character pill; without a tooltip new users do
+    // not know what "excluded" applies to. The title narrates the
+    // semantic: skip from auto-switch but keep manual access.
+    assert.match(_src_vh,
+      /title="This account is excluded from auto-switch[^"]+only manual switches will reach it"/);
+  });
+
+  // ── UX-A2 — toggle relocation into card-actions
+  it('UX-A2 — .card-actions CSS class is defined for the new actions row', () => {
+    // The class must lay out toggle + buttons on a single row with the
+    // toggle pinned left (margin-right:auto) so the action buttons
+    // hug the right edge.
+    assert.match(_src_vh,
+      /\.card-actions\s*\{[\s\S]{0,200}display:\s*flex;[\s\S]{0,200}flex-wrap:\s*wrap;\s*\}/);
+    assert.match(_src_vh,
+      /\.card-actions \.acct-pref-toggle\s*\{\s*margin-right:\s*auto;\s*\}/);
+  });
+
+  it('UX-A2 — .acct-pref-toggle has a hover/focus affordance (no longer muted)', () => {
+    // The pre-fix style declared `color: var(--muted)` inline on the
+    // <label>. The new class uses var(--foreground) so the control
+    // reads as an actionable pill, not a passive hint.
+    assert.match(_src_vh,
+      /\.acct-pref-toggle\s*\{[\s\S]{0,400}color:\s*var\(--foreground\);[\s\S]{0,400}cursor:\s*pointer;/);
+    // hover/focus rules MUST exist so the user knows it is interactive.
+    assert.match(_src_vh,
+      /\.acct-pref-toggle:hover\s*\{[^}]*background:\s*var\(--bg\);[^}]*\}/);
+    assert.match(_src_vh,
+      /\.acct-pref-toggle:focus-within\s*\{[^}]*outline:\s*2px solid var\(--primary\)/);
+  });
+
+  it('UX-A2 — .acct-pref-toggle.is-on flips colour to make the active state visible', () => {
+    // The audit pointed out that the previous form needed the user to
+    // read the checkbox state to know if the toggle was on. The is-on
+    // class flips the pill itself to the yellow-soft palette so the
+    // state is visible from across the screen.
+    assert.match(_src_vh,
+      /\.acct-pref-toggle\.is-on\s*\{[\s\S]{0,200}color:\s*var\(--yellow\);[\s\S]{0,200}background:\s*var\(--yellow-soft\);/);
+  });
+
+  it('UX-A2 — renderAccounts emits prefsHtml inside card-actions, not as a free child', () => {
+    // The pre-fix markup placed prefsHtml as a sibling of buttonsHtml
+    // (so the toggle hung loose between staleMsg and buttonsHtml).
+    // The fix moves prefsHtml INSIDE card-actions so it lives on the
+    // action-bar row.
+    // Source-grep asserts:
+    //   1. card-actions wrapper exists
+    //   2. prefsHtml is concatenated immediately INSIDE the wrapper
+    //   3. inner template no longer references prefsHtml as a sibling
+    assert.match(_src_vh,
+      /var buttonsHtml = '<div class="card-actions">'\s*\+\s*prefsHtml/);
+    // The pre-fix line `staleMsg + prefsHtml + buttonsHtml` is gone —
+    // assert the new shape `staleMsg + buttonsHtml` (no orphan
+    // prefsHtml between them).
+    assert.match(_src_vh,
+      /barsHtml \+\s*staleMsg \+\s*buttonsHtml;/);
+    assert.doesNotMatch(_src_vh, /staleMsg \+\s*prefsHtml \+\s*buttonsHtml/);
+  });
+
+  it('UX-A2 — toggle is-on class mirrors p.excludeFromAuto', () => {
+    assert.match(_src_vh,
+      /'<label class="acct-pref-toggle' \+ \(p\.excludeFromAuto \? ' is-on' : ''\)/);
+  });
+
+  // ── UX-A4 — single binding-constraint ETA
+  it('UX-A4 — renderVelocityInline picks the binding (shorter) ETA, stashes the other in title=', () => {
+    // The new function declares a `binding5h` flag from min5/min7 and
+    // builds a single badge. The pre-fix function emitted TWO middle-
+    // dot separators in a row.
+    const fn = _src_vh.slice(
+      _src_vh.indexOf('function renderVelocityInline'),
+      _src_vh.indexOf('function renderVelocityInline') + 3500,
+    );
+    assert.match(fn, /const binding5h = _eff\(min5\) <= _eff\(min7\);/);
+    // title= MUST surface the other ETA when both are available
+    assert.match(fn, /const otherKind = \(kind === '5h'\) \? '7d' : '5h';/);
+    assert.match(fn, /title \+= '\. ' \+ otherKind \+ ' ETA: ' \+ otherText;/);
+    // Single emission line — only one card-token-sep + velocity-badge
+    // is appended at the end (the pre-fix function had two such
+    // appends in series).
+    const sepCount = (fn.match(/<span class="card-token-sep">/g) || []).length;
+    assert.equal(sepCount, 1,
+      'renderVelocityInline must emit exactly ONE separator+badge pair, found ' + sepCount);
+  });
+
+  it('UX-A4 — renderVelocityInline returns empty string when both ETAs are null', () => {
+    const fn = _src_vh.slice(
+      _src_vh.indexOf('function renderVelocityInline'),
+      _src_vh.indexOf('function renderVelocityInline') + 3500,
+    );
+    assert.match(fn, /if \(min5 == null && min7 == null\) return '';/);
+  });
+
+  // ── UX-CO2 — single .beta-badge class for all BETA spans
+  it('UX-CO2 — .beta-badge CSS class is defined (replaces 4× inline style)', () => {
+    assert.match(_src_vh,
+      /\.beta-badge\s*\{[\s\S]{0,500}color:\s*var\(--yellow\);[\s\S]{0,500}background:\s*var\(--yellow-soft\);[\s\S]{0,500}border:\s*1px solid var\(--yellow-border\);/);
+  });
+
+  it('UX-CO2 — exactly 4 BETA badges in the Config tab, all using .beta-badge', () => {
+    // After the audit fix: Request Serialization, Commit Tokens,
+    // Session Monitor, Per-Tool Attribution → 4 sections, 1 badge each.
+    // The duplicate inside the "Enable session monitor" label is REMOVED.
+    const matches = _src_vh.match(/<span class="beta-badge">BETA<\/span>/g) || [];
+    assert.equal(matches.length, 4,
+      'expected exactly 4 .beta-badge spans, found ' + matches.length);
+  });
+
+  it('UX-CO2 — no inline-style BETA spans remain (regression guard)', () => {
+    // The pre-fix shape used `style="font-size:0.625rem;font-weight:500;
+    // color:var(--yellow);background:var(--yellow-soft);..."`. None of
+    // those should remain.
+    assert.doesNotMatch(_src_vh,
+      /<span style="[^"]*color:var\(--yellow\)[^"]*">BETA<\/span>/);
+  });
+
+  // ── UX-AC2 — activity-event glyph paired with dot colour
+  it('UX-AC2 — evtIcons map is defined and covers severity-critical event types', () => {
+    assert.match(_src_vh, /^const evtIcons = \{/m);
+    // Spot-check the most-critical entries the audit named:
+    //   rate-limited (warn glyph), auth-expired (error), all-exhausted
+    //   (no-entry), token-refreshed (check), account-discovered (plus).
+    assert.match(_src_vh, /'rate-limited':\s*'▲'/);
+    assert.match(_src_vh, /'auth-expired':\s*'✖'/);
+    assert.match(_src_vh, /'all-exhausted':\s*'⛔'/);
+    assert.match(_src_vh, /'token-refreshed':\s*'✓'/);
+    assert.match(_src_vh, /'account-discovered':\s*'\+'/);
+  });
+
+  it('UX-AC2 — every activity entry renders an evt-icon BEFORE the dot', () => {
+    // The renderer must emit the icon span before the dot span so the
+    // glyph and colour share the same scan zone.
+    assert.match(_src_vh,
+      /'<span class="evt-icon" aria-hidden="true" style="color:' \+ c \+ '">' \+ icon \+ '<\/span>' \+\s*'<span class="evt-dot"/);
+  });
+
+  it('UX-AC2 — .evt-icon CSS sizes the glyph and applies tabular-nums', () => {
+    assert.match(_src_vh,
+      /\.evt-icon\s*\{[\s\S]{0,400}font-size:\s*0\.75rem;[\s\S]{0,400}font-variant-numeric:\s*tabular-nums;/);
+  });
+
+  it('UX-AC2 — icon source is the closed evtIcons map, NOT user-controlled fields (XSS hardening)', () => {
+    // The renderer must source the icon from `evtIcons[e.type]` with a
+    // safe '•' fallback. If a future refactor pulled the icon from
+    // any user-controlled field on `e.*`, the aria-hidden span would
+    // become an HTML-injection sink.
+    assert.match(_src_vh, /const icon = evtIcons\[e\.type\] \|\| '•';/);
+    // Defensive: source-grep that the icon var is NOT built by string
+    // concatenation from any e.* field.
+    assert.doesNotMatch(_src_vh, /const icon = .*\+\s*e\.[a-zA-Z]/);
+  });
+
+  it('UX-AC2 — aria-hidden on the icon span (no double-announce)', () => {
+    // Screen readers MUST hear the message text alone — the icon is a
+    // redundant visual cue, not a label.
+    assert.match(_src_vh,
+      /<span class="evt-icon" aria-hidden="true"/);
+  });
+});
