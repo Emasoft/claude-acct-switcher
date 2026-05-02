@@ -4,7 +4,7 @@
 **Filename:** `design/tasks/TRDD-2b0eed81-7035-4829-b88e-b3c800df5df0-ux-audit-followups.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** In progress (batch 2 of 6 done)
+**Status:** In progress (batches 2, B, D, E of 6 done — 4/6 remaining)
 **Created:** 2026-05-02
 **Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (95 findings, Opus)
 **Owner:** unassigned
@@ -27,6 +27,31 @@ Round 3 of the dashboard.mjs audit was a UX usability audit. Opus flagged 95 fin
 - `.remove-btn` tinted with `var(--red)` border+text at rest so the destructive action is visually distinct (audit-adjacent — was hex `#dc2626` only on hover).
 
 The other 80 findings are catalogued below for follow-up. None are merge-blockers; many are quality-of-life or polish.
+
+## Applied in **batches B + D + E** (parallel agent worktree dispatch — 6 findings)
+
+### Batch B — Time formatting (UX-X8 + UX-X9)
+- New `lib.mjs` exports `fmtTokenCount(n)` and `fmtDuration(ms)`, both returning `{short, exact}`. Browser-side mirrors inside the renderHTML template literal (algorithm-locked to lib via "no drift" regression tests).
+- `formatNum` and `sessionDuration` collapsed to thin wrappers — one source of truth for compact rendering.
+- 21 token-count display sites and 8+ duration sites now carry `title=` with the exact unabbreviated value.
+- `tickCountdowns` refreshes both `textContent` and `title=` on every tick so live displays stay hover-truthful.
+
+### Batch D — Sparkline + scrubber refresh (UX-X7 + UX-VS2)
+- `renderSparkline` switches from binary on/off areas to proportional fills with a 1.0 floor. SVG carries `<title>` + `role="img" aria-label` (hover and screen reader stay in sync). Always-visible peak% / 0% overlays at the chart corners.
+- Scrubber `.vs-thumb` bumped from 16px to 28px (margin-left -14px to keep it centred). `.vs-track-wrap` height bumped to 44px for focus-ring headroom.
+- Both `::-webkit-slider-thumb` and `::-moz-range-thumb` defensively sized to 28px so a future stray native range slider can't regress to OS-default 16px.
+
+### Batch E — Logs/Activity filter UIs (UX-L2 + UX-AC1)
+- Logs tab and Activity tab each get a filter input + regex toggle + clear button + match-count badge, sharing the new `.vdm-filter-bar` style.
+- Hides non-matching entries via `.evt-hidden` / `.log-line-hidden` CSS class toggle (DOM stays stable; clearing restores without re-fetch).
+- 256-char hard cap at three levels (maxlength attribute + input handler slice + compile/persist slice). Defense in depth against ReDoS + localStorage poisoning.
+- Invalid regex compiles to `null`, count badge shows "Invalid regex" with `.error` styling, and ALL lines remain visible (no empty-pane trap).
+- Filter checked against SSE-streamed log line `textContent` BEFORE append, eliminating flicker.
+- Persistence via `vdm.logsFilter` / `vdm.logsRegex` / `vdm.activityFilter` / `vdm.activityRegex` localStorage keys.
+
+### Lessons learned about parallel agent worktrees
+- The `Agent({isolation: "worktree"})` mode does NOT fully sandbox edits when the prompt contains absolute paths into the main checkout. All 3 agents wrote to MAIN's `dashboard.mjs` / `test/lib.test.mjs` in addition to (or instead of) their worktrees, even though they were spawned with isolation. MAIN's dirty state ended up as a noisy mixture of all 3 agents' work plus debug detritus. The proper sequence was: wait for all 3 agents to commit to their branches, verify MAIN's dirty diff was a strict subset of the union of branch diffs, discard MAIN's dirty state, then merge each branch sequentially with conflict resolution.
+- Future use of parallel worktree agents should EITHER pass purely-relative paths in the prompt OR explicitly tell the agent its `cwd` is the worktree path (e.g. `"Your working directory is the parent of CLAUDE.md, NOT /Users/.../<project>/"`).
 
 ## Applied in **A11y batch 2** (3 findings + 1 test-tooling fix)
 
@@ -52,7 +77,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 - **UX-A7** — Card hover `box-shadow: var(--shadow-lg)` overlaps neighbour card.
 
 ### Activity tab
-- **UX-AC1** — Activity feed has no filter / search.
+- ~~UX-AC1~~ — *(addressed by Activity tab filter input + regex toggle + clear, batch E)*
 - **UX-AC2** — Activity dot colour is the only differentiator for event severity.
 - **UX-AC3** — Empty state "No activity yet" provides no next action.
 
@@ -66,6 +91,9 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 ### Usage tab — wasted-spend
 - **UX-WS2** — Bars use fixed yellow regardless of severity (no gradient by spend level).
 
+### Usage tab — scrubber (rest)
+- ~~UX-VS2~~ — *(addressed by 28px touch-friendly thumbs + native range thumb defaults, batch D)*
+
 ### Usage tab — cache misses
 - **UX-CM1** — First session details auto-open on every page load (sticky preference?).
 - **UX-CM3** — `… and N older miss(es)` truncation hides actionable detail.
@@ -77,7 +105,7 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 
 ### Usage tab — scrubber
 - **UX-VS1** — Scrubber's role conflicts with `tok-time` dropdown — both filter time.
-- **UX-VS2** — Scrubber thumbs are 16px diameter — too small for touch / fine drag.
+- ~~UX-VS2~~ — *(see "Usage tab — scrubber (rest)" below — addressed in batch D)*
 - **UX-VS3** — Fallback `<input type="datetime-local">` only shown at <600px.
 
 ### Sessions tab
@@ -93,13 +121,13 @@ Grouped by area. See the full audit report for code-level fixes per finding.
 
 ### Logs tab
 - **UX-L1** — Log container uses dark theme inside light dashboard.
-- **UX-L2** — Logs tab has no filter or search.
+- ~~UX-L2~~ — *(addressed by Logs tab filter input + regex toggle + clear, batch E)*
 
 ### Cross-cutting
 - ~~UX-X3~~ — *(addressed by role=button + global Enter/Space keydown delegate on tok-repo-header and session-header, A11y batch 2)*
-- **UX-X7** — Sparklines have no axes / labels — pure decoration.
-- **UX-X8** — Multiple data formats for time across the UI.
-- **UX-X9** — `formatNum(1234567)` returns `1.2M` — truncates 234K silently. Add `title=` with exact value.
+- ~~UX-X7~~ — *(addressed by proportional sparkline + min/max overlays + screen-reader label, batch D)*
+- ~~UX-X8~~ — *(addressed by `fmtTokenCount` + `fmtDuration` unification in lib.mjs, batch B)*
+- ~~UX-X9~~ — *(addressed by `title=` hover-exact attribute on every compact-form display, batch B)*
 - **UX-X10** — Many controls use `var(--muted)` for both placeholder text and active state.
 
 ## Deferred MINOR + NIT findings (≈30)
@@ -110,14 +138,18 @@ See the original report for the full list. Prioritisation rule: pick up MAJORs f
 
 1. ~~**A11y batch 2**~~ ✅ done — see "Applied in A11y batch 2" above.
 2. **Visual hierarchy batch** (UX-A2/A3/A4 + UX-CO2 + UX-AC2): account-card layout polish, BETA badge consolidation, activity dot icon redesign.
-3. **Time formatting batch** (UX-X8 + UX-X9): single `fmtDuration()` + `fmtTokenCount()` utility used everywhere.
+3. ~~**Time formatting batch (B)**~~ ✅ done.
 4. **Empty + error state pass** (UX-AC3 + UX-A5 + UX-BR3 + UX-S1): every empty state suggests a next action.
-5. **Sparkline + scrubber refresh** (UX-X7 + UX-VS2): convert binary sparklines to proportional, bigger touch targets on the thumb.
-6. **Logs / Activity search batch** (UX-L2 + UX-AC1): filter input + regex toggle.
+5. ~~**Sparkline + scrubber refresh (D)**~~ ✅ done.
+6. ~~**Logs / Activity search batch (E)**~~ ✅ done.
 
 ## What to do next session
 
-Pick any of batches 2–6 above. **Visual hierarchy batch** is the highest-impact remaining batch — it fixes the most-visible "this looks rough" complaints (account-card noise, BETA badge spam, undifferentiated activity feed). The others can land in parallel branches if multiple contributors pick them up.
+Two batches remain:
+- **Visual hierarchy batch** (UX-A2/A3/A4 + UX-CO2 + UX-AC2) — highest-impact remaining: account-card noise, BETA badge spam, undifferentiated activity feed.
+- **Empty + error state pass** (UX-AC3 + UX-A5 + UX-BR3 + UX-S1) — every empty state suggests a next action.
+
+Both touch `renderAccounts` and `renderActivityFeed`, so they should run SEQUENTIALLY in main (not in parallel worktree branches) to avoid the merge-conflict + worktree-isolation-leak problems documented in "Lessons learned about parallel agent worktrees" above.
 
 ## Acceptance criteria (per batch)
 
