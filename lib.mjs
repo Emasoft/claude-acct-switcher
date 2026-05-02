@@ -1894,6 +1894,117 @@ export function buildWastedSpendSeries(rows, opts = {}) {
   return out;
 }
 
+// ─────────────────────────────────────────────────
+// UX-WS2 — Wasted-spend severity gradient
+//
+// The wasted-spend chart used a single yellow for every bar regardless
+// of how catastrophic the day was. Operators couldn't tell at a glance
+// "this day was $5" from "this day was $50" without hovering each bar.
+// The fix is a percentile-based gradient: bars at or below the 50th
+// percentile of the visible window get a calm soft-yellow; bars between
+// the 50th and 90th percentile get the saturated yellow; bars STRICTLY
+// above the 90th percentile get red ("look here first").
+//
+// Why percentile and not absolute thresholds:
+//   - Absolute thresholds ($1 / $10 / $100) drift as Anthropic's pricing
+//     and the user's traffic volume change. A small-traffic user would
+//     never see red; a high-traffic user would see only red.
+//   - Percentile-of-current-dataset is naturally normalised to whatever
+//     the user is looking at right now. A "bad day" stands out against
+//     the user's own baseline.
+//
+// Why a pure function:
+//   - The dashboard inlines this helper into renderHTML's <script>
+//     block via source duplication (no bundler), but the source-of-
+//     truth lives here so the unit test in test/lib.test.mjs covers
+//     the percentile math directly.
+//   - The CSS-variable returns are constants so the dashboard never
+//     introduces hex colours that drift from the :root palette.
+// ─────────────────────────────────────────────────
+export const WASTED_SEVERITY_LOW  = 'var(--yellow-soft)';
+export const WASTED_SEVERITY_MED  = 'var(--yellow)';
+export const WASTED_SEVERITY_HIGH = 'var(--red)';
+
+/**
+ * Pick a severity colour for a wasted-spend bar based on its position
+ * in the distribution of the visible bars.
+ *
+ * @param {number} value — the wasted dollar amount for this bar
+ * @param {Array<number>|null} allValues — the full set of visible
+ *   wasted values (one entry per bar in the rendered chart). Used to
+ *   compute the 50th and 90th percentile thresholds.
+ * @returns {string} a CSS-variable expression usable as `background:`
+ *   on the bar element. Always returns one of WASTED_SEVERITY_LOW /
+ *   WASTED_SEVERITY_MED / WASTED_SEVERITY_HIGH.
+ *
+ * Defensive contract:
+ *   - null/undefined/NaN/negative `value` → LOW (no crash, no red).
+ *   - empty/null/undefined `allValues` → LOW (no distribution to
+ *     compare against — calm default).
+ *   - single-value or flat `allValues` → LOW (no variance means no
+ *     gradient is meaningful; without this branch the lone bar would
+ *     score above its own zero-width "90th percentile" and turn red).
+ */
+export function wastedSeverity(value, allValues) {
+  // Defensive input gates.
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return WASTED_SEVERITY_LOW;
+  }
+  if (!Array.isArray(allValues) || allValues.length === 0) {
+    return WASTED_SEVERITY_LOW;
+  }
+  // Filter to finite non-negative values so the percentile math is
+  // not skewed by NaN / null / negative entries that may have slipped
+  // through from a malformed dataset.
+  const cleaned = [];
+  for (let i = 0; i < allValues.length; i++) {
+    const v = allValues[i];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+      cleaned.push(v);
+    }
+  }
+  if (cleaned.length === 0) return WASTED_SEVERITY_LOW;
+  // Flat / single-value distributions have no meaningful gradient.
+  // Without this short-circuit the lone bar (or every bar in a flat
+  // dataset) would clear the 90th percentile threshold (since 90th of
+  // [7] is 7 and we use `value > p90` which is false, so this is also
+  // strictly defensive — the comparator is the load-bearing safeguard,
+  // but the early return saves the percentile sort on the common case).
+  let allEqual = true;
+  for (let i = 1; i < cleaned.length; i++) {
+    if (cleaned[i] !== cleaned[0]) { allEqual = false; break; }
+  }
+  if (allEqual) return WASTED_SEVERITY_LOW;
+  // Sort ascending and compute 50th + 90th percentile via linear
+  // interpolation (the standard "type 7" definition used by Excel and
+  // most stats libraries — same one users would compute by hand).
+  const sorted = cleaned.slice().sort((a, b) => a - b);
+  const p50 = _percentile(sorted, 0.50);
+  const p90 = _percentile(sorted, 0.90);
+  // Strict-inequality thresholds match the spec: HIGH only when the
+  // bar exceeds the 90th — being AT the 90th is still MED. A bar that
+  // sits exactly on the 50th (the median) is LOW (calm default).
+  if (value > p90) return WASTED_SEVERITY_HIGH;
+  if (value > p50) return WASTED_SEVERITY_MED;
+  return WASTED_SEVERITY_LOW;
+}
+
+/**
+ * Linear-interpolation percentile (type 7). Internal helper.
+ * `sorted` MUST be sorted ascending. `p` is in [0, 1].
+ */
+function _percentile(sorted, p) {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  if (n === 1) return sorted[0];
+  const rank = p * (n - 1);
+  const lo = Math.floor(rank);
+  const hi = Math.ceil(rank);
+  if (lo === hi) return sorted[lo];
+  const frac = rank - lo;
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
+}
+
 /**
  * Promise-chain mutex keyed by account name.
  * Ensures only one refresh runs per account at a time.
