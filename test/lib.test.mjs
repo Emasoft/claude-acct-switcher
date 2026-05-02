@@ -9340,3 +9340,156 @@ describe("UX batch E — UX-L2 / UX-AC1 logs/activity filter regressions", () =>
     assert.match(_src_filterE, /\.log-line-hidden\s*\{\s*display:\s*none/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// Empty + error state pass — UX-AC3 / UX-A5 / UX-BR3 / UX-S1 source-grep
+// regressions (batch C).
+//
+// Every empty-state branch the user can hit on first paint MUST suggest a
+// next action — no dead-end "Nothing to show" / "OFF" copy. Modeled after
+// the "A11y batch 2 — UX-X3 / UX-CPF3 / UX-S2" block above: the renderers
+// all live inside the renderHTML() template literal and ship as a string
+// to the browser, so behaviour-grade DOM tests aren't viable; instead we
+// pin the load-bearing copy + structural shape via source-greps so a
+// future refactor that re-introduces the dead-end strings trips at test
+// time, before reaching the dashboard.
+// ─────────────────────────────────────────────────
+describe('Empty + error state pass — UX-AC3 / UX-A5 / UX-BR3 / UX-S1 (batch C)', () => {
+  const _src_emptyC = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-AC3 — Activity tab empty state ──────────────────────────────
+  it("UX-AC3 — activity feed empty state suggests starting a Claude Code session (initial markup)", () => {
+    // The initial markup (before any data flows in) must use the
+    // .empty-state shell + actionable copy, not the bare "No activity yet"
+    // muted-text dead-end. The exact copy is part of the regression
+    // contract because users see it on first paint.
+    assert.match(_src_emptyC,
+      /<div id="activity-log" class="empty-state">No activity yet\. Start a Claude Code session/);
+  });
+
+  it("UX-AC3 — runtime renderActivity empty branch matches the initial markup", () => {
+    // renderActivity() runs after the initial paint and MUST emit the
+    // same actionable copy when the log is empty (consistency between
+    // first-paint and re-render — without this the actionable hint
+    // disappears the first time the renderer fires, which it does
+    // immediately on tab switch).
+    assert.match(_src_emptyC,
+      /el\.innerHTML\s*=\s*'<div class="empty-state">No activity yet\. Start a Claude Code session/);
+  });
+
+  it("UX-AC3 — old dead-end 'No activity yet</div>' (without actionable suffix) is gone", () => {
+    // Defense against a future revert: the bare "No activity yet" copy
+    // (no period, no follow-up sentence) must NOT survive anywhere in
+    // the source. The two surviving sites both end with "Start a Claude
+    // Code session" so we grep for the dead-end pattern explicitly.
+    const deadEndMatches = _src_emptyC.match(/No activity yet<\/div>/g) || [];
+    assert.equal(deadEndMatches.length, 0,
+      'expected zero "No activity yet</div>" dead-ends, found ' + deadEndMatches.length);
+  });
+
+  // ── UX-A5 — Dormant accounts inline hint ───────────────────────────
+  it("UX-A5 — dormant account hint mentions 'windows not started yet' instead of bare 'window preserved'", () => {
+    // The old copy "Dormant - window preserved" left users wondering if
+    // the account was broken. The replacement explains *why* (no
+    // requests have been made) and reassures via a hover title that
+    // explains conserve-strategy semantics.
+    assert.match(_src_emptyC, /Dormant — windows not started yet/);
+  });
+
+  it("UX-A5 — dormant hint carries an explanatory title= for hover discoverability", () => {
+    // Tooltip MUST be present (the inline copy is intentionally short
+    // to fit the card; the long-form explanation lives in title=).
+    // We check for the conserve-strategy keywords inside the title to
+    // ensure the hover text actually contains the explanation, not
+    // just a placeholder.
+    assert.match(_src_emptyC,
+      /title="Conserve strategy: this account[^"]*window[^"]*has not started/);
+  });
+
+  it("UX-A5 — old dead-end 'Dormant  - window preserved' copy is gone", () => {
+    // Defense against a future revert. Note the double-space in the
+    // historical copy (a typo from the original source) — we grep for
+    // the exact dead-end including the typo so a revert is caught even
+    // if someone "fixes" the spacing.
+    const deadEndMatches = _src_emptyC.match(/Dormant\s+-\s+window preserved/g) || [];
+    assert.equal(deadEndMatches.length, 0,
+      'expected zero "Dormant - window preserved" dead-ends, found ' + deadEndMatches.length);
+  });
+
+  // ── UX-BR3 — Tool Breakdown panel ──────────────────────────────────
+  it("UX-BR3 — Tool Breakdown panel does NOT silently set display:none when per-tool attribution is off", () => {
+    // The historical fix-target was `card.style.display = 'none'` inside
+    // the !hasAttributed branch. We now want the card to stay visible
+    // and render an actionable explainer instead. Greps the renderToolBreakdown
+    // function slice for the dead-end pattern.
+    const fnSlice = _src_emptyC.slice(
+      _src_emptyC.indexOf('function renderToolBreakdown'),
+      _src_emptyC.indexOf('function renderToolBreakdown') + 3000,
+    );
+    assert.doesNotMatch(fnSlice, /if\s*\(\s*!hasAttributed\s*\)\s*\{\s*card\.style\.display\s*=\s*'none'/,
+      "renderToolBreakdown must not hide the card when per-tool attribution is off — show an explainer instead");
+  });
+
+  it("UX-BR3 — Tool Breakdown empty-state explainer mentions enabling per-tool attribution in Config", () => {
+    // The replacement copy must tell the user (a) the panel is empty
+    // because the gate is off, (b) where to flip the gate. The link
+    // target is the Config tab via switchTab('config'). Source-greps
+    // the function slice to scope the assertion.
+    const fnSlice = _src_emptyC.slice(
+      _src_emptyC.indexOf('function renderToolBreakdown'),
+      _src_emptyC.indexOf('function renderToolBreakdown') + 3000,
+    );
+    assert.match(fnSlice, /Per-tool attribution is OFF/);
+    // The source emits the onclick as `switchTab(\\'config\\')` (the
+    // double-backslash is a literal '\\' in the source file because
+    // the surrounding HTML attribute is single-quoted at runtime).
+    // Match the literal source bytes here.
+    assert.match(fnSlice, /switchTab\(\\\\'config\\\\'\)/);
+  });
+
+  // ── UX-S1 — Sessions tab loading/initial empty state ───────────────
+  it("UX-S1 — Sessions tab initial markup uses 'Loading sessions' (not 'Session Monitor is OFF')", () => {
+    // The historical bug: hardcoded markup said "Session Monitor is OFF"
+    // even when the user had ENABLED the feature, because /api/sessions
+    // hadn't replied yet. Race condition on first paint after enabling.
+    // Fix: show a generic loading state initially; the renderer flips
+    // to the truth-based copy once data arrives.
+    assert.match(_src_emptyC,
+      /<div class="empty-state" id="sessions-loading">Loading sessions/);
+  });
+
+  it("UX-S1 — Sessions tab initial markup no longer hardcodes 'Session Monitor is OFF'", () => {
+    // The renderSessions() function still emits "Session Monitor is OFF"
+    // when data.enabled is false (that's the truth-based branch we keep).
+    // What we forbid is the *initial* hardcoded id="sessions-disabled"
+    // markup that fires before any fetch.
+    assert.doesNotMatch(_src_emptyC,
+      /<div class="empty-state" id="sessions-disabled">Session Monitor is OFF\./);
+  });
+
+  it("UX-S1 — renderSessions still emits truth-based 'Session Monitor is OFF' when data.enabled === false", () => {
+    // We keep the truth-based branch (after the fetch returns) so users
+    // who genuinely have the feature off see actionable copy. The
+    // initial-markup path is the only one that changes.
+    const fnSlice = _src_emptyC.slice(
+      _src_emptyC.indexOf('function renderSessions'),
+      _src_emptyC.indexOf('function renderSessions') + 2000,
+    );
+    assert.match(fnSlice, /if\s*\(\s*!data\.enabled\s*\)/);
+    assert.match(fnSlice, /Session Monitor is OFF/);
+    assert.match(fnSlice, /No sessions yet/);
+  });
+
+  // ── Cross-cutting — XSS / a11y discipline ──────────────────────────
+  it("UX-AC3 / UX-S1 — empty-state copy uses .empty-state class (consistent shell)", () => {
+    // Every actionable empty state in the dashboard uses the same shell
+    // (.empty-state class — see CSS at line ~4382). Without this,
+    // empty-state copy looks visually inconsistent across tabs. The
+    // accounts-tab empty-state at "No accounts yet. Run claude login"
+    // is the canonical reference.
+    assert.match(_src_emptyC, /class="empty-state"[^>]*>No accounts yet\. Run/);
+  });
+});
