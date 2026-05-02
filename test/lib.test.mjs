@@ -72,6 +72,9 @@ import {
   aggregateUsageForCsvExport,
   csvField,
   renderUsageTreeCsv,
+  // TRDD-1645134b Phase 5 — reason classification + per-session aggregate
+  CACHE_TTL_LIKELY_MS,
+  summarizeCacheMissesBySession,
   // Phase J — keychain account name helpers
   vdmAccountServiceName,
   vdmAccountNameFromService,
@@ -6443,16 +6446,21 @@ describe('buildCacheMissReport', () => {
   });
 
   it('flags the canonical TTL-miss pattern', () => {
+    // Phase 5 — the gap between the cache-creating turn (ts=1000) and
+    // the missing turn (ts=1000+TTL+1) must actually exceed the
+    // documented TTL for the heuristic to classify the miss as
+    // "TTL-likely". A small gap with the same shape now classifies
+    // as "unknown" (different test below covers that case).
     const r = buildCacheMissReport([
       // Turn 1 — creates cache
       row({ ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 5000 }),
       // Turn 2 — within TTL, reads cache. NOT a miss.
       row({ ts: 2000, inputTokens: 0,    cacheReadInputTokens: 5000 }),
       // Turn 3 — TTL expired, cacheRead=0 but big input. MISS.
-      row({ ts: 3000, inputTokens: 5500, cacheReadInputTokens: 0,    cacheCreationInputTokens: 5500 }),
+      row({ ts: 1000 + CACHE_TTL_LIKELY_MS + 1, inputTokens: 5500, cacheReadInputTokens: 0, cacheCreationInputTokens: 5500 }),
     ]);
     assert.equal(r.length, 1);
-    assert.equal(r[0].ts, 3000);
+    assert.equal(r[0].ts, 1000 + CACHE_TTL_LIKELY_MS + 1);
     assert.equal(r[0].sessionId, 'sess-1');
     assert.equal(r[0].inputTokens, 5500);
     assert.equal(r[0].reason, 'TTL-likely');
@@ -7318,5 +7326,390 @@ describe('Phase 4 — UI: Export tree CSV button + handler', () => {
     assert.match(fn, /a\.click\(\)/);
     // No Blob — that would defeat the streaming
     assert.ok(!/new Blob/.test(fn), 'should NOT build a Blob (lets browser stream)');
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// TRDD-1645134b Phase 5 — richer cache-miss reason classification
+// ─────────────────────────────────────────────────────────
+
+describe('Phase 5 — buildCacheMissReport reason classification', () => {
+  it('CACHE_TTL_LIKELY_MS matches Anthropic published 5-minute TTL', () => {
+    assert.equal(CACHE_TTL_LIKELY_MS, 5 * 60 * 1000);
+  });
+
+  it('reason "compact-boundary" wins when a compact preceded the miss', () => {
+    // A compact-boundary marker between the cache-creating turn and
+    // the miss explains the miss perfectly — the prefix changed by
+    // definition. Should NOT be classified as TTL-likely even when
+    // the time gap exceeds the TTL.
+    const rows = [
+      { type: 'usage',   sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'compact', sessionId: 's1', ts: 1500 },
+      { type: 'usage',   sessionId: 's1', ts: 2000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildCacheMissReport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].reason, 'compact-boundary');
+  });
+
+  it('reason "model-changed" when the prior cache was on a different model', () => {
+    // Caches are model-scoped: switching models invalidates the cache
+    // even if the prefix would otherwise have hit. Should beat
+    // "TTL-likely" when both could apply.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1100, model: 'claude-sonnet-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildCacheMissReport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].reason, 'model-changed');
+  });
+
+  it('reason "TTL-likely" when the gap exceeds the configured TTL', () => {
+    // Same model, no compact, but >= TTL since the last cache creation.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1000 + CACHE_TTL_LIKELY_MS + 1, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildCacheMissReport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].reason, 'TTL-likely');
+  });
+
+  it('reason "unknown" when within TTL, same model, no compact', () => {
+    // Could be a /clear, an OAuth-rotation gap, or a real prefix
+    // change. Heuristic admits ignorance instead of guessing wrong.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 2000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildCacheMissReport(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].reason, 'unknown');
+  });
+
+  it('cacheTtlMs opt overrides the default TTL', () => {
+    // Same gap of 100ms, but with a 10ms TTL it should be classified
+    // as TTL-likely; with a 1000ms TTL it falls to unknown.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1100, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    assert.equal(buildCacheMissReport(rows, { cacheTtlMs: 10   })[0].reason, 'TTL-likely');
+    assert.equal(buildCacheMissReport(rows, { cacheTtlMs: 1000 })[0].reason, 'unknown');
+  });
+
+  it('compact rows themselves never appear as misses', () => {
+    // The compact-boundary marker is a meta-event, not a usage turn.
+    // It should drive reason classification of subsequent usage rows
+    // but never be reported as a miss in its own right.
+    const rows = [
+      { type: 'usage',   sessionId: 's1', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'compact', sessionId: 's1', ts: 1500 },
+      { type: 'usage',   sessionId: 's1', ts: 2000, inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    const out = buildCacheMissReport(rows);
+    // Exactly one miss — the second usage row, not the compact
+    assert.equal(out.length, 1);
+    assert.equal(out[0].ts, 2000);
+  });
+
+  it('first turn is never a miss (no prior cache existed)', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    assert.deepEqual(buildCacheMissReport(rows), []);
+  });
+
+  it('input below threshold is never a miss', () => {
+    // A turn with tiny input legitimately may not need cache —
+    // shouldn't pollute the miss list with noise.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 2000, inputTokens: 100,  cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+    ];
+    assert.deepEqual(buildCacheMissReport(rows), []);
+  });
+
+  it('preserves all expected fields per miss', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 0,
+        repo: '/r', branch: 'main' },
+      { type: 'usage', sessionId: 's1', ts: 2000, model: 'claude-opus-4-7',
+        inputTokens: 5000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        repo: '/r', branch: 'main' },
+    ];
+    const out = buildCacheMissReport(rows);
+    const m = out[0];
+    assert.equal(m.sessionId, 's1');
+    assert.equal(m.ts, 2000);
+    assert.equal(m.model, 'claude-opus-4-7');
+    assert.equal(m.inputTokens, 5000);
+    assert.equal(m.repo, '/r');
+    assert.equal(m.branch, 'main');
+    assert.ok(typeof m.reason === 'string');
+  });
+});
+
+describe('Phase 5 — summarizeCacheMissesBySession', () => {
+  it('returns empty array on empty/non-array input', () => {
+    assert.deepEqual(summarizeCacheMissesBySession([]),         []);
+    assert.deepEqual(summarizeCacheMissesBySession(null),       []);
+    assert.deepEqual(summarizeCacheMissesBySession(undefined),  []);
+    assert.deepEqual(summarizeCacheMissesBySession('not-array'), []);
+  });
+
+  it('drops sessions with neither hits nor misses (silent rows)', () => {
+    // Sessions where every turn was below the threshold and no cache
+    // ever existed are noise — should not show up at all in the UI.
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 100, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 2000, inputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ];
+    assert.deepEqual(summarizeCacheMissesBySession(rows), []);
+  });
+
+  it('counts hits (any cacheRead > 0) per session', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheReadInputTokens: 0,    cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 2000, inputTokens: 5000, cacheReadInputTokens: 800,  cacheCreationInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 3000, inputTokens: 5000, cacheReadInputTokens: 800,  cacheCreationInputTokens: 0 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].hits, 2);
+    assert.equal(out[0].misses, 0);
+    assert.equal(out[0].hitRate, 100);
+  });
+
+  it('counts misses sourced from buildCacheMissReport (consistency)', () => {
+    // hit=0 + miss=1 → 0% hit rate
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheReadInputTokens: 0,    cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 2000 + CACHE_TTL_LIKELY_MS, inputTokens: 5000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].misses, 1);
+    assert.equal(out[0].hitRate, 0);
+  });
+
+  it('hitRate computes hits / (hits + misses) with one decimal', () => {
+    // 2 hits + 1 miss = 66.7%
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheReadInputTokens: 0,   cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 1100, inputTokens: 5000, cacheReadInputTokens: 800, cacheCreationInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1200, inputTokens: 5000, cacheReadInputTokens: 800, cacheCreationInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1300 + CACHE_TTL_LIKELY_MS, inputTokens: 5000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].hits, 2);
+    assert.equal(out[0].misses, 1);
+    assert.equal(out[0].hitRate, 66.7);
+  });
+
+  it('captures the most-recent repo/branch (sessions wander as user cd\'s)', () => {
+    // Session starts in /a/main, ends in /b/feat — the header should
+    // show /b/feat (the user's current expectation).
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, repo: '/a', branch: 'main', inputTokens: 5000, cacheReadInputTokens: 800 },
+      { type: 'usage', sessionId: 's1', ts: 2000, repo: '/b', branch: 'feat', inputTokens: 5000, cacheReadInputTokens: 800 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out[0].repo, '/b');
+    assert.equal(out[0].branch, 'feat');
+  });
+
+  it('sorted by lastTs descending (recently active first)', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's-old',  ts: 1000, inputTokens: 5000, cacheReadInputTokens: 800 },
+      { type: 'usage', sessionId: 's-new',  ts: 5000, inputTokens: 5000, cacheReadInputTokens: 800 },
+      { type: 'usage', sessionId: 's-mid',  ts: 3000, inputTokens: 5000, cacheReadInputTokens: 800 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out[0].sessionId, 's-new');
+    assert.equal(out[1].sessionId, 's-mid');
+    assert.equal(out[2].sessionId, 's-old');
+  });
+
+  it('missDetails is the same array shape as buildCacheMissReport rows', () => {
+    const rows = [
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheReadInputTokens: 0, cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 2000 + CACHE_TTL_LIKELY_MS, inputTokens: 5000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].missDetails.length, 1);
+    const md = out[0].missDetails[0];
+    assert.equal(md.sessionId, 's1');
+    assert.equal(md.ts, 2000 + CACHE_TTL_LIKELY_MS);
+    assert.ok('reason' in md);
+  });
+
+  it('multiple sessions are aggregated independently', () => {
+    const rows = [
+      // s1 — 1 hit + 1 miss
+      { type: 'usage', sessionId: 's1', ts: 1000, inputTokens: 5000, cacheReadInputTokens: 0,   cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's1', ts: 1100, inputTokens: 5000, cacheReadInputTokens: 800, cacheCreationInputTokens: 0 },
+      { type: 'usage', sessionId: 's1', ts: 1200 + CACHE_TTL_LIKELY_MS, inputTokens: 5000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      // s2 — 1 hit + 0 misses
+      { type: 'usage', sessionId: 's2', ts: 1500, inputTokens: 5000, cacheReadInputTokens: 0,   cacheCreationInputTokens: 1000 },
+      { type: 'usage', sessionId: 's2', ts: 1600, inputTokens: 5000, cacheReadInputTokens: 800, cacheCreationInputTokens: 0 },
+    ];
+    const out = summarizeCacheMissesBySession(rows);
+    assert.equal(out.length, 2);
+    const s1 = out.find(s => s.sessionId === 's1');
+    const s2 = out.find(s => s.sessionId === 's2');
+    assert.equal(s1.hits, 1); assert.equal(s1.misses, 1); assert.equal(s1.hitRate, 50);
+    assert.equal(s2.hits, 1); assert.equal(s2.misses, 0); assert.equal(s2.hitRate, 100);
+  });
+});
+
+describe('Phase 5 — endpoint emits missSessions when includeMisses=1', () => {
+  const _src_t5 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports summarizeCacheMissesBySession from lib.mjs', () => {
+    assert.match(_src_t5, /summarizeCacheMissesBySession,/);
+  });
+
+  it('endpoint computes summary inside the includeMisses guard', () => {
+    const fn = _src_t5.slice(
+      _src_t5.indexOf("'/api/token-usage-tree'"),
+      _src_t5.indexOf("'/api/token-usage-tree'") + 4500,
+    );
+    // Inside the guard: both the buildCacheMissReport call AND the
+    // new summarizeCacheMissesBySession call.
+    assert.match(fn, /response\.misses = buildCacheMissReport/);
+    assert.match(fn, /response\.missSessions = summarizeCacheMissesBySession/);
+    // The summary must be inside the same guard
+    const guardIdx = fn.indexOf("params.get('includeMisses')");
+    const summaryIdx = fn.indexOf('summarizeCacheMissesBySession');
+    assert.ok(summaryIdx > guardIdx, 'summary call must be inside includeMisses guard');
+  });
+
+  it('time-range pre-filter keeps compact rows (Phase 5 reason classification needs them)', () => {
+    // Without keeping compact rows in the pre-filter, every miss in a
+    // filtered view would lose its compact-boundary classification —
+    // silently degrading to TTL-likely or unknown.
+    const fn = _src_t5.slice(
+      _src_t5.indexOf("'/api/token-usage-tree'"),
+      _src_t5.indexOf("'/api/token-usage-tree'") + 4500,
+    );
+    assert.match(fn, /t !== 'usage' && t !== 'compact'/);
+  });
+});
+
+describe('Phase 5 — UI: per-session misses card', () => {
+  const _src_t5ui = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('refreshUsageTree passes missSessions to renderCacheMisses', () => {
+    const fn = _src_t5ui.slice(
+      _src_t5ui.indexOf('async function refreshUsageTree'),
+      _src_t5ui.indexOf('async function refreshUsageTree') + 2500,
+    );
+    assert.match(fn, /renderCacheMisses\(data\.misses \|\| \[\], data\.missSessions \|\| \[\]\)/);
+    // Hash must include missSessions count or stale data wins
+    assert.match(fn, /missSessions \? data\.missSessions\.length : 0/);
+  });
+
+  it('renderCacheMisses signature accepts (misses, missSessions)', () => {
+    const fn = _src_t5ui.slice(
+      _src_t5ui.indexOf('function renderCacheMisses'),
+      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+    );
+    assert.match(fn, /function renderCacheMisses\(misses, missSessions\)/);
+  });
+
+  it('renders per-session <details> blocks with hit-rate badges', () => {
+    const fn = _src_t5ui.slice(
+      _src_t5ui.indexOf('function renderCacheMisses'),
+      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+    );
+    assert.match(fn, /miss-session/);
+    assert.match(fn, /miss-rate-badge/);
+    // Hit-rate threshold matches the tree-view badge convention (50%)
+    assert.match(fn, /hitRate >= 50/);
+    // hits + misses count is shown in the badge
+    assert.match(fn, /miss-rate-counts/);
+  });
+
+  it('per-row miss line shows model + reason columns (XSS-safe)', () => {
+    const fn = _src_t5ui.slice(
+      _src_t5ui.indexOf('function renderCacheMisses'),
+      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+    );
+    assert.match(fn, /miss-model/);
+    assert.match(fn, /miss-reason/);
+    // Both model and reason routed through escHtml for XSS safety
+    assert.match(fn, /escHtml\(modelText\)/);
+    assert.match(fn, /escHtml\(reasonText\)/);
+    // Reason class derived by stripping non-alphanumerics so the CSS
+    // class selector matches reason-TTL-likely / reason-compact-boundary
+    assert.match(fn, /reason-' \+ reasonText\.replace/);
+  });
+
+  it('caps DOM at 5 sessions x 10 rows-per-session, footer reports overflow', () => {
+    const fn = _src_t5ui.slice(
+      _src_t5ui.indexOf('function renderCacheMisses'),
+      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+    );
+    assert.match(fn, /SESSION_CAP = 5/);
+    assert.match(fn, /ROWS_PER_SESSION_CAP = 10/);
+    // Both overflow footers must exist (per-session and global)
+    assert.match(fn, /more session\(s\) with cache misses/);
+    assert.match(fn, /older miss\(es\) in this session/);
+  });
+
+  it('falls back to flat list when missSessions is empty (back-compat)', () => {
+    // A older endpoint version (or future malformed response) might
+    // not emit missSessions; the UI should still render SOMETHING from
+    // the flat list rather than silently displaying empty.
+    const fn = _src_t5ui.slice(
+      _src_t5ui.indexOf('function renderCacheMisses'),
+      _src_t5ui.indexOf('function renderCacheMisses') + 4500,
+    );
+    // Fallback path must reference the flat misses array's slice/reverse
+    assert.match(fn, /misses\.slice\(-50\)\.reverse\(\)/);
+  });
+
+  it('CSS for per-session blocks uses defined design tokens', () => {
+    // Every new color reference must hit a defined --foo or --foo-soft
+    // variable. The TRDD §"CSS using existing dashboard variables (no
+    // new color palette)" mandate.
+    const cssBlock = _src_t5ui.slice(
+      _src_t5ui.indexOf('.tree-misses-card .miss-session {'),
+      _src_t5ui.indexOf('.tok-export-btn {'),
+    );
+    assert.ok(cssBlock.length > 500, 'per-session CSS block must exist');
+    // Reason classes
+    assert.match(cssBlock, /\.reason-TTL-likely/);
+    assert.match(cssBlock, /\.reason-compact-boundary/);
+    assert.match(cssBlock, /\.reason-model-changed/);
+    // No raw hex colors
+    const rawColors = cssBlock.match(/[^a-z]#[0-9a-fA-F]{3,6}\b/g);
+    assert.equal(rawColors, null, `Phase 5 CSS must not contain raw hex; found: ${rawColors}`);
+    // Only defined CSS variables — no --orange or --blue (base) which
+    // don't exist in the palette.
+    assert.ok(!/var\(--orange[^-]/.test(cssBlock), 'must not reference undefined --orange token');
+    assert.ok(!/var\(--blue\)/.test(cssBlock),     'must not reference undefined --blue token (use --primary)');
   });
 });

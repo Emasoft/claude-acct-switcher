@@ -849,6 +849,8 @@ import {
   // TRDD-1645134b Phase 4 — tree-aggregated CSV export
   aggregateUsageForCsvExport,
   renderUsageTreeCsv,
+  // TRDD-1645134b Phase 5 — per-session cache-miss aggregate
+  summarizeCacheMissesBySession,
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -3313,16 +3315,27 @@ async function handleAPI(req, res) {
         // filter here). Other filters (repo/account/model) are NOT
         // applied to misses on the theory that a user investigating
         // a cache-miss issue may want the full-session view.
+        // NOTE: keep type='compact' rows in missRows even when
+        // pre-filtering — buildCacheMissReport reads them to attribute
+        // miss reasons (compact-boundary). Stripping them here would
+        // silently degrade Phase 5 reason classification to "TTL-likely
+        // or unknown" for every miss in a filtered view.
         let missRows = rows;
         if (opts.from != null || opts.to != null) {
           missRows = rows.filter(r => {
-            if (!r || (r.type || 'usage') !== 'usage') return false;
+            if (!r) return false;
+            const t = r.type || 'usage';
+            if (t !== 'usage' && t !== 'compact') return false;
             if (opts.from != null && r.ts < opts.from) return false;
             if (opts.to   != null && r.ts > opts.to)   return false;
             return true;
           });
         }
         response.misses = buildCacheMissReport(missRows, missOpts);
+        // Phase 5 — per-session aggregate. Same opts so the two stay
+        // consistent. The summary uses the SAME flat-miss list under
+        // the hood so the two views can never disagree.
+        response.missSessions = summarizeCacheMissesBySession(missRows, missOpts);
       }
       json(res, response);
     } catch (e) {
@@ -4557,6 +4570,93 @@ function renderHTML() {
   .tree-misses-card .miss-ts { color: var(--text-muted); flex-shrink: 0; }
   .tree-misses-card .miss-account { flex: 1; overflow: hidden; text-overflow: ellipsis; }
   .tree-misses-card .miss-tokens { font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  /* Phase 5 — per-session grouping + model + reason columns. */
+  .tree-misses-card .miss-session {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.5rem;
+    background: var(--bg);
+  }
+  .tree-misses-card .miss-session > summary {
+    cursor: pointer;
+    padding: 0.4rem 0.6rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    font-size: 0.78rem;
+    list-style: none;
+  }
+  .tree-misses-card .miss-session > summary::-webkit-details-marker { display: none; }
+  .tree-misses-card .miss-session > summary::before {
+    content: "▶";
+    display: inline-block;
+    transition: transform 0.15s ease;
+    color: var(--text-muted);
+    width: 0.7rem;
+    flex-shrink: 0;
+  }
+  .tree-misses-card .miss-session[open] > summary::before { transform: rotate(90deg); }
+  .tree-misses-card .miss-sess-id {
+    font-family: var(--mono);
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .tree-misses-card .miss-sess-loc {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--text-muted);
+  }
+  .tree-misses-card .miss-rate-badge {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+  }
+  .tree-misses-card .miss-rate-badge.high {
+    background: var(--green-soft);
+    color: var(--green);
+  }
+  .tree-misses-card .miss-rate-badge.low {
+    background: var(--red-soft);
+    color: var(--red);
+  }
+  .tree-misses-card .miss-rate-counts { color: var(--text-muted); }
+  .tree-misses-card .miss-model {
+    font-family: var(--mono);
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .tree-misses-card .miss-reason {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    padding: 0.05rem 0.3rem;
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+    background: var(--bg);
+    color: var(--text-muted);
+  }
+  /* Reason-specific tints — reuse existing soft palette so we don't
+     introduce a new color set. compact-boundary is benign (user
+     action), TTL-likely is the most common (default red-soft because
+     it represents "you re-paid for cache build"), model-changed is
+     rare. unknown stays neutral. */
+  .tree-misses-card .miss-reason.reason-TTL-likely {
+    background: var(--yellow-soft);
+    color: var(--yellow);
+  }
+  .tree-misses-card .miss-reason.reason-compact-boundary {
+    background: var(--blue-soft);
+    color: var(--primary);
+  }
+  .tree-misses-card .miss-reason.reason-model-changed {
+    background: var(--purple-soft);
+    color: var(--purple);
+  }
 
   .tok-export-btn {
     background: var(--card);
@@ -6910,15 +7010,18 @@ async function refreshUsageTree(currentCutoff) {
     var data = await resp.json();
     if (!data || data.ok !== true) throw new Error(data && data.error || 'malformed response');
 
-    // Hash the tree skeleton + miss count so we don't re-render when
-    // nothing visible changed (saves DOM churn on every 5s poll).
-    var hash = (data.totals.requests | 0) + ':' + (data.misses ? data.misses.length : 0)
+    // Hash the tree skeleton + miss count + miss-session count so we
+    // don't re-render when nothing visible changed (saves DOM churn on
+    // every 5s poll).
+    var hash = (data.totals.requests | 0)
+             + ':' + (data.misses ? data.misses.length : 0)
+             + ':' + (data.missSessions ? data.missSessions.length : 0)
              + ':' + (data.tree ? data.tree.length : 0);
     if (hash === _lastTreeHash) return;
     _lastTreeHash = hash;
 
     renderUsageTree(data.totals, data.tree || []);
-    renderCacheMisses(data.misses || []);
+    renderCacheMisses(data.misses || [], data.missSessions || []);
   } finally {
     _treeFetching = false;
   }
@@ -6990,7 +7093,13 @@ function renderTreeNode(node, parentTotals, depth) {
   return html;
 }
 
-function renderCacheMisses(misses) {
+// Phase 5 — render cache-miss list grouped by session, with hit-rate
+// header per session and per-row model + reason columns.
+//
+// Both the flat misses list (used for the global count and as fallback
+// when missSessions is unavailable) and the missSessions per-session
+// aggregate come from /api/token-usage-tree?includeMisses=1.
+function renderCacheMisses(misses, missSessions) {
   var card = document.getElementById('tok-misses-card');
   var el = document.getElementById('tok-misses');
   var countEl = document.getElementById('tok-misses-count');
@@ -7001,22 +7110,79 @@ function renderCacheMisses(misses) {
   }
   card.style.display = '';
   if (countEl) countEl.textContent = String(misses.length);
-  // Cap rendered list at 50 to keep DOM bounded — the underlying data
-  // can be hundreds for a heavily-used session, but the user only
-  // needs the most recent ones to investigate.
-  var shown = misses.slice(-50).reverse();
-  var html = '';
-  for (var i = 0; i < shown.length; i++) {
-    var m = shown[i];
-    var ts = m.ts ? new Date(m.ts).toLocaleString() : '?';
-    html += '<div class="miss-row">'
-      + '<span class="miss-ts">' + escHtml(ts) + '</span>'
-      + '<span class="miss-account">' + escHtml((m.repo || '?') + ' / ' + (m.branch || '?')) + '</span>'
-      + '<span class="miss-tokens">' + formatNum(m.inputTokens || 0) + ' input</span>'
-      + '</div>';
+
+  // Render per-session groups (preferred). Cap at 5 sessions for DOM
+  // bounds; within each session, cap at 10 most-recent misses. The full
+  // count is always shown in the header so the operator knows what's
+  // being elided.
+  var SESSION_CAP = 5;
+  var ROWS_PER_SESSION_CAP = 10;
+  var sessions = (missSessions && missSessions.length) ? missSessions : [];
+
+  if (!sessions.length) {
+    // Fallback to the flat list (shouldn't happen post-Phase-5 but
+    // protects against an older endpoint version that doesn't emit
+    // missSessions).
+    var shown = misses.slice(-50).reverse();
+    var fallbackHtml = '';
+    for (var i = 0; i < shown.length; i++) {
+      var m = shown[i];
+      var ts = m.ts ? new Date(m.ts).toLocaleString() : '?';
+      fallbackHtml += '<div class="miss-row">'
+        + '<span class="miss-ts">' + escHtml(ts) + '</span>'
+        + '<span class="miss-account">' + escHtml((m.repo || '?') + ' / ' + (m.branch || '?')) + '</span>'
+        + '<span class="miss-tokens">' + formatNum(m.inputTokens || 0) + ' input</span>'
+        + '</div>';
+    }
+    if (misses.length > 50) {
+      fallbackHtml += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and ' + (misses.length - 50) + ' more</div>';
+    }
+    el.innerHTML = fallbackHtml;
+    return;
   }
-  if (misses.length > 50) {
-    html += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and ' + (misses.length - 50) + ' more</div>';
+
+  var sessionsToShow = sessions.slice(0, SESSION_CAP);
+  var html = '';
+  for (var s = 0; s < sessionsToShow.length; s++) {
+    var sess = sessionsToShow[s];
+    var hitRateText = sess.hitRate != null ? sess.hitRate.toFixed(1) + '%' : 'n/a';
+    var hitClass = (sess.hitRate != null && sess.hitRate >= 50) ? 'high' : 'low';
+    // Truncate the sessionId display: keep the first 12 chars (the UUID
+    // prefix is enough to be recognisable but doesn't dominate the row).
+    var sidShort = (sess.sessionId || '?').slice(0, 12);
+    html += '<details class="miss-session"' + (s === 0 ? ' open' : '') + '>'
+      + '<summary>'
+      + '<span class="miss-sess-id" title="' + escHtml(sess.sessionId || '?') + '">' + escHtml(sidShort) + '</span>'
+      + '<span class="miss-sess-loc">' + escHtml((sess.repo || '?') + ' / ' + (sess.branch || '?')) + '</span>'
+      + '<span class="miss-rate-badge ' + hitClass + '">'
+        + escHtml(hitRateText)
+        + ' <span class="miss-rate-counts">(' + (sess.hits | 0) + ' hits, ' + (sess.misses | 0) + ' misses)</span>'
+      + '</span>'
+      + '</summary>';
+    // Per-session miss details — most recent first
+    var details = (sess.missDetails || []).slice(-ROWS_PER_SESSION_CAP).reverse();
+    for (var d = 0; d < details.length; d++) {
+      var m2 = details[d];
+      var ts2 = m2.ts ? new Date(m2.ts).toLocaleString() : '?';
+      var modelText = m2.model || '?';
+      var reasonText = m2.reason || 'unknown';
+      var reasonClass = 'reason-' + reasonText.replace(/[^a-z0-9]/gi, '-');
+      html += '<div class="miss-row">'
+        + '<span class="miss-ts">' + escHtml(ts2) + '</span>'
+        + '<span class="miss-model">' + escHtml(modelText) + '</span>'
+        + '<span class="miss-tokens">' + formatNum(m2.inputTokens || 0) + ' input</span>'
+        + '<span class="miss-reason ' + reasonClass + '">' + escHtml(reasonText) + '</span>'
+        + '</div>';
+    }
+    if ((sess.missDetails || []).length > ROWS_PER_SESSION_CAP) {
+      html += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and '
+        + (sess.missDetails.length - ROWS_PER_SESSION_CAP) + ' older miss(es) in this session</div>';
+    }
+    html += '</details>';
+  }
+  if (sessions.length > SESSION_CAP) {
+    html += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and '
+      + (sessions.length - SESSION_CAP) + ' more session(s) with cache misses</div>';
   }
   el.innerHTML = html;
 }

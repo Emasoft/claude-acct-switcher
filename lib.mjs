@@ -1508,29 +1508,53 @@ export function renderUsageTreeCsv(rows) {
  *   - This row's cacheReadInputTokens === 0 (it didn't read the cache)
  *   - This row's inputTokens >= minInputForMissDetection (default 1000)
  *
+ * Phase 5 — richer reason classification:
+ *   - "compact-boundary" — a `compact` row preceded this miss in the
+ *     same session. Anthropic invalidates the cache on every compact
+ *     (the prefix changes by definition). Not really a "miss" in the
+ *     pejorative sense — surfaced so the operator can correlate spend
+ *     against compaction frequency.
+ *   - "model-changed" — the prior cache-creation row was on a different
+ *     model. Caches are model-scoped; switching from claude-opus-* to
+ *     claude-sonnet-* mid-session forces a fresh cache build.
+ *   - "TTL-likely" — gap between the prior cache-creating row and this
+ *     one exceeds CACHE_TTL_LIKELY_MS (default 5 min, matching
+ *     Anthropic's documented prompt-cache TTL).
+ *   - "unknown" — none of the above; could be a `/clear`, an
+ *     OAuth-rotation gap, or a real cache-prefix change. Documented
+ *     as "no signal."
+ *
  * Limitations (documented for the UI's tooltip):
  *   - First turn of a thread legitimately has no cache → not a miss
  *     (correctly excluded — no prior creation row exists)
- *   - User /clear or /compact invalidates the cache → looks like a miss
- *     but is user-initiated. Not distinguished here; the UI surfaces
- *     compact-boundary markers separately so the operator can correlate.
  *   - Different conversations within one sessionId are aggregated
  *     together (rare in practice — sessionId is per-CC-process)
  *
  * @param {Array<Object>} rows
  * @param {Object} [opts]
  * @param {number} [opts.minInputForMissDetection] default 1000
+ * @param {number} [opts.cacheTtlMs] default 300000 (5 minutes)
  * @returns {Array<{sessionId, ts, model, inputTokens, repo, branch, reason}>}
+ *   Same flat shape as before — Phase 5 enriches `reason` but does NOT
+ *   change the array's element type, so existing UI consumers still work.
+ *   Per-session aggregates are exposed via the SEPARATE
+ *   `summarizeCacheMissesBySession()` function below.
  */
+export const CACHE_TTL_LIKELY_MS = 5 * 60 * 1000; // Anthropic prompt-cache TTL
+
 export function buildCacheMissReport(rows, opts = {}) {
   if (!Array.isArray(rows)) return [];
   const minInput = (opts.minInputForMissDetection != null) ? opts.minInputForMissDetection : 1000;
+  const ttlMs    = (opts.cacheTtlMs                != null) ? opts.cacheTtlMs                : CACHE_TTL_LIKELY_MS;
 
-  // Group rows by session. Skip non-usage rows.
+  // Group rows by session. Include compact-boundary markers (type='compact')
+  // alongside usage rows because we need them for reason inference; we
+  // skip them in the miss-emission step itself.
   const bySession = new Map();
   for (const row of rows) {
     if (!row || typeof row !== 'object') continue;
-    if ((row.type || 'usage') !== 'usage') continue;
+    const t = row.type || 'usage';
+    if (t !== 'usage' && t !== 'compact') continue;
     const sid = row.sessionId || '_unknown';
     let arr = bySession.get(sid);
     if (!arr) { arr = []; bySession.set(sid, arr); }
@@ -1540,30 +1564,136 @@ export function buildCacheMissReport(rows, opts = {}) {
   const misses = [];
   for (const [sessionId, sessionRows] of bySession) {
     sessionRows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
-    let priorCacheExisted = false;
+    let lastCacheCreatedAt = 0;     // ts of the most recent row that created cache
+    let lastCacheCreatedModel = null;
+    let lastCompactAt = 0;          // ts of the most recent compact-boundary marker
     for (const row of sessionRows) {
+      const t = row.type || 'usage';
+      if (t === 'compact') {
+        lastCompactAt = row.ts || 0;
+        continue;
+      }
       const created = row.cacheCreationInputTokens || 0;
       const read    = row.cacheReadInputTokens     || 0;
       const input   = row.inputTokens              || 0;
+      const ts      = row.ts || 0;
 
-      if (priorCacheExisted && read === 0 && input >= minInput) {
+      if (lastCacheCreatedAt > 0 && read === 0 && input >= minInput) {
+        // Reason classification — order matters because compact-boundary
+        // dominates the others (a compact between us and the last cache
+        // makes the gap-since-creation moot).
+        let reason = 'unknown';
+        if (lastCompactAt > lastCacheCreatedAt && lastCompactAt <= ts) {
+          reason = 'compact-boundary';
+        } else if (lastCacheCreatedModel && row.model && row.model !== lastCacheCreatedModel) {
+          reason = 'model-changed';
+        } else if (ts - lastCacheCreatedAt >= ttlMs) {
+          reason = 'TTL-likely';
+        }
         misses.push({
           sessionId,
-          ts: row.ts,
+          ts,
           model: row.model || null,
           inputTokens: input,
           repo: row.repo || null,
           branch: row.branch || null,
-          reason: 'TTL-likely',  // best-guess; no API field tells us why
+          reason,
         });
       }
-      if (created > 0) priorCacheExisted = true;
+      if (created > 0) {
+        lastCacheCreatedAt = ts;
+        lastCacheCreatedModel = row.model || null;
+      }
     }
   }
   // Sort by ts ascending so the UI can render a chronological list
   // without an extra step.
   misses.sort((a, b) => (a.ts || 0) - (b.ts || 0));
   return misses;
+}
+
+/**
+ * Phase 5 — Per-session cache-miss aggregate.
+ *
+ * Pairs with `buildCacheMissReport()` to produce the UI's per-session
+ * header line: "session-abc-12345  Cache hit rate: 67% (4 hits, 2 misses)"
+ *
+ * Hit/miss accounting:
+ *   - A "hit" is any usage row with cacheReadInputTokens > 0.
+ *   - A "miss" is any row that buildCacheMissReport flags (i.e. a
+ *     prior cache existed but wasn't read, AND input >= threshold).
+ *   - Rows that don't qualify as either (no prior cache, or input
+ *     below the threshold) don't count toward EITHER side. This
+ *     keeps the rate meaningful — the denominator is "turns where
+ *     a cache outcome was possible," not "all turns."
+ *
+ * @param {Array<Object>} rows
+ * @param {Object} [opts] same shape as buildCacheMissReport
+ * @returns {Array<{sessionId, repo, branch, hits, misses, hitRate, lastTs, missDetails}>}
+ *   Sorted by lastTs descending so the UI's "recently active first"
+ *   order is the natural one.
+ */
+export function summarizeCacheMissesBySession(rows, opts = {}) {
+  if (!Array.isArray(rows)) return [];
+  const minInput = (opts.minInputForMissDetection != null) ? opts.minInputForMissDetection : 1000;
+
+  // Re-use the flat miss list as the source of truth for misses so
+  // the two views can never disagree about WHICH rows are misses.
+  const flatMisses = buildCacheMissReport(rows, opts);
+  const missesBySession = new Map();
+  for (const m of flatMisses) {
+    let arr = missesBySession.get(m.sessionId);
+    if (!arr) { arr = []; missesBySession.set(m.sessionId, arr); }
+    arr.push(m);
+  }
+
+  const sessionAcc = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    if ((row.type || 'usage') !== 'usage') continue;
+    const sid = row.sessionId || '_unknown';
+    let acc = sessionAcc.get(sid);
+    if (!acc) {
+      acc = {
+        sessionId: sid,
+        repo: row.repo || null,
+        branch: row.branch || null,
+        hits: 0,
+        misses: 0,
+        lastTs: 0,
+      };
+      sessionAcc.set(sid, acc);
+    }
+    // Track most-recent repo/branch — sessions can wander as the user
+    // cd's between turns; we want the LAST observed pair for the
+    // header label so it matches the user's current expectation.
+    if ((row.ts || 0) >= acc.lastTs) {
+      acc.lastTs = row.ts || 0;
+      if (row.repo)   acc.repo   = row.repo;
+      if (row.branch) acc.branch = row.branch;
+    }
+    const read  = row.cacheReadInputTokens || 0;
+    const input = row.inputTokens          || 0;
+    if (read > 0) acc.hits += 1;
+    // misses are sourced from the flat report (computed below) so we
+    // skip the per-row miss bookkeeping here.
+    void input; void minInput;
+  }
+
+  const out = [];
+  for (const [sid, acc] of sessionAcc) {
+    const sessionMisses = missesBySession.get(sid) || [];
+    acc.misses = sessionMisses.length;
+    const total = acc.hits + acc.misses;
+    acc.hitRate = total > 0 ? Math.round((acc.hits / total) * 1000) / 10 : null;
+    acc.missDetails = sessionMisses;
+    // Drop sessions that had neither hits nor misses — they're noise
+    // for the UI (sessions where every turn was below the threshold
+    // and no cache ever existed).
+    if (total > 0) out.push(acc);
+  }
+  out.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+  return out;
 }
 
 /**
