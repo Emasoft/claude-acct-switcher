@@ -4,7 +4,25 @@
 **Filename:** `design/tasks/TRDD-1645134b-526c-4abe-abfc-e21f8da5b5f0-usage-tree-view.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** Not started
+**Status:** Done — Phases 1-6 shipped + 2 audit rounds (Phase 6 +
+Round-2). Lazy-loading sub-criterion (line 307 below) deferred per
+the CLAUDE.md note ("Lazy-loading deferred ... eager-renders the full
+tree, acceptable at the current scale where the aggregated tree is
+well under 1 MB rendered HTML. Re-evaluate if a single user reports
+>100 repos × 10 worktrees in their data."). Everything else in the
+acceptance criteria is satisfied.
+
+Implementation commits (chronological):
+  - `bf15232` feat(usage-tree): TRDD-1645134b Phase 3 — UI tree view + cache misses
+  - `62eb843` feat(usage-tree): TRDD-1645134b Phase 4 — tree-aggregated CSV export
+  - `8782dc7` feat(usage-tree): TRDD-1645134b Phase 5 — cache-miss reason classifier + per-session UI
+  - `9ae3bc5` feat(usage): wasted-spend chart + chart-scoped project multi-select filter
+  - `e83199d` fix(usage-tree): apply Phase 6 audit findings — 1 CRITICAL + 4 MUST-FIX security/correctness
+  - `bd4c71e` fix(usage-tree): apply Round-2 audit findings — 5 MUST-FIX + 6 SHOULD-FIX
+
+CLAUDE.md "TRDD-1645134b — usage tree, cache-miss detection,
+wasted-spend chart" section is the live invariant reference.
+
 **Created:** 2026-05-01
 **Owner:** unassigned
 **Estimated effort:** 1.5-2 days (data layer ~4h, UI tree ~6h, CSV
@@ -302,16 +320,20 @@ re-rendering the tree from scratch.
 
 ## Acceptance criteria
 
-- [ ] `/api/token-usage-tree` returns the documented shape
-- [ ] Tree UI renders correctly with 0 / 1 / many repos
-- [ ] Lazy-loading: opening a repo node fetches its children only on
-      first expand
-- [ ] CSV tree export round-trips to the same totals as the JSON
-      response
-- [ ] Cache-miss heuristic surfaces miss events with at most 5%
-      false-positive rate on a known-good session log
-- [ ] All existing tests still pass
-- [ ] No new file in `~/.claude/projects/` outside vdm's own state
+- [x] `/api/token-usage-tree` returns the documented shape (Phase 2)
+- [x] Tree UI renders correctly with 0 / 1 / many repos (Phase 3)
+- [ ] ~~Lazy-loading: opening a repo node fetches its children only on
+      first expand~~ — DEFERRED per CLAUDE.md ("eager-renders the
+      full tree, acceptable at the current scale where the aggregated
+      tree is well under 1 MB rendered HTML"). Re-evaluate if a user
+      reports >100 repos × 10 worktrees in their data.
+- [x] CSV tree export round-trips to the same totals as the JSON
+      response (Phase 4)
+- [x] Cache-miss heuristic surfaces miss events with at most 5%
+      false-positive rate on a known-good session log (Phase 5 +
+      Round-2 audit refinements)
+- [x] All existing tests still pass (1015/0/0 as of `b5ccbf7`)
+- [x] No new file in `~/.claude/projects/` outside vdm's own state
       dir is created by the new endpoints (privacy)
 
 ## Out of scope (future work)
