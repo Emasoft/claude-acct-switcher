@@ -4354,17 +4354,20 @@ function renderHTML() {
   .fill-ok { background: var(--green); }
   .fill-mid { background: var(--yellow); }
   .fill-high { background: var(--red); }
-  /* UX-X15: pulse-fill animation tweak — using ease-in-out timing
-     produces a less abrupt opacity transition than the default linear
-     interpolation, so the per-card hash-diff cache (which already
-     prevents most full-bar re-renders) recovers visually even when a
-     bar IS re-rendered (e.g. on first hash population after refresh).
-     The animation runs forever; a re-render that drops the .fill-full
-     element and recreates it will restart the animation, but the
-     ease-in-out shape (vs the prior step-flash from the fast 50% drop)
-     reads as a smooth continuation rather than a flash. Honouring
-     prefers-reduced-motion disables the animation entirely for users
-     with vestibular sensitivities. */
+  /* UX-X15 / UX2-X10 (merged): pulse-fill animation timing is
+     ease-in-out (NOT the default linear) so the per-card hash-diff
+     cache's occasional outerHTML re-render produces a smooth
+     continuation instead of a step-flash. Background: renderAccounts
+     uses outerHTML replacement on cards whose hash changed; when a
+     card with a 100% utilization bar is replaced because some OTHER
+     field changed (velocity ETA, badge state, etc.), the .rate-fill
+     element is destroyed and recreated, so the CSS animation restarts
+     from frame 0. Cards whose hash matches across polls keep
+     animating smoothly. ease-in-out + the prefers-reduced-motion guard
+     below covers the audit's UX2-X10 NIT (animation flicker) without
+     needing per-element diffing inside the card body (which would be
+     out of proportion for the severity). UX-X15 is the actual fix;
+     UX2-X10 is then verified-addressed. */
   .fill-full { background: var(--red); animation: pulse-fill 1.5s ease-in-out infinite; }
   @keyframes pulse-fill { 0%,100%{opacity:1} 50%{opacity:0.5} }
   @media (prefers-reduced-motion: reduce) {
@@ -5065,6 +5068,59 @@ function renderHTML() {
   }
   @media (prefers-reduced-motion: reduce) {
     .skeleton-line { animation: none; background: var(--bg); }
+  }
+
+  /* UX2-X6: named classes for the four inline-style patterns the
+     round-2 audit called out by name. Promoting these out of inline
+     style attributes lets a future theme rebind their colour/spacing
+     without grepping every site, and removes the WCAG "don't override
+     theme rules with inline styles" footgun.
+       .queue-stats          - Config tab queue depth/inflight readout
+       .logs-toolbar         - Logs tab top row (status + Clear button)
+       .logs-status          - small muted text in the toolbar
+       .logs-clear-btn       - small bordered button next to logs-status
+       .miss-row-empty       - italic muted "and N more" tail row
+                               on the cache-miss list (Tokens tab)
+     Display defaults match what the inline styles produced before so
+     the visual outcome is identical.
+
+     The old inline display:none on #queue-stats is preserved as the
+     default state via the class rule below; the dashboard queue-stats
+     poll explicitly sets style.display to the literal string block
+     (NOT empty string) when serialize is on so the inline style wins
+     over the class default. Setting empty string would only REMOVE
+     the inline attribute and fall back to the class rule, leaving
+     the line hidden — caught by the pre-commit gate review. The
+     backtick-in-renderHTML trap forbids quoting code in comments
+     here; see CLAUDE.md note about that rule. */
+  .queue-stats {
+    font-size: 0.8125rem;
+    color: var(--muted);
+    margin-top: 0.25rem;
+    display: none;
+  }
+  .logs-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+  .logs-status {
+    font-size: 0.8125rem;
+    color: var(--muted);
+  }
+  .logs-clear-btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 0.25rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.75rem;
+  }
+  .miss-row-empty {
+    color: var(--text-muted);
+    font-style: italic;
   }
 
   /* ── Scrollbar ──
@@ -6408,8 +6464,12 @@ function renderHTML() {
          Substring match by default; checkbox enables regex with try/catch
          so an invalid pattern surfaces inline instead of throwing. The
          filter input value is read straight from the input.value attribute
-         (DOM-escaped) and never interpolated into innerHTML. -->
-    <div class="vdm-filter-bar" role="group" aria-label="Filter activity feed">
+         (DOM-escaped) and never interpolated into innerHTML.
+         UX2-AC3: id="activity-filter-bar" lets renderActivity() hide the
+         bar when there is genuinely nothing to filter (log.length === 0).
+         Without this, the bar reads "Filter activity..." over an empty
+         pane and users wonder if the feed is broken or filtered to nothing. -->
+    <div class="vdm-filter-bar" id="activity-filter-bar" role="group" aria-label="Filter activity feed">
       <input type="text" id="activity-filter-input" maxlength="256" placeholder="Filter activity..." autocomplete="off" spellcheck="false" aria-label="Filter activity feed">
       <label><input type="checkbox" id="activity-filter-regex"> Regex</label>
       <button type="button" id="activity-filter-clear" aria-label="Clear filter">Clear</button>
@@ -6755,7 +6815,11 @@ function renderHTML() {
             <option value="16">16</option>
           </select>
         </div>
-        <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
+        <!-- UX2-X6: inline style triplet promoted to .queue-stats. Default
+             display is none (via the class rule); the queue-stats poll
+             explicitly sets style.display to block when serialize is on
+             so the inline style wins over the class default. -->
+        <div id="queue-stats" class="queue-stats"></div>
       </div>
 
       <div class="config-section" id="config-commit-tokens">
@@ -6821,9 +6885,13 @@ function renderHTML() {
   </div>
 
   <div id="tab-logs" class="tab-content" role="tabpanel" aria-labelledby="tabbtn-logs">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
-      <div style="font-size:0.8125rem;color:var(--muted)" id="log-status">Disconnected</div>
-      <button onclick="clearLogs()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">Clear</button>
+    <!-- UX2-X6: three inline-style sites promoted to named classes
+         (.logs-toolbar / .logs-status / .logs-clear-btn). The visual
+         outcome is identical, but the rules now live in one place and
+         are reachable from a future theme. -->
+    <div class="logs-toolbar">
+      <div class="logs-status" id="log-status">Disconnected</div>
+      <button onclick="clearLogs()" class="logs-clear-btn">Clear</button>
     </div>
     <!-- UX-L2: filter bar over the log stream. Same UX as the activity
          filter (UX-AC1): substring by default, regex toggle with try/catch,
@@ -8208,7 +8276,11 @@ async function refresh() {
       var serializeToggle = document.getElementById('toggle-serialize');
       var serializeOn = serializeToggle && serializeToggle.checked;
       if (serializeOn) {
-        qEl.style.display = '';
+        // UX2-X6 follow-up: must EXPLICITLY set display value; setting
+        // ''  only removes the inline style attribute, which falls back
+        // to the .queue-stats class rule (display:none) and the line
+        // stays hidden. Use 'block' so the inline style wins.
+        qEl.style.display = 'block';
         var capPart = queueStats.maxConcurrent ? ' (cap=' + queueStats.maxConcurrent + ')' : '';
         qEl.textContent = 'Queue: ' + queueStats.inflight + ' inflight, ' + queueStats.queued + ' queued' + capPart;
       } else {
@@ -8622,6 +8694,12 @@ function renderActivity(log) {
   // UX-AC1: ensure the filter controls are wired even on the very first
   // render (before any switchTab call). Idempotent — see _vdmWireFilterControls.
   _vdmWireFilterControls();
+  // UX2-AC3: hide the filter bar when the log is genuinely empty (zero
+  // entries). With the bar visible over an empty pane, users wonder if
+  // a stale filter is hiding everything. Restore visibility the moment
+  // the feed has any data.
+  var fbar = document.getElementById('activity-filter-bar');
+  if (fbar) fbar.style.display = log.length ? '' : 'none';
   if (!log.length) {
     // UX-AC3: actionable empty state. Mirror the initial markup at
     // line ~5386 so users see the same hint regardless of whether
@@ -9554,7 +9632,7 @@ function renderCacheMisses(misses, missSessions) {
         + '</div>';
     }
     if (misses.length > 50) {
-      fallbackHtml += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and ' + (misses.length - 50) + ' more</div>';
+      fallbackHtml += '<div class="miss-row miss-row-empty">… and ' + (misses.length - 50) + ' more</div>';
     }
     el.innerHTML = fallbackHtml;
     return;
@@ -9677,7 +9755,7 @@ function renderCacheMisses(misses, missSessions) {
     html += '</details>';
   }
   if (sessions.length > SESSION_CAP) {
-    html += '<div class="miss-row" style="color:var(--text-muted);font-style:italic">… and '
+    html += '<div class="miss-row miss-row-empty">… and '
       + (sessions.length - SESSION_CAP) + ' more session(s) with cache misses</div>';
   }
   el.innerHTML = html;
