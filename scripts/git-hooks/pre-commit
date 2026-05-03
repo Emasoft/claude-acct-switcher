@@ -57,10 +57,27 @@ if [[ "$HAS_STAGED" -eq 0 && "$HAS_UNSTAGED" -eq 0 && "$HAS_UNTRACKED" -eq 0 ]];
   exit 0
 fi
 
-# ── Bookkeeping: report path under reports/codex-review/pre-commit/ ──
+# ── Bookkeeping: report path ─────────────────────────────────────────
+# Three-tier resolution (most → least specific):
+#  1. PRECOMMIT_REPORTS_DIR env var (caller can pin a path explicitly)
+#  2. $ROOT/reports/codex-review/pre-commit/ IF /reports/ is gitignored
+#     in this repo (vdm-style: keeps reports next to the code while
+#     guaranteeing they never land in commits)
+#  3. ~/.cache/codex-precommit/<repo-basename>/  (safe default for
+#     ANY repo — reports live outside the working tree so the hook is
+#     drop-in safe for repos that don't have /reports/ in gitignore)
+# Reports may contain code excerpts, secret-bearing log lines, and
+# absolute paths — leaking them into a tracked file would be a real
+# privacy hit, so the default is the global cache.
 ROOT="$(git rev-parse --show-toplevel)"
 TS="$(date +%Y%m%d_%H%M%S%z)"
-REVIEW_DIR="$ROOT/reports/codex-review/pre-commit"
+if [[ -n "${PRECOMMIT_REPORTS_DIR:-}" ]]; then
+  REVIEW_DIR="$PRECOMMIT_REPORTS_DIR"
+elif [[ -f "$ROOT/.gitignore" ]] && grep -qE '^/?reports/?$' "$ROOT/.gitignore" 2>/dev/null; then
+  REVIEW_DIR="$ROOT/reports/codex-review/pre-commit"
+else
+  REVIEW_DIR="$HOME/.cache/codex-precommit/$(basename "$ROOT")"
+fi
 mkdir -p "$REVIEW_DIR"
 REPORT="$REVIEW_DIR/${TS}-pre-commit.md"
 
@@ -188,8 +205,16 @@ fi
 if [[ "$USED_FALLBACK" -eq 1 ]]; then
   # Opus report goes under reports/review-opus-agent/ (NOT codex-review/)
   # to make the source of the verdict obvious to anyone reading the
-  # archive later.
-  OPUS_REPORT_DIR="$ROOT/reports/review-opus-agent"
+  # archive later. Mirrors the three-tier resolution from the codex
+  # report path above (env override → repo-local-if-gitignored → global
+  # cache) so the same safety guarantees apply.
+  if [[ -n "${PRECOMMIT_OPUS_REPORTS_DIR:-}" ]]; then
+    OPUS_REPORT_DIR="$PRECOMMIT_OPUS_REPORTS_DIR"
+  elif [[ -f "$ROOT/.gitignore" ]] && grep -qE '^/?reports/?$' "$ROOT/.gitignore" 2>/dev/null; then
+    OPUS_REPORT_DIR="$ROOT/reports/review-opus-agent"
+  else
+    OPUS_REPORT_DIR="$HOME/.cache/codex-precommit/$(basename "$ROOT")/review-opus-agent"
+  fi
   mkdir -p "$OPUS_REPORT_DIR"
   OPUS_REPORT="$OPUS_REPORT_DIR/${TS}-pre-commit.md"
   echo "[pre-commit] Reviewing uncommitted changes via Claude Opus (--agent review-opus-agent)..." >&2
