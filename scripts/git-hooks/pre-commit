@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# pre-commit: Codex code-review gate.
+#
+# Runs `codex review --uncommitted` on staged + unstaged + untracked
+# changes and BLOCKS the commit if Codex flags any finding at MINOR,
+# MAJOR, or CRITICAL severity. NIT findings DO NOT block (they're
+# surfaced as a count for opportunistic cleanup).
+#
+# This is the same Codex review machinery that powers the `/codex:review`
+# slash command. The `-c model_reasoning_effort="high"` override is the
+# equivalent of the `--effort high` knob that the codex-companion.mjs
+# wrapper does not expose for the `review` subcommand (it only exposes
+# `--effort` for `task`). Default reasoning effort is "xhigh"; "high" is
+# faster while still substantively complete.
+#
+# Bypass for emergencies (use sparingly):
+#   git commit --no-verify
+#
+# Source of truth: scripts/git-hooks/pre-commit (git-tracked).
+# Active copy:     .git/hooks/pre-commit (per-clone, install via
+#                  scripts/install-precommit-hook.sh).
+
+# `set -e` would abort on the bare `grep -q` returning non-zero (a
+# legitimate "no findings" signal), so we use -u (unset = error) and
+# pipefail (capture upstream pipe failure) without -e.
+set -uo pipefail
+
+# ── Skip when there is genuinely nothing to review ────────────────────
+# Three states must all be empty: staged, unstaged, untracked. If even
+# one has content, the commit is non-trivial and warrants a review.
+# `git diff --quiet` returns 0 when the diff is empty, 1 when non-empty,
+# and 128+ on internal failure — we treat anything other than 0 as
+# "there is something to review" so a transient git error doesn't
+# silently bypass the gate.
+HAS_STAGED=1; git diff --cached --quiet 2>/dev/null && HAS_STAGED=0
+HAS_UNSTAGED=1; git diff --quiet 2>/dev/null && HAS_UNSTAGED=0
+HAS_UNTRACKED=0; [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]] && HAS_UNTRACKED=1
+if [[ "$HAS_STAGED" -eq 0 && "$HAS_UNSTAGED" -eq 0 && "$HAS_UNTRACKED" -eq 0 ]]; then
+  echo "[codex pre-commit] Nothing to review — skipping." >&2
+  exit 0
+fi
+
+# ── Sanity check: codex CLI must be installed ─────────────────────────
+if ! command -v codex >/dev/null 2>&1; then
+  echo "[codex pre-commit] codex CLI not on PATH." >&2
+  echo "                   Install via /codex:setup, or bypass with: git commit --no-verify" >&2
+  exit 1
+fi
+
+# ── Bookkeeping: report path under reports/codex-review/pre-commit/ ──
+# Local time + GMT offset per ~/.claude/rules/agent-reports-location.md.
+ROOT="$(git rev-parse --show-toplevel)"
+TS="$(date +%Y%m%d_%H%M%S%z)"
+REVIEW_DIR="$ROOT/reports/codex-review/pre-commit"
+mkdir -p "$REVIEW_DIR"
+REPORT="$REVIEW_DIR/${TS}-pre-commit.md"
+
+echo "[codex pre-commit] Reviewing uncommitted changes (this can take several minutes)..." >&2
+echo "                   Effort: high  (-c model_reasoning_effort=\"high\", default xhigh)" >&2
+echo "                   Report: $REPORT" >&2
+echo >&2
+
+# ── Run the review ────────────────────────────────────────────────────
+# `--uncommitted` reviews staged + unstaged + untracked changes — the
+# closest semantic to "files not yet committed". Output (markdown) goes
+# both to the report file AND to stderr so the user sees progress live.
+# pipefail is on, so a non-zero codex exit propagates through `tee`.
+codex review --uncommitted -c model_reasoning_effort="high" 2>&1 | tee "$REPORT" >&2
+RC=${PIPESTATUS[0]}
+if [[ "$RC" -ne 0 ]]; then
+  echo >&2
+  echo "[codex pre-commit] codex CLI exited non-zero (rc=$RC)." >&2
+  echo "                   See $REPORT for details." >&2
+  echo "                   Bypass with: git commit --no-verify" >&2
+  exit 1
+fi
+
+# ── Parse findings ────────────────────────────────────────────────────
+# Codex emits a markdown findings table with rows like:
+#   | <code> | <SEVERITY> | <file:line> | <summary> |
+# We grep for rows whose second cell is CRITICAL / MAJOR / MINOR and
+# block on any match. NIT rows are explicitly NOT in the blocking set
+# per project policy: NITs are visible in the report for opportunistic
+# pickup but should not gate commits (and would otherwise reject most
+# non-trivial changes outright).
+BLOCKING_REGEX='^\|[^|]+\|[[:space:]]*(CRITICAL|MAJOR|MINOR)[[:space:]]*\|'
+
+if grep -qE "$BLOCKING_REGEX" "$REPORT"; then
+  echo >&2
+  echo "[codex pre-commit] BLOCKED — Codex found MINOR or above issue(s):" >&2
+  echo >&2
+  grep -E "$BLOCKING_REGEX" "$REPORT" | sed 's/^/    /' >&2
+  echo >&2
+  echo "[codex pre-commit] Full report: $REPORT" >&2
+  echo "[codex pre-commit] Bypass with: git commit --no-verify" >&2
+  exit 1
+fi
+
+# ── Pass — surface NIT count for context but do not block ─────────────
+NIT_COUNT=$(grep -cE '^\|[^|]+\|[[:space:]]*NIT[[:space:]]*\|' "$REPORT" 2>/dev/null || echo 0)
+if [[ "$NIT_COUNT" -gt 0 ]]; then
+  echo "[codex pre-commit] PASS — no MINOR or above. ($NIT_COUNT NIT finding(s) in $REPORT)" >&2
+else
+  echo "[codex pre-commit] PASS — no findings." >&2
+fi
+exit 0
