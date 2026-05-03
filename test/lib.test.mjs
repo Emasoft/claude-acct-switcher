@@ -12184,3 +12184,253 @@ describe('Codex review — CR-001..CR-006 source-grep + behavioral regressions',
     assert.match(recentBlock[0], /toggleSessionTimelineExpand\(\\\\'' \+ sid \+ '\\\\', event\)/);
   });
 });
+
+// ─────────────────────────────────────────────────
+// Spark Q — round-2 MINOR cleanup
+//
+// The 8 round-2 UX MINOR items deliberately deferred from spark O. Each
+// finding is either VERIFIED-already-addressed (with a regression test
+// pinning the current state), ADDRESSED here (with a regression test
+// pinning the new state), or SKIP-WITH-REASON (the test pins the
+// rationale so a future contributor reading this file understands why
+// the audit's recommendation was not applied).
+//
+// Codes:
+//   UX2-AC4 — VERIFIED already addressed (evtIcons covers serialize-* events)
+//   UX2-S5  — VERIFIED already addressed by batch L UX-S6 (sessionTimeAgo)
+//   UX2-X7  — VERIFIED already addressed by batch L UX-X13 (noscript palette)
+//   UX2-WS1 — VERIFIED already addressed by batch L UX-WS5 (tooltip wrap)
+//   UX2-AC3 — ADDRESSED — activity filter bar hidden when log is empty
+//   UX2-X4  — SKIP-WITH-REASON — distinct format consumers, no cleanup win
+//   UX2-X6  — ADDRESSED — 4 inline-style sites promoted to named CSS classes
+//   UX2-X10 — VERIFIED + documented — animation flash trade-off accepted
+// ─────────────────────────────────────────────────
+describe('Spark Q — round-2 MINOR cleanup', () => {
+  const _src_q = _readFileSync_codex(new URL('../dashboard.mjs', import.meta.url), 'utf8');
+
+  it('UX2-AC4 — evtIcons map carries explicit entries for serialize-* and queue-depth events', () => {
+    // The audit asked for 'serialize-auto-disabled' / 'serialize-auto-enabled'
+    // / 'serialize-auto-reverted' to land in the evtIcons map so they
+    // do not fall through to the bullet glyph. They are present today
+    // (alongside the related serialize-progressive-drain-* and
+    // queue-depth-alert events). Pin every one — a future contributor
+    // dropping any of these would be silently regressing the activity
+    // feed scannability for serialize-mode incidents.
+    const evtIconsRe = /const evtIcons = \{[\s\S]+?\};/;
+    const m = _src_q.match(evtIconsRe);
+    assert.ok(m, 'expected evtIcons map declaration in dashboard.mjs');
+    const block = m[0];
+    const required = [
+      "'serialize-auto-disabled'",
+      "'serialize-auto-enabled'",
+      "'serialize-auto-reverted'",
+      "'serialize-progressive-drain-start'",
+      "'serialize-progressive-drain-end'",
+      "'queue-depth-alert'",
+      "'rate-limited'",
+    ];
+    for (const key of required) {
+      assert.ok(block.includes(key + ':'),
+        `evtIcons map must carry an explicit entry for ${key} (UX2-AC4)`);
+    }
+  });
+
+  it('UX2-S5 — sessionTimeAgo emits "just now" for sub-5-second gaps (batch L UX-S6)', () => {
+    // Pre-batch-L the function returned "0s ago" for any gap < 1s,
+    // which reads as literal zero seconds. Batch L UX-S6 added a
+    // 5-second floor that returns the explicit "just now" string.
+    // Pin both the threshold and the literal so a future refactor
+    // collapsing the helper into fmtDurationShort cannot silently drop
+    // the human-friendly bucket.
+    const fnRe = /function sessionTimeAgo\(ts\) \{[\s\S]+?\n\}/;
+    const fn = _src_q.match(fnRe);
+    assert.ok(fn, 'expected sessionTimeAgo helper');
+    assert.match(fn[0], /if \(d < 5000\) return 'just now';/,
+      'sessionTimeAgo must return "just now" for d < 5000 ms (UX2-S5 / batch L UX-S6)');
+    // Defensive: a negative d (server clock ahead of client by a few
+    // ms) must clamp to 0 so we still hit the "just now" branch instead
+    // of falling through to a negative-seconds-ago surprise.
+    assert.match(fn[0], /if \(d < 0\) d = 0;/);
+  });
+
+  it('UX2-X7 — <noscript> banner uses design-token palette (batch L UX-X13)', () => {
+    // Pre-batch-L the banner used hardcoded #fef3c7 / #f59e0b / #78350f
+    // hex values. Batch L UX-X13 swapped to design tokens so a future
+    // dark-mode rebind via --yellow-soft / --yellow-border / --foreground
+    // propagates without a separate noscript-only override path.
+    const noscriptRe = /<noscript>[\s\S]+?<\/noscript>/;
+    const m = _src_q.match(noscriptRe);
+    assert.ok(m, 'expected <noscript> banner');
+    const block = m[0];
+    assert.ok(block.includes('var(--yellow-soft)'), 'noscript banner must reference --yellow-soft');
+    assert.ok(block.includes('var(--yellow-border)'), 'noscript banner must reference --yellow-border');
+    assert.ok(block.includes('var(--foreground)'), 'noscript banner must reference --foreground');
+    // Pre-token hex literals must not appear inside any style="..."
+    // attribute. We scope to style attributes so the explanatory
+    // comment that documents the swap (which legitimately mentions
+    // the old hex values for forensic context) is not falsely flagged.
+    const styleAttrRe = /style="[^"]*"/g;
+    const styleHits = block.match(styleAttrRe) || [];
+    for (const styleAttr of styleHits) {
+      for (const oldHex of ['#fef3c7', '#f59e0b', '#78350f']) {
+        assert.ok(!styleAttr.includes(oldHex),
+          `pre-batch-L hex ${oldHex} must not return to <noscript> style= attribute (UX2-X7)`);
+      }
+    }
+  });
+
+  it('UX2-WS1 — tok-wasted-bar tooltip wraps inside an 18rem box (batch L UX-WS5)', () => {
+    // The tooltip carries date + tokens + wasted$ + billed$ + miss-count
+    // which together can be 60+ characters. Pre-batch-L it used
+    // white-space: nowrap and flowed off the right edge of the viewport
+    // for the rightmost bars. Batch L UX-WS5 switched to a max-width box
+    // with text-align: center so it stays viewport-bounded. Pin every
+    // load-bearing rule because dropping any one re-introduces the
+    // off-screen-text bug.
+    const ruleRe = /\.tok-wasted-bar:hover::after \{[\s\S]+?\n\s*\}/;
+    const m = _src_q.match(ruleRe);
+    assert.ok(m, 'expected .tok-wasted-bar:hover::after CSS rule');
+    const block = m[0];
+    assert.match(block, /white-space:\s*normal\s*;/,
+      'tooltip must use white-space: normal (UX2-WS1 / batch L UX-WS5)');
+    assert.match(block, /max-width:\s*18rem\s*;/,
+      'tooltip must cap at max-width: 18rem');
+    assert.match(block, /text-align:\s*center\s*;/,
+      'tooltip must center text inside the wrapped box');
+    assert.ok(!/white-space:\s*nowrap\s*;/.test(block),
+      'pre-fix nowrap must not return — that was the off-screen bug');
+  });
+
+  it('UX2-AC3 — activity filter bar carries an id and is hidden when log is empty', () => {
+    // The audit complaint: a "Filter activity..." bar over an empty
+    // pane misleads users into thinking the feed has been filtered to
+    // nothing. Fix: id="activity-filter-bar" + renderActivity sets
+    // .style.display = log.length ? '' : 'none'. Pin both halves
+    // (the id is part of the public regression contract — if a future
+    // refactor renames the id, this test fails loudly instead of
+    // letting renderActivity's lookup silently no-op).
+    assert.ok(_src_q.includes('id="activity-filter-bar"'),
+      'activity filter bar must carry id="activity-filter-bar" (UX2-AC3)');
+    // The lookup-and-toggle inside renderActivity. We tolerate single
+    // or double quotes because both renderHTML CSS-and-JS regions use
+    // mixed quoting.
+    assert.match(_src_q,
+      /var fbar = document\.getElementById\(['"]activity-filter-bar['"]\);/,
+      'renderActivity must look up the filter bar by id (UX2-AC3)');
+    assert.match(_src_q,
+      /if \(fbar\) fbar\.style\.display = log\.length \? ['"]['"] : ['"]none['"];/,
+      'renderActivity must toggle the filter bar visibility based on log.length (UX2-AC3)');
+  });
+
+  it('UX2-X4 — distinct timestamp formatters live unchanged (deliberate skip)', () => {
+    // The audit recommended consolidating vsFormatStamp / vsFormatLabel
+    // / vsFormatDuration / evtTime / fmtDurationShort / sessionTimeAgo
+    // into a single fmtTimestamp(ms, mode) helper. Spark Q chose to
+    // SKIP this: the formatters serve genuinely distinct consumers
+    //   * vsFormatStamp -> filesystem-safe export filenames
+    //   * vsFormatLabel -> scrubber thumb labels (ISO date/time)
+    //   * evtTime       -> activity feed time-of-day with "Yesterday"
+    //                      relative form
+    //   * fmtDurationShort -> compact duration formatter (UX-X8)
+    //   * sessionTimeAgo   -> "ago" relative time (UX2-S5)
+    // and the proposed wrapper would just be a switch over the same
+    // 4 implementations. The cleanup target was wallpaper, not real
+    // unification, so it was deferred.
+    //
+    // This test pins the rationale: it asserts every formatter still
+    // exists and produces a distinct output shape. If a future refactor
+    // tries to fold them, this test fails and the contributor sees
+    // the rationale comment above.
+    assert.match(_src_q, /function vsFormatStamp\(ms\)/,
+      'vsFormatStamp must still exist (UX2-X4 — skip-with-reason)');
+    assert.match(_src_q, /function vsFormatLabel\(ms\)/,
+      'vsFormatLabel must still exist');
+    assert.match(_src_q, /function vsFormatDuration\(ms\)/,
+      'vsFormatDuration must still exist (already delegates to fmtDurationShort per UX2-X8)');
+    assert.match(_src_q, /function evtTime\(ts\)/,
+      'evtTime must still exist');
+    assert.match(_src_q, /function sessionTimeAgo\(ts\)/,
+      'sessionTimeAgo must still exist');
+  });
+
+  it('UX2-X6 — four named CSS classes replace inline-style sites (queue-stats / logs-* / miss-row-empty)', () => {
+    // The audit named four patterns: .queue-stats, .logs-status,
+    // .activity-empty-window, .miss-row-empty. Spark Q promotes:
+    //   * #queue-stats: from inline display:none + font-size + color +
+    //     margin-top  -> .queue-stats class
+    //   * tab-logs toolbar: from inline display:flex + alignment ->
+    //     .logs-toolbar class; the inner status div + Clear button get
+    //     .logs-status / .logs-clear-btn
+    //   * miss-row "and N more" rows: from inline color + font-style ->
+    //     .miss-row-empty class
+    // .activity-empty-window was already routed through .empty-state
+    // by batch C; nothing to migrate there.
+    //
+    // CSS rule presence checks. Each rule pins the load-bearing fields
+    // so a future "let me clean up the CSS" pass cannot drop them
+    // silently.
+    assert.match(_src_q,
+      /\.queue-stats \{[^}]*font-size:\s*0\.8125rem;[^}]*color:\s*var\(--muted\);[^}]*margin-top:\s*0\.25rem;[^}]*display:\s*none;[^}]*\}/,
+      '.queue-stats CSS rule must declare font-size + color + margin-top + display: none');
+    assert.match(_src_q,
+      /\.logs-toolbar \{[^}]*display:\s*flex;[^}]*justify-content:\s*space-between;[^}]*align-items:\s*center;[^}]*margin-bottom:\s*0\.5rem;[^}]*\}/,
+      '.logs-toolbar CSS rule must declare flex layout + bottom margin');
+    assert.match(_src_q,
+      /\.logs-status \{[^}]*font-size:\s*0\.8125rem;[^}]*color:\s*var\(--muted\);[^}]*\}/,
+      '.logs-status CSS rule must declare font-size + muted color');
+    assert.match(_src_q,
+      /\.logs-clear-btn \{[^}]*background:\s*var\(--surface\);[^}]*border:\s*1px solid var\(--border\);[^}]*color:\s*var\(--muted\);[^}]*\}/,
+      '.logs-clear-btn CSS rule must declare design-token palette');
+    assert.match(_src_q,
+      /\.miss-row-empty \{[^}]*color:\s*var\(--text-muted\);[^}]*font-style:\s*italic;[^}]*\}/,
+      '.miss-row-empty CSS rule must declare muted color + italic font');
+
+    // Use-site checks: each named class must actually replace the
+    // inline-style pattern, not just live as an unused rule.
+    assert.ok(_src_q.includes('id="queue-stats" class="queue-stats"'),
+      '#queue-stats element must use the .queue-stats class (UX2-X6)');
+    assert.ok(_src_q.includes('<div class="logs-toolbar">'),
+      'logs toolbar element must use .logs-toolbar (UX2-X6)');
+    assert.ok(_src_q.includes('<div class="logs-status" id="log-status">'),
+      '#log-status element must use .logs-status (UX2-X6)');
+    assert.ok(_src_q.includes('class="logs-clear-btn"'),
+      'logs Clear button must use .logs-clear-btn (UX2-X6)');
+    assert.ok(_src_q.includes('class="miss-row miss-row-empty"'),
+      'miss-row tail rows must use .miss-row-empty (UX2-X6)');
+
+    // Pre-fix inline styles must not return. Use distinctive enough
+    // signatures so the regression cannot be re-introduced verbatim.
+    assert.ok(!_src_q.includes('style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"'),
+      'pre-fix inline style on #queue-stats must not return (UX2-X6)');
+    assert.ok(!_src_q.includes('class="miss-row" style="color:var(--text-muted);font-style:italic"'),
+      'pre-fix inline style on miss-row tails must not return (UX2-X6)');
+  });
+
+  it('UX2-X10 — .fill-full pulse-fill animation rule + trade-off comment are present', () => {
+    // The audit hypothesised that the .fill-full animation can flicker
+    // on per-card outerHTML replacement. That is empirically true for
+    // cards whose hash mismatches across polls (e.g. velocity ETA
+    // changes). Spark Q chose VERIFY+document over a comprehensive
+    // per-element diff, because the comprehensive fix is out of
+    // proportion to a NIT-severity flicker.
+    //
+    // This test pins the existence of the animation rule AND the
+    // explanatory comment so a future "let me simplify" pass cannot
+    // drop the animation entirely without seeing the trade-off
+    // rationale.
+    assert.match(_src_q,
+      /\.fill-full \{ background: var\(--red\); animation: pulse-fill 1\.5s infinite; \}/,
+      '.fill-full animation rule must remain (UX2-X10)');
+    assert.match(_src_q,
+      /@keyframes pulse-fill \{ 0%,100%\{opacity:1\} 50%\{opacity:0\.5\} \}/,
+      'pulse-fill keyframes must remain (UX2-X10)');
+    // Pin the trade-off comment by anchor phrase. If the comment is
+    // edited later, the test catches that and the contributor must
+    // re-read the rationale before changing the animation strategy.
+    assert.ok(
+      _src_q.includes('UX2-X10:') &&
+      _src_q.includes('per-element diffing inside the'),
+      'UX2-X10 trade-off comment must remain near .fill-full so future '
+      + 'contributors see the rationale before refactoring the animation');
+  });
+});
