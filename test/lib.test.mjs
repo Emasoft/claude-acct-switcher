@@ -8725,6 +8725,42 @@ describe('Phase 6 — full-suite + dependency invariants', () => {
       'Replace with normal quotes or Unicode equivalents (\\u2018, \\u2019, etc.):\n  '
       + traps.join('\n  '));
   });
+
+  it('localStorage tab-restore defers switchTab via setTimeout (TDZ guard)', () => {
+    // 2026-05-03: dev-browser found a real ReferenceError on page load:
+    //   "Cannot access '_logES' before initialization"
+    // Root cause — the localStorage tab-restore at the bottom of the
+    // renderHTML script:
+    //
+    //   if (_initTab && document.getElementById('tab-' + _initTab))
+    //     switchTab(_initTab);  // <-- ran SYNCHRONOUSLY at top level
+    //
+    // With vdm.activeTab='logs' in localStorage, this called switchTab
+    // ('logs') -> connectLogStream() which reads `_logES`. But `_logES`
+    // is declared further down with `let _logES = null;` (TDZ-bound).
+    // The synchronous call ran BEFORE that declaration executed,
+    // throwing ReferenceError and aborting the SSE handshake.
+    //
+    // Fix: wrap in `setTimeout(..., 0)` so the restore fires on the
+    // next microtask, after all top-level let/const have been initialised.
+    //
+    // This regression pins the deferred pattern. If a future refactor
+    // un-defers the call (back to a synchronous switchTab), every user
+    // whose last viewed tab triggers a function reading post-init lets
+    // sees the dashboard tab silently fail to render its content.
+    const m = _src_t6ac2.match(
+      /if \(_initTab && document\.getElementById\('tab-' \+ _initTab\)\)\s*\{?\s*setTimeout\s*\(/
+    );
+    assert.ok(
+      m,
+      'localStorage tab-restore must defer switchTab(_initTab) via setTimeout(...) ' +
+      'to avoid TDZ on let/const declared later in the renderHTML script. ' +
+      'A synchronous `switchTab(_initTab)` here will throw ' +
+      '"Cannot access \'_logES\' before initialization" when localStorage ' +
+      "has vdm.activeTab='logs', and similar TDZ errors for any other tab " +
+      'whose handler reads a post-restore-line let/const.'
+    );
+  });
 });
 
 // ─────────────────────────────────────────────────

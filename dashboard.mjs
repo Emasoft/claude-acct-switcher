@@ -11412,7 +11412,21 @@ let _initTab = new URLSearchParams(location.search).get('tab');
 if (!_initTab) {
   try { _initTab = localStorage.getItem('vdm.activeTab'); } catch (e) { _initTab = null; }
 }
-if (_initTab && document.getElementById('tab-' + _initTab)) switchTab(_initTab);
+// TDZ-safety: defer the restore to the next tick so all later top-level
+// let/const declarations (e.g. _logES, _logReconnectCount, LOG_TAG_COLORS)
+// have executed before any restore-triggered side effects fire. Without
+// this, restoring vdm.activeTab=logs calls switchTab(logs) ->
+// connectLogStream() which reads _logES BEFORE its let-declaration at
+// line ~11441 has run, throwing ReferenceError: Cannot access _logES
+// before initialization, and aborting the SSE connection mid-handshake.
+// Symptom: stuck Connecting... status pill and no live log lines on the
+// Logs tab. setTimeout(0) is enough to push the call past the synchronous
+// TDZ window — perceptible delay is under 1ms. (No backticks in this
+// comment — see the renderHTML backtick-trap regression test in
+// test/lib.test.mjs which would block this otherwise.)
+if (_initTab && document.getElementById('tab-' + _initTab)) {
+  setTimeout(function() { switchTab(_initTab); }, 0);
+}
 
 // Restore Token-Usage filters from localStorage on page load. Each
 // filter is stored independently so we can grow this set without
