@@ -48,10 +48,11 @@ node_modules/
 /.claude/scheduled_tasks.lock
 /.claude/settings.local.json
 
-# Janitor / rechecker / tldr plugin runtime state
+# Janitor / rechecker / tldr plugin runtime state + per-machine config
 /.janitor/
 /.rechecker/
 /.tldr/
+/.tldrignore
 
 # Stray output files from `tokf` typos / mishaps (e.g. `tokf raw 1` → `1tokf`)
 /1tokf
