@@ -3944,6 +3944,29 @@ function renderHTML() {
     font-weight: 500;
     color: var(--foreground);
   }
+  /* UX-CO5: slider + readout pair, used in place of artificially-
+     limited dropdowns for numeric settings (e.g. serialize-delay).
+     min-width on the readout keeps the column from jiggling as the
+     value grows from "0 ms" to "2000 ms". font-variant-numeric makes
+     the digits aligned width so the eye does not see column wobble. */
+  .config-slider-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    min-width: 12rem;
+  }
+  .config-slider-wrap input[type="range"] {
+    flex: 1;
+    accent-color: var(--primary);
+    cursor: pointer;
+  }
+  .config-slider-readout {
+    font-size: 0.8125rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    min-width: 4rem;
+    text-align: right;
+  }
   .config-desc {
     font-size: 0.8125rem;
     color: var(--muted);
@@ -4331,8 +4354,22 @@ function renderHTML() {
   .fill-ok { background: var(--green); }
   .fill-mid { background: var(--yellow); }
   .fill-high { background: var(--red); }
-  .fill-full { background: var(--red); animation: pulse-fill 1.5s infinite; }
+  /* UX-X15: pulse-fill animation tweak — using ease-in-out timing
+     produces a less abrupt opacity transition than the default linear
+     interpolation, so the per-card hash-diff cache (which already
+     prevents most full-bar re-renders) recovers visually even when a
+     bar IS re-rendered (e.g. on first hash population after refresh).
+     The animation runs forever; a re-render that drops the .fill-full
+     element and recreates it will restart the animation, but the
+     ease-in-out shape (vs the prior step-flash from the fast 50% drop)
+     reads as a smooth continuation rather than a flash. Honouring
+     prefers-reduced-motion disables the animation entirely for users
+     with vestibular sensitivities. */
+  .fill-full { background: var(--red); animation: pulse-fill 1.5s ease-in-out infinite; }
   @keyframes pulse-fill { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  @media (prefers-reduced-motion: reduce) {
+    .fill-full { animation: none; }
+  }
   .rate-reset {
     font-size: 0.6875rem;
     color: var(--muted);
@@ -4385,6 +4422,17 @@ function renderHTML() {
     background: var(--red);
     color: #fff;
     border-color: var(--red);
+  }
+  /* UX-S7: pending-confirm state. The Remove button stages a 5s
+     confirmation window after the first click; during that window the
+     button is solid red so the user gets a clear "this is the danger
+     state" signal before the second click. font-weight bump separates
+     the resting state from the staged state at a glance. */
+  .remove-btn.remove-btn-confirm {
+    background: var(--red);
+    color: #fff;
+    border-color: var(--red);
+    font-weight: 600;
   }
 
   .refresh-btn {
@@ -4689,14 +4737,20 @@ function renderHTML() {
   }
 
   /* ── Activity log ── */
+  /* UX-AC5: removed max-height: 500px + overflow-y: auto. The internal
+     scroller stole trackpad scroll-momentum (the cursor had to be
+     positioned INSIDE the card or the page scrolled instead) and the
+     bouncing visual on a short feed wasted vertical real estate. The
+     activity log is already capped at 500 entries / 7 days by the
+     ring-buffer (ACTIVITY_MAX_ENTRIES), so unbounded growth is not a
+     concern. The scrubber + filter UI from batch E narrows the visible
+     set further when a power user wants to triage. */
   .activity-card {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
     padding: 1rem 1.25rem;
-    max-height: 500px;
-    overflow-y: auto;
   }
   .evt {
     display: flex;
@@ -4733,6 +4787,24 @@ function renderHTML() {
   }
   .evt-msg { flex: 1; color: var(--muted); line-height: 1.4; }
   .evt-msg b { color: var(--foreground); font-weight: 600; }
+  /* UX-AC4: day-divider rows separate "today's events" from "yesterday"
+     from older days. Without these the only date signal was the prefix
+     on the timestamp ("Yesterday 14:23:01" or "2 May 14:23:01"), which
+     varied per row and broke the visual rhythm — operators triaging an
+     incident at 03:00 could not tell at-a-glance whether a rate-limit
+     event was 30 min ago or 30 hours ago. Border-top + uppercase muted
+     label gives a clear chapter break. */
+  .activity-day-divider {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    padding: 0.75rem 0 0.25rem;
+    border-top: 1px solid var(--border);
+    margin-top: 0.5rem;
+  }
+  .activity-day-divider:first-child { border-top: none; padding-top: 0.25rem; margin-top: 0; }
   /* UX-L2 / UX-AC1: hide non-matching entries via class so the DOM
      stays stable. Clearing the filter restores visibility without a
      re-fetch. The class names are part of the public regression
@@ -4966,6 +5038,35 @@ function renderHTML() {
     font-size: 0.8125rem;
   }
 
+  /* UX-A8: skeleton card for the accounts-loading state. The skeleton
+     mimics card chrome so the "first paint → real cards" transition
+     does NOT cause a perceptible layout shift the way a centred
+     "Loading..." line did. The shimmer keyframe is gated by the
+     prefers-reduced-motion guard further down so users with vestibular
+     sensitivities see a static placeholder. */
+  .skeleton {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.875rem;
+  }
+  .skeleton-line {
+    height: 0.875rem;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--bg) 0%, var(--border) 50%, var(--bg) 100%);
+    background-size: 200% 100%;
+    animation: vdm-skeleton-shimmer 1.4s linear infinite;
+  }
+  @keyframes vdm-skeleton-shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton-line { animation: none; background: var(--bg); }
+  }
+
   /* ── Scrollbar ──
      UX-X11: bumped from 6px to 10px, with a higher-contrast thumb and
      a track-coloured border so the rounded thumb sits inside a "lane"
@@ -5125,6 +5226,25 @@ function renderHTML() {
   .tok-model-row + .tok-model-row {
     border-top: 1px solid var(--bg);
   }
+  /* UX-BR6: clickable Model Breakdown rows. Cursor + subtle hover tint
+     to advertise the affordance; padding-inline so the hover target
+     extends beyond the row's natural width. The row itself is a
+     role=button so the global Enter/Space keydown delegate (search for
+     "A11y batch 2") synthesises a click on key activation — keyboard
+     users can drill into a model exactly like mouse users. */
+  .tok-model-row-clickable {
+    cursor: pointer;
+    border-radius: 4px;
+    margin: 0 -0.375rem;
+    padding-left: 0.375rem;
+    padding-right: 0.375rem;
+    transition: background 0.1s;
+  }
+  .tok-model-row-clickable:hover,
+  .tok-model-row-clickable:focus-visible {
+    background: var(--bg);
+    outline: none;
+  }
   .tok-model-dot {
     width: 8px;
     height: 8px;
@@ -5272,7 +5392,16 @@ function renderHTML() {
     width: 1rem;
     text-align: center;
   }
-  .tok-repo-chevron.collapsed { transform: rotate(-90deg); }
+  /* UX-BR4: standardise chevron direction with the .tree-view summary
+     and .miss-session > summary patterns — base = ▶ (right-pointing),
+     rotate 90deg when expanded. Pre-fix used the inverse convention
+     (base ▼ + rotate -90deg when collapsed) which produced the same
+     pixels but inverted the CSS semantics, making the file harder to
+     reason about (a maintainer changing one chevron now had to mentally
+     flip the rotation direction in this place). The renderer at
+     renderRepoGroup() emits a "▶" base character (changed in the same
+     commit) so the collapsed state is the un-transformed natural state. */
+  .tok-repo-chevron:not(.collapsed) { transform: rotate(90deg); }
   /* UX-S2: chevron picks up colour on header hover/focus to advertise the
      toggle. UX2-BR4: the parent's opacity:0.8 was previously cancelling
      the chevron colour bump, replaced by a subtle background tint
@@ -5781,6 +5910,50 @@ function renderHTML() {
   .tok-wasted-wrap {
     padding: 0.5rem 0;
   }
+  /* UX-WS3: Y-axis labels live in a fixed-width column to the LEFT of
+     the bar area. Three rows pinned to the chart edges (top = max,
+     middle = max/2, bottom = $0). Without these the bars conveyed
+     "this day was bigger than that day" but no absolute magnitude;
+     users had to hover every bar to recover the dollar amount. */
+  .tok-wasted-chart-wrap {
+    display: flex;
+    align-items: stretch;
+    gap: 0.375rem;
+  }
+  .tok-wasted-y-axis {
+    width: 2.75rem;
+    height: 140px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: flex-end;
+    font-size: 0.625rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    padding-right: 0.125rem;
+  }
+  .tok-wasted-bars-col {
+    flex: 1;
+    min-width: 0;
+  }
+  /* UX-WS4: X-axis labels — first-of-month and Mondays — appear under
+     the bars. Empty slots stay rendered as empty divs so the column
+     widths stay aligned with the bars above. */
+  .tok-wasted-x-axis {
+    display: flex;
+    gap: 1px;
+    padding: 0.25rem 0.25rem 0;
+    font-size: 0.625rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .tok-wasted-x-axis-label {
+    flex: 1;
+    text-align: center;
+    overflow: hidden;
+    white-space: nowrap;
+  }
   .tok-wasted-bar-area {
     height: 140px;
     display: flex;
@@ -5908,6 +6081,13 @@ function renderHTML() {
   .savings-chart-total .over { color: var(--red); font-weight: 600; }
 
   /* ── Phase C — date-range scrubber ── */
+  /* UX-VS5: position: sticky removed. With the tab bar non-sticky, the
+     scrubber detached on scroll and floated alone at the viewport edge
+     with no breathing room, looking visually unmoored. The tab bar +
+     scrubber are coupled chrome — neither should pin in isolation.
+     Re-introducing sticky here would also require sticking .tabs above
+     it and adding backdrop-blur for visual separation; deferred to a
+     future "sticky chrome" pass that touches both together. */
   .vs-bar {
     background: var(--card);
     border: 1px solid var(--border);
@@ -5915,9 +6095,6 @@ function renderHTML() {
     box-shadow: var(--shadow);
     padding: 0.625rem 0.875rem;
     margin-bottom: 0.875rem;
-    position: sticky;
-    top: 0;
-    z-index: 5;
   }
   .vs-bar.hidden { display: none; }
   .vs-bar-row {
@@ -6213,7 +6390,16 @@ function renderHTML() {
 
   <div id="tab-accounts" class="tab-content active" role="tabpanel" aria-labelledby="tabbtn-accounts">
     <div id="accounts" class="accounts">
-      <div class="empty-state">Loading...</div>
+      <!-- UX-A8: skeleton card placeholder mimics real-card chrome so
+           the "first paint → real cards" transition is layout-shift
+           free. Replaced by renderAccounts() once the first /api/profiles
+           response arrives. The shimmer animation honours
+           prefers-reduced-motion via the .skeleton-line CSS rule. -->
+      <div class="skeleton" aria-busy="true" aria-label="Loading accounts">
+        <div class="skeleton-line" style="width:40%"></div>
+        <div class="skeleton-line" style="width:80%;margin-top:0.5rem"></div>
+        <div class="skeleton-line" style="width:60%;margin-top:0.5rem"></div>
+      </div>
     </div>
   </div>
 
@@ -6301,6 +6487,19 @@ function renderHTML() {
         <div class="vs-hint" id="vs-hint">
           Scrubber narrows within the selected time window from the dropdown below.
         </div>
+      </div>
+      <!-- UX-VS4: vs-tier-chips DOM container — vsRenderTierChips() in
+           dashboard.mjs has been calling getElementById('vs-tier-chips')
+           since Phase C, but the markup never existed (the function
+           silently returned, leaving tier filtering with no UI). The
+           chips populate after the first /api/profiles poll discovers
+           which tiers are present (PRO / MAX 5x / MAX 20x / FREE), so
+           on first paint the row stays empty + the label is hidden.
+           CSS for .vs-tier-chips lives near .vs-bar-row earlier in the
+           stylesheet. -->
+      <div class="vs-bar-row vs-tier-row" id="vs-tier-row" style="display:none">
+        <span class="vs-tier-label">Tier:</span>
+        <div class="vs-tier-chips" id="vs-tier-chips" role="group" aria-label="Filter by account tier"></div>
       </div>
     </div>
     <div class="tok-filters">
@@ -6393,9 +6592,20 @@ function renderHTML() {
         <div id="tok-tree" class="tree-view"><div class="tree-loading">Loading…</div></div>
       </div>
       <div class="usage-card tree-misses-card" id="tok-misses-card" style="display:none">
-        <div class="usage-title" style="display:flex;align-items:center;gap:0.5rem">
+        <div class="usage-title" style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap">
           <span>Likely Cache Misses</span>
           <span style="font-size:0.625rem;font-weight:500;color:var(--text-muted);background:var(--bg);border-radius:3px;padding:0.125rem 0.375rem" id="tok-misses-count">0</span>
+          <!-- UX-CM4: one-line "what is a cache miss" hint so first-time
+               users do not have to leave the dashboard to interpret the
+               card. The link points at Anthropic's prompt-caching docs;
+               rel="noopener" matches the rest of the dashboard's external
+               link discipline. font-weight:400 keeps the hint visually
+               below the title. margin-left:auto pushes the hint to the
+               right edge so the badge stays beside the title. -->
+          <span class="tree-misses-help" style="font-size:0.6875rem;color:var(--muted);font-weight:400;margin-left:auto">
+            Cache misses cost full input price (vs ~10% for cache reads).
+            <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener noreferrer" style="color:var(--primary)">Learn more</a>
+          </span>
         </div>
         <div id="tok-misses"></div>
       </div>
@@ -6510,13 +6720,24 @@ function renderHTML() {
             <div class="config-label">Delay between requests</div>
             <div class="config-desc">Milliseconds to wait between dispatching queued requests</div>
           </div>
-          <select class="config-select" id="sel-serialize-delay" onchange="changeSerializeDelay(Number(this.value))">
-            <option value="0">0 ms</option>
-            <option value="100">100 ms</option>
-            <option value="200">200 ms</option>
-            <option value="500">500 ms</option>
-            <option value="1000">1000 ms</option>
-          </select>
+          <!-- UX-CO5: range slider + readout pair instead of a 5-option
+               <select>. The CLI accepts arbitrary values
+               (vdm config serialize-delay-ms 250) so the dropdown was
+               artificially limiting the dashboard to a subset of valid
+               values. step=50 gives 41 stop points across 0-2000 ms,
+               which covers the full useful range without the slider
+               feeling jittery. The compact <input id="sel-serialize-delay">
+               id is preserved so the existing
+               document.getElementById('sel-serialize-delay') call sites
+               (settings load + save) continue to work unchanged. -->
+          <div class="config-slider-wrap">
+            <input type="range" min="0" max="2000" step="50" value="200"
+                   id="sel-serialize-delay"
+                   oninput="_onSerializeDelaySlider(this.value)"
+                   onchange="changeSerializeDelay(Number(this.value))"
+                   aria-label="Delay between serialised requests in milliseconds">
+            <span class="config-slider-readout" id="sel-serialize-delay-val">200 ms</span>
+          </div>
         </div>
         <div class="config-row" id="serialize-cap-ctrl" style="display:none">
           <div class="config-info">
@@ -6960,15 +7181,31 @@ function vsApplyPreset(preset) {
 function vsRenderTierChips() {
   var holder = document.getElementById('vs-tier-chips');
   if (!holder) return;
+  // UX-VS4: hide the entire row until at least one real tier is known.
+  // Without this, on first paint the user sees a "Tier: [All]"
+  // single-chip row that does nothing (no other tier to filter to).
+  // The row reveals as soon as the first /api/profiles poll reports
+  // a non-trivial tier set.
+  var row = document.getElementById('vs-tier-row');
+  var hasRealTiers = Array.isArray(_vsKnownTiers) && _vsKnownTiers.length > 0;
+  if (row) row.style.display = hasRealTiers ? '' : 'none';
   var tiers = ['all'].concat(_vsKnownTiers.slice());
   // Dedupe ('all' may collide if some odd profile reports literal 'all')
   var seen = {};
   tiers = tiers.filter(function(t) { if (seen[t]) return false; seen[t] = 1; return true; });
   var current = _vsState.tierFilter || ['all'];
+  // Codex P2 (UX-VS4): tier names come from upstream API rateLimitTier
+  // values (e.g. "max_20x", "pro"). Until UX-VS4 added the holder div,
+  // this renderer was effectively dead so the missing escape was
+  // dormant — making the UI live surfaces the latent XSS sink. Route
+  // BOTH the data-tier attribute AND the visible label through escHtml
+  // so a hostile or future schema change cannot inject HTML. The
+  // _.replace(/_/g, ' ') normalisation runs BEFORE escHtml so spaces
+  // remain literal characters (not entity-encoded) in the rendered text.
   holder.innerHTML = tiers.map(function(t) {
     var active = (current.indexOf('all') >= 0 && t === 'all') || (current.indexOf(t) >= 0 && t !== 'all');
     var label = t === 'all' ? 'All' : t.replace(/_/g, ' ');
-    return '<button class="vs-tier-chip' + (active ? ' active' : '') + '" data-tier="' + t.replace(/"/g, '&quot;') + '">' + label + '</button>';
+    return '<button class="vs-tier-chip' + (active ? ' active' : '') + '" data-tier="' + escHtml(t) + '">' + escHtml(label) + '</button>';
   }).join('');
   holder.querySelectorAll('.vs-tier-chip').forEach(function(btn) {
     btn.addEventListener('click', function() {
@@ -7418,9 +7655,66 @@ async function doSwitch(name, displayName, e) {
   if (targetCard) targetCard.classList.remove('switching');
 }
 
-async function doRemove(name, e) {
+// UX-S7: replace the native blocking confirm() dialog with an
+// inline two-stage confirmation. First click on Remove turns the button
+// into "Click again to confirm" with a 5s timeout — the same affordance
+// VS Code, GitHub UI, and most modern dashboards use. The native
+// confirm() blocked the entire page rendering, broke the dashboard's
+// toast-based feedback idiom, and could not be styled. The 5s window
+// is long enough to read but short enough that an accidental first
+// click cannot trigger a stale removal minutes later. The keychain
+// entry name and "active session not touched" detail moves into the
+// toast that fires on success, so the user gets the full context after
+// the irrevocable action — not buried in a system dialog before it.
+var _pendingRemoveTimers = {};
+async function doRemove(name, btn, e) {
   if (e) e.stopPropagation();
-  if (!confirm('Remove account "' + name + '"? This removes the saved keychain entry (vdm-account-' + name + ') and its label. The active Claude Code-credentials entry is not touched.')) return;
+  // The button can be passed as the second arg from the new HTML
+  // template; also tolerate the legacy 2-arg signature where the second
+  // arg was the event itself (during transition between renders).
+  if (btn && typeof btn === 'object' && btn.target && !btn.dataset) {
+    e = btn;
+    btn = null;
+  }
+  if (btn && btn.dataset) {
+    if (btn.dataset.confirmPending !== '1') {
+      // First click — stage the confirmation.
+      btn.dataset.confirmPending = '1';
+      var prevText = btn.textContent;
+      btn.dataset.prevText = prevText;
+      btn.textContent = 'Click again to confirm';
+      btn.classList.add('remove-btn-confirm');
+      // Cancel any prior pending timer for this name (rapid double
+      // clicks on different cards must not interfere with each other).
+      if (_pendingRemoveTimers[name]) clearTimeout(_pendingRemoveTimers[name]);
+      _pendingRemoveTimers[name] = setTimeout(function() {
+        try {
+          if (btn.dataset.confirmPending === '1') {
+            btn.dataset.confirmPending = '';
+            btn.textContent = btn.dataset.prevText || 'Remove';
+            btn.classList.remove('remove-btn-confirm');
+          }
+        } catch (_) { /* button gone — nothing to revert */ }
+        delete _pendingRemoveTimers[name];
+      }, 5000);
+      return;
+    }
+    // Second click within window → proceed.
+    // Codex P3 (UX-S7): restore the original button text BEFORE issuing
+    // the request. If the request fails (network drop, /api/remove
+    // returning a non-ok response), the success branch never runs and
+    // the card would otherwise stay showing "Click again to confirm"
+    // forever — so the next user click would skip the confirmation and
+    // fire a removal immediately. Restoring the label up-front means
+    // the failed second-click leaves the card in its resting state.
+    btn.dataset.confirmPending = '';
+    btn.classList.remove('remove-btn-confirm');
+    btn.textContent = btn.dataset.prevText || 'Remove';
+    if (_pendingRemoveTimers[name]) {
+      clearTimeout(_pendingRemoveTimers[name]);
+      delete _pendingRemoveTimers[name];
+    }
+  }
   try {
     const resp = await fetch('/api/remove', {
       method: 'POST',
@@ -7428,9 +7722,15 @@ async function doRemove(name, e) {
       body: JSON.stringify({ name })
     });
     const data = await resp.json();
-    if (data.ok) { showToast('Removed ' + name); setTimeout(refresh, 300); }
+    if (data.ok) {
+      // The post-action toast carries the keychain detail that the
+      // pre-fix confirm() dialog crammed in front of the user before
+      // the action even fired.
+      showToast('Removed ' + name + ' (vdm-account-' + name + ' keychain entry deleted; active session unaffected)');
+      setTimeout(refresh, 300);
+    }
     else showToast('Error: ' + data.error);
-  } catch(e) { showToast('Failed to remove'); }
+  } catch(_e) { showToast('Failed to remove'); }
 }
 
 async function doRefresh(name, e) {
@@ -7895,9 +8195,19 @@ async function refresh() {
     }
     if (probeStats) renderProbeStats(probeStats);
     // Queue stats
+    // UX-CO6: when serialize is ON, ALWAYS render the queue stats line
+    // (showing "0 inflight, 0 queued" at idle) instead of hiding the
+    // line when both counts are zero. The pre-fix behaviour caused the
+    // line to bounce in/out as traffic flowed — distracting for a user
+    // tuning serialize knobs and trying to observe the effect on queue
+    // depth. When serialize is OFF, hide the line entirely (no queue
+    // exists to report on). The serialize state is read off the
+    // checkbox so we don't need a fresh /api/settings round-trip.
     if (queueStats) {
       var qEl = document.getElementById('queue-stats');
-      if (queueStats.inflight > 0 || queueStats.queued > 0) {
+      var serializeToggle = document.getElementById('toggle-serialize');
+      var serializeOn = serializeToggle && serializeToggle.checked;
+      if (serializeOn) {
         qEl.style.display = '';
         var capPart = queueStats.maxConcurrent ? ' (cap=' + queueStats.maxConcurrent + ')' : '';
         qEl.textContent = 'Queue: ' + queueStats.inflight + ' inflight, ' + queueStats.queued + ' queued' + capPart;
@@ -8096,7 +8406,10 @@ function renderAccounts(profiles, animate) {
     // the user can exercise on the currently-active account.
     var buttonsHtml = '<div class="card-actions">' +
       prefsHtml +
-      (!active ? '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' : '') +
+      // UX-S7: pass the button element to doRemove so it can stage the
+      // two-click confirmation in-place (no native confirm() dialog).
+      // The third arg is the event so e.stopPropagation() still fires.
+      (!active ? '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',this,event)">Remove</button>' : '') +
       (!active && isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '') +
       (!active && !isStale ? '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayNameJs+'\\''+',event)" title="Switch to this account">Switch</button>' : '') +
     '</div>';
@@ -8350,7 +8663,32 @@ function renderActivity(log) {
     _vdmApplyActivityFilter();
     return;
   }
-  el.innerHTML = filtered.map(e => {
+  // UX-AC4: emit a sticky-day divider between rows that fall on
+  // different calendar days. The activity log is already chronological
+  // (newest first as fed in from /api/activity); we just walk it once
+  // and inject a divider whenever the day-key changes. Day key is the
+  // local-date string of e.ts so DST + timezone wrap correctly.
+  const todayKey = new Date().toDateString();
+  const yesterdayDate = new Date(); yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+  const yKey = yesterdayDate.toDateString();
+  let lastDayKey = '';
+  let html = '';
+  for (let i = 0; i < filtered.length; i++) {
+    const e = filtered[i];
+    const tsNum = Number(e.ts || 0);
+    const dObj = tsNum ? new Date(tsNum) : null;
+    const dayKey = dObj ? dObj.toDateString() : '';
+    if (dayKey && dayKey !== lastDayKey) {
+      // Friendly label: Today / Yesterday / "DD Mon YYYY". Year is
+      // included for older entries so a screenshot survives the year
+      // boundary unambiguously. escHtml the joined string defensively.
+      let label;
+      if (dayKey === todayKey) label = 'Today, ' + dObj.getDate() + ' ' + MONTHS[dObj.getMonth()];
+      else if (dayKey === yKey) label = 'Yesterday, ' + dObj.getDate() + ' ' + MONTHS[dObj.getMonth()];
+      else label = dObj.getDate() + ' ' + MONTHS[dObj.getMonth()] + ' ' + dObj.getFullYear();
+      html += '<div class="activity-day-divider">' + escHtml(label) + '</div>';
+      lastDayKey = dayKey;
+    }
     const c = evtColors[e.type] || 'var(--muted)';
     // UX-AC2: glyph BEFORE the dot so the icon and the colour both sit
     // in the same scan zone. The icon is sourced from a closed map
@@ -8359,7 +8697,7 @@ function renderActivity(log) {
     // category for screen readers (rate-limited / token-refreshed
     // / etc.) and an extra "warning warning" would just be noise.
     const icon = evtIcons[e.type] || '•';
-    return '<div class="evt">' +
+    html += '<div class="evt">' +
       // UX-AC6: defense-in-depth. evtTime returns timestamps from a number
       // input (e.ts) so today's call site is safe, but a future schema
       // change that passes a string through evtTime would otherwise let
@@ -8369,7 +8707,8 @@ function renderActivity(log) {
       '<span class="evt-dot" style="background:' + c + '"></span>' +
       '<span class="evt-msg">' + evtMsg(e) + '</span>' +
     '</div>';
-  }).join('');
+  }
+  el.innerHTML = html;
   // UX-AC1: re-apply the filter after the DOM rebuild — innerHTML wiped
   // any prior .evt-hidden classes.
   _vdmApplyActivityFilter();
@@ -8450,7 +8789,12 @@ async function loadSettingsUI() {
     updateStrategyUI(s.rotationStrategy || 'conserve');
     // Serialization
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
-    document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
+    var delayVal = s.serializeDelayMs || 200;
+    document.getElementById('sel-serialize-delay').value = delayVal;
+    // UX-CO5: keep the slider readout in sync with the persisted value
+    // on initial load, otherwise it shows the markup default ("200 ms")
+    // even when the user previously chose a different value.
+    if (typeof _onSerializeDelaySlider === 'function') _onSerializeDelaySlider(delayVal);
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
     document.getElementById('sel-serialize-cap').value = s.serializeMaxConcurrent || 1;
     document.getElementById('serialize-cap-ctrl').style.display = s.serializeRequests ? '' : 'none';
@@ -8535,6 +8879,16 @@ async function changeSerializeDelay(value) {
     });
     showToast('Serialize delay: ' + value + ' ms');
   } catch { showToast('Failed to update'); }
+}
+
+// UX-CO5: live readout updater for the serialize-delay slider. Fired
+// from oninput so the user sees the new value as they drag, before
+// the onchange POST fires when they release. Defensive — any slider
+// without a sibling readout (e.g. unit tests, Firefox older versions)
+// falls back to no-op.
+function _onSerializeDelaySlider(value) {
+  var readout = document.getElementById('sel-serialize-delay-val');
+  if (readout) readout.textContent = value + ' ms';
 }
 
 async function changeSerializeMaxConcurrent(value) {
@@ -8839,6 +9193,24 @@ function getModelColor(model, sortedModels) {
   var idx = sortedModels.indexOf(model);
   if (idx < 0) idx = 0;
   return TOK_COLORS[idx % TOK_COLORS.length];
+}
+
+// UX-BR7: stable account-to-colour mapping. Accounts in the Account
+// Breakdown panel were previously coloured by sort-order index, which
+// shuffled every render — a freshly-discovered account ranking N+1
+// took whatever colour was at index N+1, even if a previously-existing
+// account had that colour last time. Visual continuity broke. Hash the
+// account name into the TOK_COLORS palette so each account keeps its
+// colour across renders + filter changes. djb2 is collision-tolerant
+// enough for ≤6-colour bucketing across <100 accounts.
+function getAccountColor(acct) {
+  var name = String(acct == null ? '' : acct);
+  if (!name) return TOK_COLORS[0];
+  var h = 5381 | 0;
+  for (var i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) | 0;
+  // Math.abs to defend against signed-int overflow producing a
+  // negative index. Modulo over palette length.
+  return TOK_COLORS[Math.abs(h) % TOK_COLORS.length];
 }
 
 var _lastTokensHash = '';
@@ -9311,7 +9683,16 @@ function renderCacheMisses(misses, missSessions) {
   el.innerHTML = html;
 }
 
-function applyTokenModelFilter() {
+// UX-X14: optional opts arg lets a caller declare which sub-renders
+// it actually needs ('only the wasted-spend chart changed', etc.).
+// Backward-compatible: applyTokenModelFilter() with no args (the
+// vast majority of call sites) renders everything, exactly like
+// before. The inner rAF callback gates each render call on the
+// matching key — opts.all is the implicit any-key default. Granular
+// callers (UX-X14 audit fix) save 6 of 7 chart renders on filters
+// that only affect one panel.
+function applyTokenModelFilter(opts) {
+  var renderOpts = opts || { all: true };
   var modelSel = document.getElementById('tok-model');
   var accountSel = document.getElementById('tok-account');
   var modelFilter   = (modelSel   && modelSel.value)   || '';
@@ -9375,16 +9756,37 @@ function applyTokenModelFilter() {
   var prevDataForCharts = applyChartProjectFilter(prevData);
   _renderChartsRaf = requestAnimationFrame(function() {
     _renderChartsRaf = null;
-    renderTokenStats(dataForCharts, prevDataForCharts);
-    renderDailyChart(dataForCharts);
-    renderCostSavingsChart();
-    renderModelBreakdown(dataForCharts);
-    renderAccountBreakdown(dataForCharts);
-    renderRepoBranchBreakdown(dataForCharts);
-    renderToolBreakdown(dataForCharts);
-    renderWastedSpendChart();
+    // UX-X14: each render call is gated on opts.<key> || opts.all so a
+    // caller that knows "only the project-multi-select changed" can
+    // pass {wasted: true, daily: true} and skip the other six panels.
+    // opts.all (the default for callers passing nothing) renders every
+    // panel — backward compatible with all existing call sites.
+    var ro = renderOpts;
+    if (ro.all || ro.stats) renderTokenStats(dataForCharts, prevDataForCharts);
+    // UX-CA4: render only the active carousel slide. The three slides
+    // (cost savings / daily usage / wasted spend) are all carousel
+    // siblings; only one is on-screen at a time, so doing the SVG +
+    // stacked-bar layout for the off-screen ones is wasted CPU on every
+    // filter change. We track the active idx inside chartCarouselGo and
+    // re-render the now-active slide when the carousel rotates so the
+    // previously-hidden slide picks up the latest filter state.
+    if (_chartCarouselIdx === 0 && (ro.all || ro.savings)) renderCostSavingsChart();
+    else if (_chartCarouselIdx === 1 && (ro.all || ro.daily)) renderDailyChart(dataForCharts);
+    else if (_chartCarouselIdx === 2 && (ro.all || ro.wasted)) renderWastedSpendChart();
+    // Cache the most recent dataForCharts so the carousel-rotation
+    // handler can re-render the newly-visible slide with the active
+    // filter without re-fetching.
+    _carouselLastData = dataForCharts;
+    if (ro.all || ro.models)   renderModelBreakdown(dataForCharts);
+    if (ro.all || ro.accounts) renderAccountBreakdown(dataForCharts);
+    if (ro.all || ro.repos)    renderRepoBranchBreakdown(dataForCharts);
+    if (ro.all || ro.tools)    renderToolBreakdown(dataForCharts);
   });
 }
+// UX-CA4: cache of the most recent dataForCharts so chartCarouselGo
+// can re-render the newly-visible slide without re-running every other
+// chart in the tab.
+var _carouselLastData = null;
 var _renderChartsRaf = null;
 
 function populateTokenFilters(data) {
@@ -9574,7 +9976,14 @@ function renderModelBreakdown(data) {
     // because hover-targeting a sub-span inside a sibling div would
     // mean the user has to be pixel-precise about which "in" or "out"
     // to hover over — easier to expose the full breakdown on the row.
-    rows += '<div class="tok-model-row">' +
+    // UX-BR6: each row is clickable — clicking filters the entire
+    // Tokens tab to that model. Clicking the same row again clears
+    // the filter (toggle behaviour). The data-model attribute carries
+    // the raw model identifier so _filterByModel can resolve it
+    // server-side; escHtml is applied because the model name comes from
+    // arbitrary upstream API responses.
+    var safeModelName = escHtml(sortedModels[r]);
+    rows += '<div class="tok-model-row tok-model-row-clickable" role="button" tabindex="0" data-model="' + safeModelName + '" onclick="_filterByModel(this.dataset.model)" title="Click to filter the Tokens tab to this model">' +
       '<div class="tok-model-dot" style="background:'+getModelColor(sortedModels[r], sortedModels)+'"></div>' +
       '<div class="tok-model-name">'+escHtml(shortModel(sortedModels[r]))+'</div>' +
       '<div class="tok-model-detail" title="' + fmtTokenCountExact(md.input) + ' input / ' + fmtTokenCountExact(md.output) + ' output">'+formatNum(md.input)+' in / '+formatNum(md.output)+' out</div>' +
@@ -9584,6 +9993,34 @@ function renderModelBreakdown(data) {
     '</div>';
   }
   el.innerHTML = propBar + rows;
+}
+
+// UX-BR6: filter the Tokens tab to a model when the user clicks a row
+// in the Model Breakdown panel. The handler reads the current value of
+// the tok-model dropdown and toggles — clicking the active model again
+// clears the filter so users can drill in and back out without
+// scrolling to the dropdown. Re-runs applyTokenModelFilter() so every
+// chart picks up the new filter state in lockstep.
+function _filterByModel(modelName) {
+  if (!modelName) return;
+  var sel = document.getElementById('tok-model');
+  if (!sel) return;
+  // If the dropdown does not contain the requested model, bail
+  // gracefully — the row was clicked but the dropdown options have
+  // not been populated yet (race against the first /api/profiles
+  // poll). Without this guard, setting sel.value to a missing string
+  // would silently no-op and confuse the user.
+  var found = false;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === modelName) { found = true; break; }
+  }
+  if (!found) return;
+  // Toggle: if already active, clear; otherwise set.
+  sel.value = (sel.value === modelName) ? '' : modelName;
+  // tokFilterChange('model') is the existing dropdown handler —
+  // re-firing it routes through the same code path as a manual
+  // dropdown change, so all downstream renders react identically.
+  if (typeof tokFilterChange === 'function') tokFilterChange('model');
 }
 
 function renderDailyChart(data) {
@@ -9695,6 +10132,17 @@ function chartCarouselGo(idx) {
   for (var i = 0; i < btns.length; i++) {
     btns[i].classList.toggle('active', i === idx);
   }
+  // UX-CA4: render the newly-visible slide on demand. The off-screen
+  // slides skip render in applyTokenModelFilter, so without this they
+  // would show stale (or empty) content the first time the carousel
+  // rotates onto them. Each renderer is idempotent — a no-op when the
+  // data has not changed — so re-firing here is cheap.
+  try {
+    var dat = _carouselLastData;
+    if (idx === 0) renderCostSavingsChart();
+    else if (idx === 1 && dat) renderDailyChart(dat);
+    else if (idx === 2) renderWastedSpendChart();
+  } catch (_) { /* render-on-rotate must never crash the carousel timer */ }
   clearInterval(_chartCarouselTimer);
   _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
 }
@@ -9812,18 +10260,46 @@ document.addEventListener('keydown', function(ev) {
 // click-away handler already covers outside-click; Esc is the
 // keyboard counterpart that screen-reader / keyboard-only users
 // expect from any popover.
+// UX-CPF5: when the panel is open, Cmd+A / Ctrl+A toggles all checkboxes
+// — a familiar "select all" affordance that scales much better than
+// click-Tab-Tab-Tab-Space across a long project list. We intentionally
+// gate on the (panel exists AND not hidden) condition so the shortcut
+// does not hijack the browser's native Cmd+A outside the panel.
 document.addEventListener('keydown', function(ev) {
-  if (ev.key !== 'Escape') return;
   var panel = document.getElementById('cpf-panel');
   var btn = document.getElementById('cpf-toggle');
-  if (panel && !panel.hidden) {
-    panel.hidden = true;
-    if (btn) {
-      btn.setAttribute('aria-expanded', 'false');
-      btn.focus();   // return focus to the trigger
+  if (ev.key === 'Escape') {
+    if (panel && !panel.hidden) {
+      panel.hidden = true;
+      if (btn) {
+        btn.setAttribute('aria-expanded', 'false');
+        btn.focus();   // return focus to the trigger
+      }
+      document.removeEventListener('click', _closeProjectFilterOnOutside, true);
+      ev.preventDefault();
     }
-    document.removeEventListener('click', _closeProjectFilterOnOutside, true);
+    return;
+  }
+  // UX-CPF5: select-all / clear shortcut while panel open. Pressing
+  // Cmd+A (mac) or Ctrl+A (everywhere) toggles between "all selected"
+  // and "all cleared" (clear if every box was already checked, select
+  // all otherwise). The shortcut MUST NOT fire when the panel is closed
+  // — otherwise we would steal the browser's native "select all" on
+  // every page load.
+  if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'a' || ev.key === 'A')) {
+    if (!panel || panel.hidden) return;
+    if (typeof projectFilterSelectAll !== 'function') return;
+    var listEl = document.getElementById('cpf-list');
+    if (!listEl) return;
+    var boxes = listEl.querySelectorAll('input[type="checkbox"]:not(:disabled)');
+    if (!boxes.length) return;
+    var allChecked = true;
+    for (var i = 0; i < boxes.length; i++) {
+      if (!boxes[i].checked) { allChecked = false; break; }
+    }
+    projectFilterSelectAll(!allChecked);
     ev.preventDefault();
+    ev.stopPropagation();
   }
 });
 
@@ -9859,6 +10335,16 @@ function toggleProjectFilter() {
         if (typeof _refreshProjectFilterLabel === 'function') _refreshProjectFilterLabel();
       }, 2000);
     }
+    // UX-CPF4: surface a toast on top of the inline 2s "Filter
+    // unavailable" label so users without devtools open get visible
+    // feedback (the label flips back after 2s and is easy to miss).
+    // Routed through the existing showToast helper — its error variant
+    // uses the red palette so the failure stands out from successful
+    // toasts. The error message is bounded to keep the toast compact.
+    try {
+      var msg = (e && e.message) ? String(e.message).slice(0, 200) : 'unknown error';
+      if (typeof showToast === 'function') showToast('Project filter unavailable: ' + msg, { error: true });
+    } catch (_) { /* toast helper itself failed — give up silently */ }
     return;
   }
   panel.hidden = false;
@@ -10179,6 +10665,31 @@ function renderWastedSpendChart() {
     bars += '<div class="tok-wasted-bar" style="height:' + pct + '%;background:' + barColor + '" data-tooltip="' + escHtml(tooltip) + '"></div>';
   }
   bars += '</div>';
+  // UX-WS4: X-axis time labels — show date for the FIRST of each month
+  // and Mondays so the user can scan "where in time was this bar"
+  // without hovering. Empty divs preserve column widths so the labels
+  // line up with the bars above.
+  var xLabels = '<div class="tok-wasted-x-axis">';
+  for (var dk = 0; dk < days.length; dk++) {
+    var dxObj = new Date(days[dk].day + 'T00:00:00');
+    // getDay() = Monday is 1 in the ISO sense; first-of-month = 1.
+    var isMonday = dxObj.getDay() === 1;
+    var isFirst  = dxObj.getDate() === 1;
+    var lbl = (isFirst || isMonday) ? (dxObj.getDate() + ' ' + MONTHS[dxObj.getMonth()]) : '';
+    xLabels += '<div class="tok-wasted-x-axis-label">' + escHtml(lbl) + '</div>';
+  }
+  xLabels += '</div>';
+  // UX-WS3: Y-axis scale labels — three rows: max / max÷2 / $0. Pinned
+  // by the .tok-wasted-y-axis flex layout so they line up with the
+  // bar area's top, midline and base. When maxWasted is 0 we still
+  // emit a $0 row so the chart frame stays consistent.
+  var yMid = formatCost(maxWasted / 2);
+  var yMax = formatCost(maxWasted);
+  var yAxis = '<div class="tok-wasted-y-axis" aria-hidden="true">'
+    + '<span>' + yMax + '</span>'
+    + '<span>' + yMid + '</span>'
+    + '<span>$0</span>'
+    + '</div>';
   // UX-X9: hover-exact for the totals span — miss-tokens often cross
   // the 1M threshold and the compact 1.2M form is the worst-case
   // truncation example from the audit.
@@ -10188,8 +10699,14 @@ function renderWastedSpendChart() {
     + '<span class="total-cost">' + formatCost(totalWasted)
     + ' wasted</span>'
     + '</div>';
+  // UX-WS3 / UX-WS4: tok-wasted-chart-wrap composes the Y-axis labels
+  // alongside the bar column so the magnitude scale is always visible
+  // (no hover required), and the X-axis sits directly under the bars.
+  var chart = '<div class="tok-wasted-chart-wrap">' + yAxis
+    + '<div class="tok-wasted-bars-col">' + bars + xLabels + '</div>'
+    + '</div>';
   el.innerHTML = '<div class="usage-title" title="Wasted spend = full input cost minus what the same tokens would have cost at the cache-read rate (~10%). Plotted per day.">Wasted Spend (Cache Misses)</div>'
-    + '<div class="tok-wasted-wrap">' + totalsLine + bars + '</div>';
+    + '<div class="tok-wasted-wrap">' + totalsLine + chart + '</div>';
 }
 
 function getPlanMonthlyCost(subscriptionType, rateLimitTier) {
@@ -10368,7 +10885,10 @@ function renderAccountBreakdown(data) {
   var propBar = '<div class="tok-proportion">';
   for (var k = 0; k < sortedAccounts.length; k++) {
     var pct = (accountMap[sortedAccounts[k]].total / grandTotal) * 100;
-    propBar += '<div class="tok-proportion-seg" style="width:' + pct + '%;background:' + TOK_COLORS[k % TOK_COLORS.length] + '"></div>';
+    // UX-BR7: stable colour by account name — propBar segments and the
+    // per-row dots stay locked to the account regardless of sort order,
+    // matching renderModelBreakdown's getModelColor convention.
+    propBar += '<div class="tok-proportion-seg" style="width:' + pct + '%;background:' + getAccountColor(sortedAccounts[k]) + '"></div>';
   }
   propBar += '</div>';
   var rows = '';
@@ -10385,7 +10905,10 @@ function renderAccountBreakdown(data) {
     // UX-X9: hover-exact for the per-account totals so two accounts
     // displayed at "1.2M" can be distinguished by hover.
     rows += '<div class="tok-model-row">' +
-      '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
+      // UX-BR7: getAccountColor() — stable hash → colour mapping that
+      // keeps each account's colour identical across renders even when
+      // the row order shifts after a filter change or new traffic.
+      '<div class="tok-model-dot" style="background:' + getAccountColor(sortedAccounts[r]) + '"></div>' +
       '<div class="tok-model-name">' + escHtml(sortedAccounts[r]) + (planHtml ? ' ' + planHtml : '') + '</div>' +
       '<div class="tok-model-detail" title="' + fmtTokenCountExact(ad.input) + ' input / ' + fmtTokenCountExact(ad.output) + ' output">' + formatNum(ad.input) + ' in / ' + formatNum(ad.output) + ' out</div>' +
       '<div class="tok-model-total" title="' + fmtTokenCountExact(ad.total) + ' total tokens">' + formatNum(ad.total) + '</div>' +
@@ -10478,7 +11001,10 @@ function renderRepoBranchBreakdown(data) {
     // aria-expanded reflects the open/collapsed state so screen readers
     // announce "expanded" / "collapsed" as the user toggles.
     h += '<div class="tok-repo-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleRepoCollapse(this.dataset.key)" data-key="' + escHtml(repo.key) + '">';
-    h += '<span class="' + chevCls + '">\u25BC</span>';
+    // UX-BR4: \u25B6 base (U+25B6) + CSS rotate(90deg) when expanded \u2014
+    // matches the .tree-view summary and .miss-session summary
+    // chevron convention used elsewhere in the same tab.
+    h += '<span class="' + chevCls + '">\u25B6</span>';
     h += '<span class="tok-repo-name">' + escHtml(repo.name) + '</span>';
     // UX-X9: hover-exact for the per-repo totals.
     h += '<span class="tok-model-detail" style="flex:1" title="' + fmtTokenCountExact(repo.totalIn) + ' input / ' + fmtTokenCountExact(repo.totalOut) + ' output">' + formatNum(repo.totalIn) + ' in / ' + formatNum(repo.totalOut) + ' out</span>';
@@ -11032,6 +11558,14 @@ function _vdmApplyActivityFilter() {
     for (var i = 0; i < allEvts.length; i++) {
       allEvts[i].classList.remove('evt-hidden');
     }
+    // Codex P2 (UX-AC4): also un-hide any day dividers that a previous
+    // valid filter had hidden — otherwise toggling regex back to invalid
+    // shows all events but leaves the dividers from the prior render
+    // missing, breaking the chronological frame.
+    var allDividers = wrap.querySelectorAll('.activity-day-divider');
+    for (var dvi = 0; dvi < allDividers.length; dvi++) {
+      allDividers[dvi].classList.remove('evt-hidden');
+    }
     _vdmHideFilterEmptyState(wrap);
     return;
   } else {
@@ -11050,6 +11584,35 @@ function _vdmApplyActivityFilter() {
       evts[j].classList.add('evt-hidden');
     }
   }
+  // Codex P2 (UX-AC4): hide day-divider rows whose entire following day
+  // group has been filtered out — without this, a filter that matches
+  // only "today" would leave standalone "Yesterday" / older day labels
+  // visible above empty space (or above the next match if any). Walk
+  // the children sequentially: each .activity-day-divider gets shown
+  // only if at least one .evt before the next divider is NOT hidden.
+  // The dividers themselves NEVER carry .evt class, so we cannot rely
+  // on the .evt loop above to handle them.
+  var children = wrap.children;
+  var dividerEl = null;
+  var dividerHasVisible = false;
+  for (var k = 0; k < children.length; k++) {
+    var node = children[k];
+    if (node.classList && node.classList.contains('activity-day-divider')) {
+      // Apply state to the previous divider before moving on.
+      if (dividerEl) dividerEl.classList.toggle('evt-hidden', !dividerHasVisible);
+      dividerEl = node;
+      dividerHasVisible = false;
+      continue;
+    }
+    // Skip the in-pane filter empty-state node — it is a sibling of
+    // the events but is not part of any day group.
+    if (node.classList && node.classList.contains('vdm-filter-empty')) continue;
+    if (node.classList && node.classList.contains('evt') && !node.classList.contains('evt-hidden')) {
+      dividerHasVisible = true;
+    }
+  }
+  // Apply state to the trailing divider once the walk ends.
+  if (dividerEl) dividerEl.classList.toggle('evt-hidden', !dividerHasVisible);
   if (!pattern) {
     countEl.textContent = total > 0 ? (total + ' entries') : '';
     _vdmHideFilterEmptyState(wrap);
@@ -11207,7 +11770,15 @@ function connectLogStream() {
       // uniformly. NB: avoid markdown backticks in comments inside renderHTML
       // because the whole function body is one big template literal and any
       // stray backtick terminates it (see CLAUDE.md backtick-in-comment trap).
-      line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + escHtml(tag.toUpperCase()) + ']</span> ' + escHtml(data.msg || data.line || '');
+      // UX-L3: prepend a HH:MM:SS timestamp so operators correlating
+      // log lines with external events (a 429 burst, a hook firing,
+      // a deploy) do not have to guess. data.ts (server-side ms epoch)
+      // is preferred; if absent we fall back to client-now so the
+      // sequence is never undated. The timestamp is muted-coloured so
+      // the bracketed tag stays the dominant visual.
+      var _logTs = data.ts ? new Date(data.ts) : new Date();
+      var _logTsStr = _logTs.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+      line.innerHTML = '<span style="color:var(--muted);margin-right:0.5rem;font-variant-numeric:tabular-nums">' + escHtml(_logTsStr) + '</span><span style="color:' + color + ';font-weight:600">[' + escHtml(tag.toUpperCase()) + ']</span> ' + escHtml(data.msg || data.line || '');
       // UX-L2: apply the active filter to the new line BEFORE appending so
       // there is no flicker. Mirrors what _vdmApplyLogsFilter does on the
       // whole list, just for one element.
@@ -11479,7 +12050,16 @@ function renderSessions(data) {
       html += '<div class="session-timeline">';
       s.timeline.forEach(function(e) {
         if (e.type === 'input') html += '<div class="tl-input">' + escHtml(e.text) + '</div>';
-        else html += '<div class="tl-action">' + escHtml(e.text) + '</div>';
+        else {
+          // UX-S5: honour optional e.depth so nested actions (tool inside
+          // tool, agent inside agent) get visual indentation. Cap at
+          // depth=8 so a hostile or pathological transcript cannot push
+          // an item off the right edge of the card. Clamp to integer
+          // first to defend against floating-point or string inputs.
+          var d = Math.min(8, Math.max(0, parseInt(e.depth, 10) || 0));
+          var pad = (1.25 + d * 1.0).toFixed(2);
+          html += '<div class="tl-action" style="padding-left:' + pad + 'rem">' + escHtml(e.text) + '</div>';
+        }
       });
       // Current activity
       if (s.currentActivity) {
@@ -11534,7 +12114,12 @@ function renderSessions(data) {
       html += '<div class="session-timeline">';
       (s.timeline || []).forEach(function(e) {
         if (e.type === 'input') html += '<div class="tl-input">' + escHtml(e.text) + '</div>';
-        else html += '<div class="tl-action">' + escHtml(e.text) + '</div>';
+        else {
+          // UX-S5: see active-sessions emit-site above for depth handling.
+          var d = Math.min(8, Math.max(0, parseInt(e.depth, 10) || 0));
+          var pad = (1.25 + d * 1.0).toFixed(2);
+          html += '<div class="tl-action" style="padding-left:' + pad + 'rem">' + escHtml(e.text) + '</div>';
+        }
       });
       html += '</div>';
       // UX-S4: see active-sessions emit-site above for the rationale.

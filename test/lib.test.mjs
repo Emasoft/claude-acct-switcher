@@ -8000,9 +8000,14 @@ describe('Phase 6 — UI: chart-scoped project multi-select + wasted-spend chart
   });
 
   it('applyTokenModelFilter feeds project-filtered data into ALL chart renderers', () => {
+    // Spark P / UX-X14: applyTokenModelFilter grew an opts arg + per-renderer
+    // gating comments + the UX-CA4 carousel-slide split, so the function
+    // body is materially longer than the original 4000 chars. Bump the
+    // slice window to keep the contract assertions intact regardless of
+    // future comment expansion.
     const fn = _src_t6ui.slice(
       _src_t6ui.indexOf('function applyTokenModelFilter'),
-      _src_t6ui.indexOf('function applyTokenModelFilter') + 4000,
+      _src_t6ui.indexOf('function applyTokenModelFilter') + 8000,
     );
     assert.match(fn, /var dataForCharts\s*=\s*applyChartProjectFilter\(data\)/);
     assert.match(fn, /var prevDataForCharts\s*=\s*applyChartProjectFilter\(prevData\)/);
@@ -12182,5 +12187,372 @@ describe('Codex review — CR-001..CR-006 source-grep + behavioral regressions',
     assert.match(recentBlock[0], /copyTimeline\(\\\\'' \+ sid \+ '\\\\', event\)/);
     assert.match(recentBlock[0], /toggleSessionCollapse\(\\\\'' \+ sid \+ '\\\\'\)/);
     assert.match(recentBlock[0], /toggleSessionTimelineExpand\(\\\\'' \+ sid \+ '\\\\', event\)/);
+  });
+});
+
+// ── Spark P — round-1 audit MINOR/NIT cleanup ──
+//
+// Source-grep regression tests for every fix applied in spark P.
+// Each `it` pins one invariant from the audit. Future regressions
+// that touch any of these areas without updating the underlying
+// fix will trip the relevant grep here. See
+// `reports/spark-fixer/<ts>-spark-P-round1-minor-nit.md` for the
+// per-fix file:line evidence.
+describe('Spark P — round-1 MINOR/NIT cleanup', () => {
+  const _src_p = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // UX-A8 — accounts-tab loading-state skeleton card.
+  it('UX-A8: accounts loading state renders a .skeleton card with shimmer line', () => {
+    // The shimmer animation is gated by prefers-reduced-motion. Both
+    // the .skeleton class definition and the keyframes must exist.
+    assert.match(_src_p, /\.skeleton\s*\{/);
+    assert.match(_src_p, /\.skeleton-line\s*\{/);
+    assert.match(_src_p, /@keyframes vdm-skeleton-shimmer/);
+    assert.match(_src_p, /prefers-reduced-motion[^}]*\.skeleton-line\s*\{\s*animation:\s*none/);
+    // The accounts-tab markup uses a real skeleton placeholder, not
+    // the bare "Loading..." text the audit complained about.
+    assert.match(_src_p, /<div class="skeleton" aria-busy="true" aria-label="Loading accounts">/);
+    // Ensure we removed the old <div class="empty-state">Loading...
+    // marker from the accounts tab specifically (the substring still
+    // appears elsewhere — Sessions tab uses "Loading sessions…").
+    const accountsBlock = _src_p.match(/<div id="tab-accounts"[\s\S]{0,400}/);
+    assert.ok(accountsBlock, 'tab-accounts block found');
+    assert.ok(!/empty-state">Loading\.\.\.</.test(accountsBlock[0]),
+      'old "Loading..." empty-state should be replaced by the skeleton');
+  });
+
+  // UX-AC4 — activity-feed day-divider rows.
+  it('UX-AC4: renderActivity emits .activity-day-divider rows between calendar days', () => {
+    assert.match(_src_p, /\.activity-day-divider\s*\{/);
+    assert.match(_src_p, /\.activity-day-divider:first-child/);
+    // The renderer label-emit branches must cover Today / Yesterday /
+    // older. All three labels MUST go through escHtml() to stay
+    // defense-in-depth even though the source is internal.
+    assert.match(_src_p, /'Today, '\s*\+\s*dObj\.getDate\(\)/);
+    assert.match(_src_p, /'Yesterday, '\s*\+\s*dObj\.getDate\(\)/);
+    assert.match(_src_p, /<div class="activity-day-divider">'\s*\+\s*escHtml\(label\)/);
+  });
+
+  // UX-AC5 — activity-card no longer clips at 500px.
+  it('UX-AC5: .activity-card has no max-height clipping', () => {
+    // Ring-buffer + filter UI cap the visible volume; the internal
+    // scroller stole trackpad scroll-momentum and bounced visually.
+    const activityCardBlock = _src_p.match(/\.activity-card\s*\{[^}]*\}/);
+    assert.ok(activityCardBlock, 'activity-card rule found');
+    assert.ok(!/max-height/.test(activityCardBlock[0]),
+      'activity-card must not have max-height after UX-AC5');
+    assert.ok(!/overflow-y\s*:\s*auto/.test(activityCardBlock[0]),
+      'activity-card must not have internal overflow-y after UX-AC5');
+  });
+
+  // UX-CA4 — only the active carousel slide is rendered each filter.
+  it('UX-CA4: applyTokenModelFilter renders only the active carousel slide', () => {
+    const fn = _src_p.slice(
+      _src_p.indexOf('function applyTokenModelFilter'),
+      _src_p.indexOf('function applyTokenModelFilter') + 8000,
+    );
+    // The three carousel renderers are now gated on _chartCarouselIdx.
+    // Use \S for the index check + .* for the optional opts gate so the
+    // regex tolerates the UX-X14 (ro.all || ro.<key>) suffix.
+    assert.match(fn, /if \(_chartCarouselIdx === 0[\s\S]*?renderCostSavingsChart\(\)/);
+    assert.match(fn, /else if \(_chartCarouselIdx === 1[\s\S]*?renderDailyChart\(dataForCharts\)/);
+    assert.match(fn, /else if \(_chartCarouselIdx === 2[\s\S]*?renderWastedSpendChart\(\)/);
+    // The carousel handler caches dataForCharts so chartCarouselGo can
+    // re-render the newly-visible slide without re-fetching.
+    assert.match(fn, /_carouselLastData = dataForCharts/);
+    // chartCarouselGo must re-render the slide it rotated onto.
+    const goFn = _src_p.slice(
+      _src_p.indexOf('function chartCarouselGo'),
+      _src_p.indexOf('function chartCarouselGo') + 2500,
+    );
+    assert.match(goFn, /if \(idx === 0\) renderCostSavingsChart\(\)/);
+    assert.match(goFn, /else if \(idx === 1 && dat\) renderDailyChart\(dat\)/);
+    assert.match(goFn, /else if \(idx === 2\) renderWastedSpendChart\(\)/);
+  });
+
+  // UX-CPF4 — populateProjectFilterOptions failure surfaces a toast.
+  it('UX-CPF4: project-filter populate failure shows showToast on top of inline label', () => {
+    // The catch handler must call showToast with the error variant.
+    const tpFn = _src_p.slice(
+      _src_p.indexOf('function toggleProjectFilter()'),
+      _src_p.indexOf('function toggleProjectFilter()') + 2500,
+    );
+    assert.match(tpFn, /populateProjectFilterOptions\(\);/);
+    assert.match(tpFn, /showToast\([^)]*Project filter unavailable[^)]*\{ error: true \}\)/);
+  });
+
+  // UX-CPF5 — Cmd/Ctrl+A keyboard shortcut while panel open.
+  it('UX-CPF5: project-filter panel honours Cmd/Ctrl+A as select-all toggle', () => {
+    // The same Esc-handling keydown listener now also handles the
+    // (ctrlKey || metaKey) + A combination. Gated on panel-open so it
+    // does not steal the browser's native Cmd+A elsewhere.
+    assert.match(_src_p, /\(ev\.ctrlKey \|\| ev\.metaKey\) && \(ev\.key === 'a' \|\| ev\.key === 'A'\)/);
+    assert.match(_src_p, /projectFilterSelectAll\(!allChecked\)/);
+  });
+
+  // UX-WS3 — Y-axis labels for the wasted-spend chart.
+  it('UX-WS3: renderWastedSpendChart emits a .tok-wasted-y-axis label column', () => {
+    assert.match(_src_p, /\.tok-wasted-y-axis\s*\{/);
+    // Renderer wires a 3-row (max / mid / $0) y-axis labels block.
+    // Slice must be wide enough to span the full rewritten function.
+    const fn = _src_p.slice(
+      _src_p.indexOf('function renderWastedSpendChart'),
+      _src_p.indexOf('function renderWastedSpendChart') + 8000,
+    );
+    assert.match(fn, /var yMid = formatCost\(maxWasted \/ 2\)/);
+    assert.match(fn, /var yMax = formatCost\(maxWasted\)/);
+    assert.match(fn, /<div class="tok-wasted-y-axis"[^>]*>/);
+  });
+
+  // UX-WS4 — X-axis date labels (first-of-month + Mondays).
+  it('UX-WS4: renderWastedSpendChart emits per-day .tok-wasted-x-axis labels', () => {
+    assert.match(_src_p, /\.tok-wasted-x-axis\s*\{/);
+    const fn = _src_p.slice(
+      _src_p.indexOf('function renderWastedSpendChart'),
+      _src_p.indexOf('function renderWastedSpendChart') + 8000,
+    );
+    assert.match(fn, /var isMonday = dxObj\.getDay\(\) === 1/);
+    assert.match(fn, /var isFirst\s*=\s*dxObj\.getDate\(\) === 1/);
+    assert.match(fn, /xLabels \+= '<div class="tok-wasted-x-axis-label">'/);
+  });
+
+  // UX-CM4 — "What is a cache miss?" hint above the card.
+  it('UX-CM4: Likely Cache Misses card includes a "Learn more" hint with anchor', () => {
+    const cardBlock = _src_p.slice(
+      _src_p.indexOf('id="tok-misses-card"'),
+      _src_p.indexOf('id="tok-misses-card"') + 1500,
+    );
+    assert.match(cardBlock, /tree-misses-help/);
+    assert.match(cardBlock, /Cache misses cost full input price/);
+    // The Learn-more anchor must use rel="noopener noreferrer" for
+    // safety on target=_blank links.
+    assert.match(cardBlock, /href="https:\/\/docs\.anthropic\.com\/en\/docs\/build-with-claude\/prompt-caching"[^>]*rel="noopener noreferrer"/);
+  });
+
+  // UX-BR4 — chevron direction standardised to ▶ base + 90deg rotate.
+  it('UX-BR4: tok-repo-chevron CSS uses :not(.collapsed) rotate(90deg) and renderer emits ▶', () => {
+    assert.match(_src_p, /\.tok-repo-chevron:not\(\.collapsed\)\s*\{\s*transform:\s*rotate\(90deg\);/);
+    // The .collapsed { transform: rotate(-90deg) } rule must be gone.
+    assert.ok(!/\.tok-repo-chevron\.collapsed\s*\{\s*transform:\s*rotate\(-90deg\)/.test(_src_p),
+      'old .collapsed rule must be removed by UX-BR4');
+    // Renderer emits the right-pointing ▶ unicode escape.
+    assert.match(_src_p, /chevCls\s*\+\s*'">\\u25B6<\/span>/);
+  });
+
+  // UX-BR6 — clickable Model Breakdown rows with _filterByModel.
+  it('UX-BR6: renderModelBreakdown rows are role=button + onclick=_filterByModel', () => {
+    assert.match(_src_p, /tok-model-row-clickable/);
+    assert.match(_src_p, /onclick="_filterByModel\(this\.dataset\.model\)"/);
+    assert.match(_src_p, /function _filterByModel\(modelName\)/);
+    // The filter must toggle (clear if active, set otherwise).
+    const fbm = _src_p.slice(
+      _src_p.indexOf('function _filterByModel'),
+      _src_p.indexOf('function _filterByModel') + 1500,
+    );
+    assert.match(fbm, /sel\.value\s*=\s*\(sel\.value === modelName\)\s*\?\s*''\s*:\s*modelName/);
+    assert.match(fbm, /tokFilterChange\('model'\)/);
+  });
+
+  // UX-BR7 — stable account-to-colour hash mapping.
+  it('UX-BR7: renderAccountBreakdown uses getAccountColor (stable hash) instead of sort-index', () => {
+    assert.match(_src_p, /function getAccountColor\(acct\)/);
+    // Hash uses djb2 starting from 5381.
+    const acFn = _src_p.slice(
+      _src_p.indexOf('function getAccountColor'),
+      _src_p.indexOf('function getAccountColor') + 800,
+    );
+    assert.match(acFn, /var h = 5381 \| 0/);
+    assert.match(acFn, /TOK_COLORS\[Math\.abs\(h\) % TOK_COLORS\.length\]/);
+    // Renderer call sites use the helper, not TOK_COLORS[r % …].
+    const renderFn = _src_p.slice(
+      _src_p.indexOf('function renderAccountBreakdown'),
+      _src_p.indexOf('function renderAccountBreakdown') + 4000,
+    );
+    assert.match(renderFn, /getAccountColor\(sortedAccounts\[k\]\)/);
+    assert.match(renderFn, /getAccountColor\(sortedAccounts\[r\]\)/);
+  });
+
+  // UX-VS4 — vs-tier-chips DOM container exists in the markup.
+  it('UX-VS4: vs-tier-chips container exists in the scrubber markup', () => {
+    // The function vsRenderTierChips() has called getElementById on
+    // this id since Phase C, but the markup was missing — silent no-op.
+    assert.match(_src_p, /<div class="vs-tier-chips" id="vs-tier-chips"[^>]*role="group"[^>]*>/);
+    // The wrapping row is hidden until the first /api/profiles poll
+    // discovers a non-trivial tier set, so the dashboard does not show
+    // a degenerate "Tier: [All]" single-chip row at startup.
+    assert.match(_src_p, /<div class="vs-bar-row vs-tier-row" id="vs-tier-row" style="display:none"/);
+    // vsRenderTierChips reveals the row when known tiers exist.
+    const rt = _src_p.slice(
+      _src_p.indexOf('function vsRenderTierChips'),
+      _src_p.indexOf('function vsRenderTierChips') + 1500,
+    );
+    assert.match(rt, /var hasRealTiers = Array\.isArray\(_vsKnownTiers\) && _vsKnownTiers\.length > 0/);
+    assert.match(rt, /row\.style\.display = hasRealTiers \? '' : 'none'/);
+  });
+
+  // UX-VS5 — scrubber sticky positioning removed.
+  it('UX-VS5: .vs-bar no longer uses position: sticky', () => {
+    const vsBlock = _src_p.match(/\.vs-bar\s*\{[^}]*\}/);
+    assert.ok(vsBlock, '.vs-bar rule found');
+    assert.ok(!/position\s*:\s*sticky/.test(vsBlock[0]),
+      '.vs-bar must not be sticky after UX-VS5 (was floating alone above non-sticky tabs)');
+  });
+
+  // UX-S5 — depth-driven indentation for nested timeline actions.
+  it('UX-S5: tl-action emit honours an optional e.depth field with bounded indent', () => {
+    // Both renderer call sites (active sessions + recent sessions) must
+    // emit tl-action with style="padding-left:..." when depth > 0.
+    const tlActionMatches = _src_p.match(/tl-action[^']*'\s*\+\s*pad\s*\+\s*'rem"/g);
+    assert.ok(tlActionMatches && tlActionMatches.length >= 2,
+      'expected at least 2 tl-action depth-aware emits, found ' + (tlActionMatches ? tlActionMatches.length : 0));
+    // Depth is bounded so a hostile transcript cannot push items off-screen.
+    assert.match(_src_p, /Math\.min\(8, Math\.max\(0, parseInt\(e\.depth, 10\) \|\| 0\)\)/);
+  });
+
+  // UX-S7 — native confirm() dialog replaced with two-stage in-card flow.
+  it('UX-S7: doRemove no longer calls native confirm() and stages a click-again pattern', () => {
+    const drFn = _src_p.slice(
+      _src_p.indexOf('async function doRemove(name'),
+      _src_p.indexOf('async function doRemove(name') + 3500,
+    );
+    // No more blocking system dialog. Must check for an actual call site
+    // (preceded by `if (!` or `if (` or whitespace at the line start),
+    // NOT for the substring "confirm(" inside an explanatory comment
+    // (like "the native blocking confirm() dialog").
+    assert.ok(!/(if \(!?confirm\(|^\s*confirm\()/m.test(drFn),
+      'doRemove must not call native confirm() after UX-S7');
+    // Stages a 5s confirmation window via dataset.confirmPending.
+    assert.match(drFn, /btn\.dataset\.confirmPending = '1'/);
+    assert.match(drFn, /Click again to confirm/);
+    assert.match(drFn, /setTimeout\([\s\S]*5000\)/);
+    // The new CSS class for the staged state.
+    assert.match(_src_p, /\.remove-btn\.remove-btn-confirm\s*\{/);
+    // Call site passes (name, this, event) so the button element is
+    // available to stage the confirmation in-place.
+    assert.match(_src_p, /onclick="doRemove\(\\\\''\+eName\+'\\\\',this,event\)"/);
+  });
+
+  // UX-CO5 — slider for serialize-delay-ms.
+  it('UX-CO5: serialize delay uses a range slider + readout, not a 5-option select', () => {
+    // The control id is preserved (sel-serialize-delay) but the tag is
+    // now <input type="range">.
+    assert.match(_src_p, /<input type="range" min="0" max="2000" step="50"[^>]*id="sel-serialize-delay"/);
+    // Live readout helper updates the sibling span as the user drags.
+    assert.match(_src_p, /function _onSerializeDelaySlider\(value\)/);
+    assert.match(_src_p, /id="sel-serialize-delay-val"/);
+    // Settings load must sync the readout to the persisted value.
+    assert.match(_src_p, /_onSerializeDelaySlider\(delayVal\)/);
+    // CSS: slider wrap + readout class.
+    assert.match(_src_p, /\.config-slider-wrap\s*\{/);
+    assert.match(_src_p, /\.config-slider-readout\s*\{/);
+  });
+
+  // UX-CO6 — queue-stats always visible when serialize is on.
+  it('UX-CO6: queue-stats line stays visible when serialize is on, hidden when off', () => {
+    const qs = _src_p.slice(
+      _src_p.indexOf('// UX-CO6: when serialize is ON'),
+      _src_p.indexOf('// UX-CO6: when serialize is ON') + 1200,
+    );
+    assert.ok(qs.length > 0, 'UX-CO6 block found');
+    assert.match(qs, /var serializeToggle = document\.getElementById\('toggle-serialize'\)/);
+    assert.match(qs, /if \(serializeOn\) \{/);
+  });
+
+  // UX-L3 — log lines now include a HH:MM:SS timestamp.
+  it('UX-L3: connectLogStream prepends a timestamp span before the tag bracket', () => {
+    const cls = _src_p.slice(
+      _src_p.indexOf('_logES.onmessage'),
+      _src_p.indexOf('_logES.onmessage') + 2000,
+    );
+    assert.match(cls, /var _logTs = data\.ts \? new Date\(data\.ts\) : new Date\(\)/);
+    assert.match(cls, /var _logTsStr = _logTs\.toLocaleTimeString/);
+    // The timestamp is emitted via escHtml to honour the existing
+    // rendered-line discipline, even though it is internal data.
+    assert.match(cls, /color:var\(--muted\)[^"]*">'\s*\+\s*escHtml\(_logTsStr\)/);
+  });
+
+  // UX-X14 — granular invalidation via opts arg on applyTokenModelFilter.
+  it('UX-X14: applyTokenModelFilter accepts an opts arg with per-renderer keys', () => {
+    const fn = _src_p.slice(
+      _src_p.indexOf('function applyTokenModelFilter'),
+      _src_p.indexOf('function applyTokenModelFilter') + 8000,
+    );
+    // Backward-compat: opts || { all: true } default.
+    assert.match(fn, /var renderOpts = opts \|\| \{ all: true \}/);
+    // Each renderer is gated on (ro.all || ro.<key>) so a granular
+    // caller can skip what did not change.
+    assert.match(fn, /if \(ro\.all \|\| ro\.stats\) renderTokenStats/);
+    assert.match(fn, /if \(ro\.all \|\| ro\.models\)\s+renderModelBreakdown/);
+    assert.match(fn, /if \(ro\.all \|\| ro\.accounts\) renderAccountBreakdown/);
+    assert.match(fn, /if \(ro\.all \|\| ro\.repos\)\s+renderRepoBranchBreakdown/);
+    assert.match(fn, /if \(ro\.all \|\| ro\.tools\)\s+renderToolBreakdown/);
+  });
+
+  // UX-X15 — pulse-fill animation honours prefers-reduced-motion.
+  it('UX-X15: pulse-fill uses ease-in-out and disables under prefers-reduced-motion', () => {
+    assert.match(_src_p, /\.fill-full\s*\{\s*background:\s*var\(--red\);\s*animation:\s*pulse-fill\s+1\.5s\s+ease-in-out\s+infinite/);
+    assert.match(_src_p, /prefers-reduced-motion[^}]*\.fill-full\s*\{\s*animation:\s*none/);
+  });
+
+  // ── Codex P1 review fixes (applied on top of spark P) ──
+
+  // Codex P2 — vsRenderTierChips XSS hardening.
+  it('Codex P2 (UX-VS4): vsRenderTierChips routes both data-tier AND label through escHtml', () => {
+    // Slice MUST be wide enough to cover the inline-comment block plus
+    // the rewritten innerHTML emit. The Codex review fix added a 7-line
+    // explanatory comment so the relevant line sits ~2.5 KB into the
+    // function.
+    const fn = _src_p.slice(
+      _src_p.indexOf('function vsRenderTierChips'),
+      _src_p.indexOf('function vsRenderTierChips') + 3500,
+    );
+    // Both attribute and visible label MUST go through escHtml.
+    assert.match(fn, /data-tier="'\s*\+\s*escHtml\(t\)\s*\+\s*'"/);
+    assert.match(fn, />'\s*\+\s*escHtml\(label\)\s*\+\s*'</);
+    // The old quote-only escape is gone (the literal source pattern is
+    // a triple-escape: t\.replace inside the string, looking for
+    // t.replace(/"/g, '&quot;') in the actual file).
+    assert.ok(!/t\.replace\(\/"\/g,\s*'&quot;'\)/.test(fn),
+      'old quote-only escape should be removed');
+  });
+
+  // Codex P2 — day-divider hide/restore on activity filter.
+  it('Codex P2 (UX-AC4): _vdmApplyActivityFilter hides standalone day dividers', () => {
+    const fn = _src_p.slice(
+      _src_p.indexOf('function _vdmApplyActivityFilter'),
+      _src_p.indexOf('function _vdmApplyActivityFilter') + 3500,
+    );
+    // The post-filter day-divider walk must exist and toggle .evt-hidden.
+    assert.match(fn, /classList\.contains\('activity-day-divider'\)/);
+    assert.match(fn, /dividerEl\.classList\.toggle\('evt-hidden', !dividerHasVisible\)/);
+    // The invalid-regex branch MUST also un-hide any prior-hidden dividers.
+    assert.match(fn, /querySelectorAll\('\.activity-day-divider'\)/);
+    assert.match(fn, /allDividers\[dvi\]\.classList\.remove\('evt-hidden'\)/);
+  });
+
+  // Codex P3 — restore Remove button text BEFORE issuing the request.
+  it('Codex P3 (UX-S7): doRemove restores button text before /api/remove fetch', () => {
+    const drFn = _src_p.slice(
+      _src_p.indexOf('async function doRemove(name'),
+      _src_p.indexOf('async function doRemove(name') + 4000,
+    );
+    // The "Second click within window → proceed" branch must reset the
+    // textContent BEFORE the fetch — otherwise an /api/remove failure
+    // leaves the button stuck in "Click again to confirm" state.
+    const proceedBlock = drFn.slice(
+      drFn.indexOf('Second click within window'),
+      drFn.indexOf('async function doRemove(name') >= 0 ?
+        drFn.indexOf('try {\n    const resp = await fetch') : drFn.length,
+    );
+    assert.match(proceedBlock, /btn\.textContent = btn\.dataset\.prevText \|\| 'Remove'/);
+    // The reset MUST sit BEFORE the fetch (not in the catch). Index
+    // check: textContent= line index < try { line index.
+    const txtIdx   = drFn.indexOf("btn.textContent = btn.dataset.prevText || 'Remove'");
+    const tryIdx   = drFn.indexOf('try {\n    const resp = await fetch');
+    assert.ok(txtIdx > 0 && tryIdx > 0 && txtIdx < tryIdx,
+      'Remove button text restore must precede the /api/remove fetch (codex P3)');
   });
 });
