@@ -4,7 +4,7 @@
 **Filename:** `design/tasks/TRDD-2b0eed81-7035-4829-b88e-b3c800df5df0-ux-audit-followups.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** All 6 suggested batches + round-3 individual MAJORs (F, G, H, I, J, K) + round-4 MINOR/NIT cleanup pass (batch L, 11 codes) all complete. Round-2 audit (54 new findings, Opus) and code-quality audit (13 findings, 2 CRITICAL) shipped — see "Round-2 audit deliverables" below.
+**Status:** All 6 suggested batches + round-3 individual MAJORs (F, G, H, I, J, K) + round-4 MINOR/NIT cleanup pass (batch L, 11 codes) complete. **Round-2 audit fully closed: spark M (12 code-quality codes incl. 2 CRITICALs), spark N (19 UX2 CRITICAL+MAJOR codes), spark O (10 UX2 MINOR/NIT codes) all merged.** Test suite: 1002/0 (up from 689 baseline → +313 new source-grep regressions across the full backlog). See "Round-2 audit deliverables" + "Applied in spark batches M + N + O" below.
 **Created:** 2026-05-02
 **Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (round 1, 95 findings, Opus)
 **Round-2 UX audit:** `reports/audit/20260503_015904+0200-ui-usability-audit-round2-opus.md` (54 findings, Opus)
@@ -65,7 +65,78 @@ After all round-1 MAJORs + MINOR/NITs were closed, two fresh Opus auditors ran i
 - **17 MAJOR** — `vsFormatDuration` for the scrubber is a third format outside batch-B's unification (UX2-X8); `LOG_TAG_COLORS` maps `warn` to red (semantic inversion); `_repoBranchExpandAll` only iterates over already-known repos; cache-miss card still defaults to `.low` red badge for null hit-rate (note: batch L addressed this, audit ran on f645084 before L landed); activity icon vocabulary overloaded; etc.
 - **26 MINOR + 9 NIT**.
 
-These two audits give a fresh backlog. Highest-leverage actions are the 4 CRITICAL findings (2 from each audit) plus the major code-quality findings.
+These two audits gave a fresh backlog. All 4 CRITICAL findings (2 from each audit) plus all MAJORs and a 10-code MINOR/NIT pass were closed by sparks M + N + O — see next section.
+
+## Applied in **spark batches M + N + O** (round-2 + code-quality audit cleanup — 41 codes)
+
+Three Spark agents launched in parallel, each in an isolated worktree on a separate audit lane to avoid file collisions. Sequential merge with mechanical conflict resolution at the test-file describe-block boundary; one semantic conflict in `dashboard.mjs` (UX2-BR3 between sparks N and O — N's interactive uncap-button kept, O's CSS-class refactor kept, N's incomplete duplicate CSS rule + O's redundant inline style removed).
+
+### Spark M — Code-quality audit (12 codes — 2 CRITICAL + 3 MAJOR + 5 MINOR + 2 NIT)
+
+| Code | Severity | Area | Fix |
+|---|---|---|---|
+| CQ-001 | CRITICAL | Log rotation | `_rotateForensicLog` uses ESM `appendFileSync` / `statSync` import (was `require()` → undefined → swallowed throw → no rotation) |
+| CQ-002 | CRITICAL | Log rotation | `_rotateStartupLog` same fix — `startup.log` actually rotates daily + prunes past 7d now |
+| CQ-003 | MAJOR | `/api/logs/stream` | `MAX_LOG_SUBSCRIBERS = 16` hoisted to module scope; cap-check moved BEFORE `res.writeHead(200)` (no more `ERR_HTTP_HEADERS_SENT` + stuck stream) |
+| CQ-004 | MAJOR | Per-account permits | `acquireAccountPermit` `inflight++` in else-branch; `releaseAccountPermit` hands directly to next waiter — closes race that let inflight slip past `CSW_MAX_INFLIGHT_PER_ACCOUNT` |
+| CQ-005 | MAJOR | Settings cache | `/api/settings` POST clears `_runGitCached` when `commitTokenUsage` / `sessionMonitor` / `perToolAttribution` actually changed (was waiting up to 30s for cached "no git here") |
+| CQ-006 | MINOR | `loadProfiles` | `_dedupAlreadyRan` flag — destructive `deleteAccountKeychain` + `unlinkSync` only fire on first poll |
+| CQ-007 | MINOR | Plaintext recovery | New `/api/cleanup-plaintext` GET (status, no path leak) + POST (retry); migration warning points at it |
+| CQ-008 | MINOR | Auto-claim races | `_safeAutoClaim` + `_recentlyAutoClaimedSessions` Map (1000-entry FIFO, 60s TTL) wraps both prune paths |
+| CQ-009 | MINOR | Activity log writes | Debounced via `_activityLogDirty` + 1s setTimeout; `flushActivityLogSync()` wired into `shutdown()` |
+| CQ-010 | MINOR | `fetchAccountEmail` | `_connectDeadline` renamed to `_bodyDeadline` (matches what the timer actually does) |
+| CQ-011 | NIT | `/api/session-*` | Returns 400 (not 500) for malformed JSON via `e.name === 'SyntaxError'` check |
+| CQ-013 | NIT | `logForensicEvent` | Dead `if/else` removed — single direct `appendFileSync` call |
+| CQ-012 | NIT | macOS Keychain | INFORMATIONAL — Apple's `security` CLI doesn't accept stdin password; alternative is interactive prompts on every account write. No action. |
+
+19 source-grep regression tests pin every fix. Source: `reports/audit/20260503_015914+0200-code-quality-audit-opus.md` (commit `d5d72b6`, merged as `9243019`).
+
+### Spark N — UX round-2 CRITICAL + MAJOR (19 codes)
+
+| Code | Severity | Area | Fix |
+|---|---|---|---|
+| UX2-CSS1 | CRITICAL | Design tokens | `:root` declares `--surface`, `--text-muted`, `--text`, `--mono` aliases (~50 references previously fell through to `inherit/initial`) |
+| UX2-X1 | CRITICAL | Toast positioning | At ≤720px the toast moves to `bottom: 1.5rem` (≤480px → `bottom: 1rem`) so the gear/help icons stay clickable |
+| UX2-L1 | MAJOR | Logs colour map | `LOG_TAG_COLORS.warn` → yellow (was red == error); switch/proactive → cyan to free yellow |
+| UX2-L2 + UX2-AC1 | MAJOR | Filter empty state | `_vdmShowFilterEmptyState` / `_vdmHideFilterEmptyState` helpers render in-pane `.empty-state` when filter matches zero |
+| UX2-AC2 | MAJOR | Activity icons | `rate-limited` / `queue-depth-alert` use ⚠ (U+26A0) instead of ▲ (U+25B2) |
+| UX2-S1 | MAJOR | Conflicts banner | Routed through `var(--red-soft)` / `var(--red-border)` / `var(--red)` design tokens (was raw GitHub-red hex) |
+| UX2-S2 | MAJOR | Conflicts icon | Inline 12x12 `SESSION_WARNING_ICON_SVG` replaces ⚠ (renders identically across macOS / Linux / fallback fonts) |
+| UX2-S3 | MAJOR | session-meta layout | `flex-wrap: wrap` + `padding-right: 2rem` so absolute `.session-copy-btn` doesn't overlay meta on hover |
+| UX2-BR1 | MAJOR | Bulk-collapse stickiness | `_tokRepoUserPrefersAllCollapsed` override survives across freshly-discovered repos in the next 5s poll |
+| UX2-BR2 + UX2-BR3 | MAJOR | "N more branches" footer | Promoted from non-clickable italic div to `<button class="tok-branch-uncap-toggle">` with `_toggleRepoBranchUncap`; CSS class replaces inline style triplet |
+| UX2-CO1 | MAJOR | Em-dashes | `STRATEGY_DETAILS.{sticky,conserve,spread}.desc` + proxyEnabled toggle use proper U+2014 (—), not double-space-hyphen |
+| UX2-CO2 | MAJOR | Config TOC | `position: sticky` removed (TOC pinned alone with no relationship to page header) |
+| UX2-CO3 | MAJOR | Strategy XSS | Strategy-list innerHTML routes `s.name` / `s.desc` through `escHtml()` (defense-in-depth for future i18n loads) |
+| UX2-A1 | MAJOR | acct-pref toggle palette | `.acct-pref-toggle.is-on` retoned from yellow (conflicted with .beta-badge) to `.badge-excluded` palette (muted/bg/border) |
+| UX2-VS1 | MAJOR | Scrubber labels | Detect overlap (<8% apart on track) and merge into combined `<start> – <end>` label on start thumb |
+| UX2-CA1 | MAJOR | Carousel layout shift | `.chart-carousel-inner` gets `min-height: 220px` (worst-case slide footprint) — no more 10s height jiggle |
+| UX2-X2 | MAJOR | Tab badge | `color: var(--foreground)` instead of hardcoded `#000` (tokenised for future dark-mode) |
+| UX2-X8 | MAJOR | Scrubber duration | `vsFormatDuration` delegates to `fmtDurationShort` for sub-14d ranges so scrubber matches activity feed |
+
+32 source-grep regression tests pin all 19 codes. Source: `reports/audit/20260503_015904+0200-ui-usability-audit-round2-opus.md` (commit `3488d13`, merged as `757e3f5`).
+
+### Spark O — UX round-2 MINOR/NIT cleanup (10 codes)
+
+| Code | Severity | Area | Fix |
+|---|---|---|---|
+| UX2-L6 | NIT | filter-bar palette | `.vdm-filter-bar input.invalid` + `.vdm-filter-count.error` use `var(--red)` (was `#f85149`) |
+| UX2-S6 | NIT | Sessions OFF empty state | Clickable `switchTab('config')` link instead of flowing prose |
+| UX2-S4 | MINOR | Session-overhead tooltip | `fmtTokenCountExact(oh) + ' tokens'` + scope hint (preserves UX-X9 invariant; drops duplicate `(Haiku)`) |
+| UX2-CO5 | NIT | Config TOC scroll | `html { scroll-behavior: smooth }` + `prefers-reduced-motion` opt-out guard |
+| UX2-X5 | MINOR | tok-chart-label font | 0.5625rem (~9px) → 0.6875rem (~11px) to clear WCAG 1.4.4 floor |
+| UX2-BR4 | MINOR | tok-repo-header hover | `background: var(--bg)` tint replaces `opacity: 0.8` (which was cancelling UX-S2's chevron colour-bump) |
+| UX2-CA3 | MINOR | Carousel pause selector | `.chart-bar:hover` removed from `_carouselPaused` (selector lives in legacy stats chart, not in carousel) |
+| UX2-A3 | MINOR | card-actions row-gap | `row-gap: 0.5rem` so wrapped action layouts get vertical breathing room |
+| UX2-BR3 | MINOR | hidden-branches CSS class | Inline-style triplet promoted to `.tok-branch-hidden-summary` class |
+| UX2-CPF2 | MINOR | cpf-toggle no-data marker | `data-no-data="true"` + dotted-yellow border when single-select repo has no data in window |
+
+13 source-grep regression tests pin all 10 codes. Same audit source. Commit `a454c40`, merged as `89fd276`.
+
+### Lessons learned (Spark M/N/O parallel dispatch)
+- The path-discipline guard from earlier rounds worked partially — Spark M still landed initial edits in MAIN due to absolute paths in the prompt. Recovered via `git checkout HEAD -- dashboard.mjs test/lib.test.mjs` then re-applied to the worktree using relative paths. Future spark dispatch prompts: pass relative paths only OR explicitly state `cwd` is the worktree root.
+- Semantic conflicts between sibling agents (UX2-BR3) are recoverable when each agent independently arrives at a good outcome — keep the better implementation, discard the duplicate CSS/inline-style anti-patterns. Confidence comes from the source-grep regression tests both agents wrote — when both new tests pass after the merge resolution, the conflict is correctly resolved.
+- Round-2 audit ran on f645084 (before batch L landed), so a few audit codes were already addressed (e.g. UX2-CM1 ≈ UX-CM5). Spark O recognised these and skipped them with a "What was deliberately skipped" section in its report.
 
 ## Applied in **batches F + G + H + I + J + K** (round-3 parallel-Opus dispatch — 19 findings)
 
@@ -224,21 +295,25 @@ See the original report for the full list. Prioritisation rule: pick up MAJORs f
 
 ## What's left
 
-All MAJOR findings have been addressed across the original 6 suggested batches PLUS the round-3 individual-MAJOR batches (F, G, H, I, J, K). Only the ~30 deferred MINOR/NIT items from the original audit remain — pick them up opportunistically when refactoring the surrounding area, per the prioritisation rule below.
+**Both audits fully closed.** Round-1 audit (95 findings, batches A–L) and round-2 audit (54 UX findings + 13 code-quality findings, sparks M–O) are addressed. Remaining items are explicitly deferred:
+
+- **Round-2 UX MINORs deliberately skipped by spark O** (8 items): UX2-AC4 (already addressed; audit was outdated), UX2-S5 (addressed by batch L UX-S6), UX2-X7 (batch L UX-X13), UX2-WS1 (batch L UX-WS5), UX2-AC3 (collision risk with sibling agent's UX2-AC1), UX2-X4 (cross-cutting; overlapped UX2-X8), UX2-X6 (~30 sites of inline-style cleanup; pull as surrounding code is refactored), UX2-X10 (speculative — "worth verifying if the animation actually flashes").
+- **Round-1 deferred MINOR + NIT (~30)** still listed in `Deferred MINOR + NIT findings` — pick up opportunistically.
+- **CQ-012** (informational only — macOS Keychain argv exposure unavoidable per Apple's API).
 
 ## What to do next session
 
-The TRDD's full MAJOR backlog is closed. Options:
-- Pick up MINOR/NIT items as they cross your path during other work.
-- Run a fresh UX audit to surface findings the round-1 audit missed.
-- Move on to non-UX work — the dashboard's UX is now in a known-good state with comprehensive source-grep regression coverage.
+The TRDD's full MAJOR backlog is closed across both audit rounds. Options:
+- Pick up the ~30 round-1 MINOR/NIT items + the 8 round-2 MINORs above when refactoring touches their area.
+- Run a fresh UX audit to surface findings the first two audits missed.
+- Move on to non-UX work — the dashboard's UX is now in a known-good state with 1002 source-grep regressions guarding the invariants documented in CLAUDE.md.
 
 ## Acceptance criteria (per batch)
 
-- [ ] All listed findings in the chosen batch have file:line evidence in the commit message.
-- [ ] No regression in the existing 689-test suite.
-- [ ] Smoke test: dashboard loads, every tab renders, the Phase 6 endpoint returns the documented shape.
-- [ ] CLAUDE.md updated under "Round-2 audit defenses" with any new invariants worth recording.
+- [x] All listed findings in the chosen batch have file:line evidence in the commit message.
+- [x] No regression in the existing test suite (689 baseline → 1002 final, +313 new tests, 0 fail).
+- [x] Smoke test: dashboard loads, every tab renders, the Phase 6 endpoint returns the documented shape.
+- [x] CLAUDE.md updated under "UX batch invariants" + "Code-quality batch M invariants" sections with all new invariants worth recording (M, N, O — see CLAUDE.md lines ~237 onward).
 
 ## Out of scope
 
