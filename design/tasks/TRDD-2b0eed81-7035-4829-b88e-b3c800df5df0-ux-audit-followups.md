@@ -4,9 +4,11 @@
 **Filename:** `design/tasks/TRDD-2b0eed81-7035-4829-b88e-b3c800df5df0-ux-audit-followups.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
 
-**Status:** All 6 suggested batches PLUS round-3 individual MAJORs (batches F, G, H, I, J, K) complete. Only deferred MINOR/NIT items remain.
+**Status:** All 6 suggested batches + round-3 individual MAJORs (F, G, H, I, J, K) + round-4 MINOR/NIT cleanup pass (batch L, 11 codes) all complete. Round-2 audit (54 new findings, Opus) and code-quality audit (13 findings, 2 CRITICAL) shipped — see "Round-2 audit deliverables" below.
 **Created:** 2026-05-02
-**Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (95 findings, Opus)
+**Source audit:** `reports/audit/20260502_154014+0200-ui-usability-audit-opus.md` (round 1, 95 findings, Opus)
+**Round-2 UX audit:** `reports/audit/20260503_015904+0200-ui-usability-audit-round2-opus.md` (54 findings, Opus)
+**Code-quality audit:** `reports/audit/20260503_015914+0200-code-quality-audit-opus.md` (13 findings, 2 CRITICAL, Opus)
 **Owner:** unassigned
 **Estimated effort:** 1.5–2 weeks across the listed batches
 
@@ -27,6 +29,43 @@ Round 3 of the dashboard.mjs audit was a UX usability audit. Opus flagged 95 fin
 - `.remove-btn` tinted with `var(--red)` border+text at rest so the destructive action is visually distinct (audit-adjacent — was hex `#dc2626` only on hover).
 
 The other 80 findings are catalogued below for follow-up. None are merge-blockers; many are quality-of-life or polish.
+
+## Applied in **batch L** (round-1 audit MINOR/NIT cleanup — 11 codes)
+
+One Opus agent in an isolated worktree picked up the high-leverage MINOR/NIT items deferred by all prior batches. Path-discipline guard worked: agent committed cleanly to its branch with no MAIN leak.
+
+| Code | Severity | Area | Fix |
+|---|---|---|---|
+| UX-H3 | MINOR | Header | "0 accounts connected" → ellipsis placeholder + sentinel text |
+| UX-AC6 | NIT | Activity tab | escHtml() the evtTime() output for defense-in-depth |
+| UX-CM5 | MINOR | Cache-miss card | null hit-rate gets neutral .unknown class (was red .low) |
+| UX-S6 | MINOR | Sessions tab | sessionTimeAgo "0s ago" → "just now" for sub-5s gaps |
+| UX-X11 | MINOR | Cross-cutting | webkit-scrollbar 6px → 10px with higher-contrast lane |
+| UX-X12 | MINOR | Cross-cutting | global form-control font/colour inheritance |
+| UX-X13 | MINOR | Cross-cutting | `<noscript>` banner hex → design tokens |
+| UX-CO7 | NIT | Config tab | Per-Tool Attribution drops "PostToolBatch hook" jargon |
+| UX-WS5 | MINOR | Wasted-spend | tooltip white-space: normal + max-width: 18rem |
+| UX-F1 | NIT | Footer | hardcoded `#9ca3af` → var(--muted) |
+| UX-L4 | MINOR | Logs tab | log-status reconnect attempt counter + yellow tint |
+
+937 tests pass (up from 918 baseline = +19 source-grep regressions).
+
+## Round-2 audit deliverables (2026-05-03)
+
+After all round-1 MAJORs + MINOR/NITs were closed, two fresh Opus auditors ran in parallel:
+
+### Code-quality audit — `reports/audit/20260503_015914+0200-code-quality-audit-opus.md`
+- **2 CRITICAL** — `require()` is undefined in ESM, so `_rotateForensicLog` and `_rotateStartupLog` ALWAYS throw silently. `events.jsonl` and `startup.log` grow forever instead of rotating daily / pruning to 7 days. Documented invariant from CLAUDE.md is FALSE in production. Tests don't catch it because they don't exercise the rotation timer paths.
+- **3 MAJOR** — `/api/logs/stream` writes 200 headers BEFORE the cap check (then can't 503); per-account permit's release/acquire race lets inflight slip past `CSW_MAX_INFLIGHT_PER_ACCOUNT`; `_runGit` cache TTL not invalidated on settings change.
+- **5 MINOR + 3 NIT**.
+- **No CLAUDE.md invariant violations** — the prior batches' source-grep regression tests are doing their job.
+
+### UX audit round 2 — `reports/audit/20260503_015904+0200-ui-usability-audit-round2-opus.md`
+- **2 CRITICAL** — undefined CSS variables (`--surface`, `--text-muted`, `--mono`, `--text`, `--muted-foreground`) referenced ~50 times but never declared in `:root`; toast collides with batch-F header gear/help icons at ≤720px viewport.
+- **17 MAJOR** — `vsFormatDuration` for the scrubber is a third format outside batch-B's unification (UX2-X8); `LOG_TAG_COLORS` maps `warn` to red (semantic inversion); `_repoBranchExpandAll` only iterates over already-known repos; cache-miss card still defaults to `.low` red badge for null hit-rate (note: batch L addressed this, audit ran on f645084 before L landed); activity icon vocabulary overloaded; etc.
+- **26 MINOR + 9 NIT**.
+
+These two audits give a fresh backlog. Highest-leverage actions are the 4 CRITICAL findings (2 from each audit) plus the major code-quality findings.
 
 ## Applied in **batches F + G + H + I + J + K** (round-3 parallel-Opus dispatch — 19 findings)
 

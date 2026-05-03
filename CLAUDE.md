@@ -227,6 +227,13 @@ A 4-level hierarchical breakdown of the Tokens tab plus a heuristic for cache-mi
 - UX-X10 is a SURGICAL change — only the ambiguous active/inactive pairings using `var(--muted)` for both states are rewritten. The lower bound of `var(--muted)` uses (`>= 60` occurrences) is asserted by source-grep regression so a future "let me clean up muted" refactor can't break the design tokens en masse without updating the K-batch invariants.
 - Don't break the Logs tab filter UI from batch E (`.vdm-filter-bar`, `.evt-hidden`, `.log-line-hidden`) — the filter bar's CSS depends on the `var(--card)` / `var(--foreground)` rebinding from batch K.
 
+**UX batch L invariants** (round-1 audit MINOR/NIT cleanup — UX-H3 / UX-AC6 / UX-CM5 / UX-S6 / UX-X11 / UX-X12 / UX-X13 / UX-CO7 / UX-WS5 / UX-F1 / UX-L4):
+- `renderCacheMisses` MUST classify a `null`/missing hit-rate as the neutral `.unknown` CSS class, NEVER as the red `.low` class. The default-open first session is the first thing the user sees on the Tokens tab; rendering "n/a" with low-severity-red was a visual lie (UX-CM5).
+- The webkit/firefox scrollbar styling MUST use ≥10px width with a higher-contrast lane; 6px hairline scrollbars made the session-timeline overflow indicator from batch J effectively invisible (UX-X11).
+- `<noscript>` and footer hex colours MUST go through design tokens (`var(--muted)` / `var(--surface)` etc.) so the K-batch dark-mode-readiness work isn't undermined (UX-X13 / UX-F1).
+- `evtTime()` output MUST be wrapped in `escHtml()` even though it's currently a controlled timestamp string — defense-in-depth so a future refactor can't accidentally introduce a sink (UX-AC6).
+- `log-status` reconnect indicator gets a yellow tint + numeric reconnect-attempt counter (`(retry N)`) so persistent SSE failures are visually distinguishable from "connecting" (UX-L4).
+
 ### OAuth refresh
 
 `OAUTH_TOKEN_URL` defaults to `https://console.anthropic.com/v1/oauth/token` (Anthropic retired the older `platform.claude.com` host during the platform→console migration; the old URL silently 404s and refreshes against it never recover), `OAUTH_CLIENT_ID` defaults to a hardcoded UUID. Both are overridable via env var — that's the only way the integration tests in `test/api.test.mjs` work (they spin up a `createMockOAuthServer` on a random port and point `OAUTH_TOKEN_URL` at it). The refresh is a JSON POST (not form-encoded — that was a bug fix, see commit 815bd66). `REFRESH_BUFFER_MS = 1 hour` controls proactive refresh; `REFRESH_MAX_RETRIES = 3` controls retry loops. `createPerAccountLock()` from `lib.mjs` serialises refreshes per account so two concurrent requests can't double-spend a refresh token.
