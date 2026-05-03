@@ -10170,19 +10170,25 @@ describe("UX batch K — UX-L1 / UX-X10 logs theme + muted-active regressions", 
 
   it("UX-L1 — log-status connect/error colours use design tokens", () => {
     // The log-status text was hardcoded to '#3fb950' on connect and
-    // '#f85149' on error. Replace with var(--green) and var(--red) so
-    // both tones move with the rest of the palette.
+    // '#f85149' on error. Replace with design tokens so both tones move
+    // with the rest of the palette.
+    //
+    // UX-L4 follow-up: the onerror handler was upgraded from a one-liner
+    // returning red to a multi-line block that yellow-tints the status
+    // and increments _logReconnectCount. Either var(--red) (legacy) or
+    // var(--yellow) (UX-L4) is an acceptable design-token output —
+    // what we forbid is the raw GitHub hex regressing back in.
     const onopenSlice = _src_K.match(
-      /_logES\.onopen\s*=\s*\(\)\s*=>\s*\{[^}]+\};/,
+      /_logES\.onopen\s*=\s*\(\)\s*=>\s*\{[\s\S]+?\};/,
     );
     assert.ok(onopenSlice, "expected _logES.onopen handler");
     assert.match(onopenSlice[0], /var\(--green\)/);
     assert.doesNotMatch(onopenSlice[0], /#3fb950/i);
     const onerrorSlice = _src_K.match(
-      /_logES\.onerror\s*=\s*\(\)\s*=>\s*\{[^}]+\};/,
+      /_logES\.onerror\s*=\s*\(\)\s*=>\s*\{[\s\S]+?\};/,
     );
     assert.ok(onerrorSlice, "expected _logES.onerror handler");
-    assert.match(onerrorSlice[0], /var\(--red\)/);
+    assert.match(onerrorSlice[0], /var\(--(red|yellow)\)/);
     assert.doesNotMatch(onerrorSlice[0], /#f85149/i);
   });
 
@@ -10920,5 +10926,240 @@ describe('UX batch H — UX-CM1 / UX-CM3 / UX-BR1 / UX-BR2 source-grep regressio
   it('UX-BR2 — collapse default is per-repo and depends on branch count, not active count', () => {
     // The new rule: collapse a repo by default when its branch count > 3.
     assert.match(_src_uxh, /_REPO_COLLAPSE_BRANCH_THRESHOLD\s*=\s*3/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// UX batch L — round-1 audit MINOR/NIT cleanup pass
+//
+// Each helper finding from the original audit (UX-H3, UX-AC6, UX-CM5,
+// UX-S6, UX-X11, UX-X12, UX-X13, UX-CO7, UX-WS5, UX-F1, UX-L4) gets a
+// source-grep guard so a future renderer refactor cannot silently
+// regress these polish items. Modelled on the existing "A11y batch 2"
+// describe blocks above — read dashboard.mjs once into _src_uxL,
+// then assert each invariant against the source string.
+// ─────────────────────────────────────────────────────────────────────
+describe('UX batch L — MINOR/NIT cleanup source-grep regressions', () => {
+  const _src_uxL = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX-H3 — header "0 accounts connected" → loading placeholder ──
+  it('UX-H3 — initial header span uses an ellipsis placeholder, not "0"', () => {
+    // The bare numeric "0" was indistinguishable from the truthful "no
+    // accounts" state. The HTML entity &hellip; (an ellipsis) plus the
+    // data-loading sentinel attribute make the loading state explicit
+    // and keep the layout from shifting after the first refresh.
+    assert.match(
+      _src_uxL,
+      /<span id="account-count" data-loading="true">&hellip;<\/span>/,
+    );
+  });
+
+  it('UX-H3 — refresh handler clears data-loading after the first update', () => {
+    // Without removeAttribute the placeholder would never round-trip
+    // back to "loading" — which is correct, the page only loads once —
+    // but leaving the data-loading attribute around would mislead
+    // future code that branches on it. Drop it as soon as the count
+    // is truthful.
+    const refreshSlice = _src_uxL.slice(
+      _src_uxL.indexOf("getElementById('account-count')") - 200,
+      _src_uxL.indexOf("getElementById('account-count')") + 400,
+    );
+    assert.match(refreshSlice, /removeAttribute\(['"]data-loading['"]\)/);
+  });
+
+  // ── UX-AC6 — escHtml the evtTime output ──
+  it('UX-AC6 — evtTime() output is wrapped in escHtml() before HTML interpolation', () => {
+    // Defense-in-depth. The current call site passes a number through
+    // evtTime, but escHtml is the discipline applied to every other
+    // dynamic field rendered into the activity feed.
+    assert.match(
+      _src_uxL,
+      /<span class="evt-time">'\s*\+\s*escHtml\(evtTime\(e\.ts\)\)\s*\+\s*'<\/span>/,
+    );
+  });
+
+  // ── UX-CM5 — n/a hit-rate badge gets a neutral palette ──
+  it('UX-CM5 — null hit-rate routes through a dedicated "unknown" CSS class', () => {
+    // The previous code coloured "n/a" red via the .low class. The
+    // new ternary maps null → unknown so the badge renders neutral.
+    const fnSlice = _src_uxL.slice(
+      _src_uxL.indexOf('var hitRateText'),
+      _src_uxL.indexOf('var hitRateText') + 800,
+    );
+    assert.match(fnSlice, /sess\.hitRate\s*==\s*null\s*\?\s*['"]unknown['"]/);
+  });
+
+  it('UX-CM5 — .miss-rate-badge.unknown CSS rule exists with neutral palette', () => {
+    assert.match(
+      _src_uxL,
+      /\.tree-misses-card \.miss-rate-badge\.unknown\s*\{[^}]*color:\s*var\(--muted\)/,
+    );
+  });
+
+  // ── UX-S6 — sessionTimeAgo "0s ago" → "just now" ──
+  it('UX-S6 — sessionTimeAgo returns "just now" for sub-5s gaps', () => {
+    const fnSlice = _src_uxL.slice(
+      _src_uxL.indexOf('function sessionTimeAgo'),
+      _src_uxL.indexOf('function sessionTimeAgo') + 600,
+    );
+    assert.match(fnSlice, /if\s*\(\s*d\s*<\s*5000\s*\)\s*return\s+['"]just now['"]/);
+  });
+
+  it('UX-S6 — sessionTimeAgo clamps negative timestamps to zero', () => {
+    // Defensive: a clock-skew event where ts is in the future would
+    // produce a negative delta, which the floor-to-seconds form would
+    // render as a misleading "-3s ago". Clamp to zero so the next
+    // branch ("just now") wins instead.
+    const fnSlice = _src_uxL.slice(
+      _src_uxL.indexOf('function sessionTimeAgo'),
+      _src_uxL.indexOf('function sessionTimeAgo') + 600,
+    );
+    assert.match(fnSlice, /if\s*\(\s*d\s*<\s*0\s*\)\s*d\s*=\s*0/);
+  });
+
+  // ── UX-X11 — scrollbar width 6px → 10px ──
+  it('UX-X11 — ::-webkit-scrollbar width is 10px (was 6px)', () => {
+    assert.match(
+      _src_uxL,
+      /::-webkit-scrollbar\s*\{\s*width:\s*10px;\s*height:\s*10px;\s*\}/,
+    );
+  });
+
+  it('UX-X11 — scrollbar thumb has higher-contrast 0.4 alpha (was 0.25)', () => {
+    // The 6px / 25% combo was effectively invisible. Bumping the alpha
+    // floor to 0.4 keeps the lane visible without being intrusive.
+    const thumbSlice = _src_uxL.match(
+      /::-webkit-scrollbar-thumb\s*\{[^}]+\}/,
+    );
+    assert.ok(thumbSlice, 'expected scrollbar-thumb rule');
+    assert.match(thumbSlice[0], /hsl\(220 9% 46% \/ 0\.4\)/);
+  });
+
+  it('UX-X11 — scrollbar thumb uses background-clip: padding-box for the lane illusion', () => {
+    // The 2px solid var(--bg) "border" combined with background-clip
+    // padding-box clips the background INSIDE the border, leaving a
+    // visible gutter so the thumb appears centred in a lane rather
+    // than touching the content.
+    const thumbSlice = _src_uxL.match(
+      /::-webkit-scrollbar-thumb\s*\{[^}]+\}/,
+    );
+    assert.ok(thumbSlice);
+    assert.match(thumbSlice[0], /background-clip:\s*padding-box/);
+  });
+
+  // ── UX-X12 — global form-control font/colour inheritance ──
+  it('UX-X12 — global rule makes input/select/button/textarea inherit font + colour', () => {
+    // Defends against new authors forgetting "font-family: inherit"
+    // on a fresh control — the global rule covers them by default.
+    assert.match(
+      _src_uxL,
+      /input,\s*select,\s*button,\s*textarea\s*\{[^}]*font-family:\s*inherit;[^}]*font-size:\s*inherit;[^}]*color:\s*inherit;[^}]*\}/,
+    );
+  });
+
+  // ── UX-X13 — <noscript> banner uses design tokens, not raw hex ──
+  it('UX-X13 — <noscript> banner uses var(--yellow-soft) / var(--yellow-border)', () => {
+    // The hardcoded yellow hexes (#fef3c7 / #f59e0b / #78350f) bypassed
+    // the design token cascade. Switch to tokens so a future theme
+    // rebinding sweeps this banner along with everything else.
+    // Strip HTML comments before checking — the explanatory comment
+    // mentions the dropped hex codes as the regression we are
+    // guarding against, but the markup itself must not contain them.
+    const noscriptSlice = _src_uxL.match(/<noscript>[\s\S]+?<\/noscript>/);
+    assert.ok(noscriptSlice, 'expected noscript block');
+    assert.match(noscriptSlice[0], /var\(--yellow-soft\)/);
+    assert.match(noscriptSlice[0], /var\(--yellow-border\)/);
+    const stripped = noscriptSlice[0].replace(/<!--[\s\S]*?-->/g, '');
+    assert.doesNotMatch(stripped, /#fef3c7/i);
+    assert.doesNotMatch(stripped, /#f59e0b/i);
+    assert.doesNotMatch(stripped, /#78350f/i);
+  });
+
+  // ── UX-CO7 — Per-Tool Attribution description simplified ──
+  it('UX-CO7 — Per-Tool Attribution description drops the "PostToolBatch hook" jargon', () => {
+    // Users do not care about implementation hooks. The simplified
+    // copy keeps only the actionable bits: what it does + the
+    // material disk-size warning. Strip HTML comments before checking
+    // because the explanatory comment intentionally mentions the
+    // dropped phrase as the regression we are guarding against.
+    const sectionSlice = _src_uxL.slice(
+      _src_uxL.indexOf('Per-Tool Attribution'),
+      _src_uxL.indexOf('Per-Tool Attribution') + 1200,
+    );
+    const stripped = sectionSlice.replace(/<!--[\s\S]*?-->/g, '');
+    assert.doesNotMatch(stripped, /via the PostToolBatch hook/);
+    assert.match(stripped, /Track token usage by individual tool/);
+  });
+
+  it('UX-CO7 — disk-size warning is promoted into a <strong> tag', () => {
+    // Was a comma-separated tail in the same prose colour. Promote
+    // to <strong> so the eye lands on it before the toggle.
+    const sectionSlice = _src_uxL.slice(
+      _src_uxL.indexOf('Per-Tool Attribution'),
+      _src_uxL.indexOf('Per-Tool Attribution') + 1200,
+    );
+    assert.match(sectionSlice, /<strong>Increases the size/);
+  });
+
+  // ── UX-WS5 — wasted-spend tooltip wraps with max-width ──
+  it('UX-WS5 — .tok-wasted-bar tooltip uses white-space: normal + max-width: 18rem', () => {
+    // The pre-fix CSS used white-space: nowrap, which made the long
+    // multi-field tooltip spill off-screen on the rightmost bars.
+    const ruleSlice = _src_uxL.match(
+      /\.tok-wasted-bar:hover::after\s*\{[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected .tok-wasted-bar:hover::after rule');
+    assert.match(ruleSlice[0], /white-space:\s*normal/);
+    assert.match(ruleSlice[0], /max-width:\s*18rem/);
+    // Strip CSS comments before asserting nowrap is gone — the
+    // explanatory comment references "white-space: nowrap" as the
+    // pre-fix state we're guarding against, but that mention must
+    // not be confused with a literal regression.
+    const stripped = ruleSlice[0].replace(/\/\*[\s\S]*?\*\//g, '');
+    assert.doesNotMatch(stripped, /white-space:\s*nowrap/);
+  });
+
+  // ── UX-F1 — footer hex → var(--muted) ──
+  it('UX-F1 — footer drops hardcoded #9ca3af in favour of var(--muted)', () => {
+    // The casual "Vibe coded" line stays — it is the project signature
+    // — but the colour MUST move with the design tokens so the footer
+    // tones with the rest of the dashboard under any future theme.
+    const footerSlice = _src_uxL.match(/<footer[^>]*>[\s\S]+?<\/footer>/);
+    assert.ok(footerSlice, 'expected footer block');
+    assert.doesNotMatch(footerSlice[0], /#9ca3af/i);
+    // Both the footer container and the github link MUST use var(--muted).
+    const mutedHits = (footerSlice[0].match(/color:\s*var\(--muted\)/g) || []).length;
+    assert.ok(mutedHits >= 2, `expected at least 2 var(--muted) refs in footer, got ${mutedHits}`);
+  });
+
+  // ── UX-L4 — log reconnect attempt counter ──
+  it('UX-L4 — _logReconnectCount let-binding is declared at module scope', () => {
+    assert.match(_src_uxL, /^let _logReconnectCount = 0;/m);
+  });
+
+  it('UX-L4 — onerror handler increments _logReconnectCount and surfaces "attempt N"', () => {
+    // The pre-L4 onerror was a one-liner (textContent = 'Reconnecting...').
+    // The new shape is a multi-line block that increments the counter
+    // and renders "Reconnecting (attempt N)..." so users can tell
+    // ongoing browser retries from a stuck connection.
+    const onerrSlice = _src_uxL.match(
+      /_logES\.onerror\s*=\s*\(\)\s*=>\s*\{[\s\S]+?\};/,
+    );
+    assert.ok(onerrSlice, 'expected _logES.onerror handler');
+    assert.match(onerrSlice[0], /_logReconnectCount\s*=\s*\(_logReconnectCount\s*\|\s*0\)\s*\+\s*1/);
+    assert.match(onerrSlice[0], /Reconnecting \(attempt '/);
+  });
+
+  it('UX-L4 — onopen handler resets _logReconnectCount to 0 on successful (re)connect', () => {
+    // Without the reset, a brief network blip would leave the counter
+    // stuck at "attempt 47" forever after recovery.
+    const onopenSlice = _src_uxL.match(
+      /_logES\.onopen\s*=\s*\(\)\s*=>\s*\{[\s\S]+?\};/,
+    );
+    assert.ok(onopenSlice, 'expected _logES.onopen handler');
+    assert.match(onopenSlice[0], /_logReconnectCount\s*=\s*0/);
   });
 });
