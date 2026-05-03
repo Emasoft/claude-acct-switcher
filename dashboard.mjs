@@ -6277,7 +6277,7 @@ function renderHTML() {
      fallback inputs on viewports >600px. The base rule keeps display:
      none (the slider is the primary control there), .is-open promotes
      to display: flex, and the <600px media query below keeps its own
-     auto-show for small screens. The button toggles `.is-open` so the
+     auto-show for small screens. The button toggles the .is-open class so the
      state is observable both visually and programmatically (a future
      test or a11y attribute can grep for the class instead of inspecting
      computed style). */

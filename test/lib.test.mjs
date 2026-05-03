@@ -8678,13 +8678,29 @@ describe('Phase 6 — full-suite + dependency invariants', () => {
     }
   });
 
-  it('no backticks lurk in JS comments inside renderHTML template literal', () => {
+  it('no stray backticks lurk inside the renderHTML template literal (any comment style)', () => {
     // CLAUDE.md flags this as the load-bearing trap that breaks the
-    // single-template-literal returned by renderHTML(). Resolve the
-    // template range from the source dynamically — the explicit numeric
-    // window in earlier revisions silently shrank as renderHTML grew,
-    // letting traps slip through past the old upper bound. We anchor
-    // on the function header and the closing "</html>`;" sentinel.
+    // single-template-literal returned by renderHTML(). The earlier
+    // version of this test only caught `// JS comments` containing a
+    // backtick — but on 2026-05-03 a `` `.is-open` `` slipped through
+    // inside a CSS /* ... */ comment, prematurely closed the template
+    // literal, and broke the whole dashboard with
+    //     ReferenceError: open is not defined
+    // The error symptom in a browser is "loads forever, black screen"
+    // because /health works (doesn't call renderHTML) but / hangs.
+    //
+    // The CORRECT invariant: between the opening and closing backticks
+    // of the renderHTML template literal there must be EXACTLY ZERO
+    // other backticks. Comment style (// or /* */ or <!-- -->) doesn't
+    // matter — JavaScript's template-literal parser doesn't see comments
+    // inside the literal, only the raw character stream. Any backtick
+    // closes the literal.
+    //
+    // Resolve the template range from the source dynamically — the
+    // explicit numeric window in earlier revisions silently shrank as
+    // renderHTML grew, letting traps slip through past the old upper
+    // bound. We anchor on the function header and the closing
+    // "</html>`;" sentinel.
     const lines = _src_t6ac2.split('\n');
     const startIdx = lines.findIndex((l) => l.startsWith('function renderHTML()'));
     assert.ok(startIdx >= 0, 'could not locate renderHTML start');
@@ -8693,13 +8709,20 @@ describe('Phase 6 — full-suite + dependency invariants', () => {
       if (/<\/html>`;\s*$/.test(lines[i])) { endIdx = i; break; }
     }
     assert.ok(endIdx > startIdx, 'could not locate renderHTML template close');
+
+    // The opening backtick lives on the line right after the function
+    // header (the `return ` ` ... ` line). The closing backtick lives on
+    // endIdx (the `</html>`;` line). Both of those lines are EXPECTED to
+    // have a backtick — those ARE the literal's delimiters. Any line
+    // strictly between them with a backtick is a trap.
     const traps = [];
-    for (let i = startIdx; i <= endIdx; i++) {
-      // Match "// ... ` ..." patterns (a JS line-comment containing a backtick)
-      if (/\/\/[^`]*`/.test(lines[i])) traps.push((i + 1) + ': ' + lines[i].trim());
+    for (let i = startIdx + 2; i < endIdx; i++) {
+      if (lines[i].includes('`')) traps.push((i + 1) + ': ' + lines[i].trim());
     }
     assert.equal(traps.length, 0,
-      'backticks in JS comments inside renderHTML template will silently break parsing.\n  '
+      'stray backticks inside renderHTML template literal will close it prematurely\n' +
+      'and break the whole dashboard page (symptom: "loads forever, black screen").\n' +
+      'Replace with normal quotes or Unicode equivalents (\\u2018, \\u2019, etc.):\n  '
       + traps.join('\n  '));
   });
 });

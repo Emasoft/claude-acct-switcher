@@ -299,6 +299,31 @@ describe('e2e — dashboard subprocess boot + lifecycle', () => {
     assert.equal(r.status, 200, `expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
   });
 
+  test('GET / serves a parseable HTML page (catches renderHTML throws)', async () => {
+    // Regression test for the "backtick-in-renderHTML-comment trap" class
+    // of bug. /health works fine when renderHTML() throws because /health
+    // never invokes renderHTML — but the actual UI page does, and a thrown
+    // ReferenceError inside the template literal results in a hung 500
+    // response after writeHead has already gone out (the dashboard's catch
+    // handler then logs ERR_HTTP_HEADERS_SENT). Symptom in a real browser:
+    // "loads forever, black screen". This test fetches the page like a
+    // browser would and asserts a real HTML document came back.
+    const r = await httpGet(ctx.dashPort, '/', 8000);
+    assert.equal(r.status, 200,
+                 `GET / should return 200 OK; got ${r.status}: ${r.body.slice(0, 300)}`);
+    assert.ok(r.body.length > 1000,
+              `HTML body should be substantial (>1KB); got ${r.body.length} bytes: ${r.body.slice(0, 200)}`);
+    assert.ok(/^<!DOCTYPE html>/i.test(r.body),
+              `HTML body should start with <!DOCTYPE html>; got first 200 chars: ${r.body.slice(0, 200)}`);
+    assert.ok(/<\/html>\s*$/i.test(r.body),
+              `HTML body should end with </html>; got last 200 chars: ${r.body.slice(-200)}`);
+    // A renderHTML throw produces an Express-style "Server error: ..." plain-text
+    // response or a truncated/empty body. The presence of multiple structural
+    // tags confirms the template literal expanded fully.
+    assert.ok(/<head[\s>]/i.test(r.body) && /<body[\s>]/i.test(r.body),
+              'HTML body should contain <head> and <body> tags');
+  });
+
   test('singleton lock file is created on disk', async () => {
     const lockPath = join(ctx.root, '.dashboard.lock');
     assert.ok(existsSync(lockPath), 'expected .dashboard.lock to exist after boot');
