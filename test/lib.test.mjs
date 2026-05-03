@@ -8467,11 +8467,12 @@ describe('Audit SC-OPUS-004 — multi-select attribute uses escHtml (not quote-o
     assert.ok(!/safeAttr\s*=\s*name\.replace/.test(_src_sc4),
       'safeAttr should be derived via escHtml, not quote-only replace');
     // Positive: the populator uses escHtml(name) for both data-repo
-    // and title attributes. Slice bumped to 5500 to span the
-    // SR-OP-002 hint logic added at the top of the function.
+    // and title attributes. Slice bumped to 7000 to span the
+    // SR-OP-002 hint logic AND the UX2-CPF2 cpf-toggle data-no-data
+    // marker logic added at the top of the function.
     const fn = _src_sc4.slice(
       _src_sc4.indexOf('function populateProjectFilterOptions'),
-      _src_sc4.indexOf('function populateProjectFilterOptions') + 5500,
+      _src_sc4.indexOf('function populateProjectFilterOptions') + 7000,
     );
     assert.match(fn, /var safe = escHtml\(name\)/);
     assert.match(fn, /data-repo="' \+ safe \+ '"/);
@@ -11161,5 +11162,199 @@ describe('UX batch L — MINOR/NIT cleanup source-grep regressions', () => {
     );
     assert.ok(onopenSlice, 'expected _logES.onopen handler');
     assert.match(onopenSlice[0], /_logReconnectCount\s*=\s*0/);
+  });
+});
+
+// ─── UX2 round-2 audit — MINOR/NIT cleanup pass (spark-O batch) ────────
+//
+// Each fix below is a small, local change pulled from
+// reports/audit/20260503_015904+0200-ui-usability-audit-round2-opus.md
+// — chosen specifically to NOT collide with the parallel sibling
+// agent's CRITICAL/MAJOR pass on the same audit. Source-grep regression
+// tests pin the post-fix invariant so a future "let me clean this up"
+// refactor can't silently revive the audit finding.
+
+describe('UX2 round-2 audit MINOR/NIT cleanup — source-grep regressions', () => {
+  const _src_ux2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX2-L6 — filter-bar invalid hex → var(--red) ──
+  it('UX2-L6 — .vdm-filter-bar input.invalid uses var(--red), not raw #f85149', () => {
+    // Strip CSS comments before checking — the explanatory comment
+    // intentionally references the dropped hex code as the regression
+    // we are guarding against, but the rule itself must not contain it.
+    const ruleSlice = _src_ux2.match(
+      /\.vdm-filter-bar input\[type="text"\]\.invalid\s*\{[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected .vdm-filter-bar input.invalid rule');
+    const stripped = ruleSlice[0].replace(/\/\*[\s\S]*?\*\//g, '');
+    assert.match(stripped, /border-color:\s*var\(--red\)/);
+    assert.match(stripped, /outline-color:\s*var\(--red\)/);
+    assert.doesNotMatch(stripped, /#f85149/i);
+  });
+
+  it('UX2-L6 — .vdm-filter-count.error uses var(--red), not raw #f85149', () => {
+    const ruleSlice = _src_ux2.match(
+      /\.vdm-filter-count\.error\s*\{[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected .vdm-filter-count.error rule');
+    assert.match(ruleSlice[0], /color:\s*var\(--red\)/);
+    assert.doesNotMatch(ruleSlice[0], /#f85149/i);
+  });
+
+  // ── UX2-S6 — Session OFF empty state has clickable Config link ──
+  it('UX2-S6 — Session Monitor OFF empty state links to Config tab', () => {
+    // Mirror of UX-BR3 batch C (Tool Breakdown): every empty state that
+    // points at another tab MUST do so via a clickable link, not flowing
+    // prose. The regex matches the wired switchTab('config') call inside
+    // the onclick handler.
+    const offSlice = _src_ux2.match(
+      /Session Monitor is OFF\.[^<]*<a[^>]+onclick="switchTab[^"]+config[^"]*"[^>]*>Enable it in Config<\/a>/,
+    );
+    assert.ok(offSlice, 'expected Session OFF empty state to link to Config');
+  });
+
+  // ── UX2-S4 — session-overhead tooltip drops duplicate (Haiku) suffix
+  //   while preserving the UX-X9 exact-token-count invariant ──
+  it('UX2-S4 — session-overhead tooltip drops duplicate (Haiku) and keeps fmtTokenCountExact', () => {
+    // The pre-fix tooltip duplicated "(Haiku)" since the visible label
+    // already shows it. The new tooltip combines the UX-X9-mandated
+    // exact-count companion (fmtTokenCountExact(oh)) with a scope hint.
+    // The line is constructed by concatenation, so the source
+    // representation contains the literal title=" prefix followed by an
+    // interpolation expression rather than a static title value.
+    const overheadSlice = _src_ux2.match(
+      /<div class="session-overhead" title="[^"]*' \+ fmtTokenCountExact\(oh\) \+ '[^"]*"[^>]*>/,
+    );
+    assert.ok(
+      overheadSlice,
+      'expected session-overhead title to include fmtTokenCountExact(oh) (UX-X9 invariant)',
+    );
+    // The literal "(Haiku)" inside the title MUST be gone — the visible
+    // label still carries it, so the tooltip should not repeat.
+    assert.doesNotMatch(overheadSlice[0], /\(Haiku\)/);
+    // The new tooltip carries the descriptive scope hint.
+    assert.match(overheadSlice[0], /total billed for AI summarization/);
+  });
+
+  // ── UX2-CO5 — html { scroll-behavior: smooth } for in-page anchor jumps ──
+  it('UX2-CO5 — html { scroll-behavior: smooth } declared with reduced-motion guard', () => {
+    // The Config TOC chips link to #config-* anchors. Without
+    // scroll-behavior: smooth, the page snaps instantly. With it,
+    // users who opted out of motion at the OS level still get auto
+    // (no animation) — the @media block enforces that.
+    assert.match(_src_ux2, /html\s*\{\s*scroll-behavior:\s*smooth;\s*\}/);
+    assert.match(
+      _src_ux2,
+      /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{\s*html\s*\{\s*scroll-behavior:\s*auto;\s*\}\s*\}/,
+    );
+  });
+
+  // ── UX2-X5 — .tok-chart-label font-size lifted off the WCAG floor ──
+  it('UX2-X5 — .tok-chart-label uses font-size 0.6875rem (was 0.5625rem ~9px)', () => {
+    const ruleSlice = _src_ux2.match(/\.tok-chart-label\s*\{[^}]+\}/);
+    assert.ok(ruleSlice, 'expected .tok-chart-label rule');
+    assert.match(ruleSlice[0], /font-size:\s*0\.6875rem/);
+    // The sub-WCAG 0.5625rem must NOT appear inside the rule body
+    // (the explanatory comment outside the rule may mention it).
+    assert.doesNotMatch(ruleSlice[0], /font-size:\s*0\.5625rem/);
+  });
+
+  // ── UX2-BR4 — tok-repo-header hover swaps opacity dimming for bg tint ──
+  it('UX2-BR4 — .tok-repo-header:hover uses background tint, not opacity:0.8 dimming', () => {
+    // The pre-fix opacity:0.8 hover rule was cancelling the UX-S2
+    // chevron-colour bump (chevron picked up bolder var(--foreground)
+    // tone, then got dimmed by the parent's 0.8 opacity → net DIMMER
+    // than non-hovered). Replace with a subtle background tint.
+    const ruleSlice = _src_ux2.match(
+      /\.tok-repo-header:hover\s*\{[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected .tok-repo-header:hover rule');
+    assert.match(ruleSlice[0], /background:\s*var\(--bg\)/);
+    assert.doesNotMatch(ruleSlice[0], /opacity:\s*0\.8/);
+  });
+
+  // ── UX2-CA3 — _carouselPaused drops dead .chart-bar:hover sub-selector ──
+  it('UX2-CA3 — _carouselPaused selector drops the dead .chart-bar:hover predicate', () => {
+    // .chart-bar lives in the legacy "All Accounts" stats chart inside
+    // #stats-section, NOT inside .chart-carousel — querying for it on
+    // the carousel never matched. The remaining two selectors cover
+    // every interactive chart element in the carousel.
+    const fnSlice = _src_ux2.slice(
+      _src_ux2.indexOf('function _carouselPaused'),
+      _src_ux2.indexOf('function _carouselPaused') + 1500,
+    );
+    assert.match(fnSlice, /carousel\.querySelector\(['"]\.tok-chart-seg:hover, \.tok-wasted-bar:hover['"]\)/);
+    // Strip JS line comments so the explanatory comment does not
+    // produce a false positive when checking the post-fix predicate.
+    const stripped = fnSlice.replace(/\/\/.*/g, '');
+    assert.doesNotMatch(stripped, /\.chart-bar:hover/);
+  });
+
+  // ── UX2-A3 — .card-actions row-gap when wrapped ──
+  it('UX2-A3 — .card-actions has explicit row-gap so wrapped controls breathe', () => {
+    // Match the BASE .card-actions rule, NOT the .card.stale .card-actions
+    // override (which only sets opacity: 1). The base rule is uniquely
+    // identifiable by the margin-top + display: flex pair.
+    const ruleSlice = _src_ux2.match(
+      /\.card-actions\s*\{\s*margin-top:[^}]+display:\s*flex[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected base .card-actions rule with display:flex');
+    assert.match(ruleSlice[0], /row-gap:\s*0\.5rem/);
+    // flex-wrap is preserved (load-bearing for the wrapped layout).
+    assert.match(ruleSlice[0], /flex-wrap:\s*wrap/);
+  });
+
+  // ── UX2-BR3 — hidden-branches inline style → CSS class ──
+  it('UX2-BR3 — .tok-branch-hidden-summary CSS class declared with the original style triplet', () => {
+    const ruleSlice = _src_ux2.match(
+      /\.tok-branch-hidden-summary\s*\{[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected .tok-branch-hidden-summary rule');
+    assert.match(ruleSlice[0], /padding-left:\s*1\.5rem/);
+    assert.match(ruleSlice[0], /font-style:\s*italic/);
+    assert.match(ruleSlice[0], /opacity:\s*0\.75/);
+  });
+
+  it('UX2-BR3 — hidden-branches summary row uses the CSS class, not inline style', () => {
+    // The use site at the bottom of renderRepoBranchBreakdown's
+    // hiddenBranchCount > 0 branch.
+    const useSlice = _src_ux2.match(
+      /<div class="tok-branch-row tok-branch-inactive tok-branch-hidden-summary">/,
+    );
+    assert.ok(useSlice, 'expected tok-branch-hidden-summary class on the row');
+    // The pre-fix inline style triplet must NOT appear anywhere in the
+    // hidden-branches summary line. Search the full source for the
+    // exact composite to be safe — the CSS class declaration above
+    // cannot contain "tok-branch-row tok-branch-inactive" (it is the
+    // class declaration, not a use site), so this is a clean check.
+    assert.doesNotMatch(
+      _src_ux2,
+      /class="tok-branch-row tok-branch-inactive"\s+style="padding-left:1\.5rem;font-style:italic;opacity:0\.75"/,
+    );
+  });
+
+  // ── UX2-CPF2 — cpf-toggle button gets data-no-data marker when no data ──
+  it('UX2-CPF2 — populateProjectFilterOptions sets data-no-data on cpf-toggle when single-select repo has no data', () => {
+    // The marker MUST be set when singleSelectRepo is non-empty AND
+    // not in the seen set, AND removed otherwise (so the marker does
+    // not get stale).
+    const fnSlice = _src_ux2.slice(
+      _src_ux2.indexOf('function populateProjectFilterOptions'),
+      _src_ux2.indexOf('function populateProjectFilterOptions') + 7000,
+    );
+    assert.match(fnSlice, /toggleBtn\.setAttribute\(['"]data-no-data['"], ['"]true['"]\)/);
+    assert.match(fnSlice, /toggleBtn\.removeAttribute\(['"]data-no-data['"]\)/);
+  });
+
+  it('UX2-CPF2 — .cpf-toggle[data-no-data="true"] CSS rule renders the warning style', () => {
+    const ruleSlice = _src_ux2.match(
+      /\.cpf-toggle\[data-no-data="true"\]\s*\{[^}]+\}/,
+    );
+    assert.ok(ruleSlice, 'expected .cpf-toggle[data-no-data="true"] rule');
+    assert.match(ruleSlice[0], /border-color:\s*var\(--yellow\)/);
+    assert.match(ruleSlice[0], /border-style:\s*dashed/);
   });
 });
