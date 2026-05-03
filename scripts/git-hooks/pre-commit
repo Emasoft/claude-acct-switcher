@@ -226,7 +226,10 @@ if grep -qE "$BLOCKING_REGEX" "$REPORT"; then
 fi
 
 # Pass — surface NIT count for context but do not block.
-NIT_COUNT=$(grep -cE "$NIT_REGEX" "$REPORT" 2>/dev/null || echo 0)
+# `grep -c` exits 1 with stdout "0" when there are zero matches; pairing
+# that with `|| echo 0` produces a two-line "0\n0" string and trips the
+# arithmetic test below. awk's `n+0` always prints a single integer.
+NIT_COUNT=$(awk -v re="$NIT_REGEX" '$0 ~ re {n++} END {print n+0}' "$REPORT" 2>/dev/null || echo 0)
 if [[ "$NIT_COUNT" -gt 0 ]]; then
   echo "[pre-commit] PASS — no MINOR or above. ($NIT_COUNT NIT finding(s) in $REPORT)" >&2
 else
