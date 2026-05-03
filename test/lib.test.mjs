@@ -8761,6 +8761,68 @@ describe('Phase 6 — full-suite + dependency invariants', () => {
       'whose handler reads a post-restore-line let/const.'
     );
   });
+
+  it('vdm CLI inline python contains no \\" escaped-quote f-string traps', () => {
+    // 2026-05-03: dev-browser smoke-testing the CLI surfaced THREE separate
+    // python SyntaxError crashes in `vdm prefs` and a related command, all
+    // from the same root cause:
+    //
+    //     python3 -c '
+    //     ...
+    //     f"key={d[\"x\"]}"      <-- SyntaxError: backslashes are forbidden
+    //                                 inside f-string {} expressions
+    //     '
+    //
+    // The bash single-quoted heredoc preserves backslashes as literals; the
+    // resulting python source contains \" inside an f-string substitution,
+    // which Python parses as "unexpected character after line continuation
+    // character" and the WHOLE command fails. The trap is visible from the
+    // bash script — vdm even has a NOTE comment near line 1904 warning
+    // about it — but until now no automated test enforced the rule.
+    //
+    // Fix pattern: pre-extract the value to a variable and use string
+    // concatenation, e.g. `print("key=" + str(d.get("x", "default")))`.
+    const vdmPath = new URL('../vdm', import.meta.url);
+    const vdmSrc = _readFileSync_xss(vdmPath, 'utf8');
+    const vdmLines = vdmSrc.split('\n');
+
+    // Find every block bounded by  python3 -c '  ...  '  and scan the
+    // body for backslash-escaped double-quote characters. Heredoc-style
+    // EOF-blocks aren't used in vdm; the only inline-python style is
+    // `python3 -c '...'`.
+    const traps = [];
+    let inPy = false;
+    for (let i = 0; i < vdmLines.length; i++) {
+      const line = vdmLines[i];
+      if (!inPy && /python3 -c '/.test(line)) {
+        inPy = true;
+        continue;
+      }
+      if (inPy) {
+        // Closing single-quote at end of line (allowing trailing args)
+        if (/^'(\s|$)/.test(line.trim()) || /\s'\s*"\$/.test(line) || /'\s*"\$\w+"\s*$/.test(line)) {
+          inPy = false;
+          continue;
+        }
+        // Skip lines that are pure python comments (start with # after
+        // optional whitespace). Documentation comments often demonstrate
+        // the bad pattern in backtick-fenced examples — those are
+        // explanatory, not actual code that gets executed.
+        const trimmed = line.trim();
+        if (trimmed.startsWith('#')) continue;
+        // Real python-source line — check for the trap pattern.
+        if (line.includes('\\"')) {
+          traps.push((i + 1) + ': ' + line.trim());
+        }
+      }
+    }
+
+    assert.equal(traps.length, 0,
+      'inline python in vdm contains \\" inside python source, which crashes ' +
+      'with SyntaxError when the f-string substitution {} expression contains ' +
+      'a backslash. Pre-extract to a variable and use string concatenation:\n  '
+      + traps.join('\n  '));
+  });
 });
 
 // ─────────────────────────────────────────────────

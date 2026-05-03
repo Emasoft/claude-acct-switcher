@@ -2176,8 +2176,10 @@ try:
     for name, p in sorted(prefs.items()):
       flags = []
       if p.get("excludeFromAuto") is True: flags.append("excluded from auto-switch")
-      if isinstance(p.get("priority"), (int, float)) and p.get("priority"): flags.append(f"priority={p[\"priority\"]}")
-      print(f"  {name}: {\"; \".join(flags) or \"(empty)\"}")
+      pri = p.get("priority")
+      if isinstance(pri, (int, float)) and pri: flags.append("priority=" + str(pri))
+      summary = "; ".join(flags) or "(empty)"
+      print("  " + name + ": " + summary)
 except Exception as e:
   print(f"  (parse error: {e})")
 '
@@ -2195,9 +2197,9 @@ name = sys.argv[1]
 try:
   d = json.load(sys.stdin)
   p = (d.get("prefs", {}) or {}).get(name) or {}
-  print(f"  {name}:")
-  print(f"    excludeFromAuto: {p.get(\"excludeFromAuto\", False)}")
-  print(f"    priority:        {p.get(\"priority\", 0)}")
+  print("  " + name + ":")
+  print("    excludeFromAuto: " + str(p.get("excludeFromAuto", False)))
+  print("    priority:        " + str(p.get("priority", 0)))
 except Exception as e:
   print(f"  (error: {e})")
 ' "$subname"
@@ -2246,7 +2248,8 @@ try:
   if d.get("ok"):
     print("  ok")
   else:
-    print(f"  failed: {d.get(\"error\", \"unknown\")}")
+    err = d.get("error", "unknown")
+    print("  failed: " + str(err))
 except Exception:
   print("  (no response)")
 '
