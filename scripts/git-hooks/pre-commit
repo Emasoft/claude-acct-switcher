@@ -1,17 +1,32 @@
 #!/usr/bin/env bash
-# pre-commit: Codex code-review gate.
+# pre-commit: code-review gate with Codex (primary) + Opus agent (fallback).
 #
-# Runs `codex review --uncommitted` on staged + unstaged + untracked
-# changes and BLOCKS the commit if Codex flags any finding at MINOR,
-# MAJOR, or CRITICAL severity. NIT findings DO NOT block (they're
-# surfaced as a count for opportunistic cleanup).
+# Runs `codex review --uncommitted -c model_reasoning_effort="high"` on
+# staged + unstaged + untracked changes and BLOCKS the commit if the
+# reviewer flags any finding at MINOR, MAJOR, or CRITICAL severity.
+# NIT findings DO NOT block (surfaced as a count for opportunistic
+# pickup).
 #
-# This is the same Codex review machinery that powers the `/codex:review`
-# slash command. The `-c model_reasoning_effort="high"` override is the
-# equivalent of the `--effort high` knob that the codex-companion.mjs
-# wrapper does not expose for the `review` subcommand (it only exposes
-# `--effort` for `task`). Default reasoning effort is "xhigh"; "high" is
-# faster while still substantively complete.
+# If Codex returns a non-zero exit code (out of credits / rate-limited /
+# network unreachable / internal error / etc.) we fall back to a Claude
+# Opus review delivered via a custom subagent at
+#   ~/.claude/agents/review-opus-agent.md
+# launched with `claude --agent review-opus-agent --worktree <name>
+# --dangerously-skip-permissions`.
+#
+# We deliberately do NOT use `claude -p` for the fallback: per project
+# convention `-p` is observed to consume metered Anthropic API tokens
+# instead of the OAuth Pro/Max subscription. The agent + worktree path
+# uses the subscription path. The agent runs in a temporary worktree
+# (gitignored, disposable) and writes its report to
+#   $MAIN_ROOT/reports/review-opus-agent/<ts>.md
+# so the report survives worktree removal.
+#
+# Why -c instead of --effort: the codex `review` subcommand does NOT
+# accept --effort (only `task` does). The TOML config override is the
+# one-invocation-scoped equivalent. Default in ~/.codex/config.toml is
+# "xhigh"; we drop to "high" so the gate finishes in minutes instead
+# of half-hours.
 #
 # Bypass for emergencies (use sparingly):
 #   git commit --no-verify
@@ -20,87 +35,219 @@
 # Active copy:     .git/hooks/pre-commit (per-clone, install via
 #                  scripts/install-precommit-hook.sh).
 
-# `set -e` would abort on the bare `grep -q` returning non-zero (a
-# legitimate "no findings" signal), so we use -u (unset = error) and
-# pipefail (capture upstream pipe failure) without -e.
+# `set -e` would abort on bare `grep -q` returning non-zero (a legitimate
+# "no findings" signal), so use -u and pipefail without -e.
 set -uo pipefail
 
+# Tunables — override via env if needed.
+CODEX_TIMEOUT_SEC="${CODEX_TIMEOUT_SEC:-1800}"   # 30 min cap on codex review
+OPUS_TIMEOUT_SEC="${OPUS_TIMEOUT_SEC:-1800}"     # 30 min cap on opus fallback
+
 # ── Skip when there is genuinely nothing to review ────────────────────
-# Three states must all be empty: staged, unstaged, untracked. If even
-# one has content, the commit is non-trivial and warrants a review.
-# `git diff --quiet` returns 0 when the diff is empty, 1 when non-empty,
-# and 128+ on internal failure — we treat anything other than 0 as
-# "there is something to review" so a transient git error doesn't
-# silently bypass the gate.
 HAS_STAGED=1; git diff --cached --quiet 2>/dev/null && HAS_STAGED=0
 HAS_UNSTAGED=1; git diff --quiet 2>/dev/null && HAS_UNSTAGED=0
 HAS_UNTRACKED=0; [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]] && HAS_UNTRACKED=1
 if [[ "$HAS_STAGED" -eq 0 && "$HAS_UNSTAGED" -eq 0 && "$HAS_UNTRACKED" -eq 0 ]]; then
-  echo "[codex pre-commit] Nothing to review — skipping." >&2
+  echo "[pre-commit] Nothing to review — skipping." >&2
   exit 0
 fi
 
-# ── Sanity check: codex CLI must be installed ─────────────────────────
-if ! command -v codex >/dev/null 2>&1; then
-  echo "[codex pre-commit] codex CLI not on PATH." >&2
-  echo "                   Install via /codex:setup, or bypass with: git commit --no-verify" >&2
-  exit 1
-fi
-
 # ── Bookkeeping: report path under reports/codex-review/pre-commit/ ──
-# Local time + GMT offset per ~/.claude/rules/agent-reports-location.md.
 ROOT="$(git rev-parse --show-toplevel)"
 TS="$(date +%Y%m%d_%H%M%S%z)"
 REVIEW_DIR="$ROOT/reports/codex-review/pre-commit"
 mkdir -p "$REVIEW_DIR"
 REPORT="$REVIEW_DIR/${TS}-pre-commit.md"
 
-echo "[codex pre-commit] Reviewing uncommitted changes (this can take several minutes)..." >&2
-echo "                   Effort: high  (-c model_reasoning_effort=\"high\", default xhigh)" >&2
-echo "                   Report: $REPORT" >&2
-echo >&2
+# ── F-003 fix: detect timeout binary; fall through if unavailable ─────
+# GNU coreutils ships `timeout`; macOS Homebrew ships it as `gtimeout`.
+# On a clean macOS without coreutils, neither exists — we keep going
+# without a timeout rather than fail every commit.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
+else
+  TIMEOUT_BIN=""
+fi
 
-# ── Run the review ────────────────────────────────────────────────────
-# `--uncommitted` reviews staged + unstaged + untracked changes — the
-# closest semantic to "files not yet committed". Output (markdown) goes
-# both to the report file AND to stderr so the user sees progress live.
-# pipefail is on, so a non-zero codex exit propagates through `tee`.
-codex review --uncommitted -c model_reasoning_effort="high" 2>&1 | tee "$REPORT" >&2
-RC=${PIPESTATUS[0]}
-if [[ "$RC" -ne 0 ]]; then
+run_with_timeout() {
+  local secs="$1"; shift
+  if [[ -n "$TIMEOUT_BIN" ]]; then
+    "$TIMEOUT_BIN" --kill-after=30 "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# ── Severity-row regex shared by both branches ────────────────────────
+# Codex emits a markdown findings table with rows of the shape:
+#   | <code> | <SEVERITY> | <file:line> | <summary> |
+# The Opus agent prompt (~/.claude/agents/review-opus-agent.md) instructs
+# Opus to emit the SAME shape so the downstream grep works identically
+# for both reviewers.
+BLOCKING_REGEX='^\|[^|]+\|[[:space:]]*(CRITICAL|MAJOR|MINOR)[[:space:]]*\|'
+NIT_REGEX='^\|[^|]+\|[[:space:]]*NIT[[:space:]]*\|'
+
+# ── Worktree cleanup helper (called even on early-out paths) ──────────
+WT_NAME=""   # populated when we create a worktree
+WT_PATH=""
+cleanup_worktree() {
+  [[ -z "$WT_NAME" ]] && return 0
+  if [[ -n "$WT_PATH" && -d "$WT_PATH" ]]; then
+    git -C "$ROOT" worktree remove --force "$WT_PATH" 2>/dev/null || true
+  fi
+  # Best-effort branch removal (claude --worktree often creates a branch
+  # named after the worktree). Squelch errors if no branch exists.
+  git -C "$ROOT" branch -D "$WT_NAME" 2>/dev/null || true
+}
+
+# ── Helper: run the Opus fallback review via the subagent ─────────────
+# Stages the diff + untracked file list under /tmp, launches the
+# `review-opus-agent` subagent in a temporary worktree, and waits for
+# the agent to write the report at REPORT_PATH (passed in $1).
+# Returns the claude CLI exit code.
+run_opus_fallback() {
+  local report_path="$1"
+
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "[pre-commit] Opus fallback unavailable: claude CLI not on PATH." >&2
+    return 127
+  fi
+
+  # ── F-002 fix: include untracked file CONTENTS, not just the list.
+  # Stage the diff and untracked-list under /tmp; the agent will
+  # absolute-path-read each untracked file from MAIN_ROOT itself (with
+  # binary / size / cache-dir guards in the agent prompt). /tmp avoids
+  # polluting the repo with .precommit-staging/ residue.
+  local stage_dir
+  stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/precommit-agent-XXXXXX")"
+  trap "rm -rf -- '$stage_dir'" RETURN
+  local diff_file="$stage_dir/diff.patch"
+  local untracked_file="$stage_dir/untracked.txt"
+  git -C "$ROOT" diff HEAD > "$diff_file" 2>/dev/null || true
+  git -C "$ROOT" ls-files --others --exclude-standard > "$untracked_file" 2>/dev/null || true
+
+  # Ensure the report's parent directory exists BEFORE the agent runs
+  # (so the agent's Write tool can land cleanly).
+  mkdir -p "$(dirname "$report_path")"
+
+  # Build the orchestrator prompt that hands the agent its inputs.
+  local prompt
+  prompt="Run the pre-commit code review now. Inputs (absolute paths):
+
+- DIFF_PATH:      $diff_file
+- UNTRACKED_LIST: $untracked_file
+- MAIN_ROOT:      $ROOT
+- REPORT_PATH:    $report_path
+
+Begin immediately. After writing the report, finish your turn — do not wait for further instructions."
+
+  # Worktree name unique per commit attempt. claude --worktree creates
+  # the worktree adjacent to the main repo.
+  WT_NAME="precommit-review-$$-$(date +%s)"
+
+  # ── F-004 fix: pipe prompt via stdin instead of as argv. macOS
+  # ARG_MAX can be exceeded for large diffs (we already bound the
+  # prompt small here, but stdin is the safer pattern that scales).
+  # NOT using -p: we want the OAuth subscription, not metered API tokens.
+  printf '%s' "$prompt" | run_with_timeout "${OPUS_TIMEOUT_SEC}" \
+    claude --agent review-opus-agent --worktree "$WT_NAME" --dangerously-skip-permissions \
+      2>&1 | tee "${report_path}.run.log" >&2
+  local rc=${PIPESTATUS[1]}
+
+  # Resolve the worktree path by asking git AFTER claude created it,
+  # so cleanup can remove the directory regardless of where claude
+  # decided to put it.
+  WT_PATH="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null \
+             | awk -v n="$WT_NAME" '
+                 /^worktree / { p=$2 }
+                 /^branch / && index($2, n) { print p; exit }
+             ')"
+  cleanup_worktree
+
+  # The agent MAY have failed silently (no report written) even with rc=0
+  # if claude itself bailed before the agent's first turn completed.
+  # Hard-require a non-empty report file as the success signal.
+  if [[ ! -s "$report_path" ]]; then
+    echo "[pre-commit] Opus fallback: agent did not write report at $report_path" >&2
+    return ${rc:-1}
+  fi
+  return "$rc"
+}
+
+# ── Primary attempt: Codex ────────────────────────────────────────────
+USED_FALLBACK=0
+RC=127
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "[pre-commit] codex CLI not on PATH — falling back to Opus..." >&2
+  USED_FALLBACK=1
+else
+  echo "[pre-commit] Reviewing uncommitted changes via Codex (this can take several minutes)..." >&2
+  echo "             Effort: high  (-c model_reasoning_effort=\"high\", default xhigh)" >&2
+  echo "             Report: $REPORT" >&2
   echo >&2
-  echo "[codex pre-commit] codex CLI exited non-zero (rc=$RC)." >&2
-  echo "                   See $REPORT for details." >&2
-  echo "                   Bypass with: git commit --no-verify" >&2
-  exit 1
+  run_with_timeout "${CODEX_TIMEOUT_SEC}" \
+    codex review --uncommitted -c model_reasoning_effort="high" 2>&1 | tee "$REPORT" >&2
+  RC=${PIPESTATUS[0]}
+  if [[ "$RC" -ne 0 ]]; then
+    REASON=$(grep -m1 -E 'ERROR:|usage limit|rate limit|unreachable|timed out|Review was interrupted' "$REPORT" 2>/dev/null \
+             | head -c 240 || true)
+    echo >&2
+    echo "[pre-commit] Codex unavailable (rc=$RC). Falling back to Opus." >&2
+    [[ -n "$REASON" ]] && echo "             Codex said: $REASON" >&2
+    USED_FALLBACK=1
+  fi
+fi
+
+# ── Fallback: Opus subagent ───────────────────────────────────────────
+if [[ "$USED_FALLBACK" -eq 1 ]]; then
+  # Opus report goes under reports/review-opus-agent/ (NOT codex-review/)
+  # to make the source of the verdict obvious to anyone reading the
+  # archive later.
+  OPUS_REPORT_DIR="$ROOT/reports/review-opus-agent"
+  mkdir -p "$OPUS_REPORT_DIR"
+  OPUS_REPORT="$OPUS_REPORT_DIR/${TS}-pre-commit.md"
+  echo "[pre-commit] Reviewing uncommitted changes via Claude Opus (--agent review-opus-agent)..." >&2
+  echo "             Worktree:    precommit-review-$$-* (auto-removed)" >&2
+  echo "             Report path: $OPUS_REPORT" >&2
+  echo >&2
+  # ── F-001 fix: capture rc OUTSIDE the `if !` so $? reflects the
+  # function's actual exit, not the inverted test. Pre-fix the rc was
+  # always 0 because the `!` consumed the status before the `then`.
+  run_opus_fallback "$OPUS_REPORT"
+  OPUS_RC=$?
+  if [[ "$OPUS_RC" -ne 0 ]]; then
+    echo >&2
+    echo "[pre-commit] BOTH reviewers failed (codex rc=$RC, opus rc=$OPUS_RC)." >&2
+    echo "             Inspect: $REPORT" >&2
+    echo "             Inspect: ${OPUS_REPORT}.run.log (claude transcript)" >&2
+    [[ -s "$OPUS_REPORT" ]] && echo "             Inspect: $OPUS_REPORT" >&2
+    echo "             Bypass with: git commit --no-verify" >&2
+    exit 1
+  fi
+  REPORT="$OPUS_REPORT"
 fi
 
 # ── Parse findings ────────────────────────────────────────────────────
-# Codex emits a markdown findings table with rows like:
-#   | <code> | <SEVERITY> | <file:line> | <summary> |
-# We grep for rows whose second cell is CRITICAL / MAJOR / MINOR and
-# block on any match. NIT rows are explicitly NOT in the blocking set
-# per project policy: NITs are visible in the report for opportunistic
-# pickup but should not gate commits (and would otherwise reject most
-# non-trivial changes outright).
-BLOCKING_REGEX='^\|[^|]+\|[[:space:]]*(CRITICAL|MAJOR|MINOR)[[:space:]]*\|'
-
+# Block on any CRITICAL / MAJOR / MINOR row. NIT rows pass.
 if grep -qE "$BLOCKING_REGEX" "$REPORT"; then
   echo >&2
-  echo "[codex pre-commit] BLOCKED — Codex found MINOR or above issue(s):" >&2
+  echo "[pre-commit] BLOCKED — reviewer found MINOR or above issue(s):" >&2
   echo >&2
   grep -E "$BLOCKING_REGEX" "$REPORT" | sed 's/^/    /' >&2
   echo >&2
-  echo "[codex pre-commit] Full report: $REPORT" >&2
-  echo "[codex pre-commit] Bypass with: git commit --no-verify" >&2
+  echo "[pre-commit] Full report: $REPORT" >&2
+  echo "[pre-commit] Bypass with: git commit --no-verify" >&2
   exit 1
 fi
 
-# ── Pass — surface NIT count for context but do not block ─────────────
-NIT_COUNT=$(grep -cE '^\|[^|]+\|[[:space:]]*NIT[[:space:]]*\|' "$REPORT" 2>/dev/null || echo 0)
+# Pass — surface NIT count for context but do not block.
+NIT_COUNT=$(grep -cE "$NIT_REGEX" "$REPORT" 2>/dev/null || echo 0)
 if [[ "$NIT_COUNT" -gt 0 ]]; then
-  echo "[codex pre-commit] PASS — no MINOR or above. ($NIT_COUNT NIT finding(s) in $REPORT)" >&2
+  echo "[pre-commit] PASS — no MINOR or above. ($NIT_COUNT NIT finding(s) in $REPORT)" >&2
 else
-  echo "[codex pre-commit] PASS — no findings." >&2
+  echo "[pre-commit] PASS — no findings." >&2
 fi
 exit 0
