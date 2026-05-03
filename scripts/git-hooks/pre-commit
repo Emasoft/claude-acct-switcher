@@ -11,16 +11,21 @@
 # network unreachable / internal error / etc.) we fall back to a Claude
 # Opus review delivered via a custom subagent at
 #   ~/.claude/agents/review-opus-agent.md
-# launched with `claude --agent review-opus-agent --worktree <name>
-# --dangerously-skip-permissions`.
+# launched with `claude --agent review-opus-agent --dangerously-skip-permissions`.
 #
 # We deliberately do NOT use `claude -p` for the fallback: per project
 # convention `-p` is observed to consume metered Anthropic API tokens
-# instead of the OAuth Pro/Max subscription. The agent + worktree path
-# uses the subscription path. The agent runs in a temporary worktree
-# (gitignored, disposable) and writes its report to
-#   $MAIN_ROOT/reports/review-opus-agent/<ts>.md
-# so the report survives worktree removal.
+# instead of the OAuth Pro/Max subscription. The agent + custom-subagent
+# path uses the subscription path.
+#
+# We also do NOT use `--worktree`: empirically `git worktree add` fails
+# inside a pre-commit hook with
+#   fatal: .git/index: index file open failed: Not a directory
+# because the parent `git commit` holds the index. The agent runs in
+# the main checkout cwd instead. Sandbox-equivalent safety comes from
+# the agent's tool list (`Read, Write, Bash, Glob, Grep` — NO Edit) and
+# its review-only instructions: it MUST only Write to REPORT_PATH and
+# MUST NOT use Bash for any state-mutating command on source files.
 #
 # Why -c instead of --effort: the codex `review` subcommand does NOT
 # accept --effort (only `task` does). The TOML config override is the
@@ -89,23 +94,14 @@ run_with_timeout() {
 BLOCKING_REGEX='^\|[^|]+\|[[:space:]]*(CRITICAL|MAJOR|MINOR)[[:space:]]*\|'
 NIT_REGEX='^\|[^|]+\|[[:space:]]*NIT[[:space:]]*\|'
 
-# ── Worktree cleanup helper (called even on early-out paths) ──────────
-WT_NAME=""   # populated when we create a worktree
-WT_PATH=""
-cleanup_worktree() {
-  [[ -z "$WT_NAME" ]] && return 0
-  if [[ -n "$WT_PATH" && -d "$WT_PATH" ]]; then
-    git -C "$ROOT" worktree remove --force "$WT_PATH" 2>/dev/null || true
-  fi
-  # Best-effort branch removal (claude --worktree often creates a branch
-  # named after the worktree). Squelch errors if no branch exists.
-  git -C "$ROOT" branch -D "$WT_NAME" 2>/dev/null || true
-}
+# (No worktree cleanup helper — see header note: --worktree dropped
+# because it can't be created from a pre-commit hook.)
 
 # ── Helper: run the Opus fallback review via the subagent ─────────────
 # Stages the diff + untracked file list under /tmp, launches the
-# `review-opus-agent` subagent in a temporary worktree, and waits for
-# the agent to write the report at REPORT_PATH (passed in $1).
+# `review-opus-agent` subagent in the main checkout cwd (NOT a worktree
+# — see header note: --worktree fails inside a pre-commit hook), and
+# waits for the agent to write the report at REPORT_PATH (passed in $1).
 # Returns the claude CLI exit code.
 run_opus_fallback() {
   local report_path="$1"
@@ -143,28 +139,15 @@ run_opus_fallback() {
 
 Begin immediately. After writing the report, finish your turn — do not wait for further instructions."
 
-  # Worktree name unique per commit attempt. claude --worktree creates
-  # the worktree adjacent to the main repo.
-  WT_NAME="precommit-review-$$-$(date +%s)"
-
   # ── F-004 fix: pipe prompt via stdin instead of as argv. macOS
   # ARG_MAX can be exceeded for large diffs (we already bound the
   # prompt small here, but stdin is the safer pattern that scales).
   # NOT using -p: we want the OAuth subscription, not metered API tokens.
+  # NOT using --worktree: see header note (fails in pre-commit context).
   printf '%s' "$prompt" | run_with_timeout "${OPUS_TIMEOUT_SEC}" \
-    claude --agent review-opus-agent --worktree "$WT_NAME" --dangerously-skip-permissions \
+    claude --agent review-opus-agent --dangerously-skip-permissions \
       2>&1 | tee "${report_path}.run.log" >&2
   local rc=${PIPESTATUS[1]}
-
-  # Resolve the worktree path by asking git AFTER claude created it,
-  # so cleanup can remove the directory regardless of where claude
-  # decided to put it.
-  WT_PATH="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null \
-             | awk -v n="$WT_NAME" '
-                 /^worktree / { p=$2 }
-                 /^branch / && index($2, n) { print p; exit }
-             ')"
-  cleanup_worktree
 
   # The agent MAY have failed silently (no report written) even with rc=0
   # if claude itself bailed before the agent's first turn completed.
@@ -210,7 +193,6 @@ if [[ "$USED_FALLBACK" -eq 1 ]]; then
   mkdir -p "$OPUS_REPORT_DIR"
   OPUS_REPORT="$OPUS_REPORT_DIR/${TS}-pre-commit.md"
   echo "[pre-commit] Reviewing uncommitted changes via Claude Opus (--agent review-opus-agent)..." >&2
-  echo "             Worktree:    precommit-review-$$-* (auto-removed)" >&2
   echo "             Report path: $OPUS_REPORT" >&2
   echo >&2
   # ── F-001 fix: capture rc OUTSIDE the `if !` so $? reflects the
