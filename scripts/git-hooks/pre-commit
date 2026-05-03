@@ -10,8 +10,8 @@
 # If Codex returns a non-zero exit code (out of credits / rate-limited /
 # network unreachable / internal error / etc.) we fall back to a Claude
 # Opus review delivered via a custom subagent at
-#   ~/.claude/agents/review-opus-agent.md
-# launched with `claude --agent review-opus-agent --dangerously-skip-permissions`.
+#   ~/.claude/agents/chk-review-opus-agent.md
+# launched with `claude --agent chk-review-opus-agent --dangerously-skip-permissions`.
 #
 # We deliberately do NOT use `claude -p` for the fallback: per project
 # convention `-p` is observed to consume metered Anthropic API tokens
@@ -38,7 +38,7 @@
 #
 # Source of truth: scripts/git-hooks/pre-commit (git-tracked).
 # Active copy:     .git/hooks/pre-commit (per-clone, install via
-#                  scripts/install-precommit-hook.sh).
+#                  `python3 scripts/install-precommit-hook.py`).
 
 # `set -e` would abort on bare `grep -q` returning non-zero (a legitimate
 # "no findings" signal), so use -u and pipefail without -e.
@@ -105,7 +105,7 @@ run_with_timeout() {
 # ── Severity-row regex shared by both branches ────────────────────────
 # Codex emits a markdown findings table with rows of the shape:
 #   | <code> | <SEVERITY> | <file:line> | <summary> |
-# The Opus agent prompt (~/.claude/agents/review-opus-agent.md) instructs
+# The Opus agent prompt (~/.claude/agents/chk-review-opus-agent.md) instructs
 # Opus to emit the SAME shape so the downstream grep works identically
 # for both reviewers.
 BLOCKING_REGEX='^\|[^|]+\|[[:space:]]*(CRITICAL|MAJOR|MINOR)[[:space:]]*\|'
@@ -116,7 +116,7 @@ NIT_REGEX='^\|[^|]+\|[[:space:]]*NIT[[:space:]]*\|'
 
 # ── Helper: run the Opus fallback review via the subagent ─────────────
 # Stages the diff + untracked file list under /tmp, launches the
-# `review-opus-agent` subagent in the main checkout cwd (NOT a worktree
+# `chk-review-opus-agent` subagent in the main checkout cwd (NOT a worktree
 # — see header note: --worktree fails inside a pre-commit hook), and
 # waits for the agent to write the report at REPORT_PATH (passed in $1).
 # Returns the claude CLI exit code.
@@ -162,7 +162,7 @@ Begin immediately. After writing the report, finish your turn — do not wait fo
   # NOT using -p: we want the OAuth subscription, not metered API tokens.
   # NOT using --worktree: see header note (fails in pre-commit context).
   printf '%s' "$prompt" | run_with_timeout "${OPUS_TIMEOUT_SEC}" \
-    claude --agent review-opus-agent --dangerously-skip-permissions \
+    claude --agent chk-review-opus-agent --dangerously-skip-permissions \
       2>&1 | tee "${report_path}.run.log" >&2
   local rc=${PIPESTATUS[1]}
 
@@ -203,7 +203,7 @@ fi
 
 # ── Fallback: Opus subagent ───────────────────────────────────────────
 if [[ "$USED_FALLBACK" -eq 1 ]]; then
-  # Opus report goes under reports/review-opus-agent/ (NOT codex-review/)
+  # Opus report goes under reports/chk-review-opus-agent/ (NOT codex-review/)
   # to make the source of the verdict obvious to anyone reading the
   # archive later. Mirrors the three-tier resolution from the codex
   # report path above (env override → repo-local-if-gitignored → global
@@ -211,13 +211,13 @@ if [[ "$USED_FALLBACK" -eq 1 ]]; then
   if [[ -n "${PRECOMMIT_OPUS_REPORTS_DIR:-}" ]]; then
     OPUS_REPORT_DIR="$PRECOMMIT_OPUS_REPORTS_DIR"
   elif [[ -f "$ROOT/.gitignore" ]] && grep -qE '^/?reports/?$' "$ROOT/.gitignore" 2>/dev/null; then
-    OPUS_REPORT_DIR="$ROOT/reports/review-opus-agent"
+    OPUS_REPORT_DIR="$ROOT/reports/chk-review-opus-agent"
   else
-    OPUS_REPORT_DIR="$HOME/.cache/codex-precommit/$(basename "$ROOT")/review-opus-agent"
+    OPUS_REPORT_DIR="$HOME/.cache/codex-precommit/$(basename "$ROOT")/chk-review-opus-agent"
   fi
   mkdir -p "$OPUS_REPORT_DIR"
   OPUS_REPORT="$OPUS_REPORT_DIR/${TS}-pre-commit.md"
-  echo "[pre-commit] Reviewing uncommitted changes via Claude Opus (--agent review-opus-agent)..." >&2
+  echo "[pre-commit] Reviewing uncommitted changes via Claude Opus (--agent chk-review-opus-agent)..." >&2
   echo "             Report path: $OPUS_REPORT" >&2
   echo >&2
   # ── F-001 fix: capture rc OUTSIDE the `if !` so $? reflects the
