@@ -3603,6 +3603,19 @@ function renderHTML() {
     --shadow-lg: 0 4px 12px -2px rgba(0,0,0,0.06), 0 2px 6px -1px rgba(0,0,0,0.04);
     --radius: 14px;
     --radius-sm: 10px;
+    /* UX2-CSS1: declare aliases referenced ~50x throughout the dashboard
+       CSS but never defined. Without these, var(--surface) fell to
+       transparent (filter-bar Clear button invisible), var(--text-muted)
+       collapsed to inherited --foreground (no visual hierarchy on miss
+       rows / tree summaries / cpf entries / wasted-spend totals), and
+       var(--mono) fell to system-ui (tree-view + miss rows lost their
+       code-mode appearance). The aliases let any future dark-mode rebind
+       (data-theme="dark") swap palettes via these tokens too — silent
+       fallback would have broken that story. */
+    --surface: hsl(220 14% 93%);
+    --text-muted: hsl(220 9% 46%);
+    --text: hsl(224 71% 4%);
+    --mono: ui-monospace, 'SF Mono', Monaco, Consolas, 'Roboto Mono', monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   /* UX-X12: form controls do not inherit font-family / font-size / color
@@ -4056,10 +4069,14 @@ function renderHTML() {
      through the long card so they can jump to another section without
      scrolling back to the top. The chip style matches the look of
      the .header-pill so the visual language stays consistent. */
+  /* UX2-CO2 (MAJOR): the config-toc previously used position: sticky
+     while .tabs (Accounts/Activity/Usage/Sessions/Config/Logs) is
+     normal-flow. The sticky TOC pinned alone at viewport top while the
+     tabs scrolled away — the TOC looked "naked" disconnected from the
+     page header. Drop sticky to restore visual cohesion. The TOC still
+     anchors quick-jumps via #config-<section> ids; users who scroll
+     can use the browser's back-to-top affordance. */
   .config-toc {
-    position: sticky;
-    top: 0;
-    z-index: 5;
     display: flex;
     flex-wrap: wrap;
     gap: 0.375rem;
@@ -4190,7 +4207,11 @@ function renderHTML() {
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: transparent;
-    color: var(--muted-foreground);
+    /* UX2-CSS1: --muted-foreground was undefined (overridden by the
+       .remove-btn rule below with var(--red)). Use var(--muted) so the
+       resting state has a defined fallback if a future audit removes
+       the .remove-btn override. */
+    color: var(--muted);
     font-size: 0.75rem;
     font-weight: 500;
     cursor: pointer;
@@ -4324,21 +4345,34 @@ function renderHTML() {
     font-style: italic;
     font-size: 0.75rem;
   }
+  /* UX2-S3 (MAJOR): the .session-copy-btn is absolutely-positioned at
+     bottom:0.5rem;right:0.5rem and overlays the right edge of the
+     normal-flow .session-meta row when meta content extends to the
+     right. Reserve 2rem of right padding so the meta content never
+     runs into the copy button on hover. flex-wrap allows the meta
+     row to drop to a second line if the dataset is wide enough that
+     2rem of reserve is still not enough. */
   .session-meta {
     font-size: 0.75rem;
     color: var(--muted);
     margin-top: 0.375rem;
     display: flex;
     gap: 0.75rem;
+    flex-wrap: wrap;
+    padding-right: 2rem;
   }
+  /* UX2-S1 (MAJOR): route through the design tokens instead of raw
+     GitHub-red hex. Without this, a future dark-mode rebind of --red
+     would not propagate to the conflicts banner. Mirrors batch K's
+     log-container fix. */
   .session-conflicts {
-    background: rgba(248,81,73,0.08);
-    border: 1px solid rgba(248,81,73,0.3);
+    background: var(--red-soft);
+    border: 1px solid var(--red-border);
     border-radius: var(--radius);
     padding: 0.5rem 0.75rem;
     margin-bottom: 0.75rem;
     font-size: 0.8125rem;
-    color: #f85149;
+    color: var(--red);
   }
   /* UX-S3: copy button styling. Replaces the previous emoji-only
      button (📋 = U+1F4CB) with an inline SVG icon that renders
@@ -4438,12 +4472,16 @@ function renderHTML() {
   .session-timeline.session-timeline-expanded ~ .session-timeline-fade {
     display: none;
   }
+  /* UX2-X2 (MAJOR): replaced hardcoded #000 with var(--foreground) so a
+     future dark-mode rebind propagates. The tab-badge sits over a
+     yellow background which currently (light-mode) gives a near-black
+     text on yellow — same legibility, but tokenised. */
   .tab-badge {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     background: var(--yellow);
-    color: #000;
+    color: var(--foreground);
     font-size: 0.625rem;
     font-weight: 700;
     min-width: 1rem;
@@ -4736,8 +4774,14 @@ function renderHTML() {
     box-shadow: 0 8px 20px rgba(0,0,0,0.15);
   }
   .toast.show { transform: translateX(0); opacity: 1; }
+  /* UX2-X1 (CRITICAL): the responsive toast positioning lives in the
+     SAME 720px / 480px media-query blocks as the rest of the
+     responsive overrides (further down in this stylesheet). Putting
+     the toast in its own private 720px block here would split the
+     responsive cascade and create a separate first-720-block that
+     downstream UX-H1 assertions look in for .header-right. */
   @media (max-width: 480px) {
-    .toast { top: 1rem; right: 1rem; left: 1rem; max-width: calc(100vw - 2rem); }
+    .toast { top: auto; bottom: 1rem; right: 1rem; left: 1rem; max-width: calc(100vw - 2rem); }
   }
 
   .empty-state {
@@ -4851,10 +4895,16 @@ function renderHTML() {
   .acct-pref-toggle:hover { background: var(--bg); border-color: var(--muted); }
   .acct-pref-toggle:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
   .acct-pref-toggle input { cursor: pointer; }
+  /* UX2-A1 (MAJOR): yellow signals "warning / beta / unstable" — but
+     "Exclude from auto-switch" is a deliberate user preference, not a
+     warning state. Switch to muted-on-bg with a 600 weight so the
+     active toggle reads as "settled deliberate state" (matches the
+     .badge-excluded palette) instead of "hazardous setting". */
   .acct-pref-toggle.is-on {
-    color: var(--yellow);
-    border-color: var(--yellow-border);
-    background: var(--yellow-soft);
+    color: var(--muted);
+    border-color: var(--border);
+    background: var(--bg);
+    font-weight: 600;
   }
   .card-actions {
     margin-top: 0.875rem;
@@ -4973,6 +5023,33 @@ function renderHTML() {
     color: var(--muted);
     margin-top: 0.25rem;
     line-height: 1.6;
+  }
+  /* UX2-BR2 / UX2-BR3: dedicated CSS for the hidden-branches summary
+     row + Show More / Show Fewer button. Replaces the inline
+     style="padding-left:1.5rem;font-style:italic;opacity:0.75" pattern
+     on the previous footer div with a class hook so future style
+     changes touch one place. */
+  .tok-branch-hidden-summary {
+    font-style: italic;
+    opacity: 0.85;
+  }
+  .tok-branch-uncap-toggle {
+    background: none;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 0.75rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-style: normal;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .tok-branch-uncap-toggle:hover,
+  .tok-branch-uncap-toggle:focus-visible {
+    color: var(--primary);
+    border-color: var(--primary);
+    background: var(--bg);
   }
   #tok-stats.stat-grid { grid-template-columns: repeat(5, 1fr); }
   .tok-stat-sub { font-size: 0.5625rem; color: var(--muted); margin-top: 0.0625rem; }
@@ -5339,8 +5416,16 @@ function renderHTML() {
   .chart-carousel {
     position: relative;
   }
+  /* UX2-CA1 (MAJOR): pin a min-height on the carousel container so
+     auto-rotating between slides of different natural heights (cost-
+     savings ~210px, daily-usage ~165px, wasted-spend ~190px) does not
+     visibly hop the cards below every 10s. The min-height matches the
+     tallest slide so the container reserves the worst-case footprint
+     up front; min-height (not height) lets a future slide grow without
+     clipping. */
   .chart-carousel-inner {
     overflow: hidden;
+    min-height: 220px;
   }
   .chart-carousel-slides {
     display: flex;
@@ -5824,6 +5909,14 @@ function renderHTML() {
        the pills slip to a new line if the icon buttons would
        otherwise overflow. flex-wrap is what makes this graceful. */
     .header-right { flex-wrap: wrap; justify-content: flex-end; }
+    /* UX2-X1 (CRITICAL): at <=720px the header stacks vertically and
+       the two .header-icon-btn affordances (Config gear + Help "?")
+       sit in the top-right strip — same place the toast spawned. The
+       toast's z-index:100 was overlaying them for the ~3s display
+       duration on every account-switch / settings-change. Push the
+       toast below the stacked header so the gear/help buttons stay
+       clickable while a toast is showing. */
+    .toast { top: auto; bottom: 1.5rem; right: 1rem; left: 1rem; max-width: calc(100vw - 2rem); }
   }
   @media (max-width: 480px) {
     .stat-grid,
@@ -6453,17 +6546,19 @@ function vsFormatLabel(ms) {
     ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
 }
 
+// UX2-X8 (MAJOR): batch B (UX-X8) unified duration formatting under
+// fmtDurationShort everywhere except the scrubber. The scrubber's
+// vsFormatDuration was the THIRD format on the page (different from
+// fmtDurationShort which has minutes-with-seconds). Delegate to
+// fmtDurationShort so the scrubber's "5m" matches the activity feed's
+// "5m 12s" for the same logical duration. Special-case the >14-day
+// "N weeks" output — fmtDurationShort would render that as "21d 0h"
+// which is harder to read for long ranges.
 function vsFormatDuration(ms) {
   if (!ms || ms < 0) return '--';
-  var sec = Math.floor(ms / 1000);
-  var min = Math.floor(sec / 60);
-  var hr  = Math.floor(min / 60);
-  var day = Math.floor(hr / 24);
+  var day = Math.floor(ms / 86400000);
   if (day >= 14) return Math.floor(day / 7) + ' weeks';
-  if (day >= 1) return day + 'd ' + (hr % 24) + 'h';
-  if (hr  >= 1) return hr + 'h ' + (min % 60) + 'm';
-  if (min >= 1) return min + 'm';
-  return sec + 's';
+  return fmtDurationShort(ms);
 }
 
 function vsApplyVisibility(tabId) {
@@ -6525,8 +6620,18 @@ function vsRenderTrack() {
   te.style.left = ePct + '%';
   ts.setAttribute('aria-valuenow', String(Math.round(sPct)));
   te.setAttribute('aria-valuenow', String(Math.round(ePct)));
-  if (ls) ls.textContent = vsFormatLabel(_vsState.start);
-  if (le) le.textContent = vsFormatLabel(_vsState.end);
+  // UX2-VS1 (MAJOR): when both thumbs are close together (< 8% apart
+  // on the track), the two .vs-thumb-label elements overlap and become
+  // unreadable. Merge into one combined "<start> – <end>" label on the
+  // start thumb and hide the end label until they separate again.
+  var startLabel = vsFormatLabel(_vsState.start);
+  var endLabel = vsFormatLabel(_vsState.end);
+  var labelsOverlap = Math.abs(ePct - sPct) < 8;
+  if (ls) ls.textContent = labelsOverlap ? (startLabel + ' – ' + endLabel) : startLabel;
+  if (le) {
+    le.textContent = endLabel;
+    le.style.visibility = labelsOverlap ? 'hidden' : '';
+  }
   if (win) win.textContent = vsFormatDuration(_vsState.end - _vsState.start);
   // Fallback inputs for narrow viewports (kept in sync with the visual
   // track so the user isn't presented with stale values when they
@@ -7879,8 +7984,16 @@ const evtColors = {
 //   pause/play = serialize toggles
 //   gear      = config / prefs / settings / drain / renames
 //   info      = informational fallback (anything not classified)
+// UX2-AC2 (MAJOR): rate-limited and queue-depth-alert previously used
+// black-up-triangle (▲) which looks like a play button rotated and
+// carries no warning semantics. Map them to the standard warning sign
+// (U+26A0 ⚠) for instant recognition. Other multi-mapped glyphs (✖ for
+// removal/error events, ⚙ for any settings touch, ⛔ for blocked-state
+// events) stay mapped together intentionally — the dot colour and
+// tooltip already carry the per-event detail, while the icon family
+// keeps the visual scan band coherent.
 const evtIcons = {
-  'rate-limited': '▲',
+  'rate-limited': '⚠',
   'auth-expired': '✖',
   'refresh-failed': '✖',
   'all-exhausted': '⛔',
@@ -7903,7 +8016,7 @@ const evtIcons = {
   'serialize-auto-reverted': '▶',
   'serialize-progressive-drain-start': '⚙',
   'serialize-progressive-drain-end': '⚙',
-  'queue-depth-alert': '▲',
+  'queue-depth-alert': '⚠',
   'worktree_create': '+',
   'worktree_remove': '✖',
   'task_created': '+',
@@ -8020,7 +8133,11 @@ function renderActivity(log) {
     });
   }
   if (!filtered.length) {
-    el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity in selected window</div>';
+    // UX2-AC1: route through the canonical .empty-state class so this
+    // matches the chrome of the "No activity yet" branch in the initial
+    // markup. Inline-styled muted text broke the visual consistency
+    // batch C established for empty states.
+    el.innerHTML = '<div class="empty-state">No activity in the selected time window. Adjust the scrubber or pick a wider preset (Last 24h, Last 7d, All).</div>';
     _vdmApplyActivityFilter();
     return;
   }
@@ -8138,11 +8255,14 @@ async function loadSettingsUI() {
   } catch {}
 }
 
+// UX2-CO1 (MAJOR): replaced the typewriter-era "  -" (double-space-
+// hyphen-space) em-dash substitute with the proper U+2014 em-dash (—)
+// in user-facing strings. The double-space-hyphen looks like a typo.
 const STRATEGY_DETAILS = {
-  sticky:        { name: 'Sticky',      desc: 'Stay on the current account until it hits a rate limit (429) or auth error (401). Never switches proactively  - minimal disruption.' },
-  conserve:      { name: 'Conserve',    desc: 'Concentrate usage on accounts whose rate-limit windows are already active. Untouched accounts stay dormant so their 5hr and weekly windows never start  - maximizes total available capacity over time.' },
+  sticky:        { name: 'Sticky',      desc: 'Stay on the current account until it hits a rate limit (429) or auth error (401). Never switches proactively — minimal disruption.' },
+  conserve:      { name: 'Conserve',    desc: 'Concentrate usage on accounts whose rate-limit windows are already active. Untouched accounts stay dormant so their 5hr and weekly windows never start — maximizes total available capacity over time.' },
   'round-robin': { name: 'Round-robin', desc: 'Rotate to the least-used account on a fixed timer. Balances load evenly while limiting switch frequency.' },
-  spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
+  spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often — best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
 };
 
@@ -8158,10 +8278,16 @@ function updateStrategyUI(strategy) {
   const activeName = details ? details.name : strategy;
   document.getElementById('strategy-hint').textContent = 'Currently active: ' + activeName;
   const list = document.getElementById('strategy-list');
+  // UX2-CO3 (MAJOR): route s.name and s.desc through escHtml. The
+  // strings are hardcoded constants today, but the source-grep XSS
+  // regression tests in test/lib.test.mjs require every dynamic
+  // interpolation to wrap user data through h(...) / escHtml. A
+  // future refactor that loads STRATEGY_DETAILS from i18n bundles
+  // or a server endpoint would otherwise bypass the regression test.
   list.innerHTML = Object.entries(STRATEGY_DETAILS).map(([key, s]) =>
     '<div class="strategy-item' + (key === strategy ? ' active' : '') + '">' +
-      '<span class="strategy-item-name">' + s.name + '</span>' +
-      '<span class="strategy-item-desc">' + s.desc + '</span>' +
+      '<span class="strategy-item-name">' + escHtml(s.name) + '</span>' +
+      '<span class="strategy-item-desc">' + escHtml(s.desc) + '</span>' +
     '</div>'
   ).join('');
 }
@@ -8174,7 +8300,7 @@ async function toggleSetting(key, value) {
       body: JSON.stringify({ [key]: value })
     });
     const msgs = {
-      proxyEnabled: value ? 'Proxy enabled' : 'Proxy disabled  - passthrough mode',
+      proxyEnabled: value ? 'Proxy enabled' : 'Proxy disabled — passthrough mode',
       autoSwitch: value ? 'Auto-switch enabled' : 'Auto-switch disabled',
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
       serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
@@ -8272,6 +8398,12 @@ var TOK_PLANS = {
 };
 var _tokPrevPeriodData = [];
 var _tokRepoCollapsed = {};
+// UX2-BR2 — per-repo "show every branch" override. When the user
+// clicks the "Show N more" button on a hidden-branches summary row,
+// the repo key flips to true here and renderRepoGroup skips the
+// RENDER_BRANCH_CAP slice. Auto-cleared when the repo disappears
+// from the dataset (no need: re-init on next render with default).
+var _tokRepoBranchUncapped = {};
 
 // UX-CM1 / UX-CM3 — sticky open/closed state for the cache-miss session
 // list, plus per-session "show all misses" expansion. Three Sets:
@@ -8423,15 +8555,23 @@ function toggleRepoCollapse(repoKey) {
   renderRepoBranchBreakdown(_tokFilteredData || []);
 }
 
-// UX-BR2: explicit Expand all / Collapse all controls for the
-// Repository & Branch panel. The per-repo collapsed state lives in
-// _tokRepoCollapsed; bulk-flipping every key gives users a one-click
-// recovery from the per-repo branch-count default (see
-// _REPO_COLLAPSE_BRANCH_THRESHOLD in renderRepoBranchBreakdown). We
-// iterate only over the keys we already know about — adding a synthetic
-// "expand-everything-including-future-repos" mode would surprise the user
-// when a new repo appears later in a 5s poll.
+// UX-BR2 / UX2-BR1: explicit Expand all / Collapse all controls for
+// the Repository & Branch panel. The per-repo collapsed state lives
+// in _tokRepoCollapsed; bulk-flipping every key gives users a
+// one-click recovery from the per-repo branch-count default (see
+// _REPO_COLLAPSE_BRANCH_THRESHOLD in renderRepoBranchBreakdown).
+//
+// UX2-BR1 (MAJOR): the original code only iterated keys ALREADY in
+// _tokRepoCollapsed, so a freshly-discovered repo (5s poll picks up
+// a new git checkout) used the default branch-count rule and silently
+// appeared expanded — even after the user just clicked "Collapse all".
+// _tokRepoUserPrefersAllCollapsed records the user's last bulk choice
+// (null = "no override, use default"; true/false = "force all repos
+// to this state"); renderRepoGroup honours the override when
+// initialising _tokRepoCollapsed for a key it has not seen before.
+var _tokRepoUserPrefersAllCollapsed = null;
 function _repoBranchCollapseAll() {
+  _tokRepoUserPrefersAllCollapsed = true;
   for (var k in _tokRepoCollapsed) {
     if (Object.prototype.hasOwnProperty.call(_tokRepoCollapsed, k)) {
       _tokRepoCollapsed[k] = true;
@@ -8440,11 +8580,25 @@ function _repoBranchCollapseAll() {
   renderRepoBranchBreakdown(_tokFilteredData || []);
 }
 function _repoBranchExpandAll() {
+  _tokRepoUserPrefersAllCollapsed = false;
   for (var k in _tokRepoCollapsed) {
     if (Object.prototype.hasOwnProperty.call(_tokRepoCollapsed, k)) {
       _tokRepoCollapsed[k] = false;
     }
   }
+  renderRepoBranchBreakdown(_tokFilteredData || []);
+}
+
+// UX2-BR2 (MAJOR): the hidden-branches footer ("… and N more
+// branches") used to be a non-clickable italic div, which left users
+// with worktree-heavy repos unable to inspect the long tail. Promote
+// it to a real <button> that toggles _tokRepoBranchUncapped[repoKey]
+// so renderRepoGroup skips RENDER_BRANCH_CAP for that repo. The
+// repoKey is escHtml'd at the call site to defend against branch
+// names that include HTML metacharacters.
+function _toggleRepoBranchUncap(repoKey) {
+  if (!repoKey) return;
+  _tokRepoBranchUncapped[repoKey] = !_tokRepoBranchUncapped[repoKey];
   renderRepoBranchBreakdown(_tokFilteredData || []);
 }
 
@@ -10065,8 +10219,19 @@ function renderRepoBranchBreakdown(data) {
   var _REPO_COLLAPSE_BRANCH_THRESHOLD = 3;
   function renderRepoGroup(repo, isInactive) {
     if (_tokRepoCollapsed[repo.key] === undefined) {
-      var branchCount = repo.branches ? Object.keys(repo.branches).length : 0;
-      _tokRepoCollapsed[repo.key] = isInactive ? true : (branchCount > _REPO_COLLAPSE_BRANCH_THRESHOLD);
+      // UX2-BR1: honour the user's last "Collapse all" / "Expand all"
+      // bulk choice when initialising state for a freshly-discovered
+      // repo. Without this, "Collapse all" would not stick when a new
+      // repo arrived in the next poll. null = no override, use default
+      // branch-count rule.
+      if (_tokRepoUserPrefersAllCollapsed === true) {
+        _tokRepoCollapsed[repo.key] = true;
+      } else if (_tokRepoUserPrefersAllCollapsed === false) {
+        _tokRepoCollapsed[repo.key] = false;
+      } else {
+        var branchCount = repo.branches ? Object.keys(repo.branches).length : 0;
+        _tokRepoCollapsed[repo.key] = isInactive ? true : (branchCount > _REPO_COLLAPSE_BRANCH_THRESHOLD);
+      }
     }
     var collapsed = _tokRepoCollapsed[repo.key];
     var pct = Math.round((repo.total / grandTotal) * 100);
@@ -10102,6 +10267,13 @@ function renderRepoBranchBreakdown(data) {
       var hiddenBranchCount = 0;
       var hiddenBranchTotalIn = 0;
       var hiddenBranchTotalOut = 0;
+      // UX2-BR2: when the user has clicked "Show N more" for this
+      // repo, _tokRepoBranchUncapped[repo.key] is true and we render
+      // every branch instead of capping at RENDER_BRANCH_CAP. The
+      // collapse-into-footer accounting still runs (so the user can
+      // click "Show fewer" to re-cap), but the slice keeps every
+      // entry visible.
+      var uncapped = !!_tokRepoBranchUncapped[repo.key];
       if (branchKeys.length > RENDER_BRANCH_CAP) {
         for (var hi = RENDER_BRANCH_CAP; hi < branchKeys.length; hi++) {
           var hb = repo.branches[branchKeys[hi]];
@@ -10109,7 +10281,7 @@ function renderRepoBranchBreakdown(data) {
           hiddenBranchTotalOut += hb.totalOut;
           hiddenBranchCount++;
         }
-        branchKeys = branchKeys.slice(0, RENDER_BRANCH_CAP);
+        if (!uncapped) branchKeys = branchKeys.slice(0, RENDER_BRANCH_CAP);
       }
       for (var bi = 0; bi < branchKeys.length; bi++) {
         var br = repo.branches[branchKeys[bi]];
@@ -10131,18 +10303,27 @@ function renderRepoBranchBreakdown(data) {
         h += '<div class="tok-branch-detail">' + modelDetail + '</div>';
         h += '</div>';
       }
-      // Footer row summarising hidden branches (only when we actually
-      // capped the display above).
-      if (hiddenBranchCount > 0) {
+      // UX2-BR2: footer row summarising hidden branches (only when we
+      // actually capped the display above). Promoted from a static
+      // italic div to an interactive button so worktree-heavy repos
+      // can be expanded inline. The repo.key is escHtml'd before
+      // injection because branch / repo names can contain HTML
+      // metacharacters from external git worktree paths.
+      if (hiddenBranchCount > 0 || uncapped) {
         var hiddenTotal = hiddenBranchTotalIn + hiddenBranchTotalOut;
-        var hiddenPct = Math.round((hiddenTotal / grandTotal) * 100);
-        h += '<div class="tok-branch-row tok-branch-inactive" style="padding-left:1.5rem;font-style:italic;opacity:0.75">';
-        h += '<div class="tok-branch-name">… and ' + hiddenBranchCount + ' more branch' + (hiddenBranchCount === 1 ? '' : 'es') + '</div>';
-        h += '<div class="tok-branch-stats">';
-        // UX-X9: hover-exact for the hidden-branches summary totals.
-        h += '<span class="tok-branch-total" title="' + fmtTokenCountExact(hiddenBranchTotalIn) + ' input / ' + fmtTokenCountExact(hiddenBranchTotalOut) + ' output across hidden branches">' + formatNum(hiddenBranchTotalIn) + ' / ' + formatNum(hiddenBranchTotalOut) + '</span>';
-        h += '<span class="tok-branch-pct">' + hiddenPct + '%</span>';
-        h += '</div>';
+        var hiddenPct = grandTotal > 0 ? Math.round((hiddenTotal / grandTotal) * 100) : 0;
+        var safeRepoKey = escHtml(repo.key || '');
+        h += '<div class="tok-branch-row tok-branch-inactive tok-branch-hidden-summary" style="padding-left:1.5rem">';
+        if (uncapped) {
+          h += '<button type="button" class="tok-branch-uncap-toggle" onclick="_toggleRepoBranchUncap(\\'' + safeRepoKey + '\\')" title="Re-cap the branch list to the top ' + RENDER_BRANCH_CAP + ' for this repo">Show fewer</button>';
+        } else {
+          h += '<button type="button" class="tok-branch-uncap-toggle" onclick="_toggleRepoBranchUncap(\\'' + safeRepoKey + '\\')" title="Show every branch for this repo">Show ' + hiddenBranchCount + ' more branch' + (hiddenBranchCount === 1 ? '' : 'es') + '</button>';
+          h += '<div class="tok-branch-stats">';
+          // UX-X9: hover-exact for the hidden-branches summary totals.
+          h += '<span class="tok-branch-total" title="' + fmtTokenCountExact(hiddenBranchTotalIn) + ' input / ' + fmtTokenCountExact(hiddenBranchTotalOut) + ' output across hidden branches">' + formatNum(hiddenBranchTotalIn) + ' / ' + formatNum(hiddenBranchTotalOut) + '</span>';
+          h += '<span class="tok-branch-pct">' + hiddenPct + '%</span>';
+          h += '</div>';
+        }
         h += '</div>';
       }
     }
@@ -10428,9 +10609,15 @@ const LOG_MAX_LINES = 5000;
 // GitHub's dark theme — they read harshly inside a light dashboard, and a
 // future dark-mode rollout would have to update them by hand. With var(--…)
 // references, retoning is automatic.
+// UX2-L1 (MAJOR): warn was mapped to var(--red), identical to error —
+// semantic inversion. The convention everywhere else in computing is
+// info < warn < error mapped to muted/blue -> yellow -> red. With warn
+// rendered identically to error, operators triaging the log stream
+// could not distinguish "warning" from "error" without reading the tag
+// text. switch/proactive moved to cyan to free up yellow for warn.
 const LOG_TAG_COLORS = {
-  error: 'var(--red)', warn: 'var(--red)',
-  switch: 'var(--yellow)', proactive: 'var(--yellow)',
+  error: 'var(--red)', warn: 'var(--yellow)',
+  switch: 'var(--cyan)', proactive: 'var(--cyan)',
   refresh: 'var(--blue)', circuit: 'var(--blue)', fallback: 'var(--blue)',
   info: 'var(--muted)', system: 'var(--muted)',
 };
@@ -10499,6 +10686,31 @@ function _vdmPersistRegexToggle(key, on) {
 // Apply the current logs filter to every line in #log-container. Lines
 // keep their position in the DOM; only the .log-line-hidden class is
 // toggled. The "N of M" count badge is updated in the same pass.
+// UX2-L2 / UX2-AC1 (MAJOR): when a filter matches zero entries, the
+// container becomes visually empty and the user has only the small
+// "0 of N match" badge as feedback (often missed because the eye is
+// drawn to the empty pane). Render an in-pane .empty-state node so
+// the user sees an explanation instead of an empty container.
+// Idempotent — only one .vdm-filter-empty exists at any time, removed
+// when matched > 0 or when the filter is cleared.
+function _vdmShowFilterEmptyState(container, kind) {
+  if (!container) return;
+  var existing = container.querySelector('.vdm-filter-empty');
+  if (existing) return;
+  var msg = document.createElement('div');
+  msg.className = 'empty-state vdm-filter-empty';
+  msg.textContent = (kind === 'activity')
+    ? 'No activity matches the current filter. Clear the filter or try a broader pattern.'
+    : 'No log lines match the current filter. Clear the filter or try a broader pattern.';
+  container.appendChild(msg);
+}
+
+function _vdmHideFilterEmptyState(container) {
+  if (!container) return;
+  var existing = container.querySelector('.vdm-filter-empty');
+  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+}
+
 function _vdmApplyLogsFilter() {
   var container = document.getElementById('log-container');
   if (!container) return;
@@ -10519,16 +10731,22 @@ function _vdmApplyLogsFilter() {
     countEl.textContent = 'Invalid regex';
     // Show all lines while the regex is invalid so the user is not left
     // staring at an empty pane wondering what happened.
-    var allLines = container.querySelectorAll('div');
+    // Skip .vdm-filter-empty so an existing empty-state node stays
+    // visible until matched count is recomputed.
+    var allLines = container.querySelectorAll('div:not(.vdm-filter-empty)');
     for (var i = 0; i < allLines.length; i++) {
       allLines[i].classList.remove('log-line-hidden');
     }
+    _vdmHideFilterEmptyState(container);
     return;
   } else {
     input.classList.remove('invalid');
     countEl.classList.remove('error');
   }
-  var lines = container.querySelectorAll('div');
+  // Exclude .vdm-filter-empty so it is not counted as a "real" log line
+  // for matched/total tallies (otherwise it would persist after data
+  // arrives and inflate the total).
+  var lines = container.querySelectorAll('div:not(.vdm-filter-empty)');
   var total = lines.length;
   var matched = 0;
   for (var j = 0; j < lines.length; j++) {
@@ -10542,8 +10760,14 @@ function _vdmApplyLogsFilter() {
   }
   if (!pattern) {
     countEl.textContent = total > 0 ? (total + ' entries') : '';
+    _vdmHideFilterEmptyState(container);
   } else {
     countEl.textContent = matched + ' of ' + total + ' match';
+    if (matched === 0 && total > 0) {
+      _vdmShowFilterEmptyState(container, 'logs');
+    } else {
+      _vdmHideFilterEmptyState(container);
+    }
   }
 }
 
@@ -10571,6 +10795,7 @@ function _vdmApplyActivityFilter() {
     for (var i = 0; i < allEvts.length; i++) {
       allEvts[i].classList.remove('evt-hidden');
     }
+    _vdmHideFilterEmptyState(wrap);
     return;
   } else {
     input.classList.remove('invalid');
@@ -10590,8 +10815,17 @@ function _vdmApplyActivityFilter() {
   }
   if (!pattern) {
     countEl.textContent = total > 0 ? (total + ' entries') : '';
+    _vdmHideFilterEmptyState(wrap);
   } else {
     countEl.textContent = matched + ' of ' + total + ' match';
+    // UX2-L2 / UX2-AC1: render an in-pane empty-state when the filter
+    // matches zero events, so the empty pane gets a textual explanation
+    // instead of looking broken.
+    if (matched === 0 && total > 0) {
+      _vdmShowFilterEmptyState(wrap, 'activity');
+    } else {
+      _vdmHideFilterEmptyState(wrap);
+    }
   }
 }
 
@@ -10819,6 +11053,15 @@ var _collapsedSessions = new Set();
 // 16x16 viewbox, sized to 0.875rem in CSS so it sits comfortably in
 // the button's 0.25rem padding.
 var SESSION_COPY_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="4" y="3" width="9" height="11" rx="1.5"/><path d="M11 3V2.5A1.5 1.5 0 0 0 9.5 1h-2A1.5 1.5 0 0 0 6 2.5V3"/></svg>';
+// UX2-S2 (MAJOR): the conflicts banner used a unicode warning emoji
+// (\\u26A0 ⚠) which renders as a coloured emoji on macOS but as a
+// black-on-white glyph (or fallback box) on Linux servers and
+// platforms without emoji fonts. Replace with inline SVG (12x12) so
+// the warning glyph renders identically across every platform —
+// important because the conflicts banner is critical UX (two sessions
+// editing the same file simultaneously). currentColor inherits the
+// banner text colour (currently var(--red)).
+var SESSION_WARNING_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" style="vertical-align:-1px;margin-right:4px"><path d="M8 2 L14 13 L2 13 Z"/><path d="M8 6 V9"/><circle cx="8" cy="11.5" r="0.6" fill="currentColor"/></svg>';
 // Session timeline expand-toggle labels. Constants (not user-controlled)
 // so the toggle handler can swap them without re-deriving them from
 // strings sprinkled across the source.
@@ -10932,10 +11175,13 @@ function renderSessions(data) {
   var html = '';
 
   // Conflicts banner
+  // UX2-S2: use SESSION_WARNING_ICON_SVG (inline SVG) instead of the
+  // \\u26A0 emoji so the warning glyph renders consistently on Linux /
+  // server / no-emoji-font platforms.
   if (data.conflicts && data.conflicts.length) {
     html += '<div class="session-conflicts">';
     data.conflicts.forEach(function(c) {
-      html += '<div>\\u26A0 ' + c.count + ' sessions editing ' + escHtml(c.file) + '</div>';
+      html += '<div>' + SESSION_WARNING_ICON_SVG + c.count + ' sessions editing ' + escHtml(c.file) + '</div>';
     });
     html += '</div>';
   }
