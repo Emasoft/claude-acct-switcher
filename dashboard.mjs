@@ -3546,6 +3546,19 @@ function renderHTML() {
      zero-dependency / privacy-first stance and breaking the dashboard
      for users behind captive portals or strict outbound-proxy SOCs. -->
 <style>
+  /* UX2-CO5: smooth-scroll for in-page anchor jumps (Config TOC chips
+     scroll the page to each #config-* section). Without this, clicking
+     "Strategy" in the TOC snaps the page instantly and the user loses
+     spatial context. The reduce-motion media query below disables it
+     for users who opted out of motion at the OS level — anchor
+     scrolling without animation is a documented accessibility
+     tradeoff. NOTE: no backticks anywhere in this comment — the whole
+     renderHTML body is a JS template literal and a stray backtick
+     terminates the string (see CLAUDE.md backtick-trap rule). */
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+  }
   /* A11y: visually hidden but exposed to assistive tech. Lets us add
      <label for> associations to the dashboard's CSS-styled toggle
      switches without affecting the visual layout. */
@@ -4566,7 +4579,12 @@ function renderHTML() {
     font-family: inherit;
   }
   .vdm-filter-bar input[type="text"]:focus { outline: 2px solid var(--primary); outline-offset: -1px; }
-  .vdm-filter-bar input[type="text"].invalid { border-color: #f85149; outline-color: #f85149; }
+  /* UX2-L6: design-token migration — hardcoded GitHub-red hex
+     (#f85149) is a relic of pre-batch-K palette work that did not get
+     swept on the filter-bar. Routing through var(--red) keeps the
+     invalid-state border in lockstep with any future dark-mode
+     rebind. */
+  .vdm-filter-bar input[type="text"].invalid { border-color: var(--red); outline-color: var(--red); }
   .vdm-filter-bar label {
     display: inline-flex;
     align-items: center;
@@ -4610,7 +4628,8 @@ function renderHTML() {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
-  .vdm-filter-count.error { color: #f85149; }
+  /* UX2-L6: same design-token migration as the input.invalid rule above. */
+  .vdm-filter-count.error { color: var(--red); }
 
   /* ── Usage ── */
   .usage-card {
@@ -4856,11 +4875,16 @@ function renderHTML() {
     border-color: var(--yellow-border);
     background: var(--yellow-soft);
   }
+  /* UX2-A3: row-gap added so wrapped layouts (toggle pill on row 1,
+     buttons spilling to row 2) get vertical breathing room equal to
+     the inline gap. Without this, the wrapped buttons sat flush against
+     the row above, breaking the visual rhythm of the card. */
   .card-actions {
     margin-top: 0.875rem;
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    row-gap: 0.5rem;
     flex-wrap: wrap;
   }
   .card-actions .acct-pref-toggle { margin-right: auto; }
@@ -5006,7 +5030,14 @@ function renderHTML() {
     cursor: pointer;
     user-select: none;
   }
-  .tok-repo-header:hover { opacity: 0.8; }
+  /* UX2-BR4: the prior tok-repo-header hover rule (opacity: 0.8)
+     conflicted with the UX-S2 chevron-colour-bump rule below — the
+     chevron picked up the bolder var(--foreground) tone, then got
+     dimmed by the parent's 0.8 opacity so the net visual was DIMMER
+     than the non-hovered state. Replace with a subtle background tint
+     that announces interactivity without fighting the chevron.
+     Mirrors the .session-header:hover pattern. */
+  .tok-repo-header:hover { background: var(--bg); }
   .tok-repo-group + .tok-repo-group .tok-repo-header {
     border-top: 1px solid var(--bg);
   }
@@ -5020,13 +5051,24 @@ function renderHTML() {
   }
   .tok-repo-chevron.collapsed { transform: rotate(-90deg); }
   /* UX-S2: chevron picks up colour on header hover/focus to advertise the
-     toggle. The header's opacity:0.8 on hover dimmed the chevron AWAY
-     from interactivity instead of toward it. */
+     toggle. UX2-BR4: the parent's opacity:0.8 was previously cancelling
+     the chevron colour bump, replaced by a subtle background tint
+     above so the chevron-colour cue lands cleanly. */
   .tok-repo-header:hover .tok-repo-chevron,
   .tok-repo-header:focus-visible .tok-repo-chevron { color: var(--foreground); }
   .tok-repo-name { font-weight: 600; }
   .tok-repo-inactive { opacity: 0.5; }
   .tok-branch-inactive { opacity: 0.6; }
+  /* UX2-BR3: promoted from an inline style attribute on the
+     hidden-branches summary row so future palette/spacing tweaks land
+     in one place instead of having to edit a per-element style="…".
+     Kept identical to the original inline values (1.5rem indent +
+     italic + 0.75 opacity) to avoid any visual regression. */
+  .tok-branch-hidden-summary {
+    padding-left: 1.5rem;
+    font-style: italic;
+    opacity: 0.75;
+  }
   .tok-inactive-sep {
     font-size: 0.6875rem;
     color: var(--muted);
@@ -5324,8 +5366,16 @@ function renderHTML() {
     pointer-events: none;
     box-shadow: 0 2px 8px rgba(0,0,0,0.15);
   }
+  /* UX2-X5: bumped from 0.5625rem (~9px) to 0.6875rem (~11px) to lift
+     above the WCAG 1.4.4 ergonomic floor for axis labels. The chart
+     labels truncate via ellipsis when wider than max-width:100%, so
+     the bump may force more truncation on narrow buckets — verified
+     against the widest dataset (account names + repo names) and the
+     truncation pattern is acceptable. The whole-card font-size
+     inheritance below (--foreground colour + var(--muted) tone) is
+     unchanged. */
   .tok-chart-label {
-    font-size: 0.5625rem;
+    font-size: 0.6875rem;
     color: var(--muted);
     margin-top: 0.25rem;
     white-space: nowrap;
@@ -5418,6 +5468,19 @@ function renderHTML() {
     transition: transform 0.15s ease;
   }
   .cpf-toggle[aria-expanded="true"] .cpf-chevron { transform: rotate(180deg); }
+  /* UX2-CPF2: when the single-select tok-repo dropdown is set to a repo
+     that has no recent data in the current time window, the cpf-toggle
+     button picks up data-no-data="true" (set by populateProjectFilterOptions).
+     The dotted yellow border keeps the button readable while signalling
+     "the empty chart is intentional, not a bug". The title= tooltip set
+     in JS carries the explanatory text. */
+  .cpf-toggle[data-no-data="true"] {
+    border-color: var(--yellow);
+    border-style: dashed;
+  }
+  .cpf-toggle[data-no-data="true"] .cpf-chevron {
+    color: var(--yellow);
+  }
   .cpf-panel {
     position: absolute;
     top: calc(100% + 4px);
@@ -9348,7 +9411,14 @@ function _carouselPaused() {
   if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return true;
   var panel = document.getElementById('cpf-panel');
   if (panel && !panel.hidden) return true;
-  if (carousel.querySelector('.tok-chart-seg:hover, .tok-wasted-bar:hover, .chart-bar:hover')) return true;
+  // UX2-CA3: dropped the .chart-bar:hover sub-selector. .chart-bar
+  // lives in the legacy "All Accounts" stats chart inside #stats-section,
+  // NOT inside .chart-carousel — querying for it inside the carousel
+  // never matched. Dead code removal; the remaining two predicates
+  // (.tok-chart-seg:hover for the segment chart, .tok-wasted-bar:hover
+  // for the wasted-spend chart) cover every interactive element that
+  // actually lives in the carousel slides.
+  if (carousel.querySelector('.tok-chart-seg:hover, .tok-wasted-bar:hover')) return true;
   return false;
 }
 function chartCarouselNext() {
@@ -9558,6 +9628,23 @@ function populateProjectFilterOptions() {
       sorted = [];
       hintHtml += '<div class="cpf-empty" style="padding:0.25rem 0.3rem">'
         + '(no recent data for this repo in the current time window)</div>';
+    }
+  }
+  // UX2-CPF2: surface the "no recent data for this repo" warning on the
+  // cpf-toggle button itself, not just inside the panel. When the panel
+  // is closed the button was previously the sole UI element — users who
+  // closed the panel would lose all signal that the chart was empty for
+  // a real reason rather than a bug. The data-no-data attribute drives a
+  // small visual marker (see .cpf-toggle[data-no-data] CSS rule) and a
+  // title= tooltip so the warning persists across panel-close.
+  var toggleBtn = document.getElementById('cpf-toggle');
+  if (toggleBtn) {
+    if (singleSelectRepo && !seen.has(singleSelectRepo)) {
+      toggleBtn.setAttribute('data-no-data', 'true');
+      toggleBtn.setAttribute('title', 'Selected repo has no recent data in the current time window');
+    } else {
+      toggleBtn.removeAttribute('data-no-data');
+      toggleBtn.removeAttribute('title');
     }
   }
   // Drop selected entries that no longer exist in the dataset (data
@@ -10136,7 +10223,11 @@ function renderRepoBranchBreakdown(data) {
       if (hiddenBranchCount > 0) {
         var hiddenTotal = hiddenBranchTotalIn + hiddenBranchTotalOut;
         var hiddenPct = Math.round((hiddenTotal / grandTotal) * 100);
-        h += '<div class="tok-branch-row tok-branch-inactive" style="padding-left:1.5rem;font-style:italic;opacity:0.75">';
+        // UX2-BR3: inline style replaced with the .tok-branch-hidden-summary
+        // CSS class (declared near the other tok-branch-* rules) — no visual
+        // change, just deduplicates the layout into the design system so
+        // future palette/spacing changes happen in one place.
+        h += '<div class="tok-branch-row tok-branch-inactive tok-branch-hidden-summary">';
         h += '<div class="tok-branch-name">… and ' + hiddenBranchCount + ' more branch' + (hiddenBranchCount === 1 ? '' : 'es') + '</div>';
         h += '<div class="tok-branch-stats">';
         // UX-X9: hover-exact for the hidden-branches summary totals.
@@ -10923,7 +11014,14 @@ function renderSessions(data) {
   var recent = data.recent || [];
   if (!active.length && !recent.length) {
     if (!data.enabled) {
-      el.innerHTML = '<div class="empty-state">Session Monitor is OFF. Enable it in Config (BETA).</div>';
+      // UX2-S6: mirror of UX-BR3 batch C — every empty state that
+      // points the user at another tab MUST do so via a clickable link,
+      // not flowing prose. Without this, novice users have to remember
+      // to navigate to Config manually. The doubly-escaped quotes match
+      // the toggleSessionCollapse / toggleSessionTimelineExpand pattern
+      // (single-quoted JS string inside an HTML onclick attribute,
+      // inside a template literal so backslashes need doubling).
+      el.innerHTML = '<div class="empty-state">Session Monitor is OFF. <a href="#" onclick="switchTab(\\'config\\'); return false">Enable it in Config</a> (BETA).</div>';
     } else {
       el.innerHTML = '<div class="empty-state">No sessions yet. Start a Claude Code session with the proxy running.</div>';
     }
@@ -11049,8 +11147,14 @@ function renderSessions(data) {
   if (data.overhead) {
     var oh = data.overhead.inputTokens + data.overhead.outputTokens;
     if (oh > 0) {
-      // UX-X9: hover-exact for the compact tok count in the footer.
-      html += '<div class="session-overhead" title="' + fmtTokenCountExact(oh) + ' tokens of summarizer overhead (Haiku)">Summarizer overhead: ' + formatNum(oh) + ' tokens (Haiku)</div>';
+      // UX-X9 (load-bearing): the compact tok count in the footer needs
+      // an exact unabbreviated companion in the title attribute. Without
+      // this, the user can never recover the precise figure that the
+      // compact form rounds away.
+      // UX2-S4: pre-fix tooltip duplicated the visible "(Haiku)" suffix.
+      // Drop the duplicate but keep the exact-token-count promise of
+      // UX-X9 by combining "<exact> tokens" with a short scope hint.
+      html += '<div class="session-overhead" title="' + fmtTokenCountExact(oh) + ' tokens — total billed for AI summarization across all completed sessions in the current poll cycle">Summarizer overhead: ' + formatNum(oh) + ' tokens (Haiku)</div>';
     }
   }
 
