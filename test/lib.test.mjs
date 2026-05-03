@@ -5002,7 +5002,11 @@ describe('Phase I+ — forensic event log + rotation (batch 9)', () => {
   it('logForensicEvent appends JSON Lines to events.jsonl', () => {
     assert.match(_src_f, /function logForensicEvent\(category, details\)/);
     assert.match(_src_f, /JSON\.stringify\(entry\) \+ '\\n'/);
-    assert.match(_src_f, /flag: 'a', mode: 0o600/);
+    // CQ-013 fix replaced the dead `writeFileSync(..., { flag: 'a', mode: 0o600 })`
+    // fallback (under an unreachable if/else gating require() in ESM) with a
+    // direct `appendFileSync(..., { mode: 0o600 })` call. Append semantics are
+    // preserved by the dedicated appendFileSync function name.
+    assert.match(_src_f, /appendFileSync\(EVENTS_FILE, JSON\.stringify\(entry\) \+ '\\n', \{ mode: 0o600 \}\)/);
   });
 
   it('events.jsonl + startup.log rotate daily, 7-day retention', () => {
@@ -11161,5 +11165,287 @@ describe('UX batch L — MINOR/NIT cleanup source-grep regressions', () => {
     );
     assert.ok(onopenSlice, 'expected _logES.onopen handler');
     assert.match(onopenSlice[0], /_logReconnectCount\s*=\s*0/);
+  });
+});
+
+describe('Code-quality audit fixes (CQ-001 .. CQ-013) — source-grep regressions', () => {
+  const _src_cq = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── CQ-001 / CQ-002 / CQ-013 — require() must NOT appear in code ──
+  it('CQ-001/002/013 — no actual require() call in dashboard.mjs (ESM file)', () => {
+    // Strip both line-comments AND block-comments so the explanatory
+    // CQ-fix mentions of require() (which describe the bug we removed)
+    // do not trip the assertion.
+    const stripped = _src_cq
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map(l => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    // Forbid bare require( calls. Imports and ESM-style strings are
+    // unaffected.
+    const matches = stripped.match(/(^|[^\w/])require\(/g) || [];
+    assert.equal(
+      matches.length,
+      0,
+      'expected zero require() calls in dashboard.mjs (it is .mjs / ESM); found ' + matches.length,
+    );
+  });
+
+  it('CQ-001 — appendFileSync + statSync are imported from node:fs at the top of the file', () => {
+    // Without the import, the rotation/append paths fall back to the
+    // pre-fix require() calls that silently throw in ESM.
+    const importLine = _src_cq.match(
+      /^import \{[^}]*\bappendFileSync\b[^}]*\bstatSync\b[^}]*\} from 'node:fs';/m,
+    );
+    if (!importLine) {
+      const altLine = _src_cq.match(
+        /^import \{[^}]*\bstatSync\b[^}]*\bappendFileSync\b[^}]*\} from 'node:fs';/m,
+      );
+      assert.ok(
+        altLine,
+        'expected appendFileSync AND statSync to be imported from node:fs at module scope',
+      );
+    } else {
+      assert.ok(importLine);
+    }
+  });
+
+  it('CQ-001 — _rotateForensicLog uses statSync directly (not via require)', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function _rotateForensicLog'),
+      _src_cq.indexOf('function _rotateForensicLog') + 1500,
+    );
+    assert.match(fnSlice, /const st = statSync\(EVENTS_FILE\);/);
+  });
+
+  it('CQ-002 — _rotateStartupLog uses statSync directly (not via require)', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function _rotateStartupLog'),
+      _src_cq.indexOf('function _rotateStartupLog') + 1200,
+    );
+    assert.match(fnSlice, /const st = statSync\(STARTUP_LOG_FILE\);/);
+  });
+
+  it('CQ-013 — logForensicEvent uses appendFileSync directly (no if/else dispatch)', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function logForensicEvent'),
+      _src_cq.indexOf('function logForensicEvent') + 1500,
+    );
+    assert.match(
+      fnSlice,
+      /appendFileSync\(EVENTS_FILE, JSON\.stringify\(entry\) \+ '\\n', \{ mode: 0o600 \}\)/,
+    );
+    // Strip line-comments so the CQ-013 fix-explanation mentions of
+    // _appendFileSync don't trip the assertion. We're asserting the
+    // dead variable/dispatch is gone from the EXECUTABLE code.
+    const exec = fnSlice
+      .split('\n')
+      .map(l => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    assert.doesNotMatch(exec, /let _appendFileSync;/);
+  });
+
+  // ── CQ-003 — cap-check before writeHead(200) on /api/logs/stream ──
+  it('CQ-003 — /api/logs/stream cap-check runs BEFORE writeHead(200)', () => {
+    const handlerSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/logs/stream'"),
+      _src_cq.indexOf("'/api/logs/stream'") + 1500,
+    );
+    const capIdx = handlerSlice.indexOf('MAX_LOG_SUBSCRIBERS');
+    const headIdx = handlerSlice.indexOf("res.writeHead(200");
+    assert.ok(capIdx >= 0, 'expected MAX_LOG_SUBSCRIBERS check in handler');
+    assert.ok(headIdx >= 0, 'expected res.writeHead(200, ...) in handler');
+    assert.ok(
+      capIdx < headIdx,
+      'cap check (MAX_LOG_SUBSCRIBERS) MUST appear BEFORE res.writeHead(200) — otherwise the 503 path throws ERR_HTTP_HEADERS_SENT',
+    );
+  });
+
+  it('CQ-003 — MAX_LOG_SUBSCRIBERS is hoisted to module scope', () => {
+    // Was previously re-declared inside the request handler on every
+    // GET; module-scope declaration both fixes the per-request alloc
+    // waste and lets the constant be referenced before the handler.
+    const declMatches = _src_cq.match(/^const MAX_LOG_SUBSCRIBERS = \d+;/gm) || [];
+    assert.equal(
+      declMatches.length,
+      1,
+      'expected exactly one module-scope const MAX_LOG_SUBSCRIBERS = N; declaration',
+    );
+  });
+
+  // ── CQ-004 — per-account permit handoff inherits the slot ──
+  it('CQ-004 — releaseAccountPermit hands the slot to the next waiter without dipping inflight', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function releaseAccountPermit'),
+      _src_cq.indexOf('function releaseAccountPermit') + 1200,
+    );
+    assert.match(fnSlice, /if \(s\.waiters\.length > 0\) \{[\s\S]+?next\(\);[\s\S]+?return;/);
+    const nextIdx = fnSlice.indexOf('next();');
+    const decIdx = fnSlice.indexOf('s.inflight = Math.max');
+    assert.ok(nextIdx >= 0 && decIdx >= 0, 'expected both branches present');
+    assert.ok(nextIdx < decIdx, 'next() (waiter handoff) MUST appear before the inflight decrement');
+  });
+
+  it('CQ-004 — acquireAccountPermit does NOT bump inflight on the wake-from-wait path', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('async function acquireAccountPermit'),
+      _src_cq.indexOf('async function acquireAccountPermit') + 2500,
+    );
+    // The fix wraps the increment in the else branch so it only fires
+    // on the fast (no-wait) path. Pin the load-bearing shape: the
+    // increment lives INSIDE `} else { ... }`, NOT outside the if.
+    assert.match(fnSlice, /\}\s*else\s*\{\s*s\.inflight\+\+;\s*\}/);
+    // And the standalone bare increment that pre-fix lived right after
+    // the await closing brace must NOT appear anymore. Pre-fix shape:
+    //   await new Promise(...);
+    //   }    // closes the if-block
+    //   s.inflight++;   ← this line was the bug
+    // Strip line-comments first so the CQ-004 narrative comments don't
+    // produce false matches. Then assert there is no `}\n  s.inflight++;`
+    // immediately-after-if pattern.
+    const exec = fnSlice
+      .split('\n')
+      .map(l => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    assert.doesNotMatch(exec, /\}\n\s*s\.inflight\+\+;/);
+  });
+
+  // ── CQ-005 — settings POST invalidates _runGitCached on gate flips ──
+  it('CQ-005 — settings POST invalidates the git cache when gate-controlling settings flip', () => {
+    const handlerSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/settings' && req.method === 'POST'"),
+      _src_cq.indexOf("'/api/settings' && req.method === 'POST'") + 9000,
+    );
+    assert.match(handlerSlice, /_prevCommitTokenUsage/);
+    assert.match(handlerSlice, /_prevSessionMonitor/);
+    assert.match(handlerSlice, /_prevPerToolAttribution/);
+    assert.match(handlerSlice, /_invalidateRunGitCache\(null\)/);
+  });
+
+  // ── CQ-006 — loadProfiles dedup runs at most once per process ──
+  it('CQ-006 — loadProfiles dedup pass is gated behind a once-per-process flag', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('async function loadProfiles'),
+      _src_cq.indexOf('async function loadProfiles') + 6000,
+    );
+    assert.match(fnSlice, /if \(!_dedupAlreadyRan\)/);
+    // The flag itself must be declared at module scope.
+    assert.match(_src_cq, /^let _dedupAlreadyRan = false;/m);
+  });
+
+  // ── CQ-007 — /api/cleanup-plaintext endpoint exists and supports GET + POST ──
+  it('CQ-007 — /api/cleanup-plaintext endpoint accepts GET and POST', () => {
+    assert.match(
+      _src_cq,
+      /url\.pathname === '\/api\/cleanup-plaintext'/,
+    );
+    const handlerSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/cleanup-plaintext'"),
+      _src_cq.indexOf("'/api/cleanup-plaintext'") + 2000,
+    );
+    assert.match(handlerSlice, /req\.method === 'GET'/);
+    assert.match(handlerSlice, /req\.method === 'POST'/);
+    // SEC discipline — the GET response must NOT echo the absolute
+    // path (just the account name).
+    assert.match(handlerSlice, /account: e\.name/);
+  });
+
+  // ── CQ-008 — pendingSessions GC vs auto-claim race guard ──
+  it('CQ-008 — _safeAutoClaim wraps both prune paths', () => {
+    const pruneSlice = _src_cq.slice(
+      _src_cq.indexOf('function _prunePendingSessions'),
+      _src_cq.indexOf('function _prunePendingSessions') + 800,
+    );
+    assert.match(pruneSlice, /_safeAutoClaim\(id, s\)/);
+    // The inline prune in /api/session-start.
+    const inlineSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/session-start'"),
+      _src_cq.indexOf("'/api/session-start'") + 6500,
+    );
+    assert.match(inlineSlice, /_safeAutoClaim\(id, s\)/);
+  });
+
+  it('CQ-008 — _safeAutoClaim consults _wasAutoClaimedRecently before invoking _autoClaimSession', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function _safeAutoClaim'),
+      _src_cq.indexOf('function _safeAutoClaim') + 600,
+    );
+    assert.match(fnSlice, /if \(_wasAutoClaimedRecently\(sessionId\)\) return;/);
+    assert.match(fnSlice, /_markAutoClaimed\(sessionId\)/);
+    assert.match(fnSlice, /_autoClaimSession\(sessionId, session\)/);
+  });
+
+  // ── CQ-009 — debounced activity-log writes ──
+  it('CQ-009 — logActivity arms the debounce timer instead of writing synchronously', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function logActivity'),
+      _src_cq.indexOf('function logActivity') + 2500,
+    );
+    assert.match(fnSlice, /_activityLogDirty = true;/);
+    assert.match(fnSlice, /_activityLogFlushTimer = setTimeout\(_flushActivityLog/);
+    // Strip line-comments so the CQ-009 explanatory text doesn't trip
+    // the assertion. We're asserting the EXECUTABLE code no longer
+    // calls atomicWriteFileSync inline.
+    const exec = fnSlice
+      .split('\n')
+      .map(l => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    assert.doesNotMatch(exec, /atomicWriteFileSync\(ACTIVITY_LOG_FILE/);
+  });
+
+  it('CQ-009 — flushActivityLogSync is wired into the shutdown handler', () => {
+    const shutdownSlice = _src_cq.slice(
+      _src_cq.indexOf('function shutdown'),
+      _src_cq.indexOf('function shutdown') + 4000,
+    );
+    assert.match(shutdownSlice, /flushActivityLogSync\(\)/);
+  });
+
+  // ── CQ-010 — fetchAccountEmail comment + rename to _bodyDeadline ──
+  it('CQ-010 — fetchAccountEmail uses _bodyDeadline (not the misleading _connectDeadline)', () => {
+    const fnSlice = _src_cq.slice(
+      _src_cq.indexOf('function fetchAccountEmail'),
+      _src_cq.indexOf('function fetchAccountEmail') + 2500,
+    );
+    assert.match(fnSlice, /const _bodyDeadline = setTimeout/);
+    assert.match(fnSlice, /clearTimeout\(_bodyDeadline\)/);
+    // The old name MUST be gone from EXECUTABLE code (comments may
+    // still mention _connectDeadline as documentation of the rename).
+    const exec = fnSlice
+      .split('\n')
+      .map(l => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    assert.doesNotMatch(exec, /_connectDeadline/);
+  });
+
+  // ── CQ-011 — session-* endpoints return 400 for malformed JSON ──
+  it('CQ-011 — /api/session-stop returns 400 (not 500) for malformed JSON', () => {
+    const handlerSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/session-stop'"),
+      _src_cq.indexOf("'/api/session-stop'") + 1200,
+    );
+    assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
+    assert.match(handlerSlice, /\? 400 : 500/);
+  });
+
+  it('CQ-011 — /api/session-end returns 400 (not 500) for malformed JSON', () => {
+    const handlerSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/session-end'"),
+      _src_cq.indexOf("'/api/session-end'") + 1200,
+    );
+    assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
+    assert.match(handlerSlice, /\? 400 : 500/);
+  });
+
+  it('CQ-011 — /api/session-start returns 400 (not 500) for malformed JSON', () => {
+    const handlerSlice = _src_cq.slice(
+      _src_cq.indexOf("'/api/session-start'"),
+      _src_cq.indexOf("'/api/session-start'") + 7500,
+    );
+    assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
+    assert.match(handlerSlice, /\? 400 : 500/);
   });
 });

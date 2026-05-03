@@ -8,7 +8,7 @@ import { join, basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync, appendFileSync, statSync } from 'node:fs';
 import { pipeline as _streamPipeline } from 'node:stream';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -494,7 +494,10 @@ function migrateAccountsToKeychain() {
       // sticky activity event so the dashboard UI surfaces it.
       // The activity event uses ONLY the account name, never the path.
       try {
-        process.stderr.write(`[vdm migration WARNING] Account "${name}": keychain write OK but plaintext-file delete failed (${e.code || e.message}). The file still contains plaintext OAuth tokens. Open the dashboard for the recovery command.\n`);
+        // CQ-007 — point users at the new /api/cleanup-plaintext endpoint
+        // so they have a concrete next step. The endpoint retries the
+        // unlink and reports per-file error codes for diagnosis.
+        process.stderr.write(`[vdm migration WARNING] Account "${name}": keychain write OK but plaintext-file delete failed (${e.code || e.message}). The file still contains plaintext OAuth tokens. POST to http://localhost:${PORT}/api/cleanup-plaintext to retry; GET for status.\n`);
       } catch {}
       try {
         // Activity-log entry carries only the account name + reason —
@@ -584,14 +587,11 @@ function logForensicEvent(category, details) {
     };
     // appendFileSync with mode option creates the file with 0o600 if
     // it doesn't exist. Existing file's mode is preserved.
-    let _appendFileSync;
-    try { _appendFileSync = require('node:fs').appendFileSync; } catch {}
-    if (_appendFileSync) {
-      try { _appendFileSync(EVENTS_FILE, JSON.stringify(entry) + '\n', { mode: 0o600 }); } catch {}
-    } else {
-      // ESM path — use the import we already have.
-      try { writeFileSync(EVENTS_FILE, JSON.stringify(entry) + '\n', { flag: 'a', mode: 0o600 }); } catch {}
-    }
+    // CQ-013 fix — the previous if/else dispatched on a require()-loaded
+    // appendFileSync, but require is undefined in ESM so the if-branch
+    // was unreachable. Use the named ESM import directly. The CQ-001
+    // fix imports appendFileSync from node:fs at the top of this file.
+    try { appendFileSync(EVENTS_FILE, JSON.stringify(entry) + '\n', { mode: 0o600 }); } catch {}
   } catch {}
 }
 
@@ -600,7 +600,12 @@ function logForensicEvent(category, details) {
 function _rotateForensicLog() {
   try {
     if (!existsSync(EVENTS_FILE)) return;
-    const st = require('node:fs').statSync(EVENTS_FILE);
+    // CQ-001 fix — require() is undefined in ESM (this file is .mjs).
+    // The previous require('node:fs').statSync call always threw; the
+    // outer try/catch swallowed the throw silently, so daily rotation
+    // and the documented 7-day retention NEVER ran. Use the statSync
+    // named import added at the top of the file.
+    const st = statSync(EVENTS_FILE);
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     const fileMtimeDay = st.mtime.toISOString().slice(0, 10);
     const sizeOver = st.size >= EVENTS_MAX_BYTES;
@@ -628,7 +633,10 @@ function _rotateForensicLog() {
       if (!/^(events\.jsonl|startup\.log)\.\d{4}-\d{2}-\d{2}/.test(f)) continue;
       const fp = join(__dirname, f);
       try {
-        const st = require('node:fs').statSync(fp);
+        // CQ-001 fix — same root cause as the rotation block above.
+        // Without the named import the catch block silently dropped
+        // every retention attempt, leaving rotated snapshots forever.
+        const st = statSync(fp);
         if (st.mtimeMs < cutoff) {
           try { unlinkSync(fp); } catch {}
         }
@@ -645,7 +653,12 @@ const STARTUP_LOG_FILE = join(__dirname, 'startup.log');
 function _rotateStartupLog() {
   try {
     if (!existsSync(STARTUP_LOG_FILE)) return;
-    const st = require('node:fs').statSync(STARTUP_LOG_FILE);
+    // CQ-002 fix — separate but identical bug to CQ-001. require() is
+    // undefined in ESM, the catch silently swallowed every rotation,
+    // and startup.log grew monotonically forever (much faster than
+    // events.jsonl on a verbose install). Use the statSync named
+    // import added at the top of the file.
+    const st = statSync(STARTUP_LOG_FILE);
     const today = new Date().toISOString().slice(0, 10);
     const fileMtimeDay = st.mtime.toISOString().slice(0, 10);
     const sizeOver = st.size >= EVENTS_MAX_BYTES;
@@ -881,18 +894,22 @@ function fetchAccountEmail(token) {
       },
       timeout: 3000,
     }, (res) => {
-      // Connect-level deadline: `timeout: 3000` only fires on socket
-      // idle, not on slow connect. Wrap in an outer setTimeout so a
-      // hung TLS handshake doesn't keep the request open past 6s.
-      const _connectDeadline = setTimeout(() => {
-        try { req.destroy(new Error('connect deadline')); } catch {}
+      // CQ-010 — RESPONSE-BODY deadline (NOT connect-level — by the
+      // time we are inside this callback the headers are already in
+      // flight). The `timeout: 3000` option above fires on socket
+      // idle, not on slow handshake or slow body. The actual connect-
+      // level guard is the outer req.on('timeout') / req.on('error')
+      // pair installed below. This 6s cap bounds how long we stay
+      // hooked to the response stream waiting for the body to finish.
+      const _bodyDeadline = setTimeout(() => {
+        try { req.destroy(new Error('body deadline')); } catch {}
         resolve('');
       }, 6000);
-      _connectDeadline.unref?.();
+      _bodyDeadline.unref?.();
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        clearTimeout(_connectDeadline);
+        clearTimeout(_bodyDeadline);
         try {
           const d = JSON.parse(data);
           const name = d.organization_name || '';
@@ -1009,6 +1026,35 @@ try {
   }
 } catch { activityLog = []; }
 
+// CQ-009 — debounce activity-log disk writes. The pre-fix code called
+// atomicWriteFileSync synchronously on every logEvent (rate-limit burst
+// can fire 5-10/sec), blocking the event loop ~1-2 ms each (more on
+// HDD/NFS). Mirror the token-usage flush pattern (TOKEN_USAGE_FLUSH_MS):
+// dirty-flag plus a single setTimeout-armed flusher that writes once
+// per ACTIVITY_LOG_FLUSH_MS regardless of inbound write rate.
+let _activityLogDirty = false;
+let _activityLogFlushTimer = null;
+const ACTIVITY_LOG_FLUSH_MS = 1000;
+function _flushActivityLog() {
+  _activityLogFlushTimer = null;
+  if (!_activityLogDirty) return;
+  _activityLogDirty = false;
+  try {
+    atomicWriteFileSync(ACTIVITY_LOG_FILE, JSON.stringify(activityLog));
+  } catch {
+    // Re-arm the dirty flag so the next write retries.
+    _activityLogDirty = true;
+  }
+}
+// Used by shutdown() to flush any pending debounced write before exit.
+function flushActivityLogSync() {
+  if (_activityLogFlushTimer) {
+    clearTimeout(_activityLogFlushTimer);
+    _activityLogFlushTimer = null;
+  }
+  _flushActivityLog();
+}
+
 function logActivity(type, detail = {}) {
   // C4 fix — coerce string `detail` to {msg: detail}. Eleven call sites in
   // earlier code passed a string here; the previous `{ ts, type, ...detail }`
@@ -1025,15 +1071,14 @@ function logActivity(type, detail = {}) {
   while (activityLog.length > 0 && activityLog[activityLog.length - 1].ts < cutoff) activityLog.pop();
   const cap = _activityMaxEntries();
   if (activityLog.length > cap) activityLog.length = cap;
-  // C5 fix — atomicWriteFileSync replaces the previous temp+rename async
-  // write that had no per-file mutex. Two concurrent calls both targeted the
-  // same `<file>.tmp`, raced the rename, and could leave partial bytes.
-  // The activity log is small (capped at ACTIVITY_MAX_ENTRIES) so the sync
-  // cost is negligible. atomicWriteFileSync is the canonical helper used
-  // for every other state file.
-  try {
-    atomicWriteFileSync(ACTIVITY_LOG_FILE, JSON.stringify(activityLog));
-  } catch { /* persistence is best-effort */ }
+  // CQ-009 — arm the debounced flush instead of writing synchronously.
+  // The cache (activityLog above) is updated immediately, so /api/activity
+  // readers see the new entry without waiting for the disk write.
+  _activityLogDirty = true;
+  if (!_activityLogFlushTimer) {
+    _activityLogFlushTimer = setTimeout(_flushActivityLog, ACTIVITY_LOG_FLUSH_MS);
+    _activityLogFlushTimer.unref?.();
+  }
 }
 
 // ─────────────────────────────────────────────────
@@ -1713,6 +1758,12 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
 // Data loaders
 // ─────────────────────────────────────────────────
 
+// CQ-006 — guard the destructive dedup pass so it runs at most once
+// per process. /api/profiles is GET-polled every ~5s; a flaky email
+// resolution race in the per-poll pass would permanently destroy a
+// keychain entry. Run dedup once at startup; subsequent polls just
+// read profiles without mutating anything.
+let _dedupAlreadyRan = false;
 async function loadProfiles() {
   const activeCreds = readKeychain();
   const activeFp = activeCreds ? getFingerprint(activeCreds) : '';
@@ -1825,40 +1876,50 @@ async function loadProfiles() {
     }
   }
 
-  // Dedup pass: if two profiles resolved to the same email, keep the one with
-  // the newest expiresAt and remove the other from disk. This handles duplicates
-  // created when autoDiscover ran while email fetch was failing.
-  const seen = new Map(); // email → profile index
-  const toRemove = [];
-  for (let i = 0; i < profiles.length; i++) {
-    const p = profiles[i];
-    // Only dedup by real email labels (skip bare account names like "auto-1")
-    if (!p.label || p.label === p.name) continue;
-    const prev = seen.get(p.label);
-    if (prev !== undefined) {
-      const prevP = profiles[prev];
-      // Keep the one with the newer expiresAt; on tie, keep the active one
-      const keepNew = (p.expiresAt > prevP.expiresAt) || (p.expiresAt === prevP.expiresAt && p.isActive);
-      const loserIdx = keepNew ? prev : i;
-      const loser = profiles[loserIdx];
-      toRemove.push(loserIdx);
-      try {
-        deleteAccountKeychain(loser.name);
-        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
-        log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
-      } catch (e) {
-        log('warn', `Failed to remove duplicate account "${loser.name}": ${e.message}`);
+  // CQ-006 fix — gate the destructive dedup pass behind a once-per-process
+  // flag. The pre-fix code ran on every /api/profiles GET (~5s polling) and
+  // permanently destroyed a keychain entry whenever two profiles transiently
+  // resolved to the same email label (flaky network → autoDiscover races).
+  // Dedup at startup is enough — by the second poll, every account has its
+  // real label and any further "duplicates" are a sign of bug or stale state
+  // that the user should resolve manually, not have silently destroyed.
+  if (!_dedupAlreadyRan) {
+    _dedupAlreadyRan = true;
+    // Dedup pass: if two profiles resolved to the same email, keep the one with
+    // the newest expiresAt and remove the other from disk. This handles duplicates
+    // created when autoDiscover ran while email fetch was failing.
+    const seen = new Map(); // email → profile index
+    const toRemove = [];
+    for (let i = 0; i < profiles.length; i++) {
+      const p = profiles[i];
+      // Only dedup by real email labels (skip bare account names like "auto-1")
+      if (!p.label || p.label === p.name) continue;
+      const prev = seen.get(p.label);
+      if (prev !== undefined) {
+        const prevP = profiles[prev];
+        // Keep the one with the newer expiresAt; on tie, keep the active one
+        const keepNew = (p.expiresAt > prevP.expiresAt) || (p.expiresAt === prevP.expiresAt && p.isActive);
+        const loserIdx = keepNew ? prev : i;
+        const loser = profiles[loserIdx];
+        toRemove.push(loserIdx);
+        try {
+          deleteAccountKeychain(loser.name);
+          try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+          log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
+        } catch (e) {
+          log('warn', `Failed to remove duplicate account "${loser.name}": ${e.message}`);
+        }
+        if (keepNew) seen.set(p.label, i);
+      } else {
+        seen.set(p.label, i);
       }
-      if (keepNew) seen.set(p.label, i);
-    } else {
-      seen.set(p.label, i);
     }
-  }
-  if (toRemove.length > 0) {
-    invalidateAccountsCache();
-    // Return profiles with duplicates removed
-    const removeSet = new Set(toRemove);
-    return profiles.filter((_, i) => !removeSet.has(i));
+    if (toRemove.length > 0) {
+      invalidateAccountsCache();
+      // Return profiles with duplicates removed
+      const removeSet = new Set(toRemove);
+      return profiles.filter((_, i) => !removeSet.has(i));
+    }
   }
 
   return profiles;
@@ -2155,23 +2216,58 @@ async function handleAPI(req, res) {
     return true;
   }
 
+  // CQ-007 — recovery endpoint for the migrateAccountsToKeychain
+  // partial-failure path. The keychain has the credentials; the
+  // plaintext .json file refused to delete (EACCES, EBUSY, etc).
+  // GET reports the current backlog; POST re-attempts the unlink.
+  // Both surface specific error codes per file so the operator can
+  // act (chmod, mount the disk RW, kill the holder process).
+  if (url.pathname === '/api/cleanup-plaintext' && (req.method === 'GET' || req.method === 'POST')) {
+    let files = [];
+    try { files = readdirSync(ACCOUNTS_DIR); } catch {}
+    const stuck = files
+      .filter(f => f.endsWith('.json'))
+      .map(f => ({ name: basename(f, '.json'), path: join(ACCOUNTS_DIR, f) }));
+    if (req.method === 'GET') {
+      // Report only the COUNT and account names — never expose the
+      // full path through the public API (same SEC-10 discipline as
+      // the migration warn line). The retry endpoint uses the
+      // server-resolved path internally so callers don't need it.
+      json(res, { ok: true, stuck: stuck.map(e => ({ account: e.name })) });
+      return true;
+    }
+    // POST — retry unlink on each file, report per-account result.
+    const results = [];
+    for (const e of stuck) {
+      try {
+        unlinkSync(e.path);
+        results.push({ account: e.name, ok: true });
+        try { logActivity('keychain-migration-cleanup', { account: e.name }); } catch {}
+      } catch (err) {
+        results.push({ account: e.name, ok: false, code: err.code || 'EUNKNOWN', error: err.message });
+      }
+    }
+    json(res, { ok: true, results });
+    return true;
+  }
+
   // SSE endpoint: stream proxy logs in real-time (used by `vdm logs`)
   if (url.pathname === '/api/logs/stream' && req.method === 'GET') {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-    // H8 fix — cap concurrent subscribers and reject 503 beyond cap. Without
-    // this, a malicious tab opening N subscribers turns each log line into N
-    // writes against dead sockets that never get GC'd until the OS sends RST.
-    // 16 subscribers is far more than any legitimate vdm/dashboard workflow.
-    const MAX_LOG_SUBSCRIBERS = 16;
+    // CQ-003 fix — cap-check MUST run BEFORE writing 200 headers, otherwise
+    // the cap-hit branch tries to writeHead(503) on a response whose 200
+    // headers were already sent, throwing ERR_HTTP_HEADERS_SENT and leaving
+    // the client with a stuck SSE stream that never sends a single event
+    // and never closes cleanly. Hoist the cap check above writeHead.
     if (_logSubscribers.size >= MAX_LOG_SUBSCRIBERS) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'too many log subscribers' }));
       return true;
     }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
     res.write(`data: ${JSON.stringify({ tag: 'system', msg: 'Connected to log stream', line: '--- Connected to Van Damme-o-Matic log stream ---' })}\n\n`);
     // Replay buffered history so new clients see recent logs immediately
     for (const entry of _logBuffer) {
@@ -2286,9 +2382,29 @@ async function handleAPI(req, res) {
     if (Number.isFinite(patch.all429BreakerWindowMs) && patch.all429BreakerWindowMs >= 1000 && patch.all429BreakerWindowMs <= 86_400_000) {
       settings.all429BreakerWindowMs = Math.floor(patch.all429BreakerWindowMs);
     }
+    // CQ-005 fix — these three settings gate code paths that read git
+    // state via _runGitCached (commitTokenUsage gates ensureLocalCommitHook,
+    // sessionMonitor gates session-tracking git lookups, perToolAttribution
+    // gates the PostToolBatch hook's branch resolution). Toggling any of
+    // them ON should NOT see stale 30s-cached "no git here" answers from
+    // when the gate was OFF. Track which settings changed and invalidate
+    // the full cache exactly once after the value flips.
+    const _prevCommitTokenUsage = settings.commitTokenUsage;
+    const _prevSessionMonitor = settings.sessionMonitor;
+    const _prevPerToolAttribution = settings.perToolAttribution;
     if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
     if (typeof patch.perToolAttribution === 'boolean') settings.perToolAttribution = patch.perToolAttribution;
+    if (
+      _prevCommitTokenUsage !== settings.commitTokenUsage ||
+      _prevSessionMonitor !== settings.sessionMonitor ||
+      _prevPerToolAttribution !== settings.perToolAttribution
+    ) {
+      // Bounded cost — one Map.clear() call per settings toggle. The
+      // alternative was per-cwd invalidation, but we have no good signal
+      // here for which cwds were polluted by the prior gate state.
+      _invalidateRunGitCache(null);
+    }
     // Retention knobs — user-tunable trade-off between fidelity and
     // disk. Cap each at sensible bounds so a typo can't request a 1B
     // entry buffer. Numbers are days for *_MAX_AGE_DAYS, count for
@@ -2498,17 +2614,26 @@ async function handleAPI(req, res) {
         } catch { /* ignore */ }
       }
       // Prune stale sessions (>24h — sessions can be long-lived)
+      // CQ-008 — _safeAutoClaim guards against double-claiming the same
+      // session when the periodic GC timer fires concurrently with this
+      // inline prune (both run within the same Node tick under timer drift).
+      // Without the dedup, _autoClaimSession's writeFileSync to
+      // token-usage.json would silently produce duplicate rows.
       const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
       for (const [id, s] of pendingSessions) {
         if (s.startedAt < staleThreshold) {
-          // Auto-persist before pruning so data isn't lost
-          _autoClaimSession(id, s);
+          _safeAutoClaim(id, s);
           pendingSessions.delete(id);
         }
       }
       json(res, { ok: true });
     } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
+      // CQ-011 fix — _claim/_persist failures stay 500, but a malformed
+      // JSON body should be 400 (client error). The handler used to lump
+      // both into 500 and made `gh-fetch`-style polite-retry semantics
+      // misclassify recoverable client bugs as server failures.
+      const code = (e && e.name === 'SyntaxError') ? 400 : 500;
+      json(res, { ok: false, error: e.message }, code);
     }
     return true;
   }
@@ -2525,7 +2650,11 @@ async function handleAPI(req, res) {
       const result = _claimAndPersistForSession(sessionId, data, 'stop');
       json(res, { ok: true, claimed: result.claimed });
     } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
+      // CQ-011 — distinguish malformed JSON (400) from server-side
+      // failures (500). Pre-fix the catch always wrote 500 so a buggy
+      // hook payload looked like a dashboard fault to retrying clients.
+      const code = (e && e.name === 'SyntaxError') ? 400 : 500;
+      json(res, { ok: false, error: e.message }, code);
     }
     return true;
   }
@@ -2549,7 +2678,9 @@ async function handleAPI(req, res) {
       const result = _claimAndPersistForSession(sessionId, data, 'end');
       json(res, { ok: true, claimed: result.claimed });
     } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
+      // CQ-011 — same JSON-vs-server distinction as /api/session-stop.
+      const code = (e && e.name === 'SyntaxError') ? 400 : 500;
+      json(res, { ok: false, error: e.message }, code);
     }
     return true;
   }
@@ -11364,6 +11495,11 @@ const OTEL_BUFFER_MAX = parseInt(process.env.CSW_OTEL_BUFFER_MAX || '5000', 10);
 const _logSubscribers = new Set();
 const _logBuffer = [];
 const LOG_BUFFER_MAX = 2000;
+// H8 cap. Hoisted to module scope (was previously re-declared on every
+// /api/logs/stream request — wasted allocation per connection). 16
+// subscribers is far more than any legitimate vdm/dashboard workflow;
+// beyond that we 503 to protect the proxy from runaway broadcast.
+const MAX_LOG_SUBSCRIBERS = 16;
 
 // Redact secrets from a string before it enters the log stream. The
 // SSE subscribers (vdm logs / dashboard activity / startup.log file)
@@ -12169,8 +12305,18 @@ async function acquireAccountPermit(fp) {
       const entry = () => { clearTimeout(timer); resolve(); };
       s.waiters.push(entry);
     });
+    // CQ-004 fix — when we wake from the wait queue we INHERIT the slot
+    // that releaseAccountPermit handed off to us; do NOT bump inflight
+    // here. The slot was never released back to the pool — it was passed
+    // directly to this waiter (same pattern as createSemaphore in
+    // lib.mjs lines 2088-2102). Without the inheritance, a different
+    // acquireAccountPermit call entering between release()'s decrement
+    // and this waiter's microtask-scheduled increment could observe
+    // inflight=N-1 and slip past the cap, then this waiter's increment
+    // pushes inflight to N+1 — silently breaching MAX_INFLIGHT_PER_ACCOUNT.
+  } else {
+    s.inflight++;
   }
-  s.inflight++;
   // Spacing gate: prevent burst even if concurrency budget allows it.
   const since = Date.now() - s.lastDispatchAt;
   if (since < MIN_INTERVAL_PER_ACCOUNT_MS) {
@@ -12181,9 +12327,19 @@ async function acquireAccountPermit(fp) {
 
 function releaseAccountPermit(fp) {
   const s = _slot(fp);
+  // CQ-004 fix — hand the slot DIRECTLY to the next waiter without
+  // dipping inflight. A naive "decrement then resolve" pattern lets a
+  // racing acquireAccountPermit call sneak past the cap because the
+  // pre-resolve decrement makes inflight transiently visible at N-1
+  // to other microtasks. Mirrors createSemaphore.release in lib.mjs
+  // (lines 2088-2102) — see the long comment in acquireAccountPermit
+  // for the full failure mode.
+  if (s.waiters.length > 0) {
+    const next = s.waiters.shift();
+    next();
+    return;
+  }
   s.inflight = Math.max(0, s.inflight - 1);
-  const next = s.waiters.shift();
-  if (next) next();
 }
 
 // Wraps the raw forward in the per-account limiter. Backward-compatible
@@ -14176,6 +14332,43 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
 // === null on persist.
 const pendingSessions = new Map();
 
+// CQ-008 — recently-claimed-session guard. The 5-min GC timer
+// (_prunePendingSessions) and the inline 24h-stale-prune in
+// /api/session-start can both call _autoClaimSession on the same
+// session in the same Node tick when the timer happens to fire
+// mid-handler. Auto-claim writes to token-usage.json without a
+// (sessionId, messageId) dedup key, so a double-claim would write
+// duplicate rows. Track recently-auto-claimed session IDs with a TTL;
+// callers consult _wasAutoClaimedRecently before claiming.
+const _recentlyAutoClaimedSessions = new Map(); // sessionId → ts (ms)
+const _AUTO_CLAIM_DEDUP_TTL_MS = 60_000;        // 1 min — wider than any realistic
+                                                 // gap between the two prune paths
+function _wasAutoClaimedRecently(sessionId) {
+  const ts = _recentlyAutoClaimedSessions.get(sessionId);
+  if (!ts) return false;
+  if (Date.now() - ts > _AUTO_CLAIM_DEDUP_TTL_MS) {
+    _recentlyAutoClaimedSessions.delete(sessionId);
+    return false;
+  }
+  return true;
+}
+function _markAutoClaimed(sessionId) {
+  _recentlyAutoClaimedSessions.set(sessionId, Date.now());
+  // Bound the map: drop the oldest entry when over the cap so a long
+  // uptime can't accumulate entries forever.
+  if (_recentlyAutoClaimedSessions.size > 1000) {
+    const firstKey = _recentlyAutoClaimedSessions.keys().next().value;
+    if (firstKey !== undefined) _recentlyAutoClaimedSessions.delete(firstKey);
+  }
+}
+// Callers MUST check this before invoking _autoClaimSession — both prune
+// paths route through _safeAutoClaim so future call sites cannot regress.
+function _safeAutoClaim(sessionId, session) {
+  if (_wasAutoClaimedRecently(sessionId)) return;
+  _markAutoClaimed(sessionId);
+  try { _autoClaimSession(sessionId, session); } catch { /* best-effort */ }
+}
+
 // H11 fix — prune stale pendingSessions periodically. Cleanup was previously
 // only triggered inside /api/session-start (24h-stale prune). A crashed CC
 // session leaks its entry until the NEXT session-start arrives, which on a
@@ -14186,7 +14379,7 @@ function _prunePendingSessions() {
   const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
   for (const [id, s] of pendingSessions) {
     if (s.startedAt < staleThreshold) {
-      try { _autoClaimSession(id, s); } catch { /* best-effort */ }
+      _safeAutoClaim(id, s);
       pendingSessions.delete(id);
     }
   }
@@ -16061,6 +16254,10 @@ function shutdown(signal) {
   // claims persisted above + any backlog from the last 500 ms make it
   // to disk before we close the listeners.
   try { flushTokenUsageSync(); } catch {}
+  // CQ-009 — same drain pattern for the activity-log debounce.
+  // Otherwise a logEvent in the final tick before shutdown stays in
+  // memory only and is lost when the process exits.
+  try { flushActivityLogSync(); } catch {}
   // (2) Persist active monitored sessions. Each call now arms the
   // debounce timer instead of writing immediately, so we MUST drain
   // the timer at the end with flushSessionHistorySync — otherwise the
