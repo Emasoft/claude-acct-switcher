@@ -3605,6 +3605,15 @@ function renderHTML() {
     --radius-sm: 10px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* UX-X12: form controls do not inherit font-family / font-size / color
+     by default — every component author had to remember to opt in via
+     "font-family: inherit". Make inheritance global so a future control
+     does not regress to the OS-default sans-serif by accident. */
+  input, select, button, textarea {
+    font-family: inherit;
+    font-size: inherit;
+    color: inherit;
+  }
   body {
     font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     background: var(--bg);
@@ -4748,11 +4757,24 @@ function renderHTML() {
     font-size: 0.8125rem;
   }
 
-  /* ── Scrollbar ── */
-  ::-webkit-scrollbar { width: 6px; }
+  /* ── Scrollbar ──
+     UX-X11: bumped from 6px to 10px, with a higher-contrast thumb and
+     a track-coloured border so the rounded thumb sits inside a "lane"
+     instead of touching the content edge. 6px was nearly invisible
+     on trackpads and missed by mouse users with imprecise positioning. */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: hsl(220 9% 46% / 0.25); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: hsl(220 9% 46% / 0.4); }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(220 9% 46% / 0.4);
+    border-radius: 5px;
+    border: 2px solid var(--bg);
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(220 9% 30% / 0.6);
+    border: 2px solid var(--bg);
+    background-clip: padding-box;
+  }
 
   /* ── Exhausted banner ──
      UX-H2: tonally aligned with the rest of the dashboard. The
@@ -5177,6 +5199,13 @@ function renderHTML() {
     background: var(--red-soft);
     color: var(--red);
   }
+  /* UX-CM5: n/a (no signal yet) is neither good nor bad — render in
+     neutral palette so users do not read it as an error. */
+  .tree-misses-card .miss-rate-badge.unknown {
+    background: var(--bg);
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
   .tree-misses-card .miss-rate-counts { color: var(--text-muted); }
   .tree-misses-card .miss-model {
     font-family: var(--mono);
@@ -5493,7 +5522,14 @@ function renderHTML() {
     padding: 0.25rem 0.5rem;
     border-radius: var(--radius-sm);
     font-size: 0.7rem;
-    white-space: nowrap;
+    /* UX-WS5: long tooltip strings (date + tokens + wasted$ + billed$ +
+       miss-count) used to extend off-screen on rightmost bars because of
+       white-space: nowrap. Wrap inside an 18rem box centred above the
+       bar so the tooltip stays inside the viewport on every bar. */
+    white-space: normal;
+    max-width: 18rem;
+    width: max-content;
+    text-align: center;
     z-index: 30;
     pointer-events: none;
   }
@@ -5839,7 +5875,7 @@ function renderHTML() {
   <div class="header">
     <div class="header-left">
       <h1>Van Damme-o-Matic</h1>
-      <div class="header-sub"><span id="account-count">0</span> accounts connected</div>
+      <div class="header-sub"><span id="account-count" data-loading="true">&hellip;</span> accounts connected</div>
     </div>
     <div class="header-right">
       <span class="header-pill" id="current-strategy" hidden></span>
@@ -5855,7 +5891,10 @@ function renderHTML() {
   </div>
 
   <noscript>
-    <div style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:1rem;margin:1rem 0;border-radius:6px">
+    <!-- UX-X13: design-token palette so this banner re-themes cleanly
+         under any future theme. Hardcoded hex (#fef3c7 / #f59e0b / #78350f)
+         was pre-token legacy. -->
+    <div style="background:var(--yellow-soft);border:1px solid var(--yellow-border);color:var(--foreground);padding:1rem;margin:1rem 0;border-radius:var(--radius-sm)">
       <strong>JavaScript is required.</strong> The dashboard is a single-page app — every panel below this banner is empty without JS.
       Enable JavaScript for <code>localhost:${PORT}</code> in your browser, or use the CLI: <code>vdm status</code>, <code>vdm list</code>, <code>vdm tokens</code>.
     </div>
@@ -6246,7 +6285,11 @@ function renderHTML() {
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Track tokens per tool call</div>
-            <div class="config-desc">Attribute token usage to individual tool calls (Read, Edit, Bash, etc.) via the PostToolBatch hook. Off by default because it materially increases the size of token-usage.json.</div>
+            <!-- UX-CO7: dropped the internal "via the PostToolBatch hook"
+                 jargon (users do not care about implementation hooks) and
+                 promoted the disk-size warning to <strong> so it lands
+                 visually before the toggle. -->
+            <div class="config-desc">Track token usage by individual tool (Read, Edit, Bash, etc.). <strong>Increases the size of <code>token-usage.json</code>.</strong></div>
           </div>
           <input type="checkbox" class="sw" id="toggle-per-tool" onchange="toggleSetting('perToolAttribution', this.checked)">
         </div>
@@ -7520,7 +7563,12 @@ async function refresh() {
       _lastProfilesHash = ph;
       renderAccounts(profiles, _firstRender);
     }
-    document.getElementById('account-count').textContent = profiles.length;
+    // UX-H3: clear the data-loading sentinel so the placeholder can never
+    // be re-shown after the first successful refresh — the number is now
+    // truthful for the lifetime of this page load.
+    var _ac_el = document.getElementById('account-count');
+    _ac_el.textContent = profiles.length;
+    _ac_el.removeAttribute('data-loading');
     if (rotationStrategy) {
       const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first' };
       // UX-H1: the strategy span moved from the subtitle (where it
@@ -7986,7 +8034,11 @@ function renderActivity(log) {
     // / etc.) and an extra "warning warning" would just be noise.
     const icon = evtIcons[e.type] || '•';
     return '<div class="evt">' +
-      '<span class="evt-time">' + evtTime(e.ts) + '</span>' +
+      // UX-AC6: defense-in-depth. evtTime returns timestamps from a number
+      // input (e.ts) so today's call site is safe, but a future schema
+      // change that passes a string through evtTime would otherwise let
+      // it land in HTML unescaped. Route through escHtml uniformly.
+      '<span class="evt-time">' + escHtml(evtTime(e.ts)) + '</span>' +
       '<span class="evt-icon" aria-hidden="true" style="color:' + c + '">' + icon + '</span>' +
       '<span class="evt-dot" style="background:' + c + '"></span>' +
       '<span class="evt-msg">' + evtMsg(e) + '</span>' +
@@ -8779,7 +8831,12 @@ function renderCacheMisses(misses, missSessions) {
   for (var s = 0; s < sessionsToShow.length; s++) {
     var sess = sessionsToShow[s];
     var hitRateText = sess.hitRate != null ? sess.hitRate.toFixed(1) + '%' : 'n/a';
-    var hitClass = (sess.hitRate != null && sess.hitRate >= 50) ? 'high' : 'low';
+    // UX-CM5: a null hit-rate is "no signal yet", not "low". The previous
+    // code coloured "n/a" red (the low-class is red-soft) which read as
+    // an error to users. Route the unknown branch through a dedicated
+    // class with neutral colours so the "n/a" badge looks informational.
+    var hitClass = sess.hitRate == null ? 'unknown'
+      : sess.hitRate >= 50 ? 'high' : 'low';
     // Truncate the sessionId display: keep the first 12 chars (the UUID
     // prefix is enough to be recognisable but doesn't dominate the row).
     var sidShort = (sess.sessionId || '?').slice(0, 12);
@@ -10360,6 +10417,10 @@ try {
 
 // ── Log stream ──
 let _logES = null;
+// UX-L4: counter is incremented on every onerror and reset on every
+// onopen; surfaced in the status pill as "Reconnecting (attempt N)..."
+// so users can tell ongoing browser retries from a stuck connection.
+let _logReconnectCount = 0;
 const LOG_MAX_LINES = 5000;
 // UX-L1: route log tag colours through the same design tokens the rest of
 // the dashboard uses so the Logs tab fits the surrounding palette and can
@@ -10646,8 +10707,21 @@ function connectLogStream() {
   // UX-L1: status colours route through design tokens (was '#3fb950' /
   // '#f85149' GitHub greens/reds). var(--green) and var(--red) follow the
   // dashboard palette and rebind cleanly under any future theme.
-  _logES.onopen = () => { status.textContent = 'Connected'; status.style.color = 'var(--green)'; };
-  _logES.onerror = () => { status.textContent = 'Reconnecting...'; status.style.color = 'var(--red)'; };
+  // UX-L4: surface the reconnect attempt count so users can tell
+  // "browser is silently retrying" from "EventSource has given up".
+  // Reset the counter on every successful onopen so a brief network
+  // blip does not leave a stale "attempt 47" reading after recovery.
+  _logES.onopen = () => {
+    _logReconnectCount = 0;
+    status.textContent = 'Connected';
+    status.style.color = 'var(--green)';
+  };
+  _logES.onerror = () => {
+    _logReconnectCount = (_logReconnectCount | 0) + 1;
+    status.textContent = 'Reconnecting (attempt ' + _logReconnectCount + ')...';
+    // Yellow signals "transient, retrying" more accurately than red.
+    status.style.color = 'var(--yellow)';
+  };
   _logES.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
@@ -10715,6 +10789,11 @@ function sessionDuration(ms) {
 
 function sessionTimeAgo(ts) {
   var d = Date.now() - ts;
+  // UX-S6: a sub-5s gap reads as "0s ago" with the floor-to-seconds form,
+  // which a user parses as literally zero seconds — i.e. "now". Surface
+  // that explicitly so very-recent events are unambiguous.
+  if (d < 0) d = 0;
+  if (d < 5000) return 'just now';
   if (d < 60000) return Math.floor(d / 1000) + 's ago';
   if (d < 3600000) return Math.floor(d / 60000) + 'm ago';
   return Math.floor(d / 3600000) + 'h ago';
@@ -11035,9 +11114,13 @@ function copyTimeline(sessionId, ev) {
   }).catch(function() { showToast('Failed to fetch session'); });
 }
 </script>
-<footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:#9ca3af;line-height:1.8">
+<!-- UX-F1: hardcoded grey #9ca3af replaced with var(--muted) so the
+     footer rebinds cleanly under any future theme. The casual phrasing
+     intentionally stays — it is the project signature — but the
+     palette discipline is upheld. -->
+<footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:var(--muted);line-height:1.8">
   <div>🤙 Vibe coded with love by LJ &middot; ${PROJECT_VERSION}</div>
-  <a href="https://github.com/Emasoft/claude-acct-switcher" target="_blank" rel="noopener" style="color:#9ca3af;text-decoration:none">github.com/Emasoft/claude-acct-switcher</a>
+  <a href="https://github.com/Emasoft/claude-acct-switcher" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none">github.com/Emasoft/claude-acct-switcher</a>
 </footer>
 </body>
 </html>`;
