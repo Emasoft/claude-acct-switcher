@@ -264,9 +264,16 @@ let _lastKeychainDenyNotifyAt = 0;
 function readKeychain() {
   try {
     // execFileSync with argv[] — no shell, no interpolation injection vector.
+    // CR-001 (Codex review): MUST pass `-a KEYCHAIN_ACCOUNT` so multi-row
+    // keychains (e.g. after `claude logout`/`login` cycles, machine
+    // imports, or shared keychains across users) resolve to THIS user's
+    // generic-password row. writeKeychain at line ~335 already includes
+    // `-a KEYCHAIN_ACCOUNT`; the parallel `vdm` bash helper passes `-a`
+    // too. Pre-fix the dashboard could read a different row than it
+    // writes — silently forwarding the wrong OAuth token.
     const raw = execFileSync(
       'security',
-      ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
+      ['find-generic-password', '-a', KEYCHAIN_ACCOUNT, '-s', KEYCHAIN_SERVICE, '-w'],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }
     ).trim();
     return JSON.parse(raw);
@@ -850,6 +857,8 @@ import {
   vdmAccountServiceName,
   vdmAccountNameFromService,
   VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
+  // CR-006 (Codex review) — bounded-string session_id validator
+  isValidSessionId,
   // Phase I+ — bypass mode (all accounts revoked → transparent forward)
   isOAuthRevocationError,
   isPostRefreshTrulyExpired,
@@ -2538,8 +2547,12 @@ async function handleAPI(req, res) {
       const data = JSON.parse(body);
       const sessionId = data.session_id;
       const cwd = data.cwd;
-      if (!sessionId || !cwd) {
-        json(res, { ok: false, error: 'session_id and cwd required' }, 400);
+      // CR-006 (Codex review): validate session_id at the boundary so
+      // the renderer can interpolate s.id into HTML attributes / inline
+      // JS handlers without per-site escaping. Spec is opaque UUID-like
+      // strings; reject anything else with 400.
+      if (!isValidSessionId(sessionId) || !cwd) {
+        json(res, { ok: false, error: 'session_id (string, 1-128 chars matching [a-zA-Z0-9._-]+) and cwd required' }, 400);
         return true;
       }
       // Only register new sessions — don't overwrite startedAt on subsequent
@@ -2643,8 +2656,9 @@ async function handleAPI(req, res) {
       const body = await readBody(req);
       const data = JSON.parse(body);
       const sessionId = data.session_id;
-      if (!sessionId) {
-        json(res, { ok: false, error: 'session_id required' }, 400);
+      // CR-006 (Codex review): same boundary validation as /api/session-start.
+      if (!isValidSessionId(sessionId)) {
+        json(res, { ok: false, error: 'session_id (string, 1-128 chars matching [a-zA-Z0-9._-]+) required' }, 400);
         return true;
       }
       const result = _claimAndPersistForSession(sessionId, data, 'stop');
@@ -2671,8 +2685,9 @@ async function handleAPI(req, res) {
       const body = await readBody(req);
       const data = JSON.parse(body);
       const sessionId = data.session_id;
-      if (!sessionId) {
-        json(res, { ok: false, error: 'session_id required' }, 400);
+      // CR-006 (Codex review): same boundary validation as /api/session-start.
+      if (!isValidSessionId(sessionId)) {
+        json(res, { ok: false, error: 'session_id (string, 1-128 chars matching [a-zA-Z0-9._-]+) required' }, 400);
         return true;
       }
       const result = _claimAndPersistForSession(sessionId, data, 'end');
@@ -11427,7 +11442,15 @@ function renderSessions(data) {
       var proj = sessionProj(s);
       var totalTok = (s.totalInputTokens || 0) + (s.totalOutputTokens || 0);
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
-      html += '<div class="session-card ' + state + collapsed + '" data-sid="' + s.id + '">';
+      // CR-006 (Codex review): Defense-in-depth XSS escape on s.id even
+      // though /api/session-start now boundary-validates session_id to
+      // [a-zA-Z0-9._-]+ (so escHtml is a no-op for valid ids). If a
+      // future refactor adds a non-validated path that pushes a session
+      // into the renderer, escHtml here is the fallback that prevents
+      // attribute / inline-handler breakout. Same treatment in the
+      // RECENT block below.
+      var sid = escHtml(s.id);
+      html += '<div class="session-card ' + state + collapsed + '" data-sid="' + sid + '">';
       // UX-S3: clipboard SVG (Heroicons-style, 16x16 viewbox) replaces
       // the prior 📋 emoji that wouldn't render on platforms missing
       // emoji fonts. aria-label provides the screen-reader name; title
@@ -11435,8 +11458,8 @@ function renderSessions(data) {
       // SVG (CSS) routes clicks to the button. The event arg is passed
       // through so copyTimeline can stopPropagation (defense-in-depth
       // in case a future refactor moves the button INSIDE the header).
-      html += '<button class="session-copy-btn" aria-label="Copy session timeline as Markdown" title="Copy session timeline as Markdown" onclick="copyTimeline(\\'' + s.id + '\\', event)">' + SESSION_COPY_ICON_SVG + '</button>';
-      html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
+      html += '<button class="session-copy-btn" aria-label="Copy session timeline as Markdown" title="Copy session timeline as Markdown" onclick="copyTimeline(\\'' + sid + '\\', event)">' + SESSION_COPY_ICON_SVG + '</button>';
+      html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + sid + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
       // UX-X9: hover-exact for the compact "5m 12s" duration display.
@@ -11471,7 +11494,7 @@ function renderSessions(data) {
       // combinator picks up to surface them. The button is a real
       // <button> so Enter/Space activate natively.
       html += '<div class="session-timeline-fade" aria-hidden="true"></div>';
-      html += '<button class="session-timeline-expand" aria-expanded="false" onclick="toggleSessionTimelineExpand(\\'' + s.id + '\\', event)">Show all</button>';
+      html += '<button class="session-timeline-expand" aria-expanded="false" onclick="toggleSessionTimelineExpand(\\'' + sid + '\\', event)">Show all</button>';
       // Meta
       html += '<div class="session-meta">';
       html += '<span>' + s.requestCount + ' req</span>';
@@ -11493,10 +11516,16 @@ function renderSessions(data) {
       var proj = sessionProj(s);
       var totalTok = (s.totalInputTokens || 0) + (s.totalOutputTokens || 0);
       var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
-      html += '<div class="session-card completed' + collapsed + '" data-sid="' + s.id + '">';
+      // CR-006 (Codex review): see ACTIVE block above. Defense-in-depth
+      // escape on s.id so a future render path that bypasses
+      // /api/session-start validation (or any cached pre-validation
+      // session row) still cannot break out of the attribute / inline
+      // handler context.
+      var sid = escHtml(s.id);
+      html += '<div class="session-card completed' + collapsed + '" data-sid="' + sid + '">';
       // UX-S3: see active-sessions emit-site above for the rationale.
-      html += '<button class="session-copy-btn" aria-label="Copy session timeline as Markdown" title="Copy session timeline as Markdown" onclick="copyTimeline(\\'' + s.id + '\\', event)">' + SESSION_COPY_ICON_SVG + '</button>';
-      html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
+      html += '<button class="session-copy-btn" aria-label="Copy session timeline as Markdown" title="Copy session timeline as Markdown" onclick="copyTimeline(\\'' + sid + '\\', event)">' + SESSION_COPY_ICON_SVG + '</button>';
+      html += '<div class="session-header" role="button" tabindex="0" aria-expanded="' + (collapsed ? 'false' : 'true') + '" onclick="toggleSessionCollapse(\\'' + sid + '\\')">';
       html += '<span class="session-collapse-indicator">\\u25BC</span>';
       html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escHtml(s.account) + '</b> \\u00b7 ' + escHtml(proj) + '</span>';
       // UX-X9: hover-exact for the compact "5m 12s" duration display.
@@ -11510,7 +11539,7 @@ function renderSessions(data) {
       html += '</div>';
       // UX-S4: see active-sessions emit-site above for the rationale.
       html += '<div class="session-timeline-fade" aria-hidden="true"></div>';
-      html += '<button class="session-timeline-expand" aria-expanded="false" onclick="toggleSessionTimelineExpand(\\'' + s.id + '\\', event)">Show all</button>';
+      html += '<button class="session-timeline-expand" aria-expanded="false" onclick="toggleSessionTimelineExpand(\\'' + sid + '\\', event)">Show all</button>';
       html += '<div class="session-meta">';
       html += '<span>' + (s.requestCount || 0) + ' req</span>';
       // UX-X9: hover-exact for the compact tok count.
@@ -12783,17 +12812,59 @@ if (typeof _accountSlotsGcTimer.unref === 'function') _accountSlotsGcTimer.unref
 
 // Drain a response and return the body (for error responses).
 // Destroys the stream on timeout to prevent partial-data races.
+//
+// CR-003 (Codex review): callers MUST only invoke drainResponse on
+// responses they intend to inspect (currently: status === 400 for
+// empty-body detection, and 401-fallback drain). Calling drainResponse
+// on a long-running stream (text/event-stream from Claude Code) was
+// the bug — the 5s safety timer destroyed live SSE streams in bypass
+// modes. The timer is now cleared on natural completion AND unref'd
+// so it can't keep the event loop alive past process shutdown.
 function drainResponse(res) {
   return new Promise(r => {
     let done = false;
+    let timer = null;
     const chunks = [];
-    const finish = () => { if (!done) { done = true; r(Buffer.concat(chunks)); } };
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      r(Buffer.concat(chunks));
+    };
     res.on('data', c => chunks.push(c));
     res.on('end', finish);
     res.on('error', finish);
     // Safety: if stream stalls, destroy it and resolve with whatever we have
-    setTimeout(() => { res.destroy(); finish(); }, 5000);
+    timer = setTimeout(() => { try { res.destroy(); } catch {} finish(); }, 5000);
+    if (typeof timer.unref === 'function') timer.unref();
   });
+}
+
+// CR-003 (Codex review): pipe an upstream response directly to the
+// client without buffering. Used by _smartPassthrough for any non-400
+// status so long SSE streams (Claude Code's primary response shape)
+// survive the bypass modes that exist precisely to keep CC usable when
+// vdm's primary proxy path is offline. Strips upstream content-length
+// because Node's http server re-derives it from the streaming chunks
+// (or sets Transfer-Encoding: chunked).
+function _pipeUpstreamResponse(upstream, clientRes) {
+  if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) {
+    try { upstream.destroy(); } catch {}
+    return;
+  }
+  const hdrs = { ...upstream.headers };
+  // Re-derived from streaming chunks. Leaving the upstream value in
+  // place would mismatch reality if upstream lied or if chunked
+  // transfer encoding kicks in.
+  delete hdrs['content-length'];
+  clientRes.writeHead(upstream.statusCode, hdrs);
+  upstream.pipe(clientRes);
+  // Tear down upstream if client disconnects mid-stream so the socket
+  // and per-account permit (held by the surrounding handler) get
+  // released promptly. Symmetric error handling so neither side leaks.
+  const onClose = () => { if (!upstream.destroyed) { try { upstream.destroy(); } catch {} } };
+  clientRes.once('close', onClose);
+  upstream.once('error', () => { try { clientRes.destroy(); } catch {} });
 }
 
 // ── Empty-body 400 detection ──
@@ -12808,53 +12879,153 @@ function isEmptyBody400(statusCode, bodyBuffer) {
 // 1. Forward to Anthropic with provided auth
 // 2. If 400-empty-body → read fresh token from keychain (bypass cache), retry
 // 3. If still 400-empty-body → return 401 to trigger Claude Code re-auth
-// 4. Otherwise → forward response as-is
+// 4. Otherwise → forward response as-is (PIPED for non-400 to preserve SSE)
+//
+// CR-003 (Codex review): pre-fix every response was drained through
+// drainResponse before being written to the client. That truncated
+// Claude Code's text/event-stream responses (commonly minutes long) at
+// the 5s drainResponse safety timeout — exactly in the bypass modes
+// where transparency matters most. Now we ONLY drain when we need to
+// inspect (status === 400). Successful 200/SSE responses pipe straight
+// through.
 async function _smartPassthrough(clientReq, clientRes, body, fwd, label) {
   const res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, PROXY_TIMEOUT);
-  // Drain body to inspect for empty-body 400
-  const resBuf = await drainResponse(res);
-  if (isEmptyBody400(res.statusCode, resBuf)) {
-    log('fallback', `${label}: 400-empty-body detected — trying fresh keychain token`);
-    // Bypass cache: read directly from keychain
-    invalidateTokenCache();
-    const freshCreds = readKeychain();
-    const freshToken = freshCreds?.claudeAiOauth?.accessToken;
-    if (freshToken && freshToken !== fwd['authorization']?.replace(/^Bearer\s+/i, '')) {
-      const retryFwd = { ...fwd, authorization: `Bearer ${freshToken}` };
-      retryFwd['content-length'] = String(body.length);
-      try {
-        const retryRes = await forwardToAnthropic(clientReq.method, clientReq.url, retryFwd, body, 15_000);
-        const retryBuf = await drainResponse(retryRes);
-        if (!isEmptyBody400(retryRes.statusCode, retryBuf)) {
-          // Fresh token worked — forward the response
-          if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
-          const hdrs = { ...retryRes.headers };
-          if (retryBuf.length) hdrs['content-length'] = String(retryBuf.length);
-          clientRes.writeHead(retryRes.statusCode, hdrs);
-          clientRes.end(retryBuf);
-          return;
-        }
-        log('fallback', `${label}: fresh token also got 400-empty-body`);
-      } catch (e) {
-        log('error', `${label}: fresh-token retry failed: ${e.message}`);
-      }
-    }
-    // All tokens stale → convert to 401 so Claude Code re-authenticates
-    log('fallback', `${label}: converting 400-empty-body → 401 to trigger re-auth`);
-    if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
-    clientRes.writeHead(401, { 'Content-Type': 'application/json' });
-    clientRes.end(JSON.stringify({
-      type: 'error',
-      error: { type: 'authentication_error', message: 'Token expired (proxy: empty-body 400 converted to 401)' },
-    }));
+  // Non-400: pipe directly. Includes 200 (success / SSE), 401 (auth),
+  // 429 (rate limit with Retry-After), 5xx, etc. None of these need
+  // body inspection — they pass through unchanged.
+  if (res.statusCode !== 400) {
+    _pipeUpstreamResponse(res, clientRes);
     return;
   }
-  // Normal response (non-empty or non-400) — forward as-is
+  // status === 400: drain to detect empty-body fingerprint.
+  const resBuf = await drainResponse(res);
+  if (!isEmptyBody400(res.statusCode, resBuf)) {
+    // Non-empty 400 — forward the buffered body as-is.
+    if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
+    const hdrs = { ...res.headers };
+    if (resBuf.length) hdrs['content-length'] = String(resBuf.length);
+    clientRes.writeHead(res.statusCode, hdrs);
+    clientRes.end(resBuf);
+    return;
+  }
+  log('fallback', `${label}: 400-empty-body detected — trying fresh keychain token`);
+  // Bypass cache: read directly from keychain
+  invalidateTokenCache();
+  const freshCreds = readKeychain();
+  const freshToken = freshCreds?.claudeAiOauth?.accessToken;
+  if (freshToken && freshToken !== fwd['authorization']?.replace(/^Bearer\s+/i, '')) {
+    const retryFwd = { ...fwd, authorization: `Bearer ${freshToken}` };
+    retryFwd['content-length'] = String(body.length);
+    try {
+      const retryRes = await forwardToAnthropic(clientReq.method, clientReq.url, retryFwd, body, 15_000);
+      // CR-003: same routing on retry. A successful retry is most
+      // commonly a 200 SSE stream — pipe it; do NOT drain.
+      if (retryRes.statusCode !== 400) {
+        _pipeUpstreamResponse(retryRes, clientRes);
+        return;
+      }
+      const retryBuf = await drainResponse(retryRes);
+      if (!isEmptyBody400(retryRes.statusCode, retryBuf)) {
+        // Non-empty 400 on retry — forward the buffered body as-is.
+        if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
+        const hdrs = { ...retryRes.headers };
+        if (retryBuf.length) hdrs['content-length'] = String(retryBuf.length);
+        clientRes.writeHead(retryRes.statusCode, hdrs);
+        clientRes.end(retryBuf);
+        return;
+      }
+      log('fallback', `${label}: fresh token also got 400-empty-body`);
+    } catch (e) {
+      log('error', `${label}: fresh-token retry failed: ${e.message}`);
+    }
+  }
+  // All tokens stale → convert to 401 so Claude Code re-authenticates
+  log('fallback', `${label}: converting 400-empty-body → 401 to trigger re-auth`);
   if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
-  const hdrs = { ...res.headers };
-  if (resBuf.length) hdrs['content-length'] = String(resBuf.length);
-  clientRes.writeHead(res.statusCode, hdrs);
-  clientRes.end(resBuf);
+  clientRes.writeHead(401, { 'Content-Type': 'application/json' });
+  clientRes.end(JSON.stringify({
+    type: 'error',
+    error: { type: 'authentication_error', message: 'Token expired (proxy: empty-body 400 converted to 401)' },
+  }));
+}
+
+// ── Capped proxy request body reader ──
+// CR-002 (Codex review): single capped body reader used by EVERY proxy
+// branch — normal proxy path AND the three smart-passthrough branches
+// (proxy-disabled, circuit-open, oauth-bypass). Pre-fix the three
+// smart-passthrough branches read the body with no per-request and no
+// global-aggregate caps, so 10 concurrent 49 MB uploads in any of those
+// modes (oauth-bypass is default-on the moment all accounts are
+// revoked!) could push the heap to ~1 GB and OOM-kill the dashboard.
+//
+// Throws Error('body_too_large' | 'global_buffer_exceeded') on cap
+// breach so callers can convert to 413 / 503 via
+// _writeBodyReaderErrorResponse without re-implementing the accounting
+// or refund logic.
+//
+// On success: streaming-phase _bufferedBytes accounting is refunded
+// before return. The held body is bounded per-request (50 MB cap) and
+// per-account (CSW_MAX_INFLIGHT_PER_ACCOUNT permit count).
+const PROXY_MAX_BODY_SIZE = 50 * 1024 * 1024;        // per-request cap (50 MB)
+const PROXY_MAX_GLOBAL_BUFFERED = 200 * 1024 * 1024; // global cap (200 MB)
+async function _readProxyRequestBody(clientReq) {
+  const bodyChunks = [];
+  let bodySize = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      clientReq.on('data', c => {
+        bodySize += c.length;
+        if (bodySize > PROXY_MAX_BODY_SIZE) {
+          reject(new Error('body_too_large'));
+          clientReq.destroy();
+          return;
+        }
+        if (_bufferedBytes + c.length > PROXY_MAX_GLOBAL_BUFFERED) {
+          reject(new Error('global_buffer_exceeded'));
+          clientReq.destroy();
+          return;
+        }
+        _bufferedBytes += c.length;
+        bodyChunks.push(c);
+      });
+      clientReq.on('end', resolve);
+      clientReq.on('error', reject);
+    });
+  } catch (e) {
+    // Always refund global accounting on early-out paths so a
+    // body_too_large reject doesn't permanently consume budget.
+    _bufferedBytes -= bodyChunks.reduce((n, c) => n + c.length, 0);
+    throw e;
+  }
+  const body = Buffer.concat(bodyChunks);
+  // Refund streaming-phase accounting now that the chunks are
+  // consolidated into `body`. Held body is still real memory but is
+  // bounded by the per-request and per-account caps documented above.
+  _bufferedBytes -= bodySize;
+  bodyChunks.length = 0;
+  return body;
+}
+
+// CR-002 (Codex review): map _readProxyRequestBody errors to HTTP
+// responses. Returns true if the error was handled and a response
+// already written; callers should `return` after a true return value.
+// On false return the error is foreign and callers should rethrow.
+function _writeBodyReaderErrorResponse(err, clientRes) {
+  if (clientRes.headersSent || clientRes.writableEnded || clientRes.destroyed) {
+    // Cap-breach but the client is already gone — swallow silently.
+    return err.message === 'body_too_large' || err.message === 'global_buffer_exceeded';
+  }
+  if (err.message === 'body_too_large') {
+    clientRes.writeHead(413, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ error: `Request body too large (max ${PROXY_MAX_BODY_SIZE / 1024 / 1024}MB)` }));
+    return true;
+  }
+  if (err.message === 'global_buffer_exceeded') {
+    clientRes.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
+    clientRes.end(JSON.stringify({ error: 'Proxy busy: in-flight request bodies exceed memory budget. Retry shortly.' }));
+    return true;
+  }
+  return false;
 }
 
 // ── Passthrough fallback ──
@@ -15529,14 +15700,14 @@ async function handleProxyRequest(clientReq, clientRes) {
   // ── Proxy disabled: smart passthrough ──
   // Buffers the body so we can detect 400-empty-body and retry with a fresh
   // keychain token or convert to 401 for Claude Code re-auth.
+  // CR-002 (Codex review): bodies for ALL three passthrough modes now
+  // route through _readProxyRequestBody so the per-request 50 MB cap +
+  // global 200 MB cap apply uniformly. Pre-fix these branches read the
+  // body unbounded.
   if (!settings.proxyEnabled) {
-    const bodyChunks = [];
-    await new Promise((resolve, reject) => {
-      clientReq.on('data', c => bodyChunks.push(c));
-      clientReq.on('end', resolve);
-      clientReq.on('error', reject);
-    });
-    const body = Buffer.concat(bodyChunks);
+    let body;
+    try { body = await _readProxyRequestBody(clientReq); }
+    catch (e) { if (_writeBodyReaderErrorResponse(e, clientRes)) return; throw e; }
     const fwd = stripHopByHopHeaders(clientReq.headers);
     fwd['host'] = 'api.anthropic.com';
     fwd['content-length'] = String(body.length);
@@ -15560,13 +15731,9 @@ async function handleProxyRequest(clientReq, clientRes) {
   // This lets Claude Code's own auth / re-auth work normally.
   if (_isCircuitOpen()) {
     log('circuit', 'Circuit breaker open — smart passthrough');
-    const bodyChunks = [];
-    await new Promise((resolve, reject) => {
-      clientReq.on('data', c => bodyChunks.push(c));
-      clientReq.on('end', resolve);
-      clientReq.on('error', reject);
-    });
-    const body = Buffer.concat(bodyChunks);
+    let body;
+    try { body = await _readProxyRequestBody(clientReq); }
+    catch (e) { if (_writeBodyReaderErrorResponse(e, clientRes)) return; throw e; }
     const fwd = stripHopByHopHeaders(clientReq.headers);
     fwd['host'] = 'api.anthropic.com';
     fwd['content-length'] = String(body.length);
@@ -15595,13 +15762,9 @@ async function handleProxyRequest(clientReq, clientRes) {
   // the createServer layer).
   if (_oauthBypassMode) {
     log('bypass', 'OAuth bypass mode — smart passthrough (all accounts revoked)');
-    const bodyChunks = [];
-    await new Promise((resolve, reject) => {
-      clientReq.on('data', c => bodyChunks.push(c));
-      clientReq.on('end', resolve);
-      clientReq.on('error', reject);
-    });
-    const body = Buffer.concat(bodyChunks);
+    let body;
+    try { body = await _readProxyRequestBody(clientReq); }
+    catch (e) { if (_writeBodyReaderErrorResponse(e, clientRes)) return; throw e; }
     const fwd = stripHopByHopHeaders(clientReq.headers);
     fwd['host'] = 'api.anthropic.com';
     fwd['content-length'] = String(body.length);
@@ -15619,56 +15782,11 @@ async function handleProxyRequest(clientReq, clientRes) {
     return;
   }
 
-  // Buffer request body for replay on retry. Two guards:
-  //   (a) per-request MAX_BODY_SIZE — caps a single oversized payload
-  //   (b) global _bufferedBytes — caps aggregate memory across requests
-  //       so 10 concurrent 49 MB uploads can't push the heap to ~1 GB
-  //       and OOM-kill the dashboard.
-  const MAX_BODY_SIZE = 50 * 1024 * 1024;        // per-request cap (50 MB)
-  const MAX_GLOBAL_BUFFERED = 200 * 1024 * 1024; // global cap (200 MB)
-  const bodyChunks = [];
-  let bodySize = 0;
-  try {
-    await new Promise((resolve, reject) => {
-      clientReq.on('data', c => {
-        bodySize += c.length;
-        if (bodySize > MAX_BODY_SIZE) {
-          reject(new Error('body_too_large'));
-          clientReq.destroy();
-          return;
-        }
-        if (_bufferedBytes + c.length > MAX_GLOBAL_BUFFERED) {
-          reject(new Error('global_buffer_exceeded'));
-          clientReq.destroy();
-          return;
-        }
-        _bufferedBytes += c.length;
-        bodyChunks.push(c);
-      });
-      clientReq.on('end', resolve);
-      clientReq.on('error', reject);
-    });
-  } catch (e) {
-    // Always release the global accounting on early-out paths.
-    _bufferedBytes -= bodyChunks.reduce((n, c) => n + c.length, 0);
-    if (e.message === 'body_too_large') {
-      clientRes.writeHead(413, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ error: `Request body too large (max ${MAX_BODY_SIZE / 1024 / 1024}MB)` }));
-      return;
-    }
-    if (e.message === 'global_buffer_exceeded') {
-      clientRes.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
-      clientRes.end(JSON.stringify({ error: 'Proxy busy: in-flight request bodies exceed memory budget. Retry shortly.' }));
-      return;
-    }
-    throw e;
-  }
-  const body = Buffer.concat(bodyChunks);
-  // Release the streaming-phase accounting now that the chunks are
-  // consolidated into `body`. The held-body memory is still real but
-  // bounded per-request (50 MB) and per-account (4 in flight).
-  _bufferedBytes -= bodySize;
-  bodyChunks.length = 0; // help GC reclaim the chunks promptly
+  // Normal proxy path — same capped reader as the passthrough branches.
+  // Per-request and global byte caps documented at _readProxyRequestBody.
+  let body;
+  try { body = await _readProxyRequestBody(clientReq); }
+  catch (e) { if (_writeBodyReaderErrorResponse(e, clientRes)) return; throw e; }
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   const isDeadlineExceeded = () => Date.now() > deadline;
 
@@ -15759,7 +15877,12 @@ async function handleProxyRequest(clientReq, clientRes) {
     const preAcct = allAccounts.find(a => a.token === token);
     if (preAcct && preAcct.expiresAt && preAcct.expiresAt < Date.now() && !isDeadlineExceeded()) {
       log('refresh-preflight', `${preAcct.label || preAcct.name}: token expired, refreshing before forwarding...`);
+      // CR-004 (Codex review): split display vs key, same rationale as
+      // the 401 hot path below. preAcctKey seeds refreshAttempted so
+      // the 401 handler's matching `refreshAttempted.has(acctKey)` check
+      // sees the prior pre-flight attempt.
       const preAcctName = preAcct.label || preAcct.name;
+      const preAcctKey = preAcct.name;
       try {
         const result = await refreshAccountToken(preAcct.name);
         if (result.ok && result.skipped) {
@@ -15768,7 +15891,7 @@ async function handleProxyRequest(clientReq, clientRes) {
           // with force: true to pick up the new token.
           log('refresh-preflight', `${preAcctName}: skipped (another process refreshed), will allow 401 retry`);
         } else if (result.ok) {
-          refreshAttempted.add(preAcctName);
+          refreshAttempted.add(preAcctKey);
           invalidateAccountsCache();
           const refreshed = loadAllAccountTokens().find(a => a.name === preAcct.name);
           if (refreshed) {
@@ -15784,10 +15907,10 @@ async function handleProxyRequest(clientReq, clientRes) {
         } else {
           // Refresh failed — seed refreshAttempted to avoid retrying the same
           // account in the 401 handler (it would just fail again after ~37s)
-          refreshAttempted.add(preAcctName);
+          refreshAttempted.add(preAcctKey);
         }
       } catch (e) {
-        refreshAttempted.add(preAcctName);
+        refreshAttempted.add(preAcctKey);
         log('refresh-preflight', `${preAcctName}: preflight refresh failed: ${e.message}`);
       }
     }
@@ -15819,7 +15942,23 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     triedTokens.add(token);
     const acct = allAccounts.find(a => a.token === token);
-    const acctName = acct?.label || acct?.name || 'unknown';
+    // CR-004 (Codex review): TWO names in play.
+    //   acctDisplay  — for log lines and activity events (label preferred
+    //                  so users see "user@example.com" not "auto-3").
+    //   acctKey      — stable control-plane key. MUST match what
+    //                  refreshAccountToken writes to refreshFailures
+    //                  (acct.name). Pre-fix the proxy used acctName for
+    //                  BOTH purposes; refreshFailures.get(acctName) read
+    //                  by display-label missed entries written by
+    //                  refresh-name → 2-hour suppression defeated for
+    //                  every labeled account → repeated revoked-refresh
+    //                  churn against api.anthropic.com.
+    const acctDisplay = acct?.label || acct?.name || 'unknown';
+    const acctKey = acct?.name || 'unknown';
+    // Backwards-compat alias: log strings + downstream callsites still
+    // read `acctName`. Keep the name; redirect its meaning to the
+    // display form so existing log output stays identical.
+    const acctName = acctDisplay;
 
     let proxyRes;
     let lastNetworkError;
@@ -16081,13 +16220,19 @@ async function handleProxyRequest(clientReq, clientRes) {
       // `refreshFailures` covers the across-request case the audit flagged
       // as Concern 03.C5.
       const REFRESH_FAILURE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
-      const priorFailure = refreshFailures.get(acctName);
+      // CR-004 (Codex review): use acctKey (stable acct.name), NOT
+      // acctName (display label). refreshFailures is written by
+      // refreshAccountToken keyed on accountName === acct.name; reading
+      // by display label produced a 100%-miss rate for labeled accounts
+      // and burned the 2h non-retriable suppression. Same fix below in
+      // the 400 path.
+      const priorFailure = refreshFailures.get(acctKey);
       const skipRefresh =
         priorFailure &&
         priorFailure.retriable === false &&
         Date.now() - priorFailure.ts < REFRESH_FAILURE_TTL_MS;
-      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded() && !skipRefresh) {
-        refreshAttempted.add(acctName);
+      if (acct && !refreshAttempted.has(acctKey) && !isDeadlineExceeded() && !skipRefresh) {
+        refreshAttempted.add(acctKey);
         log('refresh', `${acctName}: attempting token refresh after 401...`);
         try {
           const refreshResult = await refreshAccountToken(acct.name, { force: true });
@@ -16290,8 +16435,12 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (_consecutive400s >= 3 && !_bulkRefreshAttempted && !isDeadlineExceeded() && !isBillingError) {
         _bulkRefreshAttempted = true;
         log('error', `${_consecutive400s} consecutive 400s — force-refreshing ALL account tokens (parallel)`);
-        const toRefresh = allAccounts.filter(a => !refreshAttempted.has(a.label || a.name));
-        for (const a of toRefresh) refreshAttempted.add(a.label || a.name);
+        // CR-004 (Codex review): use stable a.name for refreshAttempted
+        // (matches the per-acct path above and the refreshFailures key
+        // owned by refreshAccountToken). Pre-fix `a.label || a.name`
+        // produced cache-key drift identical to the 401 hot path.
+        const toRefresh = allAccounts.filter(a => !refreshAttempted.has(a.name));
+        for (const a of toRefresh) refreshAttempted.add(a.name);
         const results = await Promise.allSettled(
           toRefresh.map(a => refreshAccountToken(a.name, { force: true }))
         );
@@ -16312,8 +16461,12 @@ async function handleProxyRequest(clientReq, clientRes) {
 
       // ── Strategy 2: Refresh this specific account's token ──
       // (Skip for billing errors — refreshing tokens won't restore credits)
-      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded() && !isBillingError) {
-        refreshAttempted.add(acctName);
+      // CR-004 (Codex review): acctKey for the dedupe set, acctName
+      // (display) for the log line. Pre-fix used acctName for both,
+      // which still worked intra-request but added drift risk if a
+      // future refactor keys refreshFailures by this set.
+      if (acct && !refreshAttempted.has(acctKey) && !isDeadlineExceeded() && !isBillingError) {
+        refreshAttempted.add(acctKey);
         log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
           const refreshResult = await refreshAccountToken(acct.name, { force: true });

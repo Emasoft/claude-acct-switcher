@@ -81,6 +81,8 @@ import {
   vdmAccountServiceName,
   vdmAccountNameFromService,
   VDM_ACCOUNT_KEYCHAIN_SERVICE_PREFIX,
+  // CR-006 (Codex review) — bounded-string session_id validator
+  isValidSessionId,
   // UX-X8 / UX-X9 — unified time + token-count formatters with hover-exact
   fmtTokenCount,
   fmtDuration,
@@ -9927,12 +9929,14 @@ describe('Sessions tab polish — UX-S3 / UX-S4 source-grep regressions (batch J
     // the onclick passes the event through and copyTimeline calls
     // stopPropagation. This guards against a future refactor moving
     // the button INSIDE the header.
-    // Source pattern: onclick="copyTimeline(\\'' + s.id + '\\', event)"
+    // Source pattern: onclick="copyTimeline(\\'' + sid + '\\', event)"
     // (the four backslashes in the regex match two literal backslashes
     // each — one to escape the apostrophe at HTML emit time, the other
     // is just the regex-literal escape of the single backslash).
+    // CR-006 (Codex review): the variable is now `sid` (= escHtml(s.id))
+    // for defense-in-depth XSS escape; previously it was raw `s.id`.
     assert.match(_src_uxj,
-      /onclick="copyTimeline\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+      /onclick="copyTimeline\(\\\\'' \+ sid \+ '\\\\', event\)"/);
   });
 
   it('UX-S3 — copyTimeline accepts and stops propagation on the event arg', () => {
@@ -10030,9 +10034,11 @@ describe('Sessions tab polish — UX-S3 / UX-S4 source-grep regressions (batch J
 
   it('UX-S4 — toggle button onclick passes the event through (defense-in-depth)', () => {
     // Source pattern (same backslash convention as the copy button):
-    //   onclick="toggleSessionTimelineExpand(\\'' + s.id + '\\', event)"
+    //   onclick="toggleSessionTimelineExpand(\\'' + sid + '\\', event)"
+    // CR-006 (Codex review): variable renamed s.id → sid (= escHtml(s.id))
+    // for defense-in-depth XSS escape.
     assert.match(_src_uxj,
-      /onclick="toggleSessionTimelineExpand\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+      /onclick="toggleSessionTimelineExpand\(\\\\'' \+ sid \+ '\\\\', event\)"/);
   });
 
   it('UX-S4 — applySessionTimelineOverflow detects overflow and toggles the fade indicator class', () => {
@@ -10096,10 +10102,13 @@ describe('Sessions tab polish — UX-S3 / UX-S4 source-grep regressions (batch J
     // backslashes around the UUID — see the byte-level encoding above.
     // The new copy/expand onclicks must use the same pattern (no extra
     // interpolation, no user text in the JS string).
+    // CR-006 (Codex review): variable renamed s.id → sid (= escHtml(s.id))
+    // so the onclick handlers carry an HTML-escaped value as defense-in-
+    // depth on top of the new /api/session-start charset validation.
     assert.match(_src_uxj,
-      /onclick="copyTimeline\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+      /onclick="copyTimeline\(\\\\'' \+ sid \+ '\\\\', event\)"/);
     assert.match(_src_uxj,
-      /onclick="toggleSessionTimelineExpand\(\\\\'' \+ s\.id \+ '\\\\', event\)"/);
+      /onclick="toggleSessionTimelineExpand\(\\\\'' \+ sid \+ '\\\\', event\)"/);
   });
 });
 
@@ -11915,5 +11924,263 @@ describe('UX round-2 audit — CRITICAL + MAJOR source-grep regressions', () => 
     // Confirm the old format-style logic (sec / min / hr % 60 lines)
     // is gone — those are now handled by fmtDurationShort.
     assert.doesNotMatch(fnMatch[0], /var min\s*=\s*Math\.floor\(sec/);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Codex review (round-4 audit) — CR-001..CR-006 source-grep regressions
+// + behavioral tests for the pure-function and validator fixes.
+// Source: reports/codex-review/20260503_130650+0200-whole-codebase-review.md
+// ─────────────────────────────────────────────────
+import { readFileSync as _readFileSync_codex } from 'node:fs';
+const _src_codex = _readFileSync_codex(new URL('../dashboard.mjs', import.meta.url), 'utf8');
+const _libsrc_codex = _readFileSync_codex(new URL('../lib.mjs', import.meta.url), 'utf8');
+
+describe('Codex review — CR-001..CR-006 source-grep + behavioral regressions', () => {
+
+  // ── CR-001 — dashboard readKeychain MUST pass -a KEYCHAIN_ACCOUNT ──
+  it('CR-001 — dashboard readKeychain argv passes -a KEYCHAIN_ACCOUNT', () => {
+    const fn = _src_codex.match(/function readKeychain\(\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fn, 'expected readKeychain function');
+    // Argv must include the -a KEYCHAIN_ACCOUNT pair before the
+    // -s KEYCHAIN_SERVICE pair so multi-row keychains resolve to
+    // THIS user's row (mirrors writeKeychain at ~line 335).
+    assert.match(fn[0], /'-a',\s*KEYCHAIN_ACCOUNT/);
+    assert.match(fn[0], /'-s',\s*KEYCHAIN_SERVICE/);
+    // Pre-fix shape (no -a flag) must be gone.
+    assert.doesNotMatch(fn[0], /'find-generic-password',\s*'-s',\s*KEYCHAIN_SERVICE,\s*'-w'/);
+  });
+
+  // ── CR-002 — capped body reader is shared across passthrough branches ──
+  it('CR-002 — _readProxyRequestBody helper exists with per-request + global caps', () => {
+    assert.match(_src_codex, /const PROXY_MAX_BODY_SIZE\s*=\s*50\s*\*\s*1024\s*\*\s*1024/);
+    assert.match(_src_codex, /const PROXY_MAX_GLOBAL_BUFFERED\s*=\s*200\s*\*\s*1024\s*\*\s*1024/);
+    assert.match(_src_codex, /async function _readProxyRequestBody\(clientReq\)/);
+    // Helper must reference both cap constants in its body.
+    const fn = _src_codex.match(/async function _readProxyRequestBody\([\s\S]+?\n\}/);
+    assert.ok(fn);
+    assert.match(fn[0], /PROXY_MAX_BODY_SIZE/);
+    assert.match(fn[0], /PROXY_MAX_GLOBAL_BUFFERED/);
+    assert.match(fn[0], /body_too_large/);
+    assert.match(fn[0], /global_buffer_exceeded/);
+    // _writeBodyReaderErrorResponse must convert the two errors to 413 / 503.
+    const errFn = _src_codex.match(/function _writeBodyReaderErrorResponse\([\s\S]+?\n\}/);
+    assert.ok(errFn);
+    assert.match(errFn[0], /writeHead\(413/);
+    assert.match(errFn[0], /writeHead\(503/);
+  });
+
+  it('CR-002 — every smart-passthrough branch + normal proxy path uses _readProxyRequestBody', () => {
+    // Each of the 4 callsites must exist with the standard guard pattern.
+    const callMatches = _src_codex.match(/await _readProxyRequestBody\(clientReq\)/g) || [];
+    assert.ok(callMatches.length >= 4,
+      `expected ≥4 _readProxyRequestBody callsites (proxy-disabled, circuit-open, oauth-bypass, normal); found ${callMatches.length}`);
+    // The unbounded `clientReq.on('data', c => bodyChunks.push(c))` pattern
+    // (no per-byte cap) MUST NOT appear in handleProxyRequest. Pre-fix the
+    // three passthrough branches each had this exact unguarded shape.
+    const handler = _src_codex.match(/async function handleProxyRequest\([\s\S]+?\n\}\s*\n/);
+    assert.ok(handler, 'expected handleProxyRequest function');
+    assert.doesNotMatch(handler[0], /clientReq\.on\('data',\s*c\s*=>\s*bodyChunks\.push\(c\)\)/);
+  });
+
+  // ── CR-003 — drainResponse only on candidate inspection; SSE pipes through ──
+  it('CR-003 — drainResponse clears its safety timer on natural completion', () => {
+    const fn = _src_codex.match(/function drainResponse\(res\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fn);
+    // clearTimeout must fire inside finish(). Pre-fix the 5s timer leaked.
+    assert.match(fn[0], /clearTimeout\(timer\)/);
+    // Timer should be unref'd so it can't keep the event loop alive.
+    assert.match(fn[0], /\.unref\(\)/);
+  });
+
+  it('CR-003 — _smartPassthrough pipes non-400 responses via _pipeUpstreamResponse', () => {
+    const fn = _src_codex.match(/async function _smartPassthrough\([\s\S]+?\n\}/);
+    assert.ok(fn);
+    // The status !== 400 fast path MUST call _pipeUpstreamResponse,
+    // NOT drainResponse. Pre-fix every response went through drainResponse.
+    assert.match(fn[0], /res\.statusCode\s*!==\s*400/);
+    assert.match(fn[0], /_pipeUpstreamResponse\(res,\s*clientRes\)/);
+    // Retry path must also pipe non-400 retry responses.
+    assert.match(fn[0], /_pipeUpstreamResponse\(retryRes,\s*clientRes\)/);
+    // The pipe helper must exist.
+    assert.match(_src_codex, /function _pipeUpstreamResponse\(upstream,\s*clientRes\)/);
+    const pipeFn = _src_codex.match(/function _pipeUpstreamResponse\([\s\S]+?\n\}/);
+    assert.ok(pipeFn);
+    // Must strip content-length so chunked encoding works.
+    assert.match(pipeFn[0], /delete hdrs\['content-length'\]/);
+    // Must call .pipe and tear down upstream on client close.
+    assert.match(pipeFn[0], /upstream\.pipe\(clientRes\)/);
+    assert.match(pipeFn[0], /clientRes\.once\('close'/);
+  });
+
+  // ── CR-004 — refresh control-plane keys use stable acct.name ──
+  it('CR-004 — proxy hot path declares acctKey + acctDisplay split', () => {
+    // Both vars must exist near each other. acctKey reads from acct.name,
+    // acctDisplay falls back to label.
+    assert.match(_src_codex, /const acctDisplay\s*=\s*acct\?\.label\s*\|\|\s*acct\?\.name\s*\|\|\s*'unknown'/);
+    assert.match(_src_codex, /const acctKey\s*=\s*acct\?\.name\s*\|\|\s*'unknown'/);
+  });
+
+  it('CR-004 — refreshFailures.get in 401 path uses acctKey, not acctName', () => {
+    // The single get() callsite must read by stable acct.name. Pre-fix
+    // it read by display label and missed every entry refreshAccountToken
+    // wrote (which is keyed on acct.name).
+    const m = _src_codex.match(/const priorFailure\s*=\s*refreshFailures\.get\(([^)]+)\)/);
+    assert.ok(m, 'expected priorFailure read');
+    assert.equal(m[1], 'acctKey');
+  });
+
+  it('CR-004 — bulk 400 refreshAttempted uses a.name (not a.label || a.name)', () => {
+    // Both filter and add must use a.name for consistency with the
+    // single-acct path. Pre-fix used `a.label || a.name`.
+    assert.match(_src_codex, /allAccounts\.filter\(a\s*=>\s*!refreshAttempted\.has\(a\.name\)\)/);
+    assert.match(_src_codex, /for \(const a of toRefresh\) refreshAttempted\.add\(a\.name\)/);
+    // Pre-fix shape must be gone in handleProxyRequest.
+    const handler = _src_codex.match(/async function handleProxyRequest\([\s\S]+/);
+    assert.ok(handler);
+    assert.doesNotMatch(handler[0], /allAccounts\.filter\(a\s*=>\s*!refreshAttempted\.has\(a\.label\s*\|\|\s*a\.name\)\)/);
+  });
+
+  it('CR-004 — pre-flight refresh seeds refreshAttempted with preAcctKey (= preAcct.name)', () => {
+    // preAcctKey MUST be defined and the three .add() callsites MUST use it.
+    assert.match(_src_codex, /const preAcctKey\s*=\s*preAcct\.name/);
+    const preFlight = _src_codex.match(/const preAcct = allAccounts\.find\(a => a\.token === token\);[\s\S]+?\n\s\s\s\s\}\s*\n\s\s\}/);
+    assert.ok(preFlight, 'expected pre-flight block');
+    const adds = (preFlight[0].match(/refreshAttempted\.add\(preAcctKey\)/g) || []).length;
+    assert.ok(adds >= 3, `expected ≥3 refreshAttempted.add(preAcctKey) callsites; got ${adds}`);
+    assert.doesNotMatch(preFlight[0], /refreshAttempted\.add\(preAcctName\)/);
+  });
+
+  // ── CR-005 — pickConserve preserves current on equal scores ──
+  it('CR-005 — pickByStrategy conserve does not rotate when all accounts have score 0', () => {
+    const accounts = [_mkAccount('freshA'), _mkAccount('freshB')];
+    const sm = _mkStateManager({}); // every score → 0 (unknown)
+    const out = pickByStrategy({
+      strategy: 'conserve',
+      currentToken: 'freshB', // current is later in array, but both score 0
+      accounts,
+      stateManager: sm,
+    });
+    // Pre-fix: would have returned { account: { token: 'freshA' }, rotated: true }
+    // because pickConserve.sort returned 'freshA' first, and the rotation
+    // gate only checked `conserved.token !== currentToken`. Post-fix the
+    // strict-greater-than check skips the rotation entirely.
+    assert.equal(out.rotated, false, 'should not rotate on equal scores');
+    assert.equal(out.account, null);
+  });
+
+  it('CR-005 — pickByStrategy conserve does not rotate on tied warm scores', () => {
+    const accounts = [_mkAccount('warmA'), _mkAccount('warmB')];
+    const sm = _mkStateManager({
+      warmA: { utilization5h: 0.3, utilization7d: 0.2 },
+      warmB: { utilization5h: 0.3, utilization7d: 0.2 },
+    });
+    const out = pickByStrategy({
+      strategy: 'conserve',
+      currentToken: 'warmB',
+      accounts,
+      stateManager: sm,
+    });
+    assert.equal(out.rotated, false, 'tied warm scores should not rotate');
+    assert.equal(out.account, null);
+  });
+
+  it('CR-005 — pickByStrategy conserve still rotates when candidate score is strictly greater', () => {
+    const accounts = [_mkAccount('hot'), _mkAccount('cold')];
+    const sm = _mkStateManager({
+      hot:  { utilization5h: 0.6, utilization7d: 0.6 }, // score = 60.6
+      cold: { utilization5h: 0.0, utilization7d: 0.0 }, // score = 0
+    });
+    // Conserve = drain hottest first. Current=cold, candidate=hot, hot>cold → rotate.
+    const out = pickByStrategy({
+      strategy: 'conserve',
+      currentToken: 'cold',
+      accounts,
+      stateManager: sm,
+    });
+    assert.equal(out.rotated, true);
+    assert.equal(out.account?.token, 'hot');
+  });
+
+  // ── CR-006 — session_id boundary validator + renderer escHtml ──
+  it('CR-006 — isValidSessionId accepts UUID-ish ids and rejects everything else', () => {
+    // Realistic Claude Code session IDs.
+    assert.equal(isValidSessionId('5ddc8b97-de46-4be1-a26d-cae50ba5ad42'), true);
+    assert.equal(isValidSessionId('abc123'), true);
+    assert.equal(isValidSessionId('session.001-abc'), true);
+    assert.equal(isValidSessionId('a'.repeat(128)), true);
+    // Type / shape rejects.
+    assert.equal(isValidSessionId(''), false);
+    assert.equal(isValidSessionId(null), false);
+    assert.equal(isValidSessionId(undefined), false);
+    assert.equal(isValidSessionId(123), false);
+    assert.equal(isValidSessionId({}), false);
+    assert.equal(isValidSessionId(['x']), false);
+    assert.equal(isValidSessionId('a'.repeat(129)), false);
+    // Charset rejects — exactly the chars that would break out of HTML
+    // attribute / inline JS handler contexts.
+    assert.equal(isValidSessionId('a"b'), false);
+    assert.equal(isValidSessionId("a'b"), false);
+    assert.equal(isValidSessionId('a<b'), false);
+    assert.equal(isValidSessionId('a>b'), false);
+    assert.equal(isValidSessionId('a&b'), false);
+    assert.equal(isValidSessionId('a\\b'), false);
+    assert.equal(isValidSessionId('a/b'), false);
+    assert.equal(isValidSessionId('a b'), false); // whitespace
+    assert.equal(isValidSessionId('a\nb'), false);
+    assert.equal(isValidSessionId('a\x00b'), false);
+  });
+
+  it('CR-006 — isValidSessionId is exported from lib.mjs with the documented charset', () => {
+    assert.match(_libsrc_codex, /export function isValidSessionId\(s\)/);
+    // Charset must be exactly [a-zA-Z0-9._-]+ and capped at 128 chars.
+    const fn = _libsrc_codex.match(/export function isValidSessionId\([\s\S]+?\n\}/);
+    assert.ok(fn);
+    assert.match(fn[0], /\[a-zA-Z0-9\._-\]\+/);
+    assert.match(fn[0], /<=\s*128/);
+  });
+
+  it('CR-006 — /api/session-start, /stop, /end all gate on isValidSessionId', () => {
+    // Locate each handler block and confirm the validator runs at the
+    // boundary BEFORE any state mutation. Pre-fix only stop/end checked
+    // truthiness, and start only checked truthiness + cwd.
+    const startBlock = _src_codex.match(/url\.pathname === '\/api\/session-start'[\s\S]+?return true;\s*\}/);
+    assert.ok(startBlock, 'expected /api/session-start handler');
+    assert.match(startBlock[0], /isValidSessionId\(sessionId\)/);
+
+    const stopBlock = _src_codex.match(/url\.pathname === '\/api\/session-stop'[\s\S]+?return true;\s*\}/);
+    assert.ok(stopBlock, 'expected /api/session-stop handler');
+    assert.match(stopBlock[0], /isValidSessionId\(sessionId\)/);
+
+    const endBlock = _src_codex.match(/url\.pathname === '\/api\/session-end'[\s\S]+?return true;\s*\}/);
+    assert.ok(endBlock, 'expected /api/session-end handler');
+    assert.match(endBlock[0], /isValidSessionId\(sessionId\)/);
+  });
+
+  it('CR-006 — session card renderer wraps s.id with escHtml in data-sid + onclick handlers', () => {
+    // ACTIVE block: var sid = escHtml(s.id) is the canonical local var.
+    const activeBlock = _src_codex.match(/active\.forEach\(function\(s\)\s*\{[\s\S]+?\}\);\s*\}/);
+    assert.ok(activeBlock, 'expected active session forEach');
+    assert.match(activeBlock[0], /var sid = escHtml\(s\.id\)/);
+    // data-sid attr uses the escaped form, not raw s.id.
+    assert.match(activeBlock[0], /data-sid="' \+ sid \+ '"/);
+    assert.doesNotMatch(activeBlock[0], /data-sid="' \+ s\.id \+ '"/);
+    // Inline JS handlers all use the escaped form. Pattern mirrors the
+    // existing UX-S3 regression test (test/lib.test.mjs:9937 +
+    // test/lib.test.mjs:10102) — the JS-escaped quotes are `\\'` in the
+    // source which becomes `\\\\''` in the regex pattern.
+    assert.match(activeBlock[0], /copyTimeline\(\\\\'' \+ sid \+ '\\\\', event\)/);
+    assert.match(activeBlock[0], /toggleSessionCollapse\(\\\\'' \+ sid \+ '\\\\'\)/);
+    assert.match(activeBlock[0], /toggleSessionTimelineExpand\(\\\\'' \+ sid \+ '\\\\', event\)/);
+
+    // RECENT block: same shape.
+    const recentBlock = _src_codex.match(/recent\.forEach\(function\(s\)\s*\{[\s\S]+?\}\);\s*\}/);
+    assert.ok(recentBlock, 'expected recent session forEach');
+    assert.match(recentBlock[0], /var sid = escHtml\(s\.id\)/);
+    assert.match(recentBlock[0], /data-sid="' \+ sid \+ '"/);
+    assert.doesNotMatch(recentBlock[0], /data-sid="' \+ s\.id \+ '"/);
+    assert.match(recentBlock[0], /copyTimeline\(\\\\'' \+ sid \+ '\\\\', event\)/);
+    assert.match(recentBlock[0], /toggleSessionCollapse\(\\\\'' \+ sid \+ '\\\\'\)/);
+    assert.match(recentBlock[0], /toggleSessionTimelineExpand\(\\\\'' \+ sid \+ '\\\\', event\)/);
   });
 });

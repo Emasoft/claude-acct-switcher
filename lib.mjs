@@ -482,7 +482,19 @@ export function pickByStrategy(opts) {
       // Untouched accounts stay dormant  - their windows don't start
       const conserved = pickConserve(accounts, stateManager, excludeTokens, now);
       if (conserved && conserved.token !== currentToken) {
-        return { account: conserved, rotated: true };
+        // CR-005 (Codex review): Rotate only if the candidate's conserve
+        // score is STRICTLY GREATER than the current account's score.
+        // Pre-fix the equal-score case (e.g. all accounts at 0% utilization,
+        // or any tie among warm windows) would force-rotate off the
+        // current account into another equally-conservative one — waking
+        // that account's window for no benefit and violating conserve's
+        // promise ("drain already-active windows first, leave dormant
+        // accounts dormant"). pickConserve attaches `.score` to the
+        // returned spread account.
+        const currentScore = scoreAccountConserve(currentToken, stateManager);
+        if (conserved.score > currentScore) {
+          return { account: conserved, rotated: true };
+        }
       }
       return { account: null, rotated: false };
     }
@@ -2891,6 +2903,29 @@ export function vdmAccountNameFromService(service) {
   if (name.length === 0) return null;
   if (!/^[a-zA-Z0-9._@-]+$/.test(name)) return null;
   return name;
+}
+
+/**
+ * CR-006 (Codex review): Validate a session_id from a Claude Code hook
+ * payload. CC's session_id is spec'd as an opaque UUID-like string;
+ * rejecting non-conforming values at the hook-endpoint boundary means
+ * the dashboard renderer can interpolate s.id into HTML attributes and
+ * inline JS handlers without escaping every site (and without paying
+ * the cost of a future regression where a renderer site forgets to
+ * escape). The character set covers UUIDs, ULIDs, and the dot-separated
+ * sub-IDs that a future spec might add. Length cap defends against
+ * pathological 1MB session_ids that would bloat token-usage.json and
+ * blow renderer performance.
+ *
+ * Returns true iff `s` is a non-empty string ≤128 chars matching
+ * /^[a-zA-Z0-9._-]+$/. Used by /api/session-start, /api/session-stop,
+ * /api/session-end. Other session-aware endpoints (subagent-start,
+ * post-tool-batch, etc.) already route through dedicated parsers
+ * (parseSubagentStartPayload / parsePostToolBatchPayload) that apply
+ * their own bounded-string guards.
+ */
+export function isValidSessionId(s) {
+  return typeof s === 'string' && s.length > 0 && s.length <= 128 && /^[a-zA-Z0-9._-]+$/.test(s);
 }
 
 // ─── Phase H — OTLP/HTTP/JSON parser helpers ───
