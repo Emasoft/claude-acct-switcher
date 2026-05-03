@@ -9603,13 +9603,16 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
       /\.acct-pref-toggle:focus-within\s*\{[^}]*outline:\s*2px solid var\(--primary\)/);
   });
 
-  it('UX-A2 — .acct-pref-toggle.is-on flips colour to make the active state visible', () => {
+  it('UX-A2 — .acct-pref-toggle.is-on flips style to make the active state visible', () => {
     // The audit pointed out that the previous form needed the user to
     // read the checkbox state to know if the toggle was on. The is-on
-    // class flips the pill itself to the yellow-soft palette so the
-    // state is visible from across the screen.
+    // class flips the pill so the state is visible from across the
+    // screen. UX2-A1 retoned this from yellow (which conflicted with
+    // .beta-badge yellow and read as "warning") to muted-on-bg with a
+    // 600 weight so the active toggle reads as "settled deliberate
+    // state" instead of "hazardous setting".
     assert.match(_src_vh,
-      /\.acct-pref-toggle\.is-on\s*\{[\s\S]{0,200}color:\s*var\(--yellow\);[\s\S]{0,200}background:\s*var\(--yellow-soft\);/);
+      /\.acct-pref-toggle\.is-on\s*\{[\s\S]{0,300}color:\s*var\(--muted\);[\s\S]{0,300}background:\s*var\(--bg\);[\s\S]{0,300}font-weight:\s*600;/);
   });
 
   it('UX-A2 — renderAccounts emits prefsHtml inside card-actions, not as a free child', () => {
@@ -9691,10 +9694,12 @@ describe('Visual hierarchy batch — UX-A2/A3/A4 + UX-CO2 + UX-AC2 source-grep r
   // ── UX-AC2 — activity-event glyph paired with dot colour
   it('UX-AC2 — evtIcons map is defined and covers severity-critical event types', () => {
     assert.match(_src_vh, /^const evtIcons = \{/m);
-    // Spot-check the most-critical entries the audit named:
-    //   rate-limited (warn glyph), auth-expired (error), all-exhausted
-    //   (no-entry), token-refreshed (check), account-discovered (plus).
-    assert.match(_src_vh, /'rate-limited':\s*'▲'/);
+    // Spot-check the most-critical entries the audit named.
+    // UX2-AC2 (round-2 audit MAJOR): rate-limited and queue-depth-alert
+    // moved from black-up-triangle (▲) to the standard warning sign
+    // (U+26A0 ⚠) for instant warning recognition. The other glyphs
+    // stay where they were.
+    assert.match(_src_vh, /'rate-limited':\s*'⚠'/);
     assert.match(_src_vh, /'auth-expired':\s*'✖'/);
     assert.match(_src_vh, /'all-exhausted':\s*'⛔'/);
     assert.match(_src_vh, /'token-refreshed':\s*'✓'/);
@@ -11634,5 +11639,281 @@ describe('Code-quality audit fixes (CQ-001 .. CQ-013) — source-grep regression
     );
     assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
     assert.match(handlerSlice, /\? 400 : 500/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// UX round-2 audit — CRITICAL + MAJOR cleanup pass (spark-N batch).
+// ─────────────────────────────────────────────────────────────────────
+describe('UX round-2 audit — CRITICAL + MAJOR source-grep regressions', () => {
+  const _src_ux2 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // ── UX2-CSS1 — declare missing CSS variables ──
+  it('UX2-CSS1 — :root declares --surface, --text-muted, --text, --mono', () => {
+    // Pre-fix these were referenced ~50x but never defined, so they
+    // silently fell to inherit/initial. Tree-view code-mode appearance
+    // and the filter-bar Clear button background were both broken.
+    assert.match(_src_ux2, /--surface:\s*hsl\(/);
+    assert.match(_src_ux2, /--text-muted:\s*hsl\(/);
+    assert.match(_src_ux2, /--text:\s*hsl\(/);
+    assert.match(_src_ux2, /--mono:\s*ui-monospace/);
+  });
+
+  it('UX2-CSS1 — dead --muted-foreground reference cleaned up', () => {
+    // The .remove-btn rule had `color: var(--muted-foreground)` which
+    // was undefined and overridden two lines later by `color: var(--red)`.
+    // After cleanup the rule should use var(--muted) (defined fallback).
+    assert.doesNotMatch(_src_ux2, /var\(--muted-foreground\)/);
+  });
+
+  // ── UX2-X1 — toast/header collision ──
+  it('UX2-X1 — toast positioning lives inside the existing 720px media block', () => {
+    // The fix re-positions the toast to bottom on narrow viewports so
+    // the gear/help icon buttons stay clickable. Source-grep that the
+    // toast bottom-positioning override appears in the 720px block.
+    const idx720 = _src_ux2.indexOf('@media (max-width: 720px)');
+    assert.ok(idx720 >= 0, 'expected a 720px media query');
+    const block = _src_ux2.slice(idx720, idx720 + 4000);
+    assert.match(block, /\.toast\s*\{[^}]*bottom:\s*1\.5rem/);
+  });
+
+  it('UX2-X1 — toast positioning at <=480px also pushed to bottom', () => {
+    // The 480px block is the narrowest viewport — must also push the
+    // toast to bottom (it inherits from the 720px override but the
+    // explicit smaller-viewport rule keeps the bottom inset tighter).
+    const idx480 = _src_ux2.indexOf('@media (max-width: 480px)');
+    assert.ok(idx480 >= 0, 'expected a 480px media query');
+    const block = _src_ux2.slice(idx480, idx480 + 1000);
+    assert.match(block, /\.toast\s*\{[^}]*bottom:\s*1rem/);
+  });
+
+  // ── UX2-L1 — LOG_TAG_COLORS semantic correction ──
+  it('UX2-L1 — LOG_TAG_COLORS.warn maps to var(--yellow) not var(--red)', () => {
+    // Pre-fix: warn shared the same colour as error, conflating the two
+    // severities. Operators triaging the log stream couldn't tell warn
+    // from error without reading the tag text.
+    assert.match(_src_ux2, /warn:\s*'var\(--yellow\)'/);
+    assert.doesNotMatch(_src_ux2, /warn:\s*'var\(--red\)'/);
+  });
+
+  it('UX2-L1 — switch/proactive moved to cyan to free yellow for warn', () => {
+    // Yellow had to be free for warn; switch/proactive get cyan.
+    assert.match(_src_ux2, /switch:\s*'var\(--cyan\)'/);
+    assert.match(_src_ux2, /proactive:\s*'var\(--cyan\)'/);
+  });
+
+  // ── UX2-L2 / UX2-AC1 — filter empty-state ──
+  it('UX2-L2 / UX2-AC1 — _vdmShowFilterEmptyState helper exists', () => {
+    // Renders an in-pane .empty-state node when the filter matches zero
+    // entries, instead of leaving an empty container with only a small
+    // "0 of N match" badge above.
+    assert.match(_src_ux2, /function _vdmShowFilterEmptyState\(container, kind\)/);
+    assert.match(_src_ux2, /function _vdmHideFilterEmptyState\(container\)/);
+  });
+
+  it('UX2-L2 — logs filter triggers empty state on zero matches', () => {
+    // The applyLogsFilter MUST call _vdmShowFilterEmptyState when matched
+    // is 0 AND there is data. Without this, the empty-pane state has
+    // no in-pane explanation.
+    const fnMatch = _src_ux2.match(/function _vdmApplyLogsFilter\(\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fnMatch, 'expected _vdmApplyLogsFilter function');
+    assert.match(fnMatch[0], /_vdmShowFilterEmptyState\(container, 'logs'\)/);
+  });
+
+  it('UX2-L2 — activity filter triggers empty state on zero matches', () => {
+    const fnMatch = _src_ux2.match(/function _vdmApplyActivityFilter\(\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fnMatch, 'expected _vdmApplyActivityFilter function');
+    assert.match(fnMatch[0], /_vdmShowFilterEmptyState\(wrap, 'activity'\)/);
+  });
+
+  // ── UX2-AC1 — "No activity in selected window" routes through .empty-state ──
+  it('UX2-AC1 — "No activity in the selected time window" branch uses .empty-state', () => {
+    // Pre-fix used inline-styled muted text. Now uses canonical
+    // .empty-state class so it matches the chrome of the other empty
+    // states (initial markup, etc.).
+    assert.match(_src_ux2, /class="empty-state">No activity in the selected time window/);
+    assert.doesNotMatch(_src_ux2, /style="color:var\(--muted\);padding:2rem 0">No activity in selected window/);
+  });
+
+  // ── UX2-AC2 — icon vocabulary ──
+  it('UX2-AC2 — rate-limited and queue-depth-alert use the standard warning sign', () => {
+    // U+26A0 ⚠ instead of U+25B2 ▲ (which looks like a rotated play
+    // button and carries no warning semantics).
+    assert.match(_src_ux2, /'rate-limited':\s*'⚠'/);
+    assert.match(_src_ux2, /'queue-depth-alert':\s*'⚠'/);
+    assert.doesNotMatch(_src_ux2, /'rate-limited':\s*'▲'/);
+    assert.doesNotMatch(_src_ux2, /'queue-depth-alert':\s*'▲'/);
+  });
+
+  // ── UX2-S1 — session-conflicts via design tokens ──
+  it('UX2-S1 — .session-conflicts uses design tokens (no raw hex)', () => {
+    const ruleMatch = _src_ux2.match(/\.session-conflicts\s*\{[\s\S]+?\}/);
+    assert.ok(ruleMatch, 'expected .session-conflicts rule');
+    assert.match(ruleMatch[0], /background:\s*var\(--red-soft\)/);
+    assert.match(ruleMatch[0], /border:\s*1px solid var\(--red-border\)/);
+    assert.match(ruleMatch[0], /color:\s*var\(--red\)/);
+    assert.doesNotMatch(ruleMatch[0], /#f85149/);
+    assert.doesNotMatch(ruleMatch[0], /rgba\(248,81,73/);
+  });
+
+  // ── UX2-S2 — conflicts banner uses inline SVG instead of \\u26A0 ──
+  it('UX2-S2 — SESSION_WARNING_ICON_SVG constant exists', () => {
+    assert.match(_src_ux2, /var SESSION_WARNING_ICON_SVG\s*=\s*'<svg/);
+  });
+
+  it('UX2-S2 — conflicts banner uses SESSION_WARNING_ICON_SVG, not \\u26A0', () => {
+    // Find the conflicts banner emit site — it must use the SVG, not
+    // the unicode emoji. Otherwise it renders as a fallback box on
+    // Linux / no-emoji-font systems.
+    const bannerMatch = _src_ux2.match(/data\.conflicts\.forEach\(function\(c\)\s*\{[\s\S]{0,400}\}\);/);
+    assert.ok(bannerMatch, 'expected conflicts banner forEach block');
+    assert.match(bannerMatch[0], /SESSION_WARNING_ICON_SVG/);
+    assert.doesNotMatch(bannerMatch[0], /\\u26A0/);
+  });
+
+  // ── UX2-S3 — session-meta padding-right reserves space for copy button ──
+  it('UX2-S3 — .session-meta has padding-right + flex-wrap', () => {
+    const ruleMatch = _src_ux2.match(/\.session-meta\s*\{[\s\S]+?\}/);
+    assert.ok(ruleMatch, 'expected .session-meta rule');
+    assert.match(ruleMatch[0], /flex-wrap:\s*wrap/);
+    assert.match(ruleMatch[0], /padding-right:\s*2rem/);
+  });
+
+  // ── UX2-BR1 — _tokRepoUserPrefersAllCollapsed sticks for new repos ──
+  it('UX2-BR1 — _tokRepoUserPrefersAllCollapsed state variable exists', () => {
+    // Without this override, "Collapse all" wouldn't stick when a new
+    // repo appeared in a 5s poll — newly-discovered repo would use the
+    // default branch-count rule and silently appear expanded.
+    assert.match(_src_ux2, /var _tokRepoUserPrefersAllCollapsed\s*=\s*null/);
+  });
+
+  it('UX2-BR1 — _repoBranchCollapseAll sets the user-pref override to true', () => {
+    const fnMatch = _src_ux2.match(/function _repoBranchCollapseAll\(\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fnMatch, 'expected _repoBranchCollapseAll function');
+    assert.match(fnMatch[0], /_tokRepoUserPrefersAllCollapsed\s*=\s*true/);
+  });
+
+  it('UX2-BR1 — _repoBranchExpandAll sets the user-pref override to false', () => {
+    const fnMatch = _src_ux2.match(/function _repoBranchExpandAll\(\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fnMatch, 'expected _repoBranchExpandAll function');
+    assert.match(fnMatch[0], /_tokRepoUserPrefersAllCollapsed\s*=\s*false/);
+  });
+
+  it('UX2-BR1 — renderRepoGroup honours the user-pref override on init', () => {
+    // The default-state initialiser MUST check
+    // _tokRepoUserPrefersAllCollapsed before falling through to the
+    // branch-count default.
+    const fnMatch = _src_ux2.match(/function renderRepoGroup\(repo, isInactive\)\s*\{[\s\S]+?var collapsed/);
+    assert.ok(fnMatch, 'expected renderRepoGroup function start');
+    assert.match(fnMatch[0], /_tokRepoUserPrefersAllCollapsed\s*===\s*true/);
+    assert.match(fnMatch[0], /_tokRepoUserPrefersAllCollapsed\s*===\s*false/);
+  });
+
+  // ── UX2-BR2 — hidden-branches footer is now an interactive button ──
+  it('UX2-BR2 — _toggleRepoBranchUncap helper exists', () => {
+    assert.match(_src_ux2, /function _toggleRepoBranchUncap\(repoKey\)/);
+  });
+
+  it('UX2-BR2 — _tokRepoBranchUncapped state map exists', () => {
+    assert.match(_src_ux2, /var _tokRepoBranchUncapped\s*=\s*\{\}/);
+  });
+
+  it('UX2-BR2 — hidden-branches summary row uses real <button>, not div', () => {
+    // The footer used to be a non-clickable italic div with inline
+    // styles. Promote to <button class="tok-branch-uncap-toggle">.
+    assert.match(_src_ux2, /class="tok-branch-uncap-toggle"/);
+    // The repoKey is escHtml'd before injection.
+    assert.match(_src_ux2, /var safeRepoKey = escHtml\(repo\.key/);
+  });
+
+  it('UX2-BR2 — .tok-branch-uncap-toggle CSS class defined', () => {
+    assert.match(_src_ux2, /\.tok-branch-uncap-toggle\s*\{/);
+    assert.match(_src_ux2, /\.tok-branch-uncap-toggle:hover/);
+  });
+
+  // ── UX2-CO1 — em-dash in user-facing strings ──
+  it('UX2-CO1 — STRATEGY_DETAILS uses proper em-dash, not double-space-hyphen', () => {
+    const detailsMatch = _src_ux2.match(/const STRATEGY_DETAILS\s*=\s*\{[\s\S]+?\};/);
+    assert.ok(detailsMatch, 'expected STRATEGY_DETAILS object');
+    assert.doesNotMatch(detailsMatch[0], / {2}-/);
+    // Should contain at least one proper em-dash.
+    assert.match(detailsMatch[0], /—/);
+  });
+
+  it('UX2-CO1 — proxyEnabled toggle message uses proper em-dash', () => {
+    assert.match(_src_ux2, /'Proxy disabled — passthrough mode'/);
+    assert.doesNotMatch(_src_ux2, /'Proxy disabled  - passthrough mode'/);
+  });
+
+  // ── UX2-CO2 — drop sticky from .config-toc ──
+  it('UX2-CO2 — .config-toc no longer uses position: sticky', () => {
+    // Pre-fix the config-toc was sticky while .tabs was not — the TOC
+    // pinned alone with no relationship to the page header.
+    const ruleMatch = _src_ux2.match(/\.config-toc\s*\{[\s\S]+?\}/);
+    assert.ok(ruleMatch, 'expected .config-toc rule');
+    assert.doesNotMatch(ruleMatch[0], /position:\s*sticky/);
+    assert.doesNotMatch(ruleMatch[0], /top:\s*0/);
+  });
+
+  // ── UX2-CO3 — strategy descriptions routed through escHtml ──
+  it('UX2-CO3 — strategy-list innerHTML wraps s.name and s.desc through escHtml', () => {
+    // Source-grep regression: future refactor that loads
+    // STRATEGY_DETAILS from i18n / server endpoint must not bypass
+    // the XSS regression test.
+    assert.match(_src_ux2, /escHtml\(s\.name\)/);
+    assert.match(_src_ux2, /escHtml\(s\.desc\)/);
+  });
+
+  // ── UX2-A1 — acct-pref-toggle.is-on retoned ──
+  it('UX2-A1 — .acct-pref-toggle.is-on uses muted/bg/border (not yellow)', () => {
+    const ruleMatch = _src_ux2.match(/\.acct-pref-toggle\.is-on\s*\{[\s\S]+?\}/);
+    assert.ok(ruleMatch, 'expected .acct-pref-toggle.is-on rule');
+    assert.match(ruleMatch[0], /color:\s*var\(--muted\)/);
+    assert.match(ruleMatch[0], /background:\s*var\(--bg\)/);
+    assert.match(ruleMatch[0], /font-weight:\s*600/);
+    // Confirm the old yellow palette is gone.
+    assert.doesNotMatch(ruleMatch[0], /color:\s*var\(--yellow\)/);
+  });
+
+  // ── UX2-VS1 — vsRenderTrack collision detection ──
+  it('UX2-VS1 — vsRenderTrack detects label overlap and merges labels', () => {
+    const fnMatch = _src_ux2.match(/function vsRenderTrack\(\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fnMatch, 'expected vsRenderTrack function');
+    // Look for the overlap-detection arithmetic.
+    assert.match(fnMatch[0], /var labelsOverlap\s*=\s*Math\.abs\(ePct - sPct\)\s*<\s*8/);
+    // Confirm the visibility:hidden branch.
+    assert.match(fnMatch[0], /le\.style\.visibility\s*=\s*labelsOverlap\s*\?\s*'hidden'\s*:/);
+  });
+
+  // ── UX2-CA1 — carousel min-height pin ──
+  it('UX2-CA1 — .chart-carousel-inner has min-height to prevent layout shift', () => {
+    const ruleMatch = _src_ux2.match(/\.chart-carousel-inner\s*\{[\s\S]+?\}/);
+    assert.ok(ruleMatch, 'expected .chart-carousel-inner rule');
+    assert.match(ruleMatch[0], /min-height:\s*220px/);
+  });
+
+  // ── UX2-X2 — tab-badge uses design token ──
+  it('UX2-X2 — .tab-badge uses var(--foreground), not hardcoded #000', () => {
+    const ruleMatch = _src_ux2.match(/\.tab-badge\s*\{[\s\S]+?\}/);
+    assert.ok(ruleMatch, 'expected .tab-badge rule');
+    assert.match(ruleMatch[0], /color:\s*var\(--foreground\)/);
+    assert.doesNotMatch(ruleMatch[0], /color:\s*#000/);
+  });
+
+  // ── UX2-X8 — vsFormatDuration delegates to fmtDurationShort ──
+  it('UX2-X8 — vsFormatDuration delegates to fmtDurationShort for sub-14-day ranges', () => {
+    const fnMatch = _src_ux2.match(/function vsFormatDuration\(ms\)\s*\{[\s\S]+?\n\}/);
+    assert.ok(fnMatch, 'expected vsFormatDuration function');
+    // The function MUST call fmtDurationShort for sub-14-day ranges.
+    assert.match(fnMatch[0], /return fmtDurationShort\(ms\)/);
+    // The "weeks" special-case for >=14d ranges is preserved.
+    assert.match(fnMatch[0], /day >= 14/);
+    assert.match(fnMatch[0], /' weeks'/);
+    // Confirm the old format-style logic (sec / min / hr % 60 lines)
+    // is gone — those are now handled by fmtDurationShort.
+    assert.doesNotMatch(fnMatch[0], /var min\s*=\s*Math\.floor\(sec/);
   });
 });
