@@ -3539,6 +3539,96 @@ export function createUsageExtractor({ logger = null } = {}) {
 }
 
 // ─────────────────────────────────────────────────
+// JSON usage extractor (non-SSE responses)
+// ─────────────────────────────────────────────────
+// Companion to createUsageExtractor. The SSE extractor handles streaming
+// Claude Code traffic. This one handles non-streaming JSON responses
+// (direct curl, SDK calls without stream=true, /v1/messages/count_tokens,
+// scripts, debug probes). Without it, every API call that doesn't use
+// streaming bypasses recordUsage and never lands in token-usage.json —
+// even though the proxy sees the full response with `usage` data in the
+// body. The two extractors form a symmetric pair so the proxy → recentUsage
+// → claimUsageInRange → token-usage.json join works regardless of whether
+// the caller chose stream=true or stream=false.
+//
+// Returns a Transform that PASSES THROUGH every byte unchanged (so the
+// downstream pipe to the client is not delayed) AND tees a copy into a
+// bounded buffer for parsing at end. The buffer is capped at maxBytes
+// (default 1 MiB) — bigger responses are truncated and getUsage() returns
+// null rather than parse a partial JSON. Error responses, non-JSON content
+// types, and parse failures all return null; the caller is expected to
+// gate the recordUsage call on a non-null return.
+//
+// Usage:
+//   const extractor = createJsonUsageExtractor({ logger: log });
+//   proxyRes.pipe(extractor).pipe(clientRes);
+//   await new Promise(r => clientRes.on('finish', r));
+//   const usage = extractor.getUsage();
+//   if (usage) recordUsage(usage, accountName);
+export function createJsonUsageExtractor({ logger = null, maxBytes = 1024 * 1024 } = {}) {
+  const chunks = [];
+  let bufLen = 0;
+  let truncated = false;
+
+  const transform = new Transform({
+    transform(chunk, _enc, cb) {
+      try {
+        if (!truncated) {
+          if (bufLen + chunk.length <= maxBytes) {
+            chunks.push(chunk);
+            bufLen += chunk.length;
+          } else {
+            // Take what room is left and mark truncated. The downstream
+            // pipe still gets the full chunk via cb(null, chunk).
+            const room = Math.max(0, maxBytes - bufLen);
+            if (room > 0) {
+              chunks.push(chunk.slice(0, room));
+              bufLen += room;
+            }
+            truncated = true;
+          }
+        }
+      } catch (e) {
+        if (logger) try { logger('debug', 'json-usage-extractor buffer failed: ' + e.message); } catch {}
+      }
+      cb(null, chunk);  // ALWAYS pass-through — never delay the client
+    },
+  });
+
+  transform.getUsage = function() {
+    if (truncated) return null;
+    if (bufLen === 0) return null;
+    let parsed;
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks, bufLen).toString('utf8'));
+    } catch (e) {
+      if (logger) try { logger('debug', 'json-usage-extractor parse failed: ' + e.message); } catch {}
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object') return null;
+    const u = parsed.usage;
+    if (!u || typeof u !== 'object') return null;
+    // Mirror the field names the SSE extractor produces and recordUsage expects.
+    return {
+      inputTokens: u.input_tokens || 0,
+      outputTokens: u.output_tokens || 0,
+      cacheCreationInputTokens: u.cache_creation_input_tokens || 0,
+      cacheReadInputTokens: u.cache_read_input_tokens || 0,
+      model: parsed.model || '',
+      messageId: parsed.id || '',
+    };
+  };
+
+  // Compatibility shim with createUsageExtractor's API — the SSE extractor
+  // exposes finishParsing() for the abort path. The JSON extractor doesn't
+  // need it (no streaming state) but accepts the same call so downstream
+  // code can treat both extractor types interchangeably.
+  transform.finishParsing = function() {};
+
+  return transform;
+}
+
+// ─────────────────────────────────────────────────
 // UX-X8 / UX-X9 — unified time + token-count formatters
 // ─────────────────────────────────────────────────
 // One canonical place to convert raw numbers into human-readable

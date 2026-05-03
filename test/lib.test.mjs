@@ -8,6 +8,7 @@ import {
   buildForwardHeaders,
   stripHopByHopHeaders,
   HOP_BY_HOP,
+  createJsonUsageExtractor,
   createAccountStateManager,
   isAccountAvailable,
   scoreAccount,
@@ -12942,5 +12943,164 @@ describe('Spark Q — round-2 MINOR cleanup', () => {
       _src_q.includes('UX-X15 / UX2-X10') &&
       _src_q.includes('per-element diffing inside the card body'),
       'merged UX-X15 / UX2-X10 trade-off comment must remain near .fill-full');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// JSON usage extractor — unit tests + dashboard wiring + startup safeguard
+// ─────────────────────────────────────────────────
+// Closes the symmetry gap caught by user inspection on 2026-05-04: the
+// proxy's recordUsage/recentUsage join was wired ONLY for SSE responses.
+// Direct API calls (curl, scripts, SDK without stream=true) skipped the
+// integration entirely — `usage` data in the response body never reached
+// recentUsage[], so claimUsageInRange always returned 0 for direct calls.
+// createJsonUsageExtractor + the dashboard.mjs pipe-branch wiring make
+// the integration symmetric.
+describe('createJsonUsageExtractor — non-SSE response usage extraction', () => {
+  it('exists and exports a Transform-like object', () => {
+    const ex = createJsonUsageExtractor();
+    assert.equal(typeof ex.getUsage, 'function', 'extractor should expose getUsage()');
+    assert.equal(typeof ex.finishParsing, 'function', 'extractor should expose finishParsing() for API parity with createUsageExtractor');
+    assert.equal(typeof ex.write, 'function', 'extractor should be a Transform stream');
+  });
+
+  it('passes data through unchanged (tee, not gate)', async () => {
+    const ex = createJsonUsageExtractor();
+    const chunks = [];
+    ex.on('data', c => chunks.push(c));
+    const done = new Promise(r => ex.on('end', r));
+    const body = '{"usage":{"input_tokens":42,"output_tokens":7},"model":"claude-haiku-4-5"}';
+    ex.end(Buffer.from(body));
+    await done;
+    const out = Buffer.concat(chunks).toString('utf8');
+    assert.equal(out, body, 'Transform must not mutate the body bytes');
+  });
+
+  it('extracts the standard Anthropic usage shape', async () => {
+    const ex = createJsonUsageExtractor();
+    const done = new Promise(r => ex.on('end', r));
+    ex.resume();  // flowing mode so end fires
+    const body = JSON.stringify({
+      id: 'msg_01TESTABC',
+      model: 'claude-haiku-4-5-20251001',
+      usage: {
+        input_tokens: 11,
+        output_tokens: 8,
+        cache_creation_input_tokens: 3,
+        cache_read_input_tokens: 5,
+      },
+    });
+    ex.end(Buffer.from(body));
+    await done;
+    const u = ex.getUsage();
+    assert.ok(u, 'getUsage should return non-null for valid Anthropic JSON');
+    assert.equal(u.inputTokens, 11);
+    assert.equal(u.outputTokens, 8);
+    assert.equal(u.cacheCreationInputTokens, 3);
+    assert.equal(u.cacheReadInputTokens, 5);
+    assert.equal(u.model, 'claude-haiku-4-5-20251001');
+    assert.equal(u.messageId, 'msg_01TESTABC');
+  });
+
+  it('returns null for non-JSON body (parse failure)', async () => {
+    const ex = createJsonUsageExtractor();
+    const done = new Promise(r => ex.on('end', r));
+    ex.resume();
+    ex.end(Buffer.from('not json {garbage}'));
+    await done;
+    assert.equal(ex.getUsage(), null, 'getUsage should return null for invalid JSON');
+  });
+
+  it('returns null for JSON without a usage field', async () => {
+    const ex = createJsonUsageExtractor();
+    const done = new Promise(r => ex.on('end', r));
+    ex.resume();
+    ex.end(Buffer.from('{"id":"x","model":"y"}'));
+    await done;
+    assert.equal(ex.getUsage(), null, 'getUsage should return null when usage is absent');
+  });
+
+  it('returns null when body exceeds maxBytes (truncation)', async () => {
+    const ex = createJsonUsageExtractor({ maxBytes: 50 });
+    const done = new Promise(r => ex.on('end', r));
+    ex.resume();
+    // Generate a body larger than 50 bytes
+    const body = '{"id":"' + 'x'.repeat(100) + '","usage":{"input_tokens":1}}';
+    ex.end(Buffer.from(body));
+    await done;
+    assert.equal(ex.getUsage(), null, 'getUsage must return null when body was truncated mid-stream');
+  });
+
+  it('handles cache-only responses (zero input/output but non-zero cache)', async () => {
+    const ex = createJsonUsageExtractor();
+    const done = new Promise(r => ex.on('end', r));
+    ex.resume();
+    const body = JSON.stringify({
+      id: 'msg_01CACHE',
+      model: 'm',
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 1500,
+      },
+    });
+    ex.end(Buffer.from(body));
+    await done;
+    const u = ex.getUsage();
+    assert.ok(u, 'cache-only responses should still parse');
+    assert.equal(u.cacheReadInputTokens, 1500);
+  });
+});
+
+describe('Dashboard wiring — pipe branch uses JSON usage extractor + startup self-test', () => {
+  const _src_jue = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('imports createJsonUsageExtractor from lib.mjs', () => {
+    assert.match(_src_jue, /createJsonUsageExtractor as _createJsonUsageExtractor/,
+      'dashboard.mjs must import createJsonUsageExtractor — without it the pipe branch silently bypasses recordUsage for non-SSE responses.');
+  });
+
+  it('pipe branch invokes the JSON extractor for 200 + application/json + acctName', () => {
+    // The fix wires `_createJsonUsageExtractor` into the cont.kind === 'pipe'
+    // branch of _runStreamingContinuation. Pin the gate condition AND the
+    // call-site so a refactor that drops either fails loudly here.
+    assert.match(_src_jue, /cont\.kind === 'pipe'[\s\S]{0,2000}_createJsonUsageExtractor\(/,
+      'pipe branch must construct a JSON usage extractor before piping');
+    assert.match(_src_jue, /status === 200[\s\S]{0,400}application[\\\/]+json[\s\S]{0,400}cont\.acctName/,
+      'JSON extractor must be gated on (status===200 && content-type===application/json && acctName) — applying it to error responses or anonymous traffic would corrupt token-usage.json');
+    assert.match(_src_jue, /jsonExtractor\.getUsage\(\)[\s\S]{0,200}recordUsage\(usage, cont\.acctName\)/,
+      'pipe branch must call recordUsage with the extracted usage — without this the proxy buffers the body but never persists');
+  });
+
+  it('all three pipe-branch returns include acctName + status (else extractor cannot fire)', () => {
+    // The pipe-branch return statements MUST carry acctName + status into
+    // the cont structure so _runStreamingContinuation can decide whether
+    // to extract usage. Pre-fix all three pipe-kind returns omitted these
+    // fields and the extractor had nothing to work with.
+    const matches = _src_jue.match(/kind: 'pipe',\s*proxyRes[^}]*acctName/g) || [];
+    assert.ok(matches.length >= 3,
+      "expected at least 3 pipe-kind returns carrying acctName, found " + matches.length +
+      " (look for kind: 'pipe', proxyRes returns and add acctName, status: ... to each)");
+  });
+
+  it('startup self-test for renderHTML exists in server.listen callback', () => {
+    // Safeguard against the renderHTML-throws-but-/health-still-200 class
+    // of bug. Without this self-test the install loop says "all good" while
+    // every actual page load throws ReferenceError. The self-test runs in
+    // setImmediate after listen so it doesn't block startup, and it logs
+    // FATAL (not exit) so a broken UI doesn't kill the proxy's token-rotation
+    // utility.
+    assert.match(_src_jue, /server\.listen\([^{]+\{[\s\S]+?renderHTML self-test/,
+      'startup self-test that calls renderHTML() must exist in the server.listen callback');
+    assert.match(_src_jue, /renderHTML\(\)[\s\S]{0,500}<!DOCTYPE/i,
+      'self-test must validate renderHTML output starts with <!DOCTYPE>');
+    assert.match(_src_jue, /script\[\^\>\]\*\>[\s\S]{0,200}new Function\(body\)/,
+      'self-test must parse every <script> block via new Function() to catch TDZ-class bugs at startup');
+    assert.match(_src_jue, /logForensicEvent\('renderhtml_self_test_failed'/,
+      'self-test failure must emit a forensic event so post-mortem ops can grep events.jsonl');
   });
 });

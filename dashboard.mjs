@@ -834,6 +834,7 @@ import {
   createSlidingWindowCounter,
   gcAccountSlots,
   createUsageExtractor as _createUsageExtractor,
+  createJsonUsageExtractor as _createJsonUsageExtractor,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
   clampViewerState,
@@ -12451,6 +12452,57 @@ server.listen(PORT, '127.0.0.1', () => {
   autoDiscoverAccount().catch((e) => {
     log('warn', `Startup autoDiscoverAccount failed: ${e && e.message}`);
   });
+  // Startup self-test — surface renderHTML failures BEFORE the user opens
+  // the browser. Background of this check: 2026-05-03 we shipped a CSS
+  // comment containing a backtick that prematurely closed the renderHTML
+  // template literal. /health kept returning 200 (it doesn't call renderHTML)
+  // but every GET / threw ReferenceError mid-render. The user installed,
+  // /health-checked clean, opened the browser → black screen, hours wasted.
+  //
+  // Three checks here, all in-process (zero network), so they run in <10ms
+  // even on cold start:
+  //   1. renderHTML() returns a non-empty string starting with <!DOCTYPE
+  //      and ending with </html>. Catches the backtick-trap class of bug.
+  //   2. The returned string is at least 50 KB. A truncation regression
+  //      that breaks somewhere mid-template would otherwise pass check 1.
+  //   3. Every <script> block parses as valid JS. Catches the TDZ-on-
+  //      _logES class of bug at startup instead of at first GET.
+  // Failure here logs FATAL but does NOT exit — the proxy + token-rotation
+  // path is independently useful even if the UI is broken. Better degraded
+  // than dead.
+  setImmediate(() => {
+    try {
+      const html = renderHTML();
+      const errs = [];
+      if (typeof html !== 'string') errs.push('renderHTML returned non-string: ' + typeof html);
+      if (html.length < 50_000) errs.push('renderHTML returned suspiciously small body: ' + html.length + ' bytes');
+      if (!/^<!DOCTYPE\s/i.test(html)) errs.push('renderHTML output does not start with <!DOCTYPE>');
+      if (!/<\/html>\s*$/i.test(html)) errs.push('renderHTML output does not end with </html>');
+      // Cheap script parse check — extract every <script>...</script> block,
+      // try `new Function(body)` on each. If a block has a syntax error
+      // (missing brace, stray backtick, etc.) Function() throws.
+      const scripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/g) || [];
+      for (let i = 0; i < scripts.length; i++) {
+        const m = scripts[i].match(/<script[^>]*>([\s\S]*?)<\/script>/);
+        const body = m ? m[1] : '';
+        if (!body.trim()) continue;
+        try { new Function(body); } catch (e) {
+          errs.push('script block #' + i + ' failed to parse: ' + (e && e.message));
+        }
+      }
+      if (errs.length > 0) {
+        log('fatal', 'renderHTML self-test FAILED — the dashboard UI is broken (proxy is still functional). Errors:');
+        for (const e of errs) { try { log('fatal', '  ' + e); } catch {} }
+        try { logForensicEvent('renderhtml_self_test_failed', { errors: errs }); } catch {}
+      } else {
+        try { log('info', 'renderHTML self-test passed (' + html.length + ' bytes, ' + scripts.length + ' script blocks).'); } catch {}
+      }
+    } catch (e) {
+      // renderHTML() itself threw — the catastrophic case. log + forensic.
+      try { log('fatal', 'renderHTML self-test threw: ' + (e && e.message) + ' — dashboard UI will fail every page load.'); } catch {}
+      try { logForensicEvent('renderhtml_self_test_failed', { threw: e && e.message }); } catch {}
+    }
+  });
 });
 
 // Without this, a duplicate spawn from the rc-snippet race (two terminals
@@ -16244,7 +16296,34 @@ async function _runStreamingContinuation(cont, clientRes) {
     return;
   }
   if (cont.kind === 'pipe') {
-    await pipeAndWait(cont.proxyRes, clientRes);
+    // Symmetric token tracking: for non-SSE responses we still want the
+    // proxy → recentUsage → claimUsageInRange join to fire so direct API
+    // calls (curl, scripts, SDK calls without stream=true) also contribute
+    // to token-usage.json. The SSE path above already does this for streaming
+    // Claude Code traffic; without this branch, every non-streaming request
+    // bypassed the integration silently — visible to the proxy as a 200
+    // OK with a `usage` object in the body, but never recorded anywhere.
+    //
+    // Only extract for 200s with JSON content-type. Error/redirect/non-JSON
+    // responses tee through unchanged. The Transform passes every byte
+    // through unmodified; the buffer is bounded at 1 MiB so a degenerate
+    // response can't OOM the proxy.
+    const ct = (cont.contentType || (cont.proxyRes.headers && cont.proxyRes.headers['content-type']) || '');
+    const status = cont.status || cont.proxyRes.statusCode;
+    if (status === 200 && /^application\/json/i.test(ct) && cont.acctName) {
+      const jsonExtractor = _createJsonUsageExtractor({ logger: log });
+      await new Promise(resolve => {
+        _streamPipeline(cont.proxyRes, jsonExtractor, clientRes, () => resolve());
+      });
+      try {
+        const usage = jsonExtractor.getUsage();
+        if (usage) recordUsage(usage, cont.acctName);
+      } catch (e) {
+        try { log('debug', 'json-extractor recordUsage failed: ' + e.message); } catch {}
+      }
+    } else {
+      await pipeAndWait(cont.proxyRes, clientRes);
+    }
     return;
   }
   } catch (e) {
@@ -17233,7 +17312,7 @@ async function handleProxyRequest(clientReq, clientRes) {
             // serialization permit for the full body lifetime on the cold-path
             // minimal-header retry, re-introducing the exact regression that
             // B1 set out to eliminate.
-            return { kind: 'pipe', proxyRes: retryRes };
+            return { kind: 'pipe', proxyRes: retryRes, acctName, status: retryRes.statusCode };
           }
           // Still 4xx — it's genuinely a bad request or truly dead tokens
           const retryBuf = await drainResponse(retryRes);
@@ -17286,7 +17365,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       // resolved, blocking every other queued request for the full pipe
       // duration. Returning a continuation lets the queue release at the
       // headers boundary; the body pipe runs OUTSIDE the queue.
-      return { kind: 'pipe', proxyRes };
+      return { kind: 'pipe', proxyRes, acctName, status: proxyRes.statusCode };
     }
 
     // Catch all OTHER 5xx responses for the forensic log.
@@ -17336,7 +17415,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (contentType.includes('text/event-stream')) {
       return { kind: 'sse', proxyRes, body, acctName };
     }
-    return { kind: 'pipe', proxyRes };
+    return { kind: 'pipe', proxyRes, acctName, status: proxyRes.statusCode, contentType };
   }
 
   // Should not reach here, but safety net
