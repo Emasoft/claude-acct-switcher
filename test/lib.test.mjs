@@ -4451,6 +4451,34 @@ describe('Phase I — install.sh atomic block uses validated ports', () => {
       /ps -o command= -p "\$pid"[\s\S]{0,80}dashboard\\?\.mjs/,
     );
   });
+
+  it('rc-snippet startup.log size check uses wc -c, NOT `stat -f`', () => {
+    // 2026-05-04: real-world bug. The rc-snippet emitted by install.sh used
+    //   _vdm_log_sz="$(stat -f '%z' "$_vdm_log" 2>/dev/null || stat -c '%s' ...)"
+    // On macOS hosts with Homebrew coreutils on PATH (gnubin first, the
+    // default Apple Silicon brew layout), GNU stat MASKS BSD stat. GNU
+    // stat's `-f` means "filesystem status" — outputs a multi-line blob
+    // about the FILESYSTEM (not the file) to STDOUT and exits non-zero.
+    // Because exit was non-zero, the `||` fallback `stat -c '%s' file`
+    // ran and APPENDED the actual file size to the multi-line blob in
+    // _vdm_log_sz. The subsequent `[ "$_vdm_log_sz" -gt 1048576 ]`
+    // exploded with "integer expression expected" on every shell start.
+    //
+    // `wc -c < file | tr -d ' \\t'` is portable, has no flag-conflict
+    // surface (no `-f` / `-c` overload), and outputs only the byte
+    // count. Avoids stat entirely.
+    //
+    // This test guards against any future "let me make this faster
+    // with stat" refactor reintroducing the bug.
+    assert.doesNotMatch(_installSrc, /_vdm_log_sz=.*stat -f/,
+      'rc-snippet must NOT use `stat -f` for the startup.log size check — ' +
+      'on macOS+coreutils-via-homebrew this collides with GNU stat\'s -f flag ' +
+      '(filesystem status) and breaks every new shell. Use `wc -c < file`.');
+    // The rc-snippet lives inside a heredoc, so `$` is escaped as `\$` in
+    // the install.sh source. Regex needs to match the literal backslash.
+    assert.match(_installSrc, /_vdm_log_sz="\\\$\(wc -c < "\\\$_vdm_log"/,
+      'rc-snippet must use `wc -c` for the size check (portable across BSD/GNU stat)');
+  });
 });
 
 describe('Phase I — _validate_port in lib-install.sh', () => {
