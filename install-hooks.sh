@@ -288,7 +288,14 @@ def _build_hook_command(url):
     # at the same boundary CC would. Was 3s — too tight when 50
     # sub-agents fire SubagentStart simultaneously and the dashboard
     # processes them serially. HOOKS-1 audit fix.
+    # Kill-switch prefix: `vdm disable` writes ~/.claude/account-switcher/.disabled
+    # and every hook check the marker FIRST. `[ -f ... ] && exit 0` is a
+    # microsecond-fast stat — far cheaper than spawning curl. This is what
+    # makes `vdm disable` instantaneous: hooks become no-ops with no
+    # settings.json mutation. Removing the marker (`vdm enable`) restores
+    # full behaviour without any hook reinstall.
     return (
+        f'[ -f "$HOME/.claude/account-switcher/.disabled" ] && exit 0; '
         f"curl -sS --connect-timeout 1 --max-time 5 "
         f"-X POST -H 'Content-Type: application/json' "
         f"--data-binary @- {url} "
@@ -667,6 +674,15 @@ _install_git_hook() {
 # vdm-token-usage
 # Appends token usage trailer to commit messages.
 # Part of claude-acct-switcher (https://github.com/Emasoft/claude-acct-switcher)
+
+# Note: this hook is INTENTIONALLY not gated on the `vdm disable`
+# kill-switch. When the dashboard is stopped (which is what `vdm disable`
+# does), the curl below times out in <1s with `|| exit 0`, so the commit
+# goes through with no trailer. That graceful no-op is the right
+# behaviour — there's no token data to query when the dashboard is down,
+# and re-enabling vdm restores trailers automatically without rewriting
+# this hook. Don't add a marker check here; it would just duplicate the
+# already-graceful failure path.
 
 # IMPORTANT: even on merge/squash/amend we still run any chained hooks
 # (Husky, git-lfs, project-local) — they are not specific to vdm and the

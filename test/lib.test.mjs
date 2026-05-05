@@ -5040,8 +5040,17 @@ describe('Phase I+ — forensic event log + rotation (batch 9)', () => {
     assert.match(_src_f, /appendFileSync\(EVENTS_FILE, JSON\.stringify\(entry\) \+ '\\n', \{ mode: 0o600 \}\)/);
   });
 
-  it('events.jsonl + startup.log rotate daily, 7-day retention', () => {
-    assert.match(_src_f, /EVENTS_RETENTION_DAYS = 7/);
+  it('events.jsonl + startup.log rotate daily, 1-day retention by default', () => {
+    // 2026-05-04: user feedback — wants log snapshots deleted after 24h,
+    // not 7 days. The constant is now derived from the env var
+    // CSW_LOG_RETENTION_DAYS (default 1). Same retention window applies
+    // to both events.jsonl.* and startup.log.* dated snapshots.
+    assert.match(_src_f, /EVENTS_RETENTION_DAYS = \(function/,
+      'EVENTS_RETENTION_DAYS must be derived from a function (env-var aware), not a literal');
+    assert.match(_src_f, /CSW_LOG_RETENTION_DAYS/,
+      'EVENTS_RETENTION_DAYS must read CSW_LOG_RETENTION_DAYS so users can override the 1-day default');
+    assert.doesNotMatch(_src_f, /^const EVENTS_RETENTION_DAYS = 7;$/m,
+      'must NOT hard-code retention to 7 days — user wants 24h default');
     assert.match(_src_f, /function _rotateForensicLog\(\)/);
     assert.match(_src_f, /function _rotateStartupLog\(\)/);
     // Both rotated files are gzipped at rotate time

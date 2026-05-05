@@ -2269,6 +2269,98 @@ cmd_hooks() {
   install_hooks
 }
 
+# ─────────────────────────────────────────────────────────
+# Disable / enable — one-shot kill switch (NO uninstall)
+#
+# `vdm disable` writes a kill-switch marker file. From that moment on:
+#   • Every CC hook command in ~/.claude/settings.json reads the marker
+#     at the very top and `exit 0` immediately, before running curl.
+#     Hooks become no-ops without any settings.json mutation.
+#   • The rc-block self-disable check sees the marker and skips both
+#     the dashboard auto-start AND the ANTHROPIC_BASE_URL export. Any
+#     NEW shell falls back to Anthropic directly.
+#   • dashboard.mjs sees the marker on startup and exits before binding
+#     any port (defense in depth).
+#
+# The git `prepare-commit-msg` hook is INTENTIONALLY not gated. Its
+# existing curl-with-`|| exit 0` already gracefully no-ops when the
+# dashboard is unreachable — which is exactly the disable state — so
+# adding a marker check there would just be dead weight. The hook
+# silently skips the `Token-Usage:` trailer and the commit goes through
+# unchanged.
+#
+# The currently-running dashboard is killed. ANTHROPIC_BASE_URL in the
+# CURRENT shell is NOT modified (we can't reach the parent shell's env)
+# — the user must `unset ANTHROPIC_BASE_URL` in already-open shells, or
+# open new ones. The kill-switch is per-machine, not per-shell.
+#
+# `vdm enable` removes the marker and restarts the dashboard. Idempotent
+# both ways — re-running is safe and prints a no-op message.
+# ─────────────────────────────────────────────────────────
+cmd_disable() {
+  local marker="$SCRIPT_DIR/.disabled"
+  local already=0
+  [[ -f "$marker" ]] && already=1
+
+  # Write the marker FIRST so even if the dashboard-stop step crashes,
+  # vdm is already in the disabled state. Atomic rename — partial writes
+  # are never visible to the hooks racing this file.
+  local _tmp="$marker.tmp.$$"
+  if ! printf '%s\n' "disabled at $(date '+%Y-%m-%dT%H:%M:%S%z')" > "$_tmp" \
+     || ! mv -f "$_tmp" "$marker"; then
+    rm -f "$_tmp" 2>/dev/null
+    echo -e "${RED}!${NC} Failed to write kill-switch marker at $marker" >&2
+    echo -e "  ${DIM}vdm is NOT disabled. Check directory permissions and retry.${NC}" >&2
+    exit 1
+  fi
+  chmod 600 "$marker" 2>/dev/null || true
+
+  # Stop the running dashboard (cmd_dashboard prints its own status line).
+  cmd_dashboard stop
+
+  if [[ $already -eq 1 ]]; then
+    echo -e "${YELLOW}vdm was already disabled.${NC} Marker timestamp refreshed."
+  else
+    echo ""
+    echo -e "${GREEN}✓${NC} ${BOLD}vdm disabled.${NC} Acts as if vdm was never installed."
+  fi
+  echo ""
+  echo -e "  ${BOLD}Active immediately:${NC}"
+  echo -e "    • Every CC hook now ${BOLD}exits before doing anything${NC} — no curl, no token writes."
+  echo -e "    • The dashboard is stopped and ${BOLD}refuses to auto-start${NC} from new shells."
+  echo -e "    • New shells ${BOLD}skip${NC} exporting ANTHROPIC_BASE_URL — claude hits Anthropic directly."
+  echo ""
+  echo -e "  ${BOLD}For shells already open (the env var is sticky):${NC}"
+  echo -e "    ${CYAN}unset ANTHROPIC_BASE_URL${NC}    ${DIM}# in each open terminal${NC}"
+  echo ""
+  echo -e "  ${BOLD}Re-enable later:${NC} ${CYAN}vdm enable${NC}"
+}
+
+cmd_enable() {
+  local marker="$SCRIPT_DIR/.disabled"
+  if [[ ! -f "$marker" ]]; then
+    echo -e "${YELLOW}vdm is not disabled.${NC} Nothing to do."
+    return 0
+  fi
+  if ! rm -f "$marker"; then
+    echo -e "${RED}!${NC} Failed to remove kill-switch marker at $marker" >&2
+    exit 1
+  fi
+  echo -e "${GREEN}✓${NC} ${BOLD}vdm enabled.${NC}"
+
+  # Try to start the dashboard. cmd_dashboard prints its own status. If
+  # it fails (port collision, node missing, etc.) the user can retry with
+  # `vdm dashboard start` — we don't bail out here because the marker is
+  # already gone, which is the user-visible "enable" effect.
+  cmd_dashboard start
+  echo ""
+  echo -e "  ${BOLD}For NEW shells:${NC} ${DIM}ANTHROPIC_BASE_URL is exported automatically.${NC}"
+  echo -e "  ${BOLD}For shells opened while disabled:${NC}"
+  echo -e "    ${CYAN}export ANTHROPIC_BASE_URL=http://localhost:$PROXY_PORT${NC}"
+  echo ""
+  echo -e "  ${BOLD}To disable again:${NC} ${CYAN}vdm disable${NC}"
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -2293,6 +2385,9 @@ cmd_help() {
   echo -e "                            (excludeFromAuto opts an account out of auto-switch)"
   echo -e "                            (requires the dashboard to be running)"
   echo -e "    ${CYAN}hooks${NC}                   Re-install Claude Code + git hooks (idempotent)"
+  echo -e "    ${CYAN}disable${NC}                 Kill switch: hooks exit immediately, dashboard stops,"
+  echo -e "                            new shells skip ANTHROPIC_BASE_URL. Files preserved."
+  echo -e "    ${CYAN}enable${NC}                  Reverse of ${BOLD}disable${NC} — restart dashboard, re-arm everything"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
@@ -2363,6 +2458,8 @@ case "$command" in
   tokens|tok) cmd_tokens "$@" ;;
   prefs|pref) cmd_prefs "$@" ;;
   hooks|install-hooks) cmd_hooks ;;
+  disable|off) cmd_disable ;;
+  enable|on)   cmd_enable ;;
   upgrade|update) cmd_upgrade ;;
   help|--help|-h) cmd_help ;;
   *)

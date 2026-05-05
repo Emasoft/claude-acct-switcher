@@ -654,7 +654,15 @@ if [[ -n "$SHELL_RC" ]]; then
 # Use \`-f\` (regular file) — install.sh writes dashboard.mjs with mode
 # 644 (a Node module, not a shell script); \`-x\` would reject every
 # legitimate install because the .mjs file is not executable.
-if [ ! -f "\$HOME/.claude/account-switcher/dashboard.mjs" ]; then
+#
+# Second predicate: ~/.claude/account-switcher/.disabled is the
+# \`vdm disable\` kill-switch. When present we behave EXACTLY like the
+# uninstall case — strip ANTHROPIC_BASE_URL, skip dashboard auto-start.
+# This is the only safe way to make \`vdm disable\` instantaneous from
+# the user's perspective: existing shells still carry the env var (we
+# can't reach back into the parent shell's env), but every NEW shell
+# bypasses vdm entirely.
+if [ ! -f "\$HOME/.claude/account-switcher/dashboard.mjs" ] || [ -f "\$HOME/.claude/account-switcher/.disabled" ]; then
   case "\${ANTHROPIC_BASE_URL:-}" in
     http*://localhost:*|http*://127.0.0.1:*)
       unset ANTHROPIC_BASE_URL

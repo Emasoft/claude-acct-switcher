@@ -14,6 +14,27 @@ import { pipeline as _streamPipeline } from 'node:stream';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// ───────────────────────────────────────────────────────────────────
+// `vdm disable` kill-switch — defense in depth.
+//
+// If the marker file is present, abort BEFORE any port bind, any timer
+// schedule, any keychain read, any disk write, any background poll.
+// This is the last line of defense against the dashboard auto-starting
+// while the user expects vdm to be disabled (e.g. a stale rc-file in a
+// shell that was opened before the snippet was updated, a manually-run
+// `node dashboard.mjs`, a launchd plist that lost the env-var check,
+// etc.). Exit code 0 because this is intended behaviour, not failure.
+// ───────────────────────────────────────────────────────────────────
+{
+  const _disabledMarker = join(__dirname, '.disabled');
+  if (existsSync(_disabledMarker)) {
+    const _msg = 'vdm is disabled (' + _disabledMarker + ' exists). '
+      + 'Run `vdm enable` to restore. Refusing to bind ports.';
+    try { console.error('[vdm dashboard] ' + _msg); } catch {}
+    process.exit(0);
+  }
+}
+
 // Prevent EIO/EPIPE on stdout/stderr from crashing the process when
 // running as a background daemon (terminal closed, pipe broken).
 process.stdout?.on?.('error', () => {});
@@ -576,7 +597,17 @@ function atomicWriteFileSync(filePath, content) {
 //   - refresh_success / refresh_failure
 //   - token_rotation   — keychain swap from one account to another
 const EVENTS_FILE = join(__dirname, 'events.jsonl');
-const EVENTS_RETENTION_DAYS = 7;
+// Retention window for rotated log snapshots. Default 1 day — the user
+// treats these as live operational data, not historical archive. The
+// active events.jsonl + startup.log are NOT deleted; only their dated
+// `.YYYY-MM-DD(.gz)?` rotation siblings older than this window are.
+// Tunable via env: CSW_LOG_RETENTION_DAYS=N (any positive integer).
+const EVENTS_RETENTION_DAYS = (function() {
+  const raw = process.env.CSW_LOG_RETENTION_DAYS;
+  if (!raw) return 1;
+  const n = parseInt(raw, 10);
+  return (Number.isFinite(n) && n >= 1) ? n : 1;
+})();
 const EVENTS_MAX_BYTES = 32 * 1024 * 1024; // 32 MiB rotate threshold (catches runaway days)
 
 // Lazy-initialised at first use so the file path is always relative
@@ -1226,19 +1257,28 @@ async function _autoDiscoverAccountImpl() {
   // Enumerate saved profiles from the keychain (vdm-account-* entries)
   const savedNames = listVdmAccountKeychainEntries();
 
-  // Resolve email for the new token so we can deduplicate by identity
   const token = creds.claudeAiOauth.accessToken;
-  const email = await fetchAccountEmail(token);
+  const currentRefresh = creds.claudeAiOauth.refreshToken;
 
+  // PASS 1 — cheap matches that need NO network call. Fingerprint match
+  // is the common case (active token IS one of the saved accounts) and
+  // refresh-token match handles refreshed-but-not-yet-saved tokens.
+  // Both are local keychain reads, zero probes.
+  //
+  // CRITICAL: this MUST happen BEFORE any fetchAccountEmail call.
+  // Pre-fix the email fetch ran unconditionally on every proxy request,
+  // even when the active token was already a saved account. With 15 CCs
+  // running, that produced ~4,600 probes/hour against /roles, which
+  // each consume the user's unified rate-limit budget — 200K probes in
+  // 43h was enough to exhaust the 7-day window.
+  const unmatchedCandidates = [];
   for (const savedName of savedNames) {
     try {
       const saved = readAccountKeychain(savedName);
       if (!saved) continue;
       if (getFingerprint(saved) === fp) return; // exact same token already saved
 
-      // Same refresh token = same underlying account, even when email fetch failed
       const savedRefresh = saved.claudeAiOauth?.refreshToken;
-      const currentRefresh = creds.claudeAiOauth.refreshToken;
       if (savedRefresh && currentRefresh && savedRefresh === currentRefresh) {
         writeAccountKeychain(savedName, creds);
         const oldFp = getFingerprint(saved);
@@ -1253,20 +1293,29 @@ async function _autoDiscoverAccountImpl() {
         return;
       }
 
-      // Same email = same account with a refreshed token  - update in place
-      if (email) {
-        let savedEmail = '';
-        try { savedEmail = (await readFile(join(ACCOUNTS_DIR, `${savedName}.label`), 'utf8')).trim(); } catch {}
-        if (savedEmail === email) {
-          writeAccountKeychain(savedName, creds);
-          // Migrate persisted state / history from old fingerprint to new
-          const oldFp = getFingerprint(saved);
-          migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
-          log('info', `[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
-          if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
-          invalidateTokenCache(); // ensure getActiveToken() sees the updated token
-          return;
-        }
+      unmatchedCandidates.push({ savedName, saved });
+    } catch { /* skip */ }
+  }
+
+  // PASS 2 — no fingerprint OR refresh-token match. Fall back to the
+  // email identity check, which IS the expensive probe path. Most
+  // installs hit this only at first auto-discover; subsequent requests
+  // match by fingerprint in Pass 1.
+  const email = await fetchAccountEmail(token);
+
+  for (const { savedName, saved } of unmatchedCandidates) {
+    try {
+      if (!email) continue;
+      let savedEmail = '';
+      try { savedEmail = (await readFile(join(ACCOUNTS_DIR, `${savedName}.label`), 'utf8')).trim(); } catch {}
+      if (savedEmail === email) {
+        writeAccountKeychain(savedName, creds);
+        const oldFp = getFingerprint(saved);
+        migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
+        log('info', `[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
+        if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
+        invalidateTokenCache(); // ensure getActiveToken() sees the updated token
+        return;
       }
     } catch { /* skip */ }
   }
