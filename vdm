@@ -87,6 +87,17 @@ except Exception:
 }
 DASHBOARD_PORT="$(_vdm_resolve_port CSW_PORT port 3333)"
 PROXY_PORT="$(_vdm_resolve_port CSW_PROXY_PORT proxyPort 3334)"
+# UI port (TRDD-c30609ab three-port split). Currently resolved but
+# NOT WIRED — Stage A is purely additive resolver plumbing. The UI
+# server in dashboard.mjs picks this up in Stage B; until then it
+# is harmless extra parsing.
+#
+# Default 4444 was chosen to be visually distinct from 3333/3334 (so
+# users diagnosing a port-conflict can grep their netstat output for
+# "4444" without ambiguity) and to land outside the IANA reserved
+# ranges that some corporate networks block (e.g. 1024-2999, 5000s,
+# 6000s X11, 8000s common dev).
+UI_PORT="$(_vdm_resolve_port CSW_UI_PORT uiPort 4444)"
 ACTIVITY_LOG_FILE="$SCRIPT_DIR/activity-log.json"
 
 # Colors

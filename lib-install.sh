@@ -420,7 +420,11 @@ _json_is_valid() {
 
 # _json_get_int <file> <key>
 # Print the value of a top-level numeric key, or empty if missing /
-# malformed / not an int. Pure read, no writes.
+# malformed / not an int / a bool (Python bool is an int subclass —
+# without the explicit `not isinstance(v, bool)` filter, `true` /
+# `false` round-trip as 1 / 0 and silently win the resolver chain.
+# Mirrors the discriminator used in vdm:55 + install.sh:821-934).
+# Pure read, no writes.
 _json_get_int() {
   local f="$1" key="$2"
   [[ -f "$f" ]] || return 1
@@ -429,7 +433,7 @@ import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     v = d.get(sys.argv[2])
-    print(v if isinstance(v, int) else '')
+    print(v if isinstance(v, int) and not isinstance(v, bool) else '')
 except Exception:
     pass
 " "$f" "$key" 2>/dev/null

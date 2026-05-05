@@ -250,19 +250,25 @@ fi
 # the order used by the rc-snippet (config → env → default) for parity.
 _resolve_install_ports() {
   local cfg="$INSTALL_DIR/config.json"
-  local _cfg_dash="" _cfg_proxy=""
+  local _cfg_dash="" _cfg_proxy="" _cfg_ui=""
   if [[ -f "$cfg" ]]; then
     _cfg_dash="$(_json_get_int "$cfg" port 2>/dev/null || true)"
     _cfg_proxy="$(_json_get_int "$cfg" proxyPort 2>/dev/null || true)"
+    # TRDD-c30609ab Stage A: read uiPort if present. Falls back to
+    # default 4444 when missing, same as the other two — install.sh
+    # is a pre-check; the actual UI server bind happens in dashboard.mjs
+    # in Stage B.
+    _cfg_ui="$(_json_get_int "$cfg" uiPort 2>/dev/null || true)"
   fi
   # SECURITY: validate the env var BEFORE falling through. _json_get_int
-  # already returns int-only, but $CSW_PORT / $CSW_PROXY_PORT are raw
-  # string expansions — a value like 'CSW_PORT=3333; rm -rf ~' would
-  # contaminate every downstream consumer. Promote to default 3333/3334
-  # if the env var is set but malformed; warn so the user knows their
-  # env is being ignored.
+  # already returns int-only, but $CSW_PORT / $CSW_PROXY_PORT / $CSW_UI_PORT
+  # are raw string expansions — a value like 'CSW_PORT=3333; rm -rf ~'
+  # would contaminate every downstream consumer. Promote to default
+  # 3333/3334/4444 if the env var is set but malformed; warn so the
+  # user knows their env is being ignored.
   local _env_dash="${CSW_PORT:-}"
   local _env_proxy="${CSW_PROXY_PORT:-}"
+  local _env_ui="${CSW_UI_PORT:-}"
   if [[ -n "$_env_dash" ]] && ! _validate_port "$_env_dash"; then
     echo -e "  ${YELLOW}!${NC} Ignoring malformed CSW_PORT='$_env_dash' (expected 1..65535)" >&2
     _env_dash=""
@@ -271,13 +277,31 @@ _resolve_install_ports() {
     echo -e "  ${YELLOW}!${NC} Ignoring malformed CSW_PROXY_PORT='$_env_proxy' (expected 1..65535)" >&2
     _env_proxy=""
   fi
+  if [[ -n "$_env_ui" ]] && ! _validate_port "$_env_ui"; then
+    echo -e "  ${YELLOW}!${NC} Ignoring malformed CSW_UI_PORT='$_env_ui' (expected 1..65535)" >&2
+    _env_ui=""
+  fi
   _DASH_PORT_DEFAULT="${_cfg_dash:-${_env_dash:-3333}}"
   _PROXY_PORT_DEFAULT="${_cfg_proxy:-${_env_proxy:-3334}}"
+  _UI_PORT_DEFAULT="${_cfg_ui:-${_env_ui:-4444}}"
   # Final paranoia check — if config.json was hand-edited to a non-int
   # _json_get_int already rejected it, but assert anyway. Aborting here
-  # is preferable to writing a bad port into a hook command field.
-  _validate_port "$_DASH_PORT_DEFAULT" || { echo -e "  ${RED}Resolved dashboard port '$_DASH_PORT_DEFAULT' is invalid${NC}" >&2; exit 1; }
+  # is preferable to writing a bad port into a hook command field or
+  # a freshly-spawned dashboard process.
+  _validate_port "$_DASH_PORT_DEFAULT"  || { echo -e "  ${RED}Resolved dashboard port '$_DASH_PORT_DEFAULT' is invalid${NC}" >&2; exit 1; }
   _validate_port "$_PROXY_PORT_DEFAULT" || { echo -e "  ${RED}Resolved proxy port '$_PROXY_PORT_DEFAULT' is invalid${NC}" >&2; exit 1; }
+  _validate_port "$_UI_PORT_DEFAULT"    || { echo -e "  ${RED}Resolved UI port '$_UI_PORT_DEFAULT' is invalid${NC}" >&2; exit 1; }
+  # Catch foot-gun: same port for two different roles. The kernel
+  # would only let one server bind, the others would EADDRINUSE on
+  # startup, and the user would see a cryptic dashboard-start failure.
+  # Surface here at install time so the configuration is rejected
+  # before it's persisted into config.json or exported into the rc-block.
+  if [[ "$_DASH_PORT_DEFAULT" == "$_PROXY_PORT_DEFAULT" ]] \
+     || [[ "$_DASH_PORT_DEFAULT" == "$_UI_PORT_DEFAULT" ]] \
+     || [[ "$_PROXY_PORT_DEFAULT" == "$_UI_PORT_DEFAULT" ]]; then
+    echo -e "  ${RED}Daemon (${_DASH_PORT_DEFAULT}), proxy (${_PROXY_PORT_DEFAULT}), and UI (${_UI_PORT_DEFAULT}) ports must be distinct${NC}" >&2
+    exit 1
+  fi
 }
 _resolve_install_ports
 if _kill_running_vdm "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"; then
