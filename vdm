@@ -27,10 +27,66 @@ _vdm_resolve_script_path() {
 SCRIPT_DIR="$(cd "$(dirname "$(_vdm_resolve_script_path "$0")")" && pwd -P)"
 ACCOUNTS_DIR="$SCRIPT_DIR/accounts"
 KEYCHAIN_ACCOUNT="$(whoami)"
-DASHBOARD_PORT="${CSW_PORT:-3333}"
-PROXY_PORT="${CSW_PROXY_PORT:-3334}"
 DASHBOARD_PID_FILE="$SCRIPT_DIR/.dashboard.pid"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
+# Port resolution mirrors the rc-snippet's priority chain
+# (install.sh:679-700): env var wins over config.json wins over default.
+# Without this, `vdm disable` / `vdm enable` / `vdm dashboard stop` invoked
+# from a shell that did NOT source the rc-block (e.g. cron, IDE-spawned
+# subshell, manual `~/.local/bin/vdm`) would fall back to 3333/3334 and
+# fail to manage the actual running dashboard on a custom-port install.
+# Same python3 guard as the rc-snippet — silently fall through to the
+# default if python3 is missing or the JSON is malformed.
+_vdm_resolve_port() {
+  local env_var="$1" json_key="$2" default="$3"
+  local v="${!env_var:-}"
+  # Validation contract — MUST match install.sh's rc-snippet exactly so
+  # the CLI and shell auto-start agree on whether `config.json` is
+  # honoured. Both paths require:
+  #   1. value is a JSON int (NOT a string of digits — `"4444"` is rejected)
+  #   2. value is in range 1..65535 (IANA port range, 0 reserved)
+  # Anything else falls back to $default. Diverging from install.sh:687-704
+  # would re-introduce the F-001 finding (CLI uses 4444, shell uses 3333).
+  if [[ -z "$v" ]] && [[ -r "$CONFIG_FILE" ]] && command -v python3 >/dev/null 2>&1; then
+    v="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  v=d.get(sys.argv[2],"")
+  print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
+except Exception:
+  pass' "$CONFIG_FILE" "$json_key" 2>/dev/null || true)"
+  fi
+  # F-003 — env-var path doesn't pre-filter; bash regex + range test
+  # below catches CSW_PORT=999999 / =abc / ="" / =-5 and surfaces the
+  # bad value to stderr (only on env path — config-file rejection is
+  # already silent at the python step to avoid spamming every shell
+  # prompt with warnings about a malformed config.json).
+  if [[ "$v" =~ ^[1-9][0-9]*$ ]] && [[ "$v" -le 65535 ]]; then
+    printf '%s' "$v"
+  else
+    if [[ -n "$v" ]] && [[ -n "${!env_var:-}" ]]; then
+      # Rate-limit the warning so cron / polling loops don't spam stderr.
+      # Marker file is ~/.cache/vdm/port-warned-<env>-<value>; skipped if
+      # the same env=value pair was warned within the last 24 h. Touched
+      # on first emission (mkdir is idempotent). New invalid values
+      # (typo'd to a different number) get their own marker and warn
+      # once per 24 h.
+      local _bad="${!env_var}"
+      local _safe_bad="${_bad//[^A-Za-z0-9_.-]/_}"
+      local _warn_dir="$HOME/.cache/vdm"
+      local _warn_marker="$_warn_dir/port-warned-${env_var}-${_safe_bad}"
+      if [[ ! -f "$_warn_marker" ]] \
+         || [[ -z "$(find "$_warn_marker" -mtime -1 2>/dev/null)" ]]; then
+        echo "  vdm: ignoring invalid env $env_var=$_bad (must be integer 1-65535) — using $default" >&2
+        echo "       (warning rate-limited; same value silenced for 24 h)" >&2
+        mkdir -p "$_warn_dir" 2>/dev/null && touch "$_warn_marker" 2>/dev/null || true
+      fi
+    fi
+    printf '%s' "$default"
+  fi
+}
+DASHBOARD_PORT="$(_vdm_resolve_port CSW_PORT port 3333)"
+PROXY_PORT="$(_vdm_resolve_port CSW_PROXY_PORT proxyPort 3334)"
 ACTIVITY_LOG_FILE="$SCRIPT_DIR/activity-log.json"
 
 # Colors
@@ -1654,6 +1710,76 @@ cmd_upgrade() {
   if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
     source "$SCRIPT_DIR/install-hooks.sh"
     install_hooks && echo -e "  ${GREEN}✓${NC} Token tracking hooks installed" || true
+  fi
+
+  # Copy slash commands (commands/*.md → ~/.claude/commands/). Mirrors
+  # install.sh:975-993. Without this, a `vdm upgrade` would silently miss
+  # any new slash commands shipped in the upgrade — pre-fix the user
+  # would NOT get `/vdm-disable` and `/vdm-enable` until they reran
+  # install.sh manually. Atomic install via lib-install.sh's helper
+  # (already sourced by install-hooks.sh above).
+  #
+  # Includes a per-loop success counter (F-001) so the green ✓ only
+  # prints when at least one command actually installed.
+  #
+  # Stale-command pruning is INTENTIONALLY not done here. Two earlier
+  # attempts (vdm-*.md glob; $SCRIPT_DIR/commands/ snapshot diff) both
+  # got rejected: the glob would clobber user-rolled commands matching
+  # the prefix, and the snapshot dir was cruft outside Claude Code's
+  # expected layout. Slash commands removed from a release stay in
+  # ~/.claude/commands/ until the user removes them manually
+  # (`rm ~/.claude/commands/vdm-<old>.md`) or runs `./uninstall.sh`
+  # followed by `./install.sh` for a clean slate.
+  local _CMD_SRC="$tmpdir/commands"
+  local _CMD_DST="$HOME/.claude/commands"
+  if [[ -d "$_CMD_SRC" ]]; then
+    mkdir -p "$_CMD_DST"
+    # F-002 — install loop has its own INT/TERM/HUP trap. The earlier
+    # _upg_cleanup trap (covering the main file replacement loop) was
+    # cleared at line 1671 (`trap - INT TERM HUP`), so a Ctrl-C here
+    # would leave `~/.claude/commands/<name>.new` stragglers in place
+    # — they live OUTSIDE $tmpdir and thus aren't covered by the
+    # process-RETURN cleanup that handles tmpdir. Sweep them here.
+    _cmd_install_cleanup() {
+      rm -f "$_CMD_DST"/*.new 2>/dev/null || true
+    }
+    trap '_cmd_install_cleanup; trap - INT TERM HUP; exit 130' INT TERM HUP
+    local _cmd_file _cmd_bn _cmd_ok=0 _cmd_fail=0
+    for _cmd_file in "$_CMD_SRC"/*.md; do
+      [[ -f "$_cmd_file" ]] || continue
+      _cmd_bn="$(basename "$_cmd_file")"
+      if declare -f _atomic_install >/dev/null 2>&1 \
+         && _atomic_install "$_cmd_file" "$_CMD_DST/$_cmd_bn" 644 2>/dev/null; then
+        _cmd_ok=$((_cmd_ok + 1))
+      else
+        # Fallback if _atomic_install isn't available — plain cp+chmod.
+        # Still write to a tmp + mv-rename so the install is atomic.
+        local _tmp="$_CMD_DST/${_cmd_bn}.new"
+        if cp "$_cmd_file" "$_tmp" 2>/dev/null \
+           && chmod 644 "$_tmp" 2>/dev/null \
+           && mv -f "$_tmp" "$_CMD_DST/$_cmd_bn" 2>/dev/null; then
+          _cmd_ok=$((_cmd_ok + 1))
+        else
+          rm -f "$_tmp" 2>/dev/null
+          echo -e "  ${YELLOW}!${NC} Failed to install slash command $_cmd_bn"
+          _cmd_fail=$((_cmd_fail + 1))
+          continue
+        fi
+      fi
+    done
+    trap - INT TERM HUP
+    if [[ $_cmd_ok -gt 0 ]]; then
+      if [[ $_cmd_fail -eq 0 ]]; then
+        echo -e "  ${GREEN}✓${NC} Slash commands updated in $_CMD_DST ($_cmd_ok installed)"
+      else
+        echo -e "  ${GREEN}✓${NC} Slash commands updated in $_CMD_DST ($_cmd_ok installed, $_cmd_fail failed)"
+      fi
+    elif [[ $_cmd_fail -gt 0 ]]; then
+      # NOT \`vdm hooks\` — that command only re-installs CC + git
+      # hooks, NOT slash commands. The right recovery is another
+      # `vdm upgrade` retry or a full `install.sh` rerun.
+      echo -e "  ${YELLOW}!${NC} Slash commands could NOT be installed ($_cmd_fail failed) — retry with ${CYAN}vdm upgrade${NC} or rerun ${CYAN}install.sh${NC}"
+    fi
   fi
 
   # Restart dashboard if it was running

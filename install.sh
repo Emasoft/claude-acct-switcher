@@ -685,11 +685,14 @@ else
   # interpreter, so the snippet stays inert on a broken-environment shell
   # instead of polluting stderr at every prompt.
   if [ -z "\${CSW_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    # MUST stay aligned with vdm's _vdm_resolve_port (vdm:30+) — same
+    # contract: JSON int (no string-of-digits) AND 1..65535 (no >65535,
+    # no <=0). Diverging here re-introduces opus F-001.
     CSW_PORT="\$(python3 -c 'import json,sys
 try:
   d=json.load(open(sys.argv[1]))
   v=d.get("port","")
-  print(v if isinstance(v,int) else "")
+  print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
 except Exception:
   pass' "\$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"
   fi
@@ -698,7 +701,7 @@ except Exception:
 try:
   d=json.load(open(sys.argv[1]))
   v=d.get("proxyPort","")
-  print(v if isinstance(v,int) else "")
+  print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
 except Exception:
   pass' "\$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"
   fi
@@ -785,9 +788,10 @@ else
   echo "  Add this to your shell profile manually:"
   echo ""
   echo '    # BEGIN claude-account-switcher'
-  echo '    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone.'
+  echo '    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone'
+  echo '    # OR if `vdm disable` has written the kill-switch marker file.'
   echo '    # `-f` (file exists), NOT `-x` (executable): dashboard.mjs is mode 644.'
-  echo '    if [ ! -f "$HOME/.claude/account-switcher/dashboard.mjs" ]; then'
+  echo '    if [ ! -f "$HOME/.claude/account-switcher/dashboard.mjs" ] || [ -f "$HOME/.claude/account-switcher/.disabled" ]; then'
   echo '      case "${ANTHROPIC_BASE_URL:-}" in'
   echo '        http*://localhost:*|http*://127.0.0.1:*) unset ANTHROPIC_BASE_URL ;;'
   echo '      esac'
@@ -795,13 +799,13 @@ else
   echo '      if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
   echo '        CSW_PORT="$(python3 -c '"'"'import json,sys'
   echo 'try:'
-  echo '  d=json.load(open(sys.argv[1])); v=d.get("port",""); print(v if isinstance(v,int) else "")'
+  echo '  d=json.load(open(sys.argv[1])); v=d.get("port",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
   echo 'except Exception: pass'"'"' "$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"'
   echo '      fi'
   echo '      if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
   echo '        CSW_PROXY_PORT="$(python3 -c '"'"'import json,sys'
   echo 'try:'
-  echo '  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) else "")'
+  echo '  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
   echo 'except Exception: pass'"'"' "$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"'
   echo '      fi'
   echo '      CSW_PORT="${CSW_PORT:-3333}"'
@@ -977,6 +981,12 @@ fi
 # is atomic per-file (tmp + rename) and idempotent — re-running picks up
 # the new content. Uninstall removes the files we copied here, leaving
 # unrelated commands alone.
+#
+# Single destination: $HOME/.claude/commands/. Claude Code reads slash
+# commands from this path globally (and from plugin manifests, but
+# vdm is not a plugin). No snapshot dir, no install-dir mirror — those
+# would just be cruft that lives outside Claude Code's expected layout
+# and could be confused with stale data.
 COMMANDS_SRC_DIR="$SCRIPT_DIR/commands"
 COMMANDS_DST_DIR="$HOME/.claude/commands"
 if [[ -d "$COMMANDS_SRC_DIR" ]]; then
