@@ -1407,10 +1407,45 @@ cmd_dashboard() {
 
   case "$action" in
     stop)
-      # Try PID file first, then fall back to port-based detection.
-      # `read_pidfile` returns "" for a missing/garbage/non-numeric pidfile,
-      # so we never pass arbitrary text to `kill` (which would otherwise
-      # send SIGTERM to whatever PID a tampered pidfile happens to hold).
+      # Phase 1.0 — separation of concerns. "Stop the dashboard" means
+      # "close the UI listener" (port 3333), NOT "kill the daemon".
+      # The proxy (port 3334), hook ingestion, account rotation, OAuth
+      # refresh, and token tracking ALL keep running because the Node
+      # process stays alive — the proxy server's event loop holds it.
+      #
+      # Path 1 — daemon is alive (proxy responds on 3334):
+      #   POST /api/dashboard/ui-listener/stop on 3334. Endpoint
+      #   closes `server` (the 3333 listener) and returns 200.
+      #   Existing connections drain; new connections refused.
+      #   Process stays alive. Hooks, proxy, rotation continue.
+      # Path 2 — daemon is NOT responding (proxy port unreachable):
+      #   Fall back to the legacy kill-PID + port-pid behaviour.
+      #   This is the "everything is wedged, hard reset" path.
+      #
+      # To kill the WHOLE process (proxy and all), use `vdm disable`
+      # for the kill-switch path or stop manually via OS process tools.
+      if curl -s --max-time 2 -o /dev/null -w '%{http_code}' \
+              "http://localhost:$PROXY_PORT/health" 2>/dev/null \
+           | grep -q '^200$'; then
+        # Daemon is alive — soft-stop the UI listener only.
+        local resp
+        resp="$(curl -s --max-time 5 -X POST \
+                  "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/stop" 2>/dev/null || echo '')"
+        if echo "$resp" | grep -q '"ok":true'; then
+          echo -e "${GREEN}✓${NC} Dashboard UI stopped (port $DASHBOARD_PORT closed)."
+          echo -e "  ${DIM}Proxy continues running on port $PROXY_PORT — token tracking, account rotation, hook ingestion all unaffected.${NC}"
+          echo -e "  ${DIM}Re-open the UI: ${CYAN}vdm dashboard start${NC}${DIM}. Stop everything: ${CYAN}vdm disable${NC}${DIM}.${NC}"
+          # Do NOT remove the pidfile — daemon is still alive and the
+          # pidfile's PID is still meaningful for monitoring.
+          return 0
+        fi
+        # API did not confirm; fall through to legacy hard-kill below.
+        echo -e "  ${DIM}Soft-stop did not confirm (response: $resp); falling back to hard-kill.${NC}"
+      fi
+      # Legacy hard-kill: process appears unresponsive on the proxy
+      # port too, so the only safe option is the kill-PID + port-pid
+      # sweep. This kills the WHOLE Node process (UI + proxy together)
+      # — the user is opting in to that by stopping a wedged daemon.
       local stopped=false
       local pid
       pid=$(read_pidfile "$DASHBOARD_PID_FILE")
@@ -1451,15 +1486,56 @@ cmd_dashboard() {
         fi
       fi
       if [[ "$stopped" == "true" ]]; then
+        # Preserve the legacy "Dashboard stopped." literal — operator
+        # scripts / docs / tests grep for this exact string. The
+        # extra-context line below clarifies what really happened
+        # without breaking the contract on the success token.
         echo -e "${GREEN}✓${NC} Dashboard stopped."
+        echo -e "  ${DIM}(hard-killed: proxy on $PROXY_PORT was unresponsive — UI + proxy died together)${NC}"
       else
         echo -e "${YELLOW}Dashboard was not running.${NC}"
       fi
       ;;
     start|"")
-      # Check if already running (by PID file or port). Stale or tampered
-      # pidfiles fail the integer check and are removed below so the start
-      # path can proceed.
+      # Phase 1.0 — three-state start logic:
+      #
+      # State 1: Daemon alive AND UI listener already up
+      #   → no-op, just report.
+      #
+      # State 2: Daemon alive (proxy responds on 3334) but UI listener
+      #   was previously stopped via `vdm dashboard stop`. Soft-start:
+      #   POST /api/dashboard/ui-listener/start on 3334 to re-bind 3333
+      #   in-process. No new node spawned.
+      #
+      # State 3: Daemon NOT running (proxy port unreachable). Spawn a
+      #   fresh nohup node process — same legacy behaviour as before.
+      if curl -s --max-time 2 -o /dev/null -w '%{http_code}' \
+              "http://localhost:$PROXY_PORT/health" 2>/dev/null \
+           | grep -q '^200$'; then
+        # Daemon is alive. Check UI listener state.
+        local ui_status
+        ui_status="$(curl -s --max-time 3 \
+                       "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/status" 2>/dev/null || echo '')"
+        if echo "$ui_status" | grep -q '"listening":true'; then
+          # State 1
+          echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
+          echo -e "${DIM}Use 'vdm dashboard stop' to close just the UI (proxy stays up).${NC}"
+          return 0
+        fi
+        # State 2 — soft-restart of the UI listener.
+        local resp
+        resp="$(curl -s --max-time 5 -X POST \
+                  "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/start" 2>/dev/null || echo '')"
+        if echo "$resp" | grep -q '"listening":true'; then
+          echo -e "${GREEN}✓${NC} Dashboard UI re-opened at http://localhost:$DASHBOARD_PORT"
+          echo -e "  ${DIM}Daemon was already running — no new process spawned.${NC}"
+          return 0
+        fi
+        echo -e "  ${YELLOW}!${NC} Soft-start failed (response: $resp). Falling back to spawn."
+      fi
+      # State 3 — old behaviour: clean up stale pidfile / port checks
+      # and spawn a new node process. Same code as before (kept verbatim
+      # so existing operational habits keep working).
       local pid
       pid=$(read_pidfile "$DASHBOARD_PID_FILE")
       if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then

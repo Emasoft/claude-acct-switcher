@@ -16413,6 +16413,92 @@ const proxyServer = createServer((clientReq, clientRes) => {
     return;
   }
 
+  // Phase 1.0 — UI-listener control. The proxy server (3334) is the
+  // always-on daemon endpoint; the UI server (3333) can be toggled
+  // independently. `vdm dashboard stop` closes 3333 without killing
+  // the process so token tracking, hook ingestion, and account
+  // rotation keep working. `vdm dashboard start` re-opens 3333.
+  // Status reports current listener state. All three endpoints
+  // bypass the serialization queue and are handled inline here.
+  //
+  // CSRF defense — POST endpoints reject foreign origins. Host-
+  // header check (above) defends DNS-rebind, but a sibling localhost
+  // service or browser tab COULD fetch-POST these without the
+  // origin check. GET (/status) is safe to leave open since the
+  // browser won't expose the response body to a foreign origin
+  // without matching CORS headers.
+  if (clientReq.url === '/api/dashboard/ui-listener/status' && clientReq.method === 'GET') {
+    clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ ok: true, listening: server.listening, port: PORT }));
+    return;
+  }
+  if (clientReq.url === '/api/dashboard/ui-listener/stop' && clientReq.method === 'POST') {
+    const _origin = clientReq.headers.origin || '';
+    if (_origin && !_isOriginAllowed(_origin)) {
+      clientRes.writeHead(403, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({ error: 'cross-origin request rejected' }));
+      return;
+    }
+    if (server.listening) {
+      try { server.close(); } catch (e) { /* already closed */ }
+      log('info', '[ui-listener] stopped via /api/dashboard/ui-listener/stop — proxy continues running');
+    }
+    clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ ok: true, listening: server.listening, message: 'UI listener closed; proxy continues running' }));
+    return;
+  }
+  if (clientReq.url === '/api/dashboard/ui-listener/start' && clientReq.method === 'POST') {
+    const _origin = clientReq.headers.origin || '';
+    if (_origin && !_isOriginAllowed(_origin)) {
+      clientRes.writeHead(403, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({ error: 'cross-origin request rejected' }));
+      return;
+    }
+    if (server.listening) {
+      clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({ ok: true, listening: true, message: 'UI listener already running' }));
+      return;
+    }
+    // Re-bind and respond after the listener is actually accepting
+    // connections, so the CLI knows the dashboard is reachable when
+    // the response arrives. Bind error (e.g. port collision with a
+    // different process that grabbed 3333 in the meantime) surfaces
+    // as a 500 instead of a hung curl.
+    //
+    // EventEmitter cleanup — Node's `once()` registers a one-shot
+    // listener that auto-removes after firing. BUT only the listener
+    // that FIRES gets removed; the OTHER one stays attached forever.
+    // Across N start/stop cycles that's N stale listeners → MaxListenersExceededWarning.
+    // Fix: each handler removes its sibling explicitly.
+    let _settled = false;
+    const _onListening = () => {
+      if (_settled) return;
+      _settled = true;
+      server.removeListener('error', _onError);
+      log('info', '[ui-listener] re-opened via /api/dashboard/ui-listener/start');
+      clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({ ok: true, listening: true, port: PORT }));
+    };
+    const _onError = (e) => {
+      if (_settled) return;
+      _settled = true;
+      server.removeListener('listening', _onListening);
+      log('warn', `[ui-listener] re-open failed: ${e.message}`);
+      try {
+        clientRes.writeHead(500, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ ok: false, error: e.message, code: e.code }));
+      } catch {}
+    };
+    server.once('listening', _onListening);
+    server.once('error', _onError);
+    try {
+      server.listen(PORT, '127.0.0.1');
+    } catch (e) {
+      _onError(e);
+    }
+    return;
+  }
+
   // Phase F audit B1/D1 — handleProxyRequest may return a "streaming
   // continuation" descriptor for the success/529 paths. The serialization
   // queue releases at handleProxyRequest's resolution (decision boundary);
