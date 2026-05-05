@@ -3,7 +3,9 @@
 **TRDD ID:** `ffc4e8e2-6c88-470f-8dcd-6c8f9e6dddb6`
 **Filename:** `design/tasks/TRDD-ffc4e8e2-hooks-on-proxy-port.md`
 **Tracked in:** this repo (design/tasks/ is git-tracked)
-**Status:** Not started — blocked Phase 1.5 commit on 2026-05-06; Phase 1.5 work parked on local branch `phase-1.5-blocked-on-f001` (see "Phase 1.5 work parked" section below for recovery instructions).
+**Status:** SUPERSEDED on 2026-05-06 by [TRDD-c30609ab](TRDD-c30609ab-three-port-split.md), which inverts the approach: instead of moving hooks from the dashboard server (3333) to the proxy server (3334), the new plan keeps hooks where they are and instead moves the UI to its own new port (4444 default, configurable). Same total scope, but install-hooks.sh stays untouched and existing installs upgrade invisibly. Body retained below for historical context only — DO NOT IMPLEMENT this approach.
+
+(Original status: Not started — blocked Phase 1.5 commit on 2026-05-06; Phase 1.5 work parked on local branch `phase-1.5-blocked-on-f001` (see "Phase 1.5 work parked" section below for recovery instructions).)
 
 ## Background — what discovered the issue
 
