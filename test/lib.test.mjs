@@ -4317,8 +4317,15 @@ describe('Phase I — install-hooks.sh rejects malicious $CSW_PORT', () => {
     // execFileSync) so we capture both stdout AND stderr regardless of
     // exit status.
     const home = _mkdtempSync_inj(_join_inj(_tmpdir_inj(), 'vdm-test-inj-'));
-    _execFileSync_inj('mkdir', ['-p', _join_inj(home, '.claude/account-switcher')]);
-    _writeFileSync_inj(_join_inj(home, '.claude/account-switcher/dashboard.mjs'), '');
+    // Post-Phase-1.5 migration — install_hooks now checks ~/.vdm/dashboard.mjs
+    // (the new canonical path). Create the fake there so the dashboard-
+    // presence guard passes and we reach the port-validation code path
+    // we actually want to test. Also create ~/.claude/ since the
+    // settings.json write below requires it (the previous mkdir of
+    // .claude/account-switcher created .claude/ implicitly; now we
+    // need to ensure the parent dir exists explicitly).
+    _execFileSync_inj('mkdir', ['-p', _join_inj(home, '.vdm'), _join_inj(home, '.claude')]);
+    _writeFileSync_inj(_join_inj(home, '.vdm/dashboard.mjs'), '');
     _writeFileSync_inj(_join_inj(home, '.claude/settings.json'), '{}');
     const r = _spawnSync_inj('bash', ['-c', `. "${_scriptPath}"; install_hooks`], {
       env: { ...env, HOME: home, PATH: process.env.PATH },
