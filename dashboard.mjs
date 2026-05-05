@@ -550,7 +550,7 @@ function migrateAccountsToKeychain() {
 // state file. Used for every state file whose corruption would lose data.
 function atomicWriteFileSync(filePath, content) {
   const tmpPath = filePath + '.tmp';
-  // SECURITY: state files under ~/.claude/account-switcher/ contain
+  // SECURITY: state files under ~/.vdm/ contain
   // absolute paths, session IDs, account labels, fingerprints, and
   // (for token-usage / activity-log) prompt-derived metadata. Default
   // umask-derived 644 leaves them world-readable on multi-user macOS.
@@ -580,7 +580,7 @@ function atomicWriteFileSync(filePath, content) {
 // so jq / awk / grep / cut all work directly. One line per event;
 // each event carries a `category` plus a typed payload.
 //
-// File: ~/.claude/account-switcher/events.jsonl
+// File: ~/.vdm/events.jsonl
 // Rotation: daily, keep 7 days. Active file is `events.jsonl`; daily
 // snapshots are `events.jsonl.YYYY-MM-DD.gz` (compressed at rotate
 // time). `events.jsonl` itself is mode 0o600 — same rationale as

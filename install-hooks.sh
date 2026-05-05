@@ -54,7 +54,7 @@ fi
 # M8 fix — port resolution priority is config.json > env > default.
 # Reading $CSW_PORT alone is wrong because vdm's self-heal block re-sources
 # this file WITHOUT exporting CSW_PORT, even when the user persisted a
-# custom dashboard port via the UI (which writes to ~/.claude/account-switcher/
+# custom dashboard port via the UI (which writes to ~/.vdm/
 # config.json). The resulting hooks would always point at port 3333, but
 # the live dashboard is listening on whatever port the user picked — every
 # UserPromptSubmit / Stop / etc. would fire ECONNREFUSED into the void.
@@ -63,7 +63,7 @@ fi
 # so the keyset of "what controls vdm's port" stays consistent across
 # every entrypoint (rc-snippet → install.sh → install-hooks.sh).
 _resolve_vdm_port() {
-  local cfg="$HOME/.claude/account-switcher/config.json"
+  local cfg="$HOME/.vdm/config.json"
   local from_cfg=""
   local env_port="${CSW_PORT:-}"
   # SECURITY: validate env BEFORE using it. CSW_PORT is a raw env var —
@@ -134,12 +134,12 @@ install_hooks() {
   # script); only the `vdm` CLI gets +x. The earlier `-x` check
   # rejected every legitimate install because a non-executable .mjs
   # file fails -x even when it exists.
-  if [ ! -f "$HOME/.claude/account-switcher/dashboard.mjs" ]; then
+  if [ ! -f "$HOME/.vdm/dashboard.mjs" ]; then
     # printf '%s\n' instead of echo: echo interprets backslash escapes
     # under some shells (dash/POSIX) so a $HOME containing literal '\n'
     # bytes (rare but possible on a misconfigured account) would render
     # garbage. printf '%s' treats the path as opaque text.
-    printf 'install-hooks.sh: %s/.claude/account-switcher/dashboard.mjs not found — refusing to install hooks against a missing dashboard. Run install.sh from the source repo to (re)install vdm.\n' "$HOME" >&2
+    printf 'install-hooks.sh: %s/.vdm/dashboard.mjs not found — refusing to install hooks against a missing dashboard. Run install.sh from the source repo to (re)install vdm.\n' "$HOME" >&2
     return 1
   fi
   _install_claude_code_hooks
@@ -198,7 +198,7 @@ _install_claude_code_hooks() {
   # dashboard's settings UI / vdm CLI toggles this flag file. Default:
   # NOT subscribed. Computed in bash so the python heredoc can stay
   # closed-quoted (no shell interpolation inside, modulo argv).
-  local _per_tool_flag="$HOME/.claude/account-switcher/per-tool-attribution.flag"
+  local _per_tool_flag="$HOME/.vdm/per-tool-attribution.flag"
   local _per_tool_enabled=0
   [[ -f "$_per_tool_flag" ]] && _per_tool_enabled=1
   if ! python3 - "$settings_file" "$_VDM_PORT" "$_per_tool_enabled" "$_VDM_HOOK_SENTINEL" <<'PYEOF'
@@ -288,14 +288,14 @@ def _build_hook_command(url):
     # at the same boundary CC would. Was 3s — too tight when 50
     # sub-agents fire SubagentStart simultaneously and the dashboard
     # processes them serially. HOOKS-1 audit fix.
-    # Kill-switch prefix: `vdm disable` writes ~/.claude/account-switcher/.disabled
+    # Kill-switch prefix: `vdm disable` writes ~/.vdm/.disabled
     # and every hook check the marker FIRST. `[ -f ... ] && exit 0` is a
     # microsecond-fast stat — far cheaper than spawning curl. This is what
     # makes `vdm disable` instantaneous: hooks become no-ops with no
     # settings.json mutation. Removing the marker (`vdm enable`) restores
     # full behaviour without any hook reinstall.
     return (
-        f'[ -f "$HOME/.claude/account-switcher/.disabled" ] && exit 0; '
+        f'[ -f "$HOME/.vdm/.disabled" ] && exit 0; '
         f"curl -sS --connect-timeout 1 --max-time 5 "
         f"-X POST -H 'Content-Type: application/json' "
         f"--data-binary @- {url} "
@@ -390,7 +390,7 @@ def ensure_hook(event_name, url):
 #   * PostToolBatch      — gated by per-tool-attribution.flag (default
 #                          off because this fires once per tool batch
 #                          and would flood the dashboard). Enabled via
-#                          `touch ~/.claude/account-switcher/per-tool-attribution.flag`.
+#                          `touch ~/.vdm/per-tool-attribution.flag`.
 #   * WorktreeCreate     — log new worktree to activity feed; mostly for
 #                          correlation with branch-attribution shifts.
 #   * WorktreeRemove     — load-bearing: a session in a removed worktree

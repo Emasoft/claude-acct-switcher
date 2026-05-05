@@ -107,7 +107,7 @@ mkdir -p "$ACCOUNTS_DIR"
 # ─────────────────────────────────────────────────────────
 
 # Self-healing hook re-install ONLY when running from the CANONICAL install
-# location ($HOME/.claude/account-switcher) AND the install dashboard.mjs
+# location ($HOME/.vdm) AND the install dashboard.mjs
 # exists. Without these guards, running `./vdm` directly from a source-repo
 # checkout (during dev, after uninstall, or to test a release tarball) would
 # silently re-add hooks to ~/.claude/settings.json — resurrecting entries
@@ -115,14 +115,14 @@ mkdir -p "$ACCOUNTS_DIR"
 # UserPromptSubmit once the dashboard process is gone. Self-heal is wanted
 # ONLY in the context where the install is supposed to be live.
 if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]] \
-   && [[ "$SCRIPT_DIR" == "$HOME/.claude/account-switcher" ]] \
+   && [[ "$SCRIPT_DIR" == "$HOME/.vdm" ]] \
    && [[ -f "$SCRIPT_DIR/dashboard.mjs" ]]; then
   # Opt-out sentinel: a user who deliberately removed the token-tracking
   # hooks (perhaps because they're noisy or they're testing alternative
   # tracking) can place this file to keep them removed across vdm
   # invocations. Without this, the migration silently re-installed disabled
   # hooks every time any vdm subcommand ran (audit finding 05.C10).
-  if [[ -f "$HOME/.claude/account-switcher/.hooks-disabled" ]]; then
+  if [[ -f "$HOME/.vdm/.hooks-disabled" ]]; then
     : # respect user's opt-out
   else
     _needs_hooks=false
@@ -498,7 +498,7 @@ print(json.load(sys.stdin).get(sys.argv[1], ""))
 
 # M9 fix — POST a single settings patch to the running dashboard.
 # Without this, `vdm config <key> <val>` and the dashboard's settings
-# UI both write to ~/.claude/account-switcher/config.json from different
+# UI both write to ~/.vdm/config.json from different
 # processes with no shared lock — a simultaneous CLI write and UI save
 # can interleave at the python `json.load` / `os.replace` boundary and
 # clobber one of the two changes (last-writer-wins, no merge).

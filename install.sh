@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Account Switcher  - Installer
-# Installs vdm to ~/.claude/account-switcher/ and configures your shell.
+# Installs vdm to ~/.vdm/ and configures your shell.
 #
 # Robustness contract:
 # - Every disk write is atomic (tmp + rename) via lib-install.sh helpers.
@@ -74,7 +74,7 @@ BOLD=$'\033[1m'
 DIM=$'\033[2m'
 NC=$'\033[0m'
 
-INSTALL_DIR="$HOME/.claude/account-switcher"
+INSTALL_DIR="$HOME/.vdm"
 # POSIX-portable: resolve the directory containing this script. `pwd -P`
 # canonicalises any symlink components in the path. This works whether
 # install.sh is invoked directly, via a symlink, or via $PATH — and does
@@ -148,6 +148,89 @@ if [[ "$NON_INTERACTIVE" == "true" ]]; then
 fi
 echo ""
 
+# ── Migrate legacy install dir (~/.claude/account-switcher → ~/.vdm) ──
+# vdm used to live inside ~/.claude/, which is Claude Code's own
+# namespace. A maintenance sweep there could wipe vdm state. The new
+# canonical location is ~/.vdm/ (in the user's own dot-dir namespace).
+# Detect a legacy install and migrate atomically.
+#
+# Migration rules:
+#   • Only migrate when ~/.claude/account-switcher exists AND ~/.vdm
+#     does NOT exist. Both existing means the user has already
+#     migrated; we leave both alone (manual intervention required).
+#   • Stop any running dashboard at the legacy path FIRST so files
+#     aren't held open during the move.
+#   • Single `mv` is atomic on the same filesystem ($HOME → $HOME).
+#     If the user's $HOME is on a tmpfs / different mount than the
+#     legacy dir, mv falls back to copy+delete which is non-atomic
+#     but acceptable for a one-shot migration.
+#   • Leave a tombstone at ~/.claude/account-switcher.migrated-to.txt
+#     so a confused user grepping for the old path finds the new one.
+#   • The rc-block and CC hooks reference the OLD path; install.sh's
+#     normal flow rewrites both AFTER this migration step, so the
+#     stale references are repaired in the same install run.
+LEGACY_INSTALL_DIR="$HOME/.claude/account-switcher"
+if [[ -d "$LEGACY_INSTALL_DIR" ]] && [[ -d "$INSTALL_DIR" ]]; then
+  # F-004 — both paths present means a previous migration completed
+  # (or the user manually created ~/.vdm/ before running install.sh).
+  # The legacy dir is now orphaned. Surface this clearly so the user
+  # can decide whether to merge or delete.
+  echo -e "${YELLOW}  Note:${NC} both install paths exist:"
+  echo -e "    ${CYAN}$INSTALL_DIR${NC}            ${DIM}(canonical, used by this install)${NC}"
+  echo -e "    ${CYAN}$LEGACY_INSTALL_DIR${NC}  ${DIM}(legacy, orphaned)${NC}"
+  echo -e "    ${DIM}This install will use ${CYAN}$INSTALL_DIR${DIM}. The legacy dir is left in place — you can:${NC}"
+  echo -e "      ${DIM}• inspect it for any state you want to copy across, then${NC}"
+  echo -e "      ${DIM}• rm -rf ${LEGACY_INSTALL_DIR} when you are done${NC}"
+  echo ""
+elif [[ -d "$LEGACY_INSTALL_DIR" ]] && [[ ! -d "$INSTALL_DIR" ]]; then
+  echo -e "${BOLD}  Migrating legacy install dir${NC}"
+  echo -e "    ${DIM}from:${NC} ${CYAN}$LEGACY_INSTALL_DIR${NC}"
+  echo -e "    ${DIM}to:  ${NC} ${CYAN}$INSTALL_DIR${NC}"
+  # Stop the running dashboard at the legacy path first. _kill_running_vdm
+  # is idempotent and cmdline-validated so it won't snipe an unrelated
+  # listener. Pass legacy ports — the new dashboard hasn't started yet.
+  if declare -f _kill_running_vdm >/dev/null 2>&1; then
+    # F-005 — validate ports BEFORE handing them to _kill_running_vdm.
+    # _json_get_int already filters non-int values, but a corrupt
+    # config.json with `"port": "9; rm -rf ~"` could in theory leak
+    # garbage downstream. _validate_port (lib-install.sh) enforces
+    # the 1..65535 contract. Fall back to defaults on rejection.
+    _legacy_dash_port=3333
+    _legacy_proxy_port=3334
+    if [[ -f "$LEGACY_INSTALL_DIR/config.json" ]] && declare -f _json_get_int >/dev/null 2>&1; then
+      _v="$(_json_get_int "$LEGACY_INSTALL_DIR/config.json" port 2>/dev/null || true)"
+      if [[ -n "$_v" ]] && declare -f _validate_port >/dev/null 2>&1 && _validate_port "$_v" 2>/dev/null; then
+        _legacy_dash_port="$_v"
+      fi
+      _v="$(_json_get_int "$LEGACY_INSTALL_DIR/config.json" proxyPort 2>/dev/null || true)"
+      if [[ -n "$_v" ]] && declare -f _validate_port >/dev/null 2>&1 && _validate_port "$_v" 2>/dev/null; then
+        _legacy_proxy_port="$_v"
+      fi
+    fi
+    _kill_running_vdm "$_legacy_dash_port" "$_legacy_proxy_port" 2>/dev/null || true
+  fi
+  # Atomic rename (single mv on same FS). On cross-FS this falls back
+  # to copy+delete — non-atomic but acceptable for one-shot migration.
+  if mv "$LEGACY_INSTALL_DIR" "$INSTALL_DIR" 2>/dev/null; then
+    # Leave a tombstone so a user later searching for the old path
+    # gets a clear pointer to the new location. The .txt suffix
+    # discourages tools from treating it as a directory.
+    printf '%s\n' "$INSTALL_DIR" > "$LEGACY_INSTALL_DIR.migrated-to.txt" 2>/dev/null || true
+    echo -e "    ${GREEN}✓${NC} Migrated ${DIM}(see tombstone at $LEGACY_INSTALL_DIR.migrated-to.txt)${NC}"
+    echo -e "    ${DIM}rc-block and CC hooks will be rewritten with the new path below.${NC}"
+  else
+    # Atomic move failed — likely permission or cross-FS issue. Fail
+    # loudly: the user needs to investigate before we proceed.
+    echo -e "    ${RED}!${NC} Failed to mv $LEGACY_INSTALL_DIR → $INSTALL_DIR" >&2
+    echo -e "    ${DIM}Common causes: permissions, cross-filesystem move (rare on $HOME), legacy dir held open by another process.${NC}" >&2
+    echo -e "    ${DIM}Manual recovery: ensure no vdm processes are running, then run:${NC}" >&2
+    echo -e "      ${CYAN}mv $LEGACY_INSTALL_DIR $INSTALL_DIR${NC}" >&2
+    echo -e "    ${DIM}Then re-run ./install.sh to repair rc-block + hooks.${NC}" >&2
+    exit 1
+  fi
+  echo ""
+fi
+
 # ── Stop any previously-running dashboard/proxy ──
 # Re-installing while the old dashboard is still serving on 3333/3334 is
 # the classic "uninstall didn't take" complaint — the file install would
@@ -160,7 +243,7 @@ echo ""
 #
 # H6 fix — port resolution priority is config.json > env > default. Without
 # the config.json read here, a user who changed `port` / `proxyPort` via
-# the dashboard UI (which persists into ~/.claude/account-switcher/config.json)
+# the dashboard UI (which persists into ~/.vdm/config.json)
 # but did NOT set CSW_PORT in their shell would fall through to the 3333/3334
 # defaults — _kill_running_vdm would scan the wrong ports and the live
 # dashboard would survive while we rewrite its files underneath. Mirror
@@ -551,7 +634,13 @@ for candidate in \
     "/usr/local/bin/vdm"   "/usr/local/bin/csw"; do
   if [[ -L "$candidate" ]]; then
     target="$(readlink "$candidate" 2>/dev/null || true)"
-    if [[ "$target" == *"/.claude/account-switcher/"* ]]; then
+    # Sweep symlinks pointing at EITHER the canonical or the legacy
+    # path. Post-migration, a `~/.local/bin/vdm` left over from the
+    # legacy install would point at `~/.claude/account-switcher/vdm`
+    # which now doesn't exist — without the legacy substring match
+    # the dead symlink would survive AND shadow the new install on
+    # PATH lookup if `~/.local/bin` precedes `/usr/local/bin`.
+    if [[ "$target" == *"/.vdm/"* ]] || [[ "$target" == *"/.claude/account-switcher/"* ]]; then
       rm -f "$candidate" 2>/dev/null || true
     fi
   fi
@@ -595,7 +684,44 @@ done
 SNIPPET_MARKER="# BEGIN claude-account-switcher"
 
 if [[ -n "$SHELL_RC" ]]; then
-  if grep -q "$SNIPPET_MARKER" "$SHELL_RC" 2>/dev/null; then
+  # Detect a stale rc-block from a legacy install (still references the
+  # old `~/.claude/account-switcher/...` paths). After the path
+  # migration above, those paths point at nothing — the block needs to
+  # be rewritten with the new ~/.vdm/ paths. Detection is conservative:
+  # we look for the literal `.claude/account-switcher` substring INSIDE
+  # the BEGIN/END block (not anywhere in the rc file). If found, drop
+  # the old block; the install flow below will write a fresh one.
+  _STALE_BLOCK_REMOVED=false
+  _STALE_BLOCK_REMOVAL_FAILED=false
+  if grep -q "$SNIPPET_MARKER" "$SHELL_RC" 2>/dev/null \
+     && awk '/^# BEGIN claude-account-switcher$/,/^# END claude-account-switcher$/' "$SHELL_RC" 2>/dev/null \
+        | grep -q '\.claude/account-switcher'; then
+    echo -e "  ${YELLOW}Stale rc-block${NC} in ${CYAN}$SHELL_RC${NC} still references the legacy install path."
+    if declare -f _atomic_remove_block >/dev/null 2>&1; then
+      if _atomic_remove_block "$SHELL_RC" \
+            '^[[:space:]]*# BEGIN claude-account-switcher[[:space:]]*$' \
+            '^[[:space:]]*# END claude-account-switcher[[:space:]]*$'; then
+        echo -e "    ${GREEN}✓${NC} Removed stale block — fresh block will be written below."
+        _STALE_BLOCK_REMOVED=true
+      else
+        echo -e "    ${YELLOW}!${NC} Could not remove stale block atomically — leaving rc-write disabled."
+        _STALE_BLOCK_REMOVAL_FAILED=true
+      fi
+    else
+      echo -e "    ${YELLOW}!${NC} _atomic_remove_block helper unavailable — leaving rc-write disabled."
+      _STALE_BLOCK_REMOVAL_FAILED=true
+    fi
+  fi
+  # Flow control — three states:
+  #   • removal_failed → skip rc-write; user must manually delete the
+  #     stale block. Don't print the misleading "already present"
+  #     message that contradicts the prior failure warning.
+  #   • removed → block is GONE (no marker), fall through to write.
+  #   • neither (block already absent OR fresh-path block present) →
+  #     legacy preserve-on-fresh-block behaviour.
+  if [[ "$_STALE_BLOCK_REMOVAL_FAILED" == "true" ]]; then
+    echo -e "  ${DIM}Skipping rc-block update. After fixing $SHELL_RC, re-run ./install.sh.${NC}"
+  elif grep -q "$SNIPPET_MARKER" "$SHELL_RC" 2>/dev/null; then
     echo -e "  ${DIM}Shell config already present in $SHELL_RC${NC}"
   else
     # ANTHROPIC_BASE_URL clobber check. If the user already exports a
@@ -621,7 +747,7 @@ if [[ -n "$SHELL_RC" ]]; then
       # the rc snippet falling back to bare `node` is a PATH-hijack
       # vector — a later-installed `~/.local/bin/node` (any node version
       # manager creates one) would execute on every shell startup with
-      # full read access to ~/.claude/account-switcher/. Refuse the
+      # full read access to ~/.vdm/. Refuse the
       # install instead.
       echo -e "  ${RED}!${NC} node not found on PATH. Install Node 18+ first," >&2
       echo -e "      then re-run ./install.sh. Refusing to write a bare-name" >&2
@@ -655,14 +781,14 @@ if [[ -n "$SHELL_RC" ]]; then
 # 644 (a Node module, not a shell script); \`-x\` would reject every
 # legitimate install because the .mjs file is not executable.
 #
-# Second predicate: ~/.claude/account-switcher/.disabled is the
+# Second predicate: ~/.vdm/.disabled is the
 # \`vdm disable\` kill-switch. When present we behave EXACTLY like the
 # uninstall case — strip ANTHROPIC_BASE_URL, skip dashboard auto-start.
 # This is the only safe way to make \`vdm disable\` instantaneous from
 # the user's perspective: existing shells still carry the env var (we
 # can't reach back into the parent shell's env), but every NEW shell
 # bypasses vdm entirely.
-if [ ! -f "\$HOME/.claude/account-switcher/dashboard.mjs" ] || [ -f "\$HOME/.claude/account-switcher/.disabled" ]; then
+if [ ! -f "\$HOME/.vdm/dashboard.mjs" ] || [ -f "\$HOME/.vdm/.disabled" ]; then
   case "\${ANTHROPIC_BASE_URL:-}" in
     http*://localhost:*|http*://127.0.0.1:*)
       unset ANTHROPIC_BASE_URL
@@ -674,7 +800,7 @@ else
   #      run \`CSW_PORT=4444 CSW_PROXY_PORT=4445 …\` in the SAME shell (or via a
   #      launchd plist that already exported the value) without this snippet
   #      stomping it back to 3333/3334.
-  #   2. Else, parse ~/.claude/account-switcher/config.json for "port" /
+  #   2. Else, parse ~/.vdm/config.json for "port" /
   #      "proxyPort" — that's where the dashboard persists user-configured
   #      ports via the settings UI, so a setting saved last week is still
   #      honoured by every fresh shell this week.
@@ -684,7 +810,7 @@ else
   # parse errors and the \`command -v python3\` guard handles a missing
   # interpreter, so the snippet stays inert on a broken-environment shell
   # instead of polluting stderr at every prompt.
-  if [ -z "\${CSW_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
+  if [ -z "\${CSW_PORT:-}" ] && [ -r "\$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then
     # MUST stay aligned with vdm's _vdm_resolve_port (vdm:30+) — same
     # contract: JSON int (no string-of-digits) AND 1..65535 (no >65535,
     # no <=0). Diverging here re-introduces opus F-001.
@@ -694,16 +820,16 @@ try:
   v=d.get("port","")
   print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
 except Exception:
-  pass' "\$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"
+  pass' "\$HOME/.vdm/config.json" 2>/dev/null || true)"
   fi
-  if [ -z "\${CSW_PROXY_PORT:-}" ] && [ -r "\$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then
+  if [ -z "\${CSW_PROXY_PORT:-}" ] && [ -r "\$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then
     CSW_PROXY_PORT="\$(python3 -c 'import json,sys
 try:
   d=json.load(open(sys.argv[1]))
   v=d.get("proxyPort","")
   print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
 except Exception:
-  pass' "\$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"
+  pass' "\$HOME/.vdm/config.json" 2>/dev/null || true)"
   fi
   # Numeric default fallback runs unconditionally — covers the case where
   # python3 ran but returned an empty string (key missing / non-int value).
@@ -745,7 +871,7 @@ except Exception:
     # \`wc -c < file\` is portable, has no flag-conflict surface, and
     # outputs only the byte count (with optional leading whitespace
     # that \`-gt\` tolerates). Avoids stat entirely.
-    _vdm_log="\$HOME/.claude/account-switcher/startup.log"
+    _vdm_log="\$HOME/.vdm/startup.log"
     if [ -f "\$_vdm_log" ]; then
       _vdm_log_sz="\$(wc -c < "\$_vdm_log" 2>/dev/null | tr -d ' \t' || echo 0)"
       if [ "\${_vdm_log_sz:-0}" -gt 1048576 ]; then
@@ -758,8 +884,8 @@ except Exception:
     # user with \`CSW_PORT=4444\` already running would still get a second
     # dashboard.mjs spawned because lsof looked at the wrong port.
     if ! lsof -iTCP:"\$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
-      nohup ${NODE_BIN_QUOTED} ~/.claude/account-switcher/dashboard.mjs \\
-        >>~/.claude/account-switcher/startup.log 2>&1 &
+      nohup ${NODE_BIN_QUOTED} ~/.vdm/dashboard.mjs \\
+        >>~/.vdm/startup.log 2>&1 &
       disown
     fi
     rmdir "\$_vdm_lock" 2>/dev/null
@@ -791,22 +917,22 @@ else
   echo '    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone'
   echo '    # OR if `vdm disable` has written the kill-switch marker file.'
   echo '    # `-f` (file exists), NOT `-x` (executable): dashboard.mjs is mode 644.'
-  echo '    if [ ! -f "$HOME/.claude/account-switcher/dashboard.mjs" ] || [ -f "$HOME/.claude/account-switcher/.disabled" ]; then'
+  echo '    if [ ! -f "$HOME/.vdm/dashboard.mjs" ] || [ -f "$HOME/.vdm/.disabled" ]; then'
   echo '      case "${ANTHROPIC_BASE_URL:-}" in'
   echo '        http*://localhost:*|http*://127.0.0.1:*) unset ANTHROPIC_BASE_URL ;;'
   echo '      esac'
   echo '    else'
-  echo '      if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
+  echo '      if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then'
   echo '        CSW_PORT="$(python3 -c '"'"'import json,sys'
   echo 'try:'
   echo '  d=json.load(open(sys.argv[1])); v=d.get("port",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
-  echo 'except Exception: pass'"'"' "$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"'
+  echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
   echo '      fi'
-  echo '      if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.claude/account-switcher/config.json" ] && command -v python3 >/dev/null 2>&1; then'
+  echo '      if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then'
   echo '        CSW_PROXY_PORT="$(python3 -c '"'"'import json,sys'
   echo 'try:'
   echo '  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
-  echo 'except Exception: pass'"'"' "$HOME/.claude/account-switcher/config.json" 2>/dev/null || true)"'
+  echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
   echo '      fi'
   echo '      CSW_PORT="${CSW_PORT:-3333}"'
   echo '      CSW_PROXY_PORT="${CSW_PROXY_PORT:-3334}"'
@@ -817,8 +943,8 @@ else
   echo '      fi'
   echo '      if mkdir "$_vdm_lock" 2>/dev/null; then'
   echo '        if ! lsof -iTCP:"$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then'
-  echo "          nohup $(command -v node) ~/.claude/account-switcher/dashboard.mjs \\"
-  echo '            >>~/.claude/account-switcher/startup.log 2>&1 &'
+  echo "          nohup $(command -v node) ~/.vdm/dashboard.mjs \\"
+  echo '            >>~/.vdm/startup.log 2>&1 &'
   echo '          disown'
   echo '        fi'
   echo '        rmdir "$_vdm_lock" 2>/dev/null'

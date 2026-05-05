@@ -352,8 +352,8 @@ _kill_running_vdm() {
   local proxy_port="${2:-3334}"
   local stopped=false port pid
 
-  if [[ -x "$HOME/.claude/account-switcher/vdm" ]]; then
-    "$HOME/.claude/account-switcher/vdm" dashboard stop 2>/dev/null && stopped=true || true
+  if [[ -x "$HOME/.vdm/vdm" ]]; then
+    "$HOME/.vdm/vdm" dashboard stop 2>/dev/null && stopped=true || true
   fi
 
   for port in "$dash_port" "$proxy_port"; do
@@ -363,7 +363,17 @@ _kill_running_vdm() {
     done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
   done
 
-  if pkill -TERM -f '\.claude/account-switcher/dashboard\.mjs' 2>/dev/null; then
+  # Match BOTH the new canonical install path AND the legacy
+  # `~/.claude/account-switcher/dashboard.mjs` so a legacy-running
+  # daemon gets killed correctly during migration / legacy-only
+  # uninstall.
+  #
+  # CRITICAL: pkill -f uses POSIX EXTENDED regex (ERE), not BRE.
+  # In ERE, parens and `|` are alternation metacharacters with NO
+  # backslash escapes. The previous escaped form `\(\|\)` matched
+  # literal `(`, `|`, `)` characters and would never match any
+  # process. Confirmed via empirical test against both paths.
+  if pkill -TERM -f '(\.vdm/|\.claude/account-switcher/)dashboard\.mjs' 2>/dev/null; then
     stopped=true
   fi
   # H12 fix — narrowed from `node.*-e.*dashboard\.mjs` (which would match any
@@ -461,7 +471,7 @@ _issue() {
 # install), accounts/*.json plaintext files (Phase J pre-migration),
 # `.dashboard.pid` referring to a dead PID, `startup.log` > 10 MB.
 detect_old_install_remnants() {
-  local root="${1:-$HOME/.claude/account-switcher}"
+  local root="${1:-$HOME/.vdm}"
   if [[ -d "$root" ]] && [[ ! -f "$root/dashboard.mjs" ]]; then
     _issue partial-install warn \
       "Install dir exists but dashboard.mjs is missing: $root" \
@@ -620,7 +630,7 @@ detect_port_holders() {
 # Surfaces vdm-account-* entries when no install dir exists — they
 # survived a prior uninstall (kept) but are otherwise unowned.
 detect_orphan_keychain_entries() {
-  local root="${1:-$HOME/.claude/account-switcher}"
+  local root="${1:-$HOME/.vdm}"
   [[ -d "$root" ]] && return 0  # not an orphan — current install owns them
   local n
   n=$(security dump-keychain 2>/dev/null \
@@ -638,7 +648,7 @@ detect_orphan_keychain_entries() {
 # (port, proxyPort) must be either absent or numeric. A truncated /
 # corrupted config makes shell startup spew python tracebacks.
 detect_truncated_config() {
-  local cfg="${1:-$HOME/.claude/account-switcher/config.json}"
+  local cfg="${1:-$HOME/.vdm/config.json}"
   [[ -f "$cfg" ]] || return 0
   if ! _json_is_valid "$cfg"; then
     _issue config-corrupt error \

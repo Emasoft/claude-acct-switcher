@@ -24,7 +24,20 @@ BOLD=$'\033[1m'
 DIM=$'\033[2m'
 NC=$'\033[0m'
 
-INSTALL_DIR="$HOME/.claude/account-switcher"
+INSTALL_DIR="$HOME/.vdm"
+# Legacy install path. vdm used to live here (under Claude Code's own
+# namespace). install.sh atomic-migrates legacy installs to $INSTALL_DIR
+# on next run, but a user who runs uninstall.sh BEFORE that migration
+# would see a stale-looking ~/.claude/account-switcher/ left behind.
+# Detect and handle. If both paths exist, prefer the new one.
+LEGACY_INSTALL_DIR="$HOME/.claude/account-switcher"
+if [[ ! -d "$INSTALL_DIR" ]] && [[ -d "$LEGACY_INSTALL_DIR" ]]; then
+  echo -e "${YELLOW}  Note:${NC} only the legacy install dir was found at"
+  echo -e "        ${CYAN}$LEGACY_INSTALL_DIR${NC}"
+  echo -e "        Treating that as the install root for this uninstall run."
+  echo ""
+  INSTALL_DIR="$LEGACY_INSTALL_DIR"
+fi
 # Preserve the original path for the section-9 audit (the variable can be
 # blanked mid-script when the accounts/ backup fails — see section 5).
 INSTALL_DIR_ORIG="$INSTALL_DIR"
@@ -249,13 +262,17 @@ _run_full_audit() {
       LEFT_ARTIFACTS+=("$HOME/.claude/settings.json [contains vdm hook URL(s)]")
     fi
   fi
-  # Symlinks.
+  # Symlinks. Audit accepts BOTH the canonical and the legacy
+  # install-dir target so a legacy-only uninstall (top-of-script
+  # fallback to LEGACY_INSTALL_DIR) reports stale symlinks too.
+  # Without the legacy match, the "left artifacts" listing would be
+  # silently incomplete after a pre-migration uninstall.
   for _lnk in "$HOME/.local/bin/vdm" "$HOME/.local/bin/csw" \
               "/opt/homebrew/bin/vdm" "/opt/homebrew/bin/csw" \
               "/usr/local/bin/vdm"    "/usr/local/bin/csw"; do
     if [[ -L "$_lnk" ]]; then
       _t="$(readlink "$_lnk" 2>/dev/null || true)"
-      if [[ "$_t" == *"/.claude/account-switcher/"* ]]; then
+      if [[ "$_t" == *"/.vdm/"* ]] || [[ "$_t" == *"/.claude/account-switcher/"* ]]; then
         LEFT_ARTIFACTS+=("$_lnk -> $_t")
       fi
     fi
@@ -856,7 +873,7 @@ removed_link=false
 # string (e.g. `/Users/dev/my-account-switcher-tool/bin/vdm`, or a forked
 # project under a similarly-named directory, or `/opt/homebrew/bin/vdm`
 # pointing at a homebrew-installed account-switcher) would be deleted by
-# uninstall. Mirror install.sh's stricter `*"/.claude/account-switcher/"*`
+# uninstall. Mirror install.sh's stricter `*"/.vdm/"*`
 # anchor so we only ever remove links we created. Also include the
 # Apple-Silicon homebrew bindir which install.sh now writes to as well.
 for link in \
@@ -865,7 +882,12 @@ for link in \
     "/usr/local/bin/vdm"       "/usr/local/bin/csw"; do
   if [[ -L "$link" ]]; then
     target=$(readlink "$link" 2>/dev/null || true)
-    if [[ "$target" == *"/.claude/account-switcher/"* ]]; then
+    # Remove symlinks pointing at EITHER the canonical or the legacy
+    # install dir. Legacy-only uninstalls (the top-of-script fallback
+    # path) without the legacy substring match would leave stale
+    # `~/.claude/account-switcher/...` symlinks behind dead and
+    # orphaned.
+    if [[ "$target" == *"/.vdm/"* ]] || [[ "$target" == *"/.claude/account-switcher/"* ]]; then
       rm -f "$link"
       echo -e "  ${GREEN}✓${NC} Removed symlink ${DIM}$link${NC}"
       removed_link=true
@@ -942,7 +964,7 @@ fi
 #
 # Defence-in-depth: refuse to rm -rf unless the path looks vdm-shaped.
 # Three layers:
-#   1. The path must end in `/.claude/account-switcher` (exact suffix).
+#   1. The path must end in `/.vdm` (exact suffix).
 #      Catches a corrupted INSTALL_DIR pointing at $HOME or `/`.
 #   2. The path must be under $HOME — never delete a system path.
 #   3. The dir must contain at least one of dashboard.mjs, vdm,
@@ -956,7 +978,15 @@ ACCOUNTS_BACKUP=""
 _safe_to_rmrf() {
   local d="$1"
   [[ -z "$d" ]] && return 1
-  [[ "$d" != *"/.claude/account-switcher" ]] && return 1
+  # Accept both the new canonical path (`/.vdm`) AND the legacy path
+  # (`/.claude/account-switcher`). The legacy match is required for
+  # uninstall-on-pre-migration installs (user runs uninstall.sh BEFORE
+  # ever running the new install.sh). Without it the legacy-only
+  # fallback at the top of this script (sets INSTALL_DIR to the
+  # legacy path) couldn't proceed past this gate.
+  if [[ "$d" != *"/.vdm" ]] && [[ "$d" != *"/.claude/account-switcher" ]]; then
+    return 1
+  fi
   [[ "$d" != "$HOME"* ]] && return 1
   [[ ! -d "$d" ]] && return 1
   # If the dir has vdm executables, it's clearly vdm-owned.
