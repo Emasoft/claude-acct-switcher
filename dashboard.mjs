@@ -1009,13 +1009,14 @@ import {
   summarizeCacheMissesBySession,
   // Phase 6 — wasted-spend (cache-miss cost) time series
   buildWastedSpendSeries,
-  // UX-X8 / UX-X9 — unified time + token-count formatters with hover-exact.
-  // dashboard.mjs ships a browser-side mirror of these inside the
-  // renderHTML template literal (fmtTokenCountShort / fmtTokenCountExact /
-  // fmtDurationShort / fmtDurationExact); the Node-side import is for
-  // any non-renderHTML callers (CLI command output, hook log strings).
-  fmtTokenCount,
-  fmtDuration,
+  // Note on UX-X8 / UX-X9 formatters: dashboard.mjs ships browser-side
+  // mirrors of `fmtTokenCount` / `fmtDuration` inside the renderHTML
+  // template literal (fmtTokenCountShort / fmtTokenCountExact /
+  // fmtDurationShort / fmtDurationExact). The Node-side helpers are NOT
+  // imported here because no non-renderHTML caller currently uses
+  // them — keep this list driven by actual uses to avoid TS6133
+  // unused-import drift; re-import on demand if a CLI / hook log
+  // string needs them later.
 } from './lib.mjs';
 
 // Fetch email from Anthropic roles API using OAuth token. This is an
@@ -16983,7 +16984,11 @@ const proxyServer = createServer((clientReq, clientRes) => {
       if (_settled) return;
       _settled = true;
       uiServer.removeListener('error', _onError);
-      log('info', '[ui-listener] re-opened via /api/dashboard/ui-listener/start');
+      // Phrase as "(re-)bound" rather than "re-opened" because Phase 1.5
+      // daemon-only mode (CSW_DISABLE_UI=1) boots the process WITHOUT
+      // ever calling uiServer.listen(); the first call to this endpoint
+      // is a fresh bind, not a re-open. (chk-review F-002.)
+      log('info', '[ui-listener] (re-)bound via /api/dashboard/ui-listener/start');
       clientRes.writeHead(200, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({ ok: true, listening: true, port: UI_PORT }));
     };

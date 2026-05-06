@@ -1690,11 +1690,29 @@ cmd_dashboard() {
       # CSW_DISABLE_UI=1 in the spawn env (dashboard.mjs reads it at
       # module-init).
       local _no_ui=0
-      shift 2>/dev/null || true  # consume "start"
+      # Drop the "start" subcommand token if present. `vdm dashboard`
+      # (zero args) defaults action="start" via the case-statement
+      # default, so $1 is already a flag in that path — `shift`
+      # would still need protection. Use `[[ "${1:-}" == start ]]`
+      # to drop only when actually present (chk-review F-004).
+      [[ "${1:-}" == "start" ]] && shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --no-ui|--daemon-only) _no_ui=1; shift ;;
-          *) shift ;;  # ignore unknown args; preserve forward-compat
+          # chk-review F-001: any unknown `--`/`-` flag is almost
+          # certainly a typo of `--no-ui` (e.g. `--noui`, `--no-Ui`,
+          # `-no-ui`). Without surfacing the typo, the user expects
+          # daemon-only and silently gets a UI-bound dashboard. Warn
+          # + abort. Non-flag tokens still pass through silently —
+          # that's the forward-compat surface for future positional
+          # args (none defined today).
+          -*)
+            echo -e "${RED}Unknown flag: $1${NC}" >&2
+            echo -e "${DIM}  Supported: --no-ui (alias --daemon-only).${NC}" >&2
+            echo -e "${DIM}  If you meant a typo of --no-ui, fix it; otherwise drop the flag.${NC}" >&2
+            return 64  # EX_USAGE
+            ;;
+          *) shift ;;  # ignore non-flag tokens — forward-compat
         esac
       done
       # Phase 1.0 — three-state start logic:

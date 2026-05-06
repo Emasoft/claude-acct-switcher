@@ -1167,7 +1167,6 @@ describe('createAccountStateManager switch tracking', () => {
   it('wasRecentlySwitchedFrom returns true within the window', () => {
     const sm = createAccountStateManager();
     sm.update('tokB', 'acctB', {});
-    const now = 1_000_000_000_000;
     // Manually inject lastSwitchAtMs via markSwitchedFrom with clock control.
     // Since markSwitchedFrom uses Date.now() internally, we drive the test
     // through the public API and observe it by passing nowMs explicitly.
@@ -2931,6 +2930,32 @@ describe('pickByStrategy — injected `now` reaches candidate availability check
 });
 
 // ─────────────────────────────────────────────────
+// scoreAccount — bare 5h-utilization score used by the default
+// `pickBestAccount` strategy. Trivial wrapper around the state
+// manager, but worth pinning so a future "let me richen this scoring"
+// refactor doesn't accidentally diverge from the documented contract.
+// ─────────────────────────────────────────────────
+describe('scoreAccount', () => {
+  it('returns 0 for unknown token', () => {
+    const sm = _mkStateManager({});
+    assert.equal(scoreAccount('missing', sm), 0);
+  });
+
+  it('returns 0 for known token with no utilization5h', () => {
+    const sm = _mkStateManager({ a: {} });
+    assert.equal(scoreAccount('a', sm), 0);
+  });
+
+  it('returns the 5h utilization verbatim (no scaling)', () => {
+    const sm = _mkStateManager({
+      a: { utilization5h: 0.42, utilization7d: 0.99 },
+    });
+    // utilization7d MUST be ignored — that's the whole reason
+    // scoreAccountConserve exists as a separate function.
+    assert.equal(scoreAccount('a', sm), 0.42);
+  });
+});
+
 // scoreAccountConserve — weekly dominates 5h tiebreaker (×100 / ×1).
 // Critical: with weekly window already active, conserve should
 // concentrate on it even when its 5h is HIGH (the whole point of
@@ -4852,12 +4877,22 @@ describe('Phase 1.5 — daemon-only mode (CSW_DISABLE_UI=1)', () => {
     // Pattern: find `server.listen(PORT, '127.0.0.1'` and check no
     // `_UI_DISABLED` token within the preceding 200 chars on a
     // controlling-statement line.
+    // Tightened pattern (chk-review F-003): we ONLY want to catch the
+    // "if (_UI_DISABLED) { … } else {" wrap that gates a .listen()
+    // call. The literal token `if (_UI_DISABLED)` may legitimately
+    // appear elsewhere in the file (other gates that don't touch
+    // listen). Anchor: the `if` AND a `} else {` close ON THE SAME
+    // line (the `} else {` shape is what would actually wrap the
+    // following .listen() call). Regex matches both literal forms
+    // chk-review identified ("if (...) … else {" and bare "else {"
+    // at slice end).
+    const _gatePattern = /if \(_UI_DISABLED\)\s*\{[\s\S]*?\}\s*else\s*\{\s*$|\}\s*else\s*\{\s*$/;
     const daemonIdx = _src_p15.indexOf("server.listen(PORT, '127.0.0.1'");
     assert.notStrictEqual(daemonIdx, -1, 'daemon server.listen call not found');
     const daemonContext = _src_p15.slice(Math.max(0, daemonIdx - 200), daemonIdx);
     assert.doesNotMatch(
       daemonContext,
-      /if \(_UI_DISABLED\)[\s\S]*$|else \{\s*$/,
+      _gatePattern,
       'daemon server.listen appears gated by _UI_DISABLED — REGRESSION (would break hooks)',
     );
     const proxyIdx = _src_p15.indexOf("proxyServer.listen(PROXY_PORT");
@@ -4865,7 +4900,7 @@ describe('Phase 1.5 — daemon-only mode (CSW_DISABLE_UI=1)', () => {
     const proxyContext = _src_p15.slice(Math.max(0, proxyIdx - 200), proxyIdx);
     assert.doesNotMatch(
       proxyContext,
-      /if \(_UI_DISABLED\)[\s\S]*$|else \{\s*$/,
+      _gatePattern,
       'proxyServer.listen appears gated by _UI_DISABLED — REGRESSION (would break the proxy + token tracking)',
     );
   });
