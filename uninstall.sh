@@ -1017,6 +1017,15 @@ _safe_to_rmrf() {
   # Otherwise: every entry must be a vdm-shaped state file or the
   # accounts/ subdir. Any unrecognised entry → refuse (could be user
   # data we don't recognise).
+  #
+  # Whitelist invariant: this list MUST stay in sync with the
+  # "Runtime state files" table in CLAUDE.md. New runtime state files
+  # added there MUST be added here in the same commit, otherwise a
+  # user with the new file present would have uninstall refuse to
+  # rm -rf the install dir, leaving stale state on disk. The current
+  # set covers every documented file; rotated snapshots
+  # (events.jsonl.YYYY-MM-DD.gz, startup.log.YYYY-MM-DD.gz) are
+  # matched via glob since their date suffix varies daily.
   local entry name
   for entry in "$d"/* "$d"/.[!.]*; do
     [[ -e "$entry" ]] || continue
@@ -1024,7 +1033,11 @@ _safe_to_rmrf() {
     case "$name" in
       accounts|config.json|account-state.json|activity-log.json \
       |utilization-history.json|probe-log.json|token-usage.json \
-      |.dashboard.pid|.hooks-disabled|.version|startup.log \
+      |session-history.json|account-prefs.json|viewer-state.json \
+      |events.jsonl|migration.log \
+      |events.jsonl.*|startup.log.* \
+      |.dashboard.pid|.dashboard.lock|.hooks-disabled|.disabled \
+      |.version|.version.new|startup.log \
       |per-tool-attribution.flag|*.tmp|*.tmp.*) ;;
       *) return 1 ;;
     esac

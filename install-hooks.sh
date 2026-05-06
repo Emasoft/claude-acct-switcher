@@ -85,12 +85,22 @@ _resolve_vdm_port() {
      && command -v python3 >/dev/null 2>&1; then
     # Inline python — _json_get_int from lib-install.sh may not be sourced
     # yet (this script is also sourced from `vdm` directly without the lib).
+    # Python detail: `bool` is a subclass of `int`, so
+    # `isinstance(True, int)` returns True and `True` would print as
+    # `True` (bash string `"True"`). The downstream paranoia regex
+    # at line ~105 catches that string, but rejecting at the source
+    # keeps the validator consistent with `lib-install.sh:_json_get_int`
+    # and the rc-snippet's check (both of which exclude bool). A
+    # value of `false` would otherwise print as `False` (also caught
+    # downstream), but `0` would correctly fall through here regardless
+    # because the downstream `(( v >= 1 ))` check rejects 0. Belt
+    # + suspender across all three port-reading sites.
     from_cfg="$(python3 -c '
 import json, sys
 try:
   d = json.load(open(sys.argv[1]))
   v = d.get("port")
-  print(v if isinstance(v, int) else "")
+  print(v if isinstance(v, int) and not isinstance(v, bool) else "")
 except Exception:
   pass
 ' "$cfg" 2>/dev/null || true)"

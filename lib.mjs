@@ -4,6 +4,7 @@
 
 import { createHash } from 'node:crypto';
 import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 // ─────────────────────────────────────────────────
 // Fingerprinting
@@ -3197,8 +3198,18 @@ export function createSerializationQueue(opts = {}) {
   let lastDispatchAt = 0;
   let dispatchTimer = null;
   const queue = [];
+  // Set when drainProgressively() is actively releasing entries on its
+  // own cadence. _maybeDispatch MUST stay out of the way during that
+  // time — otherwise a new acquire() arriving mid-drain races: it sees
+  // dispatchTimer=null + inflight=0 (in the sliver between a drained
+  // entry's .finally(inflight--) and the next drain tick) and schedules
+  // a parallel dispatch that overshoots serializeMaxConcurrent. The
+  // flag is cleared by drain's tick when the queue empties OR by
+  // cancel(). Without it the cap-violation window is small but real.
+  let draining = false;
 
   function _maybeDispatch() {
+    if (draining) return; // progressive drain owns the schedule
     if (dispatchTimer) return; // a dispatch is already pending
     if (queue.length === 0) return;
     if (inflight >= Math.max(1, getMaxConcurrent())) return;
@@ -3327,14 +3338,27 @@ export function createSerializationQueue(opts = {}) {
       if (onDrained) try { onDrained({ released: 0, cancelled: false }); } catch {}
       return { cancel: () => {}, released: () => 0, remaining: () => 0 };
     }
+    // Take ownership of the dispatch schedule. Cleared on tick-empty,
+    // cancel(), or when the drain ends naturally. _maybeDispatch
+    // checks this flag before scheduling its own setTimeout (see the
+    // declaration block above).
+    draining = true;
     let released = 0;
     let cancelled = false;
     let tickHandle = null;
+    const _endDrain = (cancelledFlag) => {
+      draining = false;
+      if (onDrained) try { onDrained({ released, cancelled: cancelledFlag }); } catch {}
+      // After drain ends, kick the regular dispatcher so any acquire()
+      // calls that arrived mid-drain (and were left queued because
+      // _maybeDispatch was no-op'd) get processed under normal cap.
+      _maybeDispatch();
+    };
     const tick = () => {
       tickHandle = null;
       if (cancelled) return;
       if (queue.length === 0) {
-        if (onDrained) try { onDrained({ released, cancelled: false }); } catch {}
+        _endDrain(false);
         return;
       }
       const entry = queue.shift();
@@ -3349,12 +3373,13 @@ export function createSerializationQueue(opts = {}) {
           inflight--;
           // Don't call _maybeDispatch here — we own the dispatch
           // schedule for the duration of the progressive drain.
+          // (`draining` keeps _maybeDispatch out of the way too.)
         });
       if (queue.length > 0) {
         tickHandle = setTimeout(tick, intervalMs);
         if (tickHandle.unref) tickHandle.unref();
-      } else if (onDrained) {
-        try { onDrained({ released, cancelled: false }); } catch {}
+      } else {
+        _endDrain(false);
       }
     };
     // Fire the first dispatch immediately (rate is "1 per intervalMs"
@@ -3367,7 +3392,7 @@ export function createSerializationQueue(opts = {}) {
           clearTimeout(tickHandle);
           tickHandle = null;
         }
-        if (onDrained) try { onDrained({ released, cancelled: true }); } catch {}
+        _endDrain(true);
       },
       released: () => released,
       remaining: () => queue.length,
@@ -3454,6 +3479,18 @@ export function createUsageExtractor({ logger = null } = {}) {
     }
   }
 
+  // SSE chunks arrive as Buffers from http.IncomingMessage. A naive
+  // `chunk.toString('utf8')` per chunk corrupts multi-byte UTF-8
+  // characters that get split across chunk boundaries — TCP gives no
+  // guarantee chunks align to character boundaries. The replacement
+  // chars (U+FFFD) would propagate into the lineBuffer, and any SSE
+  // line containing user-controlled UTF-8 (text-delta payloads in
+  // assistant content) becomes uparseable. The token-usage events
+  // (message_start / message_delta) are pure ASCII so the practical
+  // blast radius is small, but a StringDecoder buffers partial
+  // sequences across chunks at zero cost — closes the gap and keeps
+  // future extractor expansions (e.g. parsing model_id strings) safe.
+  const decoder = new StringDecoder('utf8');
   const extractor = new Transform({
     // `_encoding` is required by the Transform API positional signature
     // (transform(chunk, encoding, callback)) but unused — chunks are always
@@ -3462,8 +3499,11 @@ export function createUsageExtractor({ logger = null } = {}) {
       // Pass through bytes unchanged
       this.push(chunk);
 
-      // Scan for usage data in SSE events
-      const text = chunk.toString('utf8');
+      // Scan for usage data in SSE events. `decoder.write` emits any
+      // complete characters and buffers the trailing partial sequence
+      // for the next chunk; `decoder.end()` runs in flush() to drain
+      // any final partial.
+      const text = decoder.write(chunk);
       lineBuffer += text;
 
       const lines = lineBuffer.split('\n');
@@ -3507,6 +3547,12 @@ export function createUsageExtractor({ logger = null } = {}) {
       callback();
     },
     flush(callback) {
+      // Drain any partial multi-byte sequence the decoder buffered
+      // (relevant only when the stream ends mid-character — extremely
+      // rare for Anthropic's SSE which always terminates on `\n\n`,
+      // but keeps the contract symmetric with the StringDecoder docs).
+      const tail = decoder.end();
+      if (tail) lineBuffer += tail;
       // Try the trailing partial line one last time so the final
       // message_delta isn't lost when upstream closes between newlines.
       // Delegated to the shared helper so the abort path can run the

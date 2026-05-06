@@ -657,8 +657,15 @@ detect_orphan_keychain_entries() {
 
 # detect_truncated_config
 # config.json must be valid JSON and the keys we read in the rc snippet
-# (port, proxyPort) must be either absent or numeric. A truncated /
+# (port, proxyPort, uiPort) must be either absent or numeric. A truncated /
 # corrupted config makes shell startup spew python tracebacks.
+#
+# `uiPort` was added by TRDD-c30609ab Stage A. Validating it here keeps
+# the validator in sync with the documented config.json schema — without
+# this, a malformed `uiPort` (e.g. `"uiPort": "4444"` string instead of
+# integer) silently corrupts the env-var export at shell startup, which
+# is exactly the bug class this validator was created to catch for the
+# other two ports.
 detect_truncated_config() {
   local cfg="${1:-$HOME/.vdm/config.json}"
   [[ -f "$cfg" ]] || return 0
@@ -669,7 +676,7 @@ detect_truncated_config() {
     return 0
   fi
   local p
-  for p in port proxyPort; do
+  for p in port proxyPort uiPort; do
     local v
     v="$(python3 -c "
 import json, sys
@@ -678,7 +685,15 @@ try:
     v = d.get(sys.argv[2])
     if v is None:
         print('absent')
-    elif isinstance(v, int):
+    elif isinstance(v, int) and not isinstance(v, bool):
+        # Python detail: bool is a subclass of int, so isinstance(True,
+        # int) is True. Without the bool exclusion, {\"port\": true}
+        # would print 'ok' here while every other port-reading site
+        # (rc-snippet, _json_get_int, install-hooks.sh:_resolve_vdm_port)
+        # rejects it — the diagnostic was reporting clean while the
+        # downstream chain silently fell back to the default. Excluding
+        # bool here makes detect_truncated_config consistent with the
+        # canonical validators in the same file.
         print('ok')
     else:
         print('bad-type')
