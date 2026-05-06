@@ -3417,9 +3417,32 @@ describe('XSS regression — renderAccounts card rendering', () => {
   it('displayName is HTML-escaped before innerHTML', () => {
     // The fix in commit e2f0b35 introduced a separate displayName
     // (escHtml-wrapped) vs displayNameJs (single-quote-escaped) split.
-    // Ensure both are still present.
+    // The audit F-001 follow-up extended displayNameJs / eName to
+    // ALSO HTML-attr-escape `"` and `&` so an account label can not
+    // break out of the `onclick="..."` attribute boundary. The regex
+    // is whitespace-tolerant since the chain may span multiple lines.
     assert.match(_dashboardSrc, /const displayName = escHtml\(rawDisplayName\);/);
-    assert.match(_dashboardSrc, /const displayNameJs = String\(rawDisplayName\)\.replace/);
+    assert.match(_dashboardSrc, /const displayNameJs = String\(rawDisplayName\)[\s\S]{0,20}\.replace/);
+  });
+
+  it('displayNameJs and eName escape both single-quote AND double-quote (audit F-001)', () => {
+    // F-001 CRITICAL — pre-fix `displayNameJs` only escaped `'`. A
+    // label like `x" onmouseover="alert(1)` would break out of the
+    // `onclick="doSwitch('...', '<displayNameJs>', event)"` attribute
+    // boundary at the literal `"`. After the fix, both helpers chain
+    // .replace(/"/g, '&quot;') after the JS-quote escape. Pin the
+    // chain so a future "let me simplify" refactor that drops the
+    // `"` substitution fails the build.
+    assert.match(
+      _dashboardSrc,
+      /displayNameJs[\s\S]{0,200}\.replace\(\/'\/g[^)]*\)[\s\S]{0,200}\.replace\(\/"\/g, '&quot;'\)/,
+      'displayNameJs must chain a `.replace(/"/g, \'&quot;\')` after the single-quote escape',
+    );
+    assert.match(
+      _dashboardSrc,
+      /eName[\s\S]{0,200}\.replace\(\/'\/g[^)]*\)[\s\S]{0,200}\.replace\(\/"\/g, '&quot;'\)/,
+      'eName must chain a `.replace(/"/g, \'&quot;\')` after the single-quote escape',
+    );
   });
 
   it('card-name span uses the escaped displayName, not raw', () => {

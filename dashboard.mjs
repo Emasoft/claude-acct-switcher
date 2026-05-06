@@ -683,10 +683,12 @@ function atomicWriteFileSync(filePath, content) {
 // each event carries a `category` plus a typed payload.
 //
 // File: ~/.vdm/events.jsonl
-// Rotation: daily, keep 7 days. Active file is `events.jsonl`; daily
-// snapshots are `events.jsonl.YYYY-MM-DD.gz` (compressed at rotate
-// time). `events.jsonl` itself is mode 0o600 — same rationale as
-// every other state file (paths, fingerprints, error excerpts).
+// Rotation: daily; retention defaults to EVENTS_RETENTION_DAYS = 1 day
+// (override via env CSW_LOG_RETENTION_DAYS — see the constant declaration
+// below). Active file is `events.jsonl`; daily snapshots are
+// `events.jsonl.YYYY-MM-DD.gz` (compressed at rotate time).
+// `events.jsonl` itself is mode 0o600 — same rationale as every other
+// state file (paths, fingerprints, error excerpts).
 //
 // Categories vdm currently emits:
 //   - rate_limit       — 429 from upstream (fingerprint + reset-at + retry-after)
@@ -8783,15 +8785,33 @@ function renderAccounts(profiles, animate) {
     // discover from the Anthropic API's organization_name field, OR
     // set manually via the vdm-label command). Two derived forms:
     //   * displayName    HTML-escaped for rendering in innerHTML.
-    //   * displayNameJs  raw value with single-quote-as-JS-string
-    //     escaping ONLY, used inside onclick=doSwitch single-quoted args.
-    // The two MUST stay separate: HTML-escaping the JS-string form
-    // would inject the &amp;#39; entity into the toast message instead
-    // of an apostrophe.
+    //   * displayNameJs  HTML-attr-safe + JS-string-safe, used inside
+    //     onclick=&quot;doSwitch(&apos;...&apos;, &apos;DNJS&apos;, event)&quot;
+    //     — a single-quoted JS string nested inside a double-quoted
+    //     HTML attribute. Two passes:
+    //       1) JS-escape single quotes so a quote in the label can not
+    //          break out of the inner JS string (replaces &apos; with
+    //          backslash-&apos;).
+    //       2) HTML-attr-escape double-quote and ampersand so a quote
+    //          can not break out of the OUTER HTML attribute (audit
+    //          F-001 CRITICAL — a label like x&quot; onmouseover=...
+    //          was a real XSS sink before this added &amp;quot;
+    //          substitution). The HTML-decode for &amp;quot; runs
+    //          AFTER the attribute boundary is parsed, so the JS
+    //          string sees a literal double-quote which is harmless
+    //          inside a single-quoted JS string. No need to escape
+    //          less-than / greater-than — browsers do not terminate
+    //          attribute values on those.
     const rawDisplayName = p.label || p.name;
     const displayName = escHtml(rawDisplayName);
-    const displayNameJs = String(rawDisplayName).replace(/'/g, "\\\\'");
-    const eName = p.name.replace(/'/g, "\\\\'");
+    const displayNameJs = String(rawDisplayName)
+      .replace(/'/g, "\\\\'")
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;');
+    const eName = p.name
+      .replace(/'/g, "\\\\'")
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;');
     const tok = tokenStatus(p.expiresAt);
 
     let barsHtml = '';
