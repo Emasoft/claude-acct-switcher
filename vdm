@@ -1678,6 +1678,25 @@ cmd_dashboard() {
       fi
       ;;
     start|"")
+      # Phase 1.5 — `--no-ui` (alias `--daemon-only`) flag spawns the
+      # dashboard with the UI listener disabled. The daemon (PORT) and
+      # proxy (PROXY_PORT) bind normally; only uiServer (UI_PORT) is
+      # skipped. Use case: a launchd plist or rc-snippet auto-start
+      # that wants the proxy + token tracking + account rotation
+      # always running, but treats the HTML UI as something the user
+      # explicitly opens later via plain `vdm dashboard start` — the
+      # Phase 1.0 ui-listener/start endpoint re-binds UI_PORT
+      # in-process without restarting node. Implemented by exporting
+      # CSW_DISABLE_UI=1 in the spawn env (dashboard.mjs reads it at
+      # module-init).
+      local _no_ui=0
+      shift 2>/dev/null || true  # consume "start"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --no-ui|--daemon-only) _no_ui=1; shift ;;
+          *) shift ;;  # ignore unknown args; preserve forward-compat
+        esac
+      done
       # Phase 1.0 — three-state start logic:
       #
       # State 1: Daemon alive AND UI listener already up
@@ -1698,12 +1717,36 @@ cmd_dashboard() {
         ui_status="$(curl -s --max-time 3 \
                        "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/status" 2>/dev/null || echo '')"
         if echo "$ui_status" | grep -q '"listening":true'; then
-          # State 1
+          # State 1 — UI is up.
+          if [[ "$_no_ui" -eq 1 ]]; then
+            # User asked for --no-ui but the UI is already bound.
+            # Don't silently do nothing — surface the contradiction
+            # so they can decide whether to `vdm dashboard stop`
+            # first or ignore the flag.
+            #
+            # Return 1 so scripts / launchd / CI that chain
+            # `vdm dashboard start --no-ui && …` see "the requested
+            # state was NOT achieved." Mirror's the post-spawn
+            # `--no-ui but UI bound` case below — same observable
+            # state, same exit code (chk-review F-001).
+            echo -e "${YELLOW}--no-ui requested but the UI is already bound at http://localhost:$UI_PORT${NC}"
+            echo -e "${DIM}To run UI-less, first close the listener: ${CYAN}vdm dashboard stop${NC}${DIM}, then ${CYAN}vdm dashboard start --no-ui${NC}${DIM}.${NC}"
+            return 1
+          fi
           echo -e "${YELLOW}Dashboard already running at http://localhost:$UI_PORT${NC}"
           echo -e "${DIM}Use 'vdm dashboard stop' to close just the UI (daemon + proxy stay up).${NC}"
           return 0
         fi
-        # State 2 — soft-restart of the UI listener.
+        # State 2 — daemon alive, UI closed.
+        if [[ "$_no_ui" -eq 1 ]]; then
+          # User asked for --no-ui and the daemon is already in the
+          # desired UI-less state — treat as a no-op success rather
+          # than soft-binding the UI back. No new process is spawned.
+          echo -e "${GREEN}✓${NC} Daemon already running on $DASHBOARD_PORT — UI listener is closed (as requested via --no-ui)."
+          echo -e "  ${DIM}Open the UI later with: ${CYAN}vdm dashboard start${NC}${DIM} (without --no-ui).${NC}"
+          return 0
+        fi
+        # State 2 (no --no-ui flag) — soft-restart of the UI listener.
         local resp
         resp="$(curl -s --max-time 5 -X POST \
                   "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/start" 2>/dev/null || echo '')"
@@ -1790,7 +1833,16 @@ cmd_dashboard() {
       # whatever was (or wasn't) in the parent env and bind a
       # different port. Explicit assignment closes that gap and
       # mirrors install.sh's atomic-install spawn (install.sh:1118).
-      ( cd "$SCRIPT_DIR" && CSW_PORT="$DASHBOARD_PORT" CSW_PROXY_PORT="$PROXY_PORT" CSW_UI_PORT="$UI_PORT" exec nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
+      #
+      # Phase 1.5 — propagate CSW_DISABLE_UI=1 only when --no-ui /
+      # --daemon-only was requested. The env var must be set BEFORE
+      # `exec` replaces the subshell with node, otherwise node never
+      # sees it.
+      if [[ "$_no_ui" -eq 1 ]]; then
+        ( cd "$SCRIPT_DIR" && CSW_PORT="$DASHBOARD_PORT" CSW_PROXY_PORT="$PROXY_PORT" CSW_UI_PORT="$UI_PORT" CSW_DISABLE_UI=1 exec nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
+      else
+        ( cd "$SCRIPT_DIR" && CSW_PORT="$DASHBOARD_PORT" CSW_PROXY_PORT="$PROXY_PORT" CSW_UI_PORT="$UI_PORT" exec nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
+      fi
       local new_pid=$!
       disown 2>/dev/null || true
       echo "$new_pid" > "$DASHBOARD_PID_FILE"
@@ -1879,6 +1931,19 @@ cmd_dashboard() {
         # path with stale, possibly-reused mktemp paths.
         trap - EXIT INT TERM HUP
         if [[ $_daemon_up -eq 1 && $_ui_up -eq 1 ]]; then
+          if [[ "$_no_ui" -eq 1 ]]; then
+            # Phase 1.5 surprise — user asked for --no-ui, but the UI
+            # is up. Most likely cause: dashboard.mjs ignored
+            # CSW_DISABLE_UI (env-var didn't propagate, or a stale
+            # build is missing the gate). Surface the contradiction
+            # rather than silently celebrating; return non-zero so
+            # CI / launchd plists notice.
+            echo -e "${YELLOW}!${NC} Dashboard running (PID $new_pid) but the UI listener bound DESPITE --no-ui."
+            echo -e "  ${DIM}Likely causes: (a) CSW_DISABLE_UI did not reach the spawned process, or (b) a stale ~/.vdm/dashboard.mjs is running without the Phase 1.5 gate.${NC}"
+            echo -e "  ${DIM}Verify with: ${CYAN}grep -n CSW_DISABLE_UI ${SCRIPT_DIR}/dashboard.mjs${NC}"
+            echo -e "  Logs: ${DIM}$startup_log${NC}"
+            return 1
+          fi
           echo -e "${GREEN}✓${NC} Dashboard running (PID $new_pid)"
           echo -e "  UI:        ${CYAN}http://localhost:$UI_PORT${NC}"
           echo -e "  Daemon:    ${CYAN}http://localhost:$DASHBOARD_PORT${NC} ${DIM}(hooks, always-on)${NC}"
@@ -1897,11 +1962,25 @@ cmd_dashboard() {
           echo -e "  Logs: ${DIM}$startup_log${NC}"
           return 1
         else
-          # Daemon up, UI down. Token tracking works; only the HTML
-          # UI is unreachable. Skip `open`. Return non-zero — the
-          # user explicitly asked for `vdm dashboard start` (which
-          # implies UI bound) and we didn't deliver. Token-tracking
-          # being unaffected is the silver lining, not a success.
+          # Daemon up, UI down.
+          if [[ "$_no_ui" -eq 1 ]]; then
+            # Phase 1.5 daemon-only mode — UI down is the INTENDED
+            # state. Token tracking + proxy continue working, the
+            # user can re-bind the UI later via plain
+            # `vdm dashboard start`. Skip `open`, return success.
+            echo -e "${GREEN}✓${NC} Dashboard daemon running (PID $new_pid) — UI listener disabled (--no-ui)."
+            echo -e "  Daemon:    ${CYAN}http://localhost:$DASHBOARD_PORT${NC} ${DIM}(hooks, always-on)${NC}"
+            echo -e "  API Proxy: ${CYAN}http://localhost:$PROXY_PORT${NC} ${DIM}(claude → anthropic, always-on)${NC}"
+            echo -e "  Logs:      ${DIM}$startup_log${NC}"
+            echo -e "  ${DIM}Open the UI later with: ${CYAN}vdm dashboard start${NC}${DIM} (without --no-ui).${NC}"
+            return 0
+          fi
+          # Daemon up, UI down, no --no-ui flag — token tracking works
+          # but the HTML UI is unreachable. Skip `open`. Return
+          # non-zero — the user explicitly asked for `vdm dashboard
+          # start` (which implies UI bound) and we didn't deliver.
+          # Token-tracking being unaffected is the silver lining, not
+          # a success.
           echo -e "${YELLOW}!${NC} Dashboard process running (PID $new_pid) — daemon up, but UI port $UI_PORT did NOT respond."
           echo -e "  ${DIM}Most likely cause: another process is listening on $UI_PORT (lsof -iTCP:$UI_PORT). Daemon + proxy are up — token tracking and the proxy continue to work; only the HTML UI is unreachable.${NC}"
           echo -e "  ${DIM}Fix: change CSW_UI_PORT or 'uiPort' in $SCRIPT_DIR/config.json to a free port, then 'vdm dashboard stop && vdm dashboard start'.${NC}"
@@ -2896,7 +2975,12 @@ cmd_help() {
   echo -e "    ${CYAN}remove${NC} <name>           Delete a saved profile"
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
-  echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
+  echo -e "    ${CYAN}dashboard${NC} [start [--no-ui]|stop]"
+  echo -e "                            Launch / stop the dashboard. ${BOLD}stop${NC} closes ONLY the UI"
+  echo -e "                            listener (daemon + proxy continue → hooks + token tracking"
+  echo -e "                            keep running). ${BOLD}--no-ui${NC} (alias ${BOLD}--daemon-only${NC}) starts the"
+  echo -e "                            daemon without the HTML UI bound; reopen later with"
+  echo -e "                            plain ${BOLD}vdm dashboard start${NC}."
   echo -e "    ${CYAN}logs${NC} [filter]            Stream live proxy logs"
   echo -e "    ${CYAN}tokens${NC} [options]        Show token usage (use --per-commit for"
   echo -e "                            per-branch + per-commit breakdown; --help for options)"

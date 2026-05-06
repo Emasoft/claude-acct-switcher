@@ -124,6 +124,25 @@ const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
   }
 })();
 
+// Phase 1.5 — daemon-only mode. CSW_DISABLE_UI=1 skips the UI listener
+// so the process binds ONLY the always-on daemon (hooks) + proxy
+// (Anthropic forwarding). Use case: a launchd plist that wants the
+// proxy + token tracking + account rotation always running, but
+// treats the HTML UI as something the user explicitly opens via
+// `vdm dashboard start` (which uses the Phase 1.0 ui-listener/start
+// endpoint to re-bind UI_PORT in-process).
+//
+// Three-port architecture (TRDD-c30609ab) eliminated the original
+// blocker: closing the UI listener no longer breaks hooks, because
+// hooks live on the daemon at PORT (3333), not on the UI server at
+// UI_PORT (4444). Daemon-only mode is now safe.
+//
+// Acceptance: only the literal string "1" enables it. Any other
+// value (including "true" / "yes" / "on") leaves UI binding on,
+// matching the spec for boolean env vars elsewhere in the codebase
+// (CSW_OTEL_ENABLED, etc.).
+const _UI_DISABLED = process.env.CSW_DISABLE_UI === '1';
+
 const ACCOUNTS_DIR = join(__dirname, 'accounts');
 const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
@@ -13019,9 +13038,20 @@ server.on('error', (e) => {
 // daemon's self-test (same setImmediate-deferred check); duplicating
 // the test on uiServer's listen callback would emit two passes per
 // startup so we leave it on the daemon's callback only.
-uiServer.listen(UI_PORT, '127.0.0.1', () => {
-  console.log(`UI dashboard running at http://localhost:${UI_PORT}`);
-});
+//
+// Phase 1.5 — when CSW_DISABLE_UI=1, skip the .listen() call so the
+// process boots in the closed-UI state. The user can re-bind later
+// via the Phase 1.0 endpoint POST /api/dashboard/ui-listener/start
+// on the proxy port — no node restart needed. Daemon and proxy keep
+// running unaffected (hooks fire, token tracking continues, account
+// rotation works normally).
+if (_UI_DISABLED) {
+  console.log(`[daemon-only] CSW_DISABLE_UI=1 — UI listener NOT bound on ${UI_PORT}; daemon (${PORT}) + proxy (${PROXY_PORT}) running.`);
+} else {
+  uiServer.listen(UI_PORT, '127.0.0.1', () => {
+    console.log(`UI dashboard running at http://localhost:${UI_PORT}`);
+  });
+}
 uiServer.on('error', (e) => {
   if (e && e.code === 'EADDRINUSE') {
     // EADDRINUSE on the UI port is recoverable — the daemon is still

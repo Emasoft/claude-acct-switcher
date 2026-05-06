@@ -4799,6 +4799,91 @@ describe('TRDD-c30609ab Stage C — port keys in /api/settings POST', () => {
 });
 
 // ─────────────────────────────────────────────────────────
+// Phase 1.5 — daemon-only mode (CSW_DISABLE_UI=1)
+// ─────────────────────────────────────────────────────────
+//
+// `CSW_DISABLE_UI=1` makes dashboard.mjs skip the UI listener so the
+// process boots in the closed-UI state. The user can re-bind later
+// via the Phase 1.0 endpoint POST /api/dashboard/ui-listener/start
+// on the proxy port — no node restart needed.
+//
+// Three invariants pinned by source-grep:
+//   1. Strict `=== '1'` check (not loose truthy) so accidental
+//      shell-quoting (`CSW_DISABLE_UI=true` / `=yes` / `=on`)
+//      doesn't enable a state with surprising semantics.
+//   2. uiServer.listen() is wired through the `_UI_DISABLED` gate.
+//   3. Daemon (server) and proxy (proxyServer) listens are NOT
+//      gated by the flag — they always run, otherwise hooks +
+//      token tracking would silently break.
+describe('Phase 1.5 — daemon-only mode (CSW_DISABLE_UI=1)', () => {
+  const _src_p15 = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  it('reads CSW_DISABLE_UI === \'1\' (strict, not truthy)', () => {
+    assert.match(
+      _src_p15,
+      /const _UI_DISABLED = process\.env\.CSW_DISABLE_UI === '1';/,
+      '_UI_DISABLED must be a strict "=== 1" check at module scope',
+    );
+  });
+
+  it('uiServer.listen() is wrapped in the !_UI_DISABLED guard', () => {
+    // The gate must guard the .listen() call directly, not e.g. a
+    // wrapper that also runs side effects unconditionally. The
+    // canonical shape is `if (_UI_DISABLED) { ...log... } else {
+    // uiServer.listen(UI_PORT, '127.0.0.1', () => { ... }); }`.
+    assert.match(
+      _src_p15,
+      /if \(_UI_DISABLED\) \{[\s\S]{0,400}\} else \{\s*uiServer\.listen\(UI_PORT/,
+      'uiServer.listen() not wrapped by the _UI_DISABLED gate',
+    );
+  });
+
+  it('daemon (server) and proxy (proxyServer) listens are NOT gated by _UI_DISABLED', () => {
+    // Hooks + token tracking depend on the daemon and proxy. If
+    // either bind got accidentally pulled inside the _UI_DISABLED
+    // gate, daemon-only mode would silently break the very thing
+    // it's trying to keep alive. Source-grep that the two
+    // .listen() heads are NOT preceded by `if (_UI_DISABLED)` /
+    // `else` on the same line.
+    //
+    // Pattern: find `server.listen(PORT, '127.0.0.1'` and check no
+    // `_UI_DISABLED` token within the preceding 200 chars on a
+    // controlling-statement line.
+    const daemonIdx = _src_p15.indexOf("server.listen(PORT, '127.0.0.1'");
+    assert.notStrictEqual(daemonIdx, -1, 'daemon server.listen call not found');
+    const daemonContext = _src_p15.slice(Math.max(0, daemonIdx - 200), daemonIdx);
+    assert.doesNotMatch(
+      daemonContext,
+      /if \(_UI_DISABLED\)[\s\S]*$|else \{\s*$/,
+      'daemon server.listen appears gated by _UI_DISABLED — REGRESSION (would break hooks)',
+    );
+    const proxyIdx = _src_p15.indexOf("proxyServer.listen(PROXY_PORT");
+    assert.notStrictEqual(proxyIdx, -1, 'proxyServer.listen call not found');
+    const proxyContext = _src_p15.slice(Math.max(0, proxyIdx - 200), proxyIdx);
+    assert.doesNotMatch(
+      proxyContext,
+      /if \(_UI_DISABLED\)[\s\S]*$|else \{\s*$/,
+      'proxyServer.listen appears gated by _UI_DISABLED — REGRESSION (would break the proxy + token tracking)',
+    );
+  });
+
+  it('emits a daemon-only console.log when _UI_DISABLED is true', () => {
+    // The user staring at startup.log after `vdm dashboard start
+    // --no-ui` needs proof that the gate fired. A "daemon-only"
+    // tagged log line is the single visible signal — without it,
+    // diagnosing "did the gate even run?" is needlessly opaque.
+    assert.match(
+      _src_p15,
+      /\[daemon-only\] CSW_DISABLE_UI=1 — UI listener NOT bound on/,
+      'daemon-only log marker missing',
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────
 // Phase I+ — competitor-audit fixes
 // ─────────────────────────────────────────────────────────
 
