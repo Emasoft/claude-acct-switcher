@@ -718,7 +718,36 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # v6→v4 fallback can stall the commit by several seconds. Without
 # --connect-timeout, --max-time alone covers transfer time but not the
 # pre-transfer connect phase on a dual-stack name.
-VDM_PORT="${CSW_PORT:-3333}"
+#
+# VDM port resolution chain — MUST mirror the rc-snippet's contract
+# (env > ~/.vdm/config.json > default 3333). Without the config.json
+# fallback, a custom-port install that the user configured via
+# `vdm config port <N>` works fine in interactive shells (where the
+# rc-snippet exported CSW_PORT) but silently breaks in shells that
+# never sourced the rc-block (cron, launchd plist, IDE-spawned,
+# `git commit` from a fresh subprocess). On those shells, $CSW_PORT
+# is unset, the hook fell back to 3333, the dashboard is on a
+# different port, curl fails the /api/settings probe, and the
+# trailer is silently skipped — no error, no diagnostic, the user
+# just notices their commit messages stop carrying token usage.
+# Reading config.json directly here closes that gap.
+#
+# JSON read uses python3 (already required above for the
+# urllib.parse.quote call). Reject anything that isn't a finite int
+# in 1..65535 — same contract as `_vdm_resolve_port` in vdm and the
+# rc-snippet in install.sh, so all three port-reading sites accept
+# exactly the same inputs.
+VDM_PORT="${CSW_PORT:-}"
+if [[ -z "$VDM_PORT" ]] && [[ -r "$HOME/.vdm/config.json" ]]; then
+  VDM_PORT="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  v=d.get("port","")
+  print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
+except Exception:
+  pass' "$HOME/.vdm/config.json" 2>/dev/null || true)"
+fi
+VDM_PORT="${VDM_PORT:-3333}"
 SETTINGS=$(curl -s --connect-timeout 1 --max-time 2 "http://localhost:${VDM_PORT}/api/settings" 2>/dev/null) || true
 if echo "$SETTINGS" | python3 -c "import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get('commitTokenUsage',False) else 1)" 2>/dev/null; then
   : # enabled, continue

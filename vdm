@@ -1690,7 +1690,7 @@ cmd_dashboard() {
       # CSW_DISABLE_UI=1 in the spawn env (dashboard.mjs reads it at
       # module-init).
       local _no_ui=0
-      # Drop the "start" subcommand token if present. Three reachable
+      # Drop the "start" subcommand token if present. Four reachable
       # input shapes after the outer `case "$action" in start|"")`
       # branch resolves:
       #   • `vdm dashboard`            → action="" (set by default-empty
@@ -1698,13 +1698,14 @@ cmd_dashboard() {
       #   • `vdm dashboard start`      → action="start"; $1 is "start".
       #   • `vdm dashboard start FLAG` → action="start"; $1 is "start",
       #     $2 is FLAG.
+      #   • `vdm dashboard FLAG`       → action=FLAG, falls through to
+      #     the outer `*)` re-dispatch which calls
+      #     `cmd_dashboard start FLAG`; in the recursive call $1 is
+      #     "start", $2 is FLAG.
       # In the first shape there is no token to consume; in the other
-      # two, "start" is the literal $1 and we shift it off so the
+      # three, "start" is the literal $1 and we shift it off so the
       # while-loop below sees only flags. `[[ "${1:-}" == start ]] &&
-      # shift` correctly handles all three (chk-review F-004 + F-001).
-      # NOTE: a stray `vdm dashboard --no-ui` is impossible to reach
-      # here because the outer case treats unknown $1 as the catch-all
-      # `*)` Usage branch — never touches this start-handler.
+      # shift` correctly handles all four (chk-review F-004 + F-001).
       [[ "${1:-}" == "start" ]] && shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2027,7 +2028,18 @@ cmd_dashboard() {
       fi
       ;;
     *)
-      echo -e "${RED}Usage: vdm dashboard [start|stop]${NC}"
+      # If the user typed a flag-shaped first arg (e.g.
+      # `vdm dashboard --no-ui`), the case-statement's `start|""`
+      # branch never fired (because `$action` is the flag, not
+      # "start" or empty). Detect this common typo and re-dispatch
+      # as `start <flag>` instead of bouncing the user out with a
+      # bare Usage error — the action they wanted is unambiguous.
+      if [[ "$action" == --* || "$action" == -* ]]; then
+        cmd_dashboard start "$@"
+        return $?
+      fi
+      echo -e "${RED}Usage: vdm dashboard [start [--no-ui]|stop]${NC}"
+      return 64
       ;;
   esac
 }
@@ -2197,9 +2209,22 @@ cmd_upgrade() {
 
   # Write version marker — full SHA-1 so future upgrades can compare without
   # ambiguity. Display value remains the tag/short-hash in the user-facing
-  # messages below. Atomic write.
-  printf '%s' "$latest_full" > "$SCRIPT_DIR/.version.new" \
-    && mv -f "$SCRIPT_DIR/.version.new" "$SCRIPT_DIR/.version"
+  # messages below. Atomic write with cleanup-on-failure: if `printf`
+  # succeeds but `mv` fails (out of space, read-only FS, permission
+  # change between create and rename), the half-written `.version.new`
+  # would otherwise stick around and eventually confuse the next
+  # upgrade. The trap removes it on any non-success path; cleared on
+  # the happy path so a future tmp file with the same name isn't
+  # zapped.
+  trap 'rm -f "$SCRIPT_DIR/.version.new" 2>/dev/null || true' EXIT INT TERM HUP
+  if printf '%s' "$latest_full" > "$SCRIPT_DIR/.version.new" \
+     && mv -f "$SCRIPT_DIR/.version.new" "$SCRIPT_DIR/.version"; then
+    trap - EXIT INT TERM HUP
+  else
+    trap - EXIT INT TERM HUP
+    rm -f "$SCRIPT_DIR/.version.new" 2>/dev/null || true
+    echo -e "${YELLOW}!${NC} Failed to write $SCRIPT_DIR/.version (continuing without version marker)"
+  fi
 
   # Install hooks if not yet present
   if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
