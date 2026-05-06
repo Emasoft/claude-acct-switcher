@@ -226,17 +226,49 @@ PYEOF
 }
 
 # Count current-user processes whose env (visible via `ps eww`) carries
-# ANTHROPIC_BASE_URL pointing at our localhost:<port>. The ps output is
-# piped to Python where the pattern is built with re.escape(); bash
-# never sees the regex string.
+# ANTHROPIC_BASE_URL pointing at our dashboard's port. Best-effort:
+#
+#   1. **TOCTOU race (chk-review F-001 MINOR, ack'd)** — PIDs are
+#      enumerated in step 1 then their env is read in step 2. Procs
+#      that exit between the two steps yield "ps eww -p" stderr we
+#      already silence; procs that spawn between the two steps are
+#      missed entirely. Acceptable for a leak-audit hint shown to
+#      the user during `uninstall.sh --detect`; the mitigation for
+#      "did I really catch every leaker" is the suggestion to
+#      restart the shell, not stronger detection.
+#
+#   2. **Bind-address coverage (chk-review F-003 NIT)** — the
+#      dashboard binds 127.0.0.1 / localhost today, so the regex
+#      below also accepts 0.0.0.0 and [::1] purely as forward-
+#      compat for any future bind-address change. Adding them is
+#      free; missing them later would silently regress audit
+#      coverage exactly when it matters most.
+#
+# Implementation:
+#   * Python script is passed via `-c` (NOT heredoc into `python3 -`).
+#     The original `ps ... | python3 - "$port" <<PYEOF...PYEOF` form
+#     was BROKEN — bash's heredoc and the pipe both want to feed
+#     python's stdin, the pipe wins, python interprets ps output
+#     as a script, errors out, and the `|| printf '%s' 0` fallback
+#     fires silently. shellcheck SC2259 catches this. Net effect:
+#     pre-fix this function returned 0 on every platform.
+#   * `ps eww -u "$USER"` returns zero lines on macOS (BSD `e` flag
+#     is incompatible with -u filtering without root). Portable
+#     workaround: enumerate user PIDs via `ps -u "$USER" -o pid=`,
+#     comma-join, then `ps eww -p PID,PID,...` — works on macOS
+#     AND Linux.
+#   * `re.escape(port)` keeps bash out of the regex-string business.
 _scan_running_procs_for_proxy_url() {
   local port="$1"
-  ps eww -u "$USER" 2>/dev/null | python3 - "$port" <<'PYEOF' 2>/dev/null || printf '%s' 0
+  local user_pids
+  user_pids="$(ps -u "$USER" -o pid= 2>/dev/null | tr -d ' ' | tr '\n' ',' | sed 's/,$//')"
+  [[ -z "$user_pids" ]] && { printf '%s' 0; return; }
+  ps eww -p "$user_pids" 2>/dev/null | python3 -c '
 import re, sys
 port = sys.argv[1]
-pattern = re.compile(r'ANTHROPIC_BASE_URL=https?://(?:localhost|127\.0\.0\.1):' + re.escape(port) + r'(?!\d)')
+pattern = re.compile(r"ANTHROPIC_BASE_URL=https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):" + re.escape(port) + r"(?!\d)")
 print(sum(1 for line in sys.stdin if pattern.search(line)))
-PYEOF
+' "$port" 2>/dev/null || printf '%s' 0
 }
 
 _UNINST_DIR_TOP="$(cd "$(dirname "$0")" && pwd -P 2>/dev/null || true)"
