@@ -4675,6 +4675,130 @@ describe('TRDD-c30609ab — endpoint classification', () => {
 });
 
 // ─────────────────────────────────────────────────────────
+// TRDD-c30609ab Stage C — port keys in /api/settings POST
+// ─────────────────────────────────────────────────────────
+//
+// The /api/settings POST handler must accept `port`, `proxyPort`,
+// `uiPort` so that:
+//   1. The CLI (`vdm config <port-key> <value>`) can persist port
+//      changes without racing the dashboard's own saveSettings()
+//      writes.
+//   2. Distinctness is checked server-side against the EFFECTIVE
+//      post-patch values (so a single POST setting two ports at
+//      once validates correctly).
+//   3. Out-of-range / non-integer values fail HTTP 400 with a clear
+//      per-key error.
+//   4. Collisions reject the ENTIRE patch (no half-apply).
+//
+// All four invariants are pinned via source-grep so a future
+// "let me simplify this" refactor in dashboard.mjs's POST handler
+// either keeps them OR fails the build with a clear diff.
+describe('TRDD-c30609ab Stage C — port keys in /api/settings POST', () => {
+  const _src_portKeys = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // Locate the /api/settings POST handler body (between the dispatcher
+  // signature and the next `if (url.pathname === ` / `function `).
+  const _postStart = _src_portKeys.indexOf(
+    "url.pathname === '/api/settings' && req.method === 'POST'",
+  );
+  assert.notStrictEqual(_postStart, -1, 'POST /api/settings dispatcher not found');
+  // Slice forward to the next dispatcher head so we only assert against
+  // THIS handler's body. Using two anchor candidates (next dispatcher,
+  // next async function) is what the endpoint-classification suite
+  // above does — same pattern, same robustness against insertions.
+  const _afterPostStart = _postStart + "url.pathname === '/api/settings' && req.method === 'POST'".length;
+  const _nextDispatcher = _src_portKeys.indexOf("if (url.pathname === '", _afterPostStart);
+  const _postEnd = _nextDispatcher === -1 ? _src_portKeys.length : _nextDispatcher;
+  const _postBody = _src_portKeys.slice(_postStart, _postEnd);
+
+  it('accepts the three port keys (port, proxyPort, uiPort)', () => {
+    // Each port key must show up in the per-key validation loop AND
+    // in the assignment block. The hasOwnProperty check guards
+    // against `port: undefined` triggering the validator.
+    for (const k of ['port', 'proxyPort', 'uiPort']) {
+      assert.match(
+        _postBody,
+        new RegExp(`hasOwnProperty\\.call\\(patch,\\s*'${k}'\\)`),
+        `POST handler does not check patch.${k} via hasOwnProperty`,
+      );
+    }
+  });
+
+  it('rejects non-integer / out-of-range ports with HTTP 400', () => {
+    // Number.isInteger guards NaN + floats. Lower bound 1, upper
+    // bound 65535 (IANA TCP port range minus the reserved 0).
+    assert.match(
+      _postBody,
+      /Number\.isInteger\(_v\)\s*\|\|\s*_v\s*<\s*1\s*\|\|\s*_v\s*>\s*65535/,
+      'port range guard missing or weakened',
+    );
+    assert.match(
+      _postBody,
+      /must be an integer 1\.\.65535/,
+      'port range error message missing',
+    );
+  });
+
+  it('checks distinctness against effective post-patch values', () => {
+    // The collision check uses `patch.X ?? settings.X ?? PORT` shape,
+    // not just `patch.X`. Without the fallback to settings + bound
+    // PORT/etc., setting one port without the other two would be
+    // unable to validate against current state.
+    assert.match(
+      _postBody,
+      /_effPort\s*=\s*Object\.prototype\.hasOwnProperty\.call\(patch,\s*'port'\)/,
+      'effective-port resolution missing',
+    );
+    assert.match(
+      _postBody,
+      /_effPort\s*===\s*_effProxyPort\s*\|\|\s*_effPort\s*===\s*_effUiPort\s*\|\|\s*_effProxyPort\s*===\s*_effUiPort/,
+      'three-way distinctness check missing',
+    );
+    assert.match(
+      _postBody,
+      /port collision after patch/,
+      'collision error message missing',
+    );
+  });
+
+  it('rejects the ENTIRE patch on any port-related failure (no half-apply)', () => {
+    // `return true;` after the json(res, ..., 400) branches means
+    // the rest of the POST handler (autoSwitch, proxyEnabled, etc.)
+    // never runs. That's the no-half-apply guarantee. The pattern
+    // is `json(res, { ok: false, ... }, 400);\n      return true;`
+    // — there must be at least two such occurrences inside the
+    // port-key block (one for range, one for collision).
+    const portBlockStart = _postBody.indexOf('TRDD-c30609ab Stage C');
+    assert.notStrictEqual(portBlockStart, -1, 'TRDD-c30609ab Stage C marker missing in POST handler');
+    // The block ends at the first `if (typeof patch.autoSwitch` (the
+    // next non-port handler).
+    const portBlockEnd = _postBody.indexOf("if (typeof patch.autoSwitch", portBlockStart);
+    assert.notStrictEqual(portBlockEnd, -1, 'autoSwitch handler missing — port block extent unclear');
+    const portBlock = _postBody.slice(portBlockStart, portBlockEnd);
+    const _earlyReturns = (portBlock.match(/return true;/g) || []).length;
+    assert.ok(
+      _earlyReturns >= 2,
+      `port-key block must early-return on each rejection, found ${_earlyReturns} return-true sites`,
+    );
+  });
+
+  it('persists accepted port values into in-memory settings', () => {
+    // The POST handler updates settings.port etc. so a later
+    // saveSettings() doesn't overwrite the user's change.
+    for (const k of ['port', 'proxyPort', 'uiPort']) {
+      assert.match(
+        _postBody,
+        new RegExp(`settings\\.${k}\\s*=\\s*patch\\.${k}`),
+        `settings.${k} not updated from patch.${k}`,
+      );
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────
 // Phase I+ — competitor-audit fixes
 // ─────────────────────────────────────────────────────────
 
@@ -11798,10 +11922,17 @@ describe('Code-quality audit fixes (CQ-001 .. CQ-013) — source-grep regression
 
   // ── CQ-005 — settings POST invalidates _runGitCached on gate flips ──
   it('CQ-005 — settings POST invalidates the git cache when gate-controlling settings flip', () => {
-    const handlerSlice = _src_cq.slice(
-      _src_cq.indexOf("'/api/settings' && req.method === 'POST'"),
-      _src_cq.indexOf("'/api/settings' && req.method === 'POST'") + 9000,
-    );
+    // Slice from the POST handler signature to the next dispatcher
+    // (the viewer-state branch). Width-anchored slices broke when
+    // TRDD-c30609ab Stage C added the port-key block at the top of
+    // this handler — the prior 9000-char cap missed the
+    // _prevCommitTokenUsage block. Anchor on the next dispatcher
+    // instead so the slice grows with the handler body.
+    const _postStart = _src_cq.indexOf("'/api/settings' && req.method === 'POST'");
+    assert.notStrictEqual(_postStart, -1, 'POST /api/settings dispatcher signature missing');
+    const _postEnd = _src_cq.indexOf("url.pathname === '/api/viewer-state'", _postStart);
+    assert.notStrictEqual(_postEnd, -1, 'next dispatcher (viewer-state) missing — anchor broke');
+    const handlerSlice = _src_cq.slice(_postStart, _postEnd);
     assert.match(handlerSlice, /_prevCommitTokenUsage/);
     assert.match(handlerSlice, /_prevSessionMonitor/);
     assert.match(handlerSlice, /_prevPerToolAttribution/);

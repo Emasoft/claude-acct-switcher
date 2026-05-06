@@ -16,8 +16,8 @@ node --test 'test/*.test.mjs'
 node --test test/lib.test.mjs
 
 # Run the dashboard + proxy directly from the repo (skips install)
-node dashboard.mjs                                  # ports 3333 (UI) and 3334 (proxy)
-CSW_PORT=4444 CSW_PROXY_PORT=4445 node dashboard.mjs
+node dashboard.mjs                                                   # daemon 3333, proxy 3334, UI 4444
+CSW_PORT=5000 CSW_PROXY_PORT=5001 CSW_UI_PORT=5002 node dashboard.mjs
 
 # Local dev install — copies dashboard.mjs/lib.mjs/vdm to ~/.vdm/
 # and writes a `# BEGIN claude-account-switcher` block into ~/.zshrc.
@@ -39,7 +39,7 @@ Requires Node 18+, macOS (uses Keychain), and `python3` (used by `vdm` and `inst
 Four source files do all the work. Understand these and you understand the whole project:
 
 - **`vdm`** (bash, ~2300 lines) — user-facing CLI. Dispatches to `cmd_*` functions; talks to the macOS Keychain via `security(1)` and to the dashboard's HTTP API for anything stateful. The `case` block at the bottom of the file is the command map.
-- **`dashboard.mjs`** (Node, ~11,700 lines) — runs **two HTTP servers in one process**: the web dashboard (default port 3333, all the `/api/*` routes plus the embedded HTML in `renderHTML()`) and the API proxy (default port 3334, `handleProxyRequest`). Holds all I/O, timers, and global state. The HTML/CSS/JS for the UI is a single template string returned by `renderHTML()` — there is no separate frontend.
+- **`dashboard.mjs`** (Node, ~17K lines) — runs **three HTTP servers in one process** (TRDD-c30609ab three-port split, see "Three-port architecture" below): an always-on **daemon** (default port 3333, hook endpoints + dual-use reads), the **API proxy** (default port 3334, `handleProxyRequest`), and the user-facing **UI** server (default port 4444, all UI-only `/api/*` routes plus the embedded HTML in `renderHTML()`). Holds all I/O, timers, and global state. The HTML/CSS/JS for the UI is a single template string returned by `renderHTML()` — there is no separate frontend.
 - **`lib.mjs`** (Node, ~2200 lines) — pure functions only, zero side effects. Anything testable lives here: fingerprinting, header rewriting (`buildForwardHeaders`/`stripHopByHopHeaders`), the `createAccountStateManager`/`createUtilizationHistory`/`createProbeTracker`/`createPerAccountLock` factories, rotation-strategy logic (`pickByStrategy` and friends — see **Per-account `excludeFromAuto`** below), OAuth-refresh helpers, `parseRetryAfter` (RFC 7231 §7.1.3 — handles both delta-seconds and HTTP-date forms; capped at `PARSE_RETRY_AFTER_MAX = 86400s`), the SSE token usage extractor (`createUsageExtractor`), and the serialization queue factory (`createSerializationQueue`). **When adding logic that can be expressed as a pure function, put it in `lib.mjs` and unit-test it in `test/lib.test.mjs`** — that's how the existing code is structured.
 - **`lib-install.sh`** (bash, ~770 lines) — shared install/uninstall helpers sourced by `install.sh`, `uninstall.sh`, and `install-hooks.sh`. Atomic file ops (`_atomic_replace`, `_atomic_remove_block`), signal-safe cleanup stack (`_register_cleanup`/`_run_cleanup`), BSD/GNU portability shims (`_bsd_chmod_match`), env detectors, the `_kill_running_vdm` shutdown helper, and JSON readers (`_json_get_int`). NOT a runtime library — it's only loaded during install/uninstall lifecycles. The atomic helpers MUST be used for any file write outside `~/.vdm/` because partial writes to user-controlled paths (rc files, hooks dirs) have outsized blast radius.
 
@@ -65,6 +65,58 @@ claude CLI ──ANTHROPIC_BASE_URL=http://localhost:3334──▶ dashboard.mjs
 ```
 
 The shell `install.sh` writes `export ANTHROPIC_BASE_URL=http://localhost:3334` into the user's rc file and auto-starts `dashboard.mjs` on every new shell. That env var is the entire integration point with Claude Code — there is no plugin, no SDK hook on the request path.
+
+### TRDD-c30609ab — three-port architecture
+
+`dashboard.mjs` runs three independent HTTP servers in one Node process. They share state and timers but are bound to different ports with non-overlapping role-classified endpoints. The split was forced by Phase 1.0 (`vdm dashboard stop` closes the UI without breaking hooks); without it, closing 3333 silently broke every Claude Code session globally because the hooks POSTed there.
+
+```
+                       Daemon (always on)            Proxy (always on)         UI (stoppable)
+                       CSW_PORT, default 3333        CSW_PROXY_PORT, default   CSW_UI_PORT, default
+                                                     3334                       4444
+                       ─────────────────────         ─────────────────────     ─────────────────────
+hook events (curl) ───▶ /api/session-{start,stop}
+                        /api/PostToolBatch
+                        /api/SubagentStart...
+                        (every CC hook)
+
+claude CLI (LLM)    ────────────────────────────────▶ ANTHROPIC_BASE_URL
+                                                      → handleProxyRequest
+
+git commit-msg      ───▶ /api/settings (GET, dual-use)
+trailer (curl)          /api/token-usage (GET, dual-use)
+
+browser (user)       ────────────────────────────────────────────────────────▶ /  (renderHTML)
+                                                                                /api/switch (POST)
+                                                                                /api/refresh (POST)
+                                                                                /api/account-prefs
+                                                                                /api/logs/stream
+                                                                                /api/settings (POST)
+                                                                                ...
+```
+
+**Endpoint classification** lives in three Sets near the top of `handleAPI` in `dashboard.mjs`:
+
+- `HOOK_PATHS` — daemon-served, hook-originated. Closing the UI never affects these.
+- `UI_PATHS` — UI-only. The daemon refuses to handle them (returns 308 → UI on GET, 404 on POST). 18 endpoints as of Stage B.
+- `DUAL_USE_PATHS` — read-only, served by both. Currently `GET /api/settings` and `GET /api/token-usage` (the git commit-msg trailer needs them when the UI is closed).
+
+`handleAPI(req, res, role)` takes a mandatory `role` parameter (`'ui'` or `'hook'`) — anything else fails closed (HTTP 500 with a "missing classification" message). The role filter is the canonical source of "is this endpoint allowed on this listener". Unclassified `/api/*` paths get HTTP 500 (no silent dual-serve).
+
+A `describe('TRDD-c30609ab — endpoint classification', ...)` regression suite in `test/lib.test.mjs` parses `handleAPI`'s body, extracts every dispatcher pathname, and asserts each one is in exactly one set. CI fails if a new endpoint lands without classification — belt + suspender alongside the runtime fail-closed.
+
+**Configurability**:
+
+- All three ports accept env-var overrides (`CSW_PORT`, `CSW_PROXY_PORT`, `CSW_UI_PORT`).
+- Persistent settings via `~/.vdm/config.json` keys `port`, `proxyPort`, `uiPort` (read by the rc snippet at shell startup; exported as the matching env vars).
+- CLI: `vdm config port <N>`, `vdm config proxy-port <N>`, `vdm config ui-port <N>`. Each writes to config.json AND POSTs to `/api/settings` so the running dashboard's in-memory `settings.<key>` matches disk (eliminating the saveSettings race where the dashboard would otherwise overwrite the user's port back to the OLD in-memory value).
+- Validation: integer 1..65535 + three-way distinctness. Both client (vdm) and server (dashboard.mjs) enforce — the server's check is canonical (against effective post-patch values). Out-of-range or collision rejects the entire patch with HTTP 400 (no half-apply).
+
+**The dashboard cannot rebind without a process restart.** `vdm config <port-key> <N>` persists the change and prints a "restart required" message. Same-shell apply: `unset CSW_*_PORT && vdm dashboard stop && vdm dashboard start`. Globally: open a new terminal — the rc snippet runs, exports the new port from config.json, and the shell points at the new ports automatically. The spawn line at vdm:1622 explicitly propagates `CSW_PORT/CSW_PROXY_PORT/CSW_UI_PORT` to the spawned dashboard process so the resolved values reach `process.env`.
+
+**Runtime distinctness check** in `dashboard.mjs:94-122` runs at module init, BEFORE any `.listen()` call: it rejects NaN / out-of-range ports via `Number.isInteger`, then pairwise-compares the three. `Number.isInteger` runs FIRST so two NaN ports cannot reach the `===` comparison (which would silently pass because `NaN === NaN` is false). Hard-fails with exit 78 (EX_CONFIG) and a message naming both colliding env vars.
+
+`install.sh` has the matching check at install time (`_resolve_install_ports`) plus a probe of all three `/health` endpoints before writing hooks (atomic install — see "Phase I" notes elsewhere).
 
 ### Credential storage — the load-bearing detail
 
@@ -378,7 +430,7 @@ There is currently no integration test that exercises the full proxy server end-
 - **The dashboard HTML is in `renderHTML()` in `dashboard.mjs`** as a template string. There is no build step or framework — vanilla JS, fetch calls to `/api/*`. UI changes go directly in that function.
 - **Accounts are auto-discovered**, not manually added. `autoDiscoverAccount()` runs on every proxy request (and on hooks) — it reads the active keychain entry (`Claude Code-credentials`), hashes the access token to a fingerprint, and creates a new `vdm-account-auto-N` keychain entry if no saved account matches. The `vdm add` command is mostly a fallback for headless/CI flows. Don't add a manual-add UI without understanding why discovery is the primary path.
 - **Slash commands** ship in `commands/` (e.g. `commands/vdm-switch.md`). `install.sh` copies every `commands/*.md` to `~/.claude/commands/` so they're invokable as `/vdm-switch`. `uninstall.sh` removes only the `.md` files we own (matched by source-dir basename). When adding a new slash command, drop the file in `commands/` — install.sh's copy step picks it up automatically.
-- **Ports are configurable via `CSW_PORT` (dashboard) and `CSW_PROXY_PORT` (proxy)** — always read them from env, don't hardcode 3333/3334 in new code. Both `vdm` and `dashboard.mjs` honour these.
+- **Ports are configurable via `CSW_PORT` (daemon, default 3333), `CSW_PROXY_PORT` (proxy, default 3334), and `CSW_UI_PORT` (UI, default 4444)** — always read them from env, don't hardcode in new code. Both `vdm` and `dashboard.mjs` honour these. See "Three-port architecture" below for the role split.
 - **Proxy queue + timeout knobs (Phase F) are env-var configurable** — read once at `dashboard.mjs` startup. Defaults reflect lessons from the Phase F audit (the 45 s deadline + per-account permit released at headers were causing false rate-limits and "Anthropic unresponsive" reports). Tunable via:
   - `CSW_PROXY_TIMEOUT_MS` — idle socket timeout per upstream call (default 900000 = 15 min). Bump if Opus 4 extended-thinking phases produce SSE gaps wider than this.
   - `CSW_REQUEST_DEADLINE_MS` — wall-clock cap on a single `handleProxyRequest` (incl. retries) (default 600000 = 10 min). Only checked at retry boundaries, NOT during a successful first-attempt stream.

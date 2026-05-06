@@ -681,6 +681,79 @@ os.replace(tmp, config_file)
 ' "$CONFIG_FILE" "$key" "$value"
 }
 
+# TRDD-c30609ab Stage C — set a port key (port / proxyPort / uiPort)
+# in config.json with cross-key distinctness validation.
+#
+# Port changes are special vs other config: the dashboard CANNOT
+# rebind without a process restart, so the change is only persisted
+# (in-memory + on-disk) and the user is told to restart. The
+# dashboard-POST path (preferred) updates settings.<key> in-memory
+# at the same time, eliminating the race where a later saveSettings()
+# would overwrite the user's change with the OLD in-memory port
+# value. The local-write fallback (no dashboard) lacks that
+# protection — explicitly noted in the post-write message.
+#
+# Distinctness is checked client-side here (so we can fail fast with
+# a clear error) AND server-side in dashboard.mjs's /api/settings
+# POST handler (the canonical check, against effective in-memory
+# state). Two layers of belt + suspender.
+set_config_port() {
+  local key="$1"      # one of: port | proxyPort | uiPort
+  local value="$2"    # integer 1..65535
+  local other1_key other2_key other1_default other2_default
+  case "$key" in
+    port)       other1_key=proxyPort; other2_key=uiPort;    other1_default=3334; other2_default=4444 ;;
+    proxyPort)  other1_key=port;      other2_key=uiPort;    other1_default=3333; other2_default=4444 ;;
+    uiPort)     other1_key=port;      other2_key=proxyPort; other1_default=3333; other2_default=3334 ;;
+    *)
+      echo -e "${RED}set_config_port: invalid key $key${NC}" >&2
+      return 1
+      ;;
+  esac
+  # Read CURRENT values of the OTHER two ports from config.json. If
+  # missing or non-int, fall back to the documented default. The
+  # comparison must use the post-patch effective values — exactly
+  # what dashboard.mjs's POST handler does — so the two layers
+  # produce identical error text on collision.
+  local current_o1 current_o2
+  current_o1="$(get_config_string "$other1_key")"
+  current_o2="$(get_config_string "$other2_key")"
+  [[ -z "$current_o1" ]] && current_o1="$other1_default"
+  [[ -z "$current_o2" ]] && current_o2="$other2_default"
+  if [[ "$value" == "$current_o1" || "$value" == "$current_o2" ]]; then
+    echo -e "${RED}Port collision: ${BOLD}$key=$value${NC}${RED} would conflict with ${other1_key}=${current_o1}, ${other2_key}=${current_o2}.${NC}" >&2
+    echo -e "${DIM}  All three ports (port / proxyPort / uiPort) must be distinct. Pick a different value.${NC}" >&2
+    return 1
+  fi
+  # Try the dashboard POST first (preserves saveSettings race
+  # protection). On success, the dashboard has already written
+  # config.json + updated in-memory settings; we're done.
+  if _post_settings_to_dashboard "$key" number "$value"; then
+    return 0
+  fi
+  # Local fallback — dashboard unreachable (`vdm dashboard stop`,
+  # daemon-only mode, fresh install before first start, etc.).
+  # Atomic write directly to config.json. The next dashboard start
+  # will read the new value at module-init via the rc-snippet's
+  # config.json fallback chain.
+  python3 -c '
+import json, os, sys
+config_file = sys.argv[1]
+key = sys.argv[2]
+raw = sys.argv[3]
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+cfg[key] = int(raw)
+tmp = config_file + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+os.replace(tmp, config_file)
+' "$CONFIG_FILE" "$key" "$value"
+}
+
 # ─────────────────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────────────────
@@ -1252,6 +1325,26 @@ cmd_config() {
     echo -e "  tokenUsageMaxEntries: ${tu_max_entries:-50000}"
     local act_max=$(get_config_string "activityMaxEntries")
     echo -e "  activityMaxEntries: ${act_max:-500}"
+    # TRDD-c30609ab Stage C — port keys. Show the EFFECTIVE values
+    # vdm is currently using (env > config.json > default), with the
+    # source labelled so the user can see why a config.json change
+    # may not be taking effect (env override).
+    local _src_dash _src_proxy _src_ui
+    if [[ -n "${CSW_PORT:-}" ]]; then _src_dash="env"; else
+      local _v_dash="$(get_config_string "port")"
+      [[ -n "$_v_dash" ]] && _src_dash="config.json" || _src_dash="default"
+    fi
+    if [[ -n "${CSW_PROXY_PORT:-}" ]]; then _src_proxy="env"; else
+      local _v_proxy="$(get_config_string "proxyPort")"
+      [[ -n "$_v_proxy" ]] && _src_proxy="config.json" || _src_proxy="default"
+    fi
+    if [[ -n "${CSW_UI_PORT:-}" ]]; then _src_ui="env"; else
+      local _v_ui="$(get_config_string "uiPort")"
+      [[ -n "$_v_ui" ]] && _src_ui="config.json" || _src_ui="default"
+    fi
+    echo -e "  port (daemon):      ${CYAN}${DASHBOARD_PORT}${NC} ${DIM}(from ${_src_dash})${NC}"
+    echo -e "  proxyPort:          ${CYAN}${PROXY_PORT}${NC} ${DIM}(from ${_src_proxy})${NC}"
+    echo -e "  uiPort:             ${CYAN}${UI_PORT}${NC} ${DIM}(from ${_src_ui})${NC}"
     echo ""
     echo -e "  ${DIM}Usage: vdm config <key> <value>${NC}"
     echo -e "  ${DIM}  vdm config proxy on${NC}"
@@ -1268,6 +1361,9 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config token-usage-max-age <1-365 days>${NC}"
     echo -e "  ${DIM}  vdm config token-usage-max-entries <1-500000>${NC}"
     echo -e "  ${DIM}  vdm config activity-max-entries <1-5000>${NC}"
+    echo -e "  ${DIM}  vdm config port|daemon-port <1-65535>     (TCP port for hooks)${NC}"
+    echo -e "  ${DIM}  vdm config proxy-port <1-65535>           (TCP port for the API proxy)${NC}"
+    echo -e "  ${DIM}  vdm config ui-port <1-65535>              (TCP port for the dashboard UI)${NC}"
     return 0
   fi
 
@@ -1290,6 +1386,14 @@ cmd_config() {
     token-usage-max-age|tokenUsageMaxAgeDays|token-usage-max-age-days) key="tokenUsageMaxAgeDays"; is_bool=false ;;
     token-usage-max-entries|tokenUsageMaxEntries) key="tokenUsageMaxEntries"; is_bool=false ;;
     activity-max-entries|activityMaxEntries) key="activityMaxEntries"; is_bool=false ;;
+    # TRDD-c30609ab Stage C — port keys. Three CSW_* env vars and
+    # config.json keys back the three HTTP servers (daemon/proxy/UI).
+    # All three need integer 1..65535 with cross-key distinctness;
+    # validation lives in set_config_port (which also dispatches to
+    # the dashboard or falls back to local-write).
+    port|daemonPort|daemon-port)          key="port"; is_bool=false ;;
+    proxy-port|proxyPort)                 key="proxyPort"; is_bool=false ;;
+    ui-port|uiPort)                       key="uiPort"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
       echo "  Available settings:"
@@ -1307,6 +1411,9 @@ cmd_config() {
       echo "    token-usage-max-age         <days>       prune token-usage rows older than N days"
       echo "    token-usage-max-entries     <n>          cap token-usage rows by count"
       echo "    activity-max-entries        <n>          cap activity log rows by count"
+      echo "    port|daemon-port            <1-65535>    TCP port for the always-on daemon (hooks)"
+      echo "    proxy-port                  <1-65535>    TCP port for the API proxy"
+      echo "    ui-port                     <1-65535>    TCP port for the dashboard UI"
       return 1
       ;;
   esac
@@ -1397,6 +1504,38 @@ cmd_config() {
     fi
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} entries${NC}"
+  elif [[ "$key" == "port" || "$key" == "proxyPort" || "$key" == "uiPort" ]]; then
+    # TRDD-c30609ab Stage C — port keys (daemon / proxy / UI). Range
+    # is the IANA TCP port range minus the reserved 0. Distinctness is
+    # enforced inside set_config_port (against the OTHER two
+    # config.json values, with documented defaults for absent keys).
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 65535 ]]; then
+      echo -e "${RED}Invalid port: $value${NC}  (must be an integer between 1 and 65535)"
+      return 1
+    fi
+    if ! set_config_port "$key" "$value"; then
+      return 1
+    fi
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}(saved to $CONFIG_FILE)${NC}"
+    # Tell the user why nothing happened yet. The dashboard cannot
+    # rebind without a restart, AND the parent shell's CSW_*_PORT env
+    # var (set by the rc snippet on shell startup) takes priority over
+    # config.json in vdm's `_vdm_resolve_port`. So a same-shell apply
+    # requires unsetting the env var first; new shells pick up the
+    # change automatically because their rc snippet runs fresh and
+    # reads config.json.
+    local _env_var
+    case "$key" in
+      port)      _env_var="CSW_PORT" ;;
+      proxyPort) _env_var="CSW_PROXY_PORT" ;;
+      uiPort)    _env_var="CSW_UI_PORT" ;;
+    esac
+    echo ""
+    echo -e "  ${YELLOW}Restart required.${NC} The dashboard cannot rebind without a process restart."
+    echo -e "  ${BOLD}Apply now (this shell):${NC}"
+    echo -e "    ${CYAN}unset ${_env_var} && vdm dashboard stop && vdm dashboard start${NC}"
+    echo -e "  ${BOLD}Apply globally:${NC} open a new terminal — the rc snippet picks up the new"
+    echo -e "    port from ${CYAN}$CONFIG_FILE${NC} automatically."
   fi
 
   log_activity "settings-changed" "$key=$value"
@@ -1619,7 +1758,19 @@ cmd_dashboard() {
       # readiness probe's `kill -0` reports false-negative "Dashboard failed
       # to start" even though the dashboard is running fine. `exec` replaces
       # the subshell with the node process so $! captures node's PID.
-      ( cd "$SCRIPT_DIR" && exec nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
+      #
+      # TRDD-c30609ab Stage C — explicitly propagate the resolved ports
+      # (DASHBOARD_PORT/PROXY_PORT/UI_PORT) into the spawned dashboard's
+      # env. Without this, dashboard.mjs would only see the env vars
+      # the parent shell already exported (typically set by the rc
+      # snippet at shell startup). After `vdm config ui-port 5555` +
+      # `unset CSW_UI_PORT && vdm dashboard start`, vdm's
+      # `_vdm_resolve_port` re-reads config.json and gets 5555, but
+      # without explicit propagation the spawned node would inherit
+      # whatever was (or wasn't) in the parent env and bind a
+      # different port. Explicit assignment closes that gap and
+      # mirrors install.sh's atomic-install spawn (install.sh:1118).
+      ( cd "$SCRIPT_DIR" && CSW_PORT="$DASHBOARD_PORT" CSW_PROXY_PORT="$PROXY_PORT" CSW_UI_PORT="$UI_PORT" exec nohup node "$SCRIPT_DIR/dashboard.mjs" >>"$startup_log" 2>&1 < /dev/null ) &
       local new_pid=$!
       disown 2>/dev/null || true
       echo "$new_pid" > "$DASHBOARD_PID_FILE"

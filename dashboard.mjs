@@ -2635,6 +2635,63 @@ async function handleAPI(req, res, role) {
       json(res, { ok: false, error: 'body must be a JSON object' }, 400);
       return true;
     }
+    // TRDD-c30609ab Stage C — port keys (port / proxyPort / uiPort).
+    //
+    // The CLI (`vdm config <port-key> <value>`) routes through here so
+    // that in-memory `settings.<key>` matches the on-disk config.json
+    // value the moment the change lands. Without that, a later
+    // saveSettings() call (e.g. user toggles serialize 30s after
+    // changing the port) would write the OLD in-memory port back to
+    // disk and silently revert the user's change.
+    //
+    // The dashboard CANNOT rebind to the new port without a process
+    // restart. We accept the value, persist it, and rely on the
+    // caller to restart the dashboard so the next .listen() call
+    // picks up the new port.
+    //
+    // Distinctness is enforced against the EFFECTIVE post-patch values
+    // (`patch.port ?? settings.port ?? PORT` and so on) — that way a
+    // single POST setting two ports at once validates as one atomic
+    // change, AND a stale `settings.port` carried over from a prior
+    // version doesn't trip a false collision.
+    //
+    // The whole patch is rejected with HTTP 400 on any port-related
+    // failure, so we never half-apply (e.g. accept proxyPort but
+    // reject uiPort, leaving config.json in an inconsistent state).
+    const _hasPortKey = ['port', 'proxyPort', 'uiPort'].some(
+      k => Object.prototype.hasOwnProperty.call(patch, k));
+    if (_hasPortKey) {
+      // Per-key range validation. A non-integer / out-of-range value
+      // for any of the three rejects the entire patch.
+      for (const k of ['port', 'proxyPort', 'uiPort']) {
+        if (Object.prototype.hasOwnProperty.call(patch, k)) {
+          const _v = patch[k];
+          if (!Number.isInteger(_v) || _v < 1 || _v > 65535) {
+            json(res, {
+              ok: false,
+              error: `${k} must be an integer 1..65535 (got ${JSON.stringify(_v)})`,
+            }, 400);
+            return true;
+          }
+        }
+      }
+      // Effective post-patch values for the distinctness check. Falls
+      // back to settings.* (persisted) then to the bound PORT/etc.
+      // (env-resolved, used for the original .listen()).
+      const _effPort      = Object.prototype.hasOwnProperty.call(patch, 'port')      ? patch.port      : (Number.isInteger(settings.port)      ? settings.port      : PORT);
+      const _effProxyPort = Object.prototype.hasOwnProperty.call(patch, 'proxyPort') ? patch.proxyPort : (Number.isInteger(settings.proxyPort) ? settings.proxyPort : PROXY_PORT);
+      const _effUiPort    = Object.prototype.hasOwnProperty.call(patch, 'uiPort')    ? patch.uiPort    : (Number.isInteger(settings.uiPort)    ? settings.uiPort    : UI_PORT);
+      if (_effPort === _effProxyPort || _effPort === _effUiPort || _effProxyPort === _effUiPort) {
+        json(res, {
+          ok: false,
+          error: `port collision after patch — port=${_effPort}, proxyPort=${_effProxyPort}, uiPort=${_effUiPort} (all three must be distinct)`,
+        }, 400);
+        return true;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, 'port'))      settings.port      = patch.port;
+      if (Object.prototype.hasOwnProperty.call(patch, 'proxyPort')) settings.proxyPort = patch.proxyPort;
+      if (Object.prototype.hasOwnProperty.call(patch, 'uiPort'))    settings.uiPort    = patch.uiPort;
+    }
     if (typeof patch.autoSwitch === 'boolean') settings.autoSwitch = patch.autoSwitch;
     if (typeof patch.proxyEnabled === 'boolean') {
       const wasEnabled = settings.proxyEnabled;
