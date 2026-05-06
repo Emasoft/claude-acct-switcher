@@ -87,10 +87,11 @@ except Exception:
 }
 DASHBOARD_PORT="$(_vdm_resolve_port CSW_PORT port 3333)"
 PROXY_PORT="$(_vdm_resolve_port CSW_PROXY_PORT proxyPort 3334)"
-# UI port (TRDD-c30609ab three-port split). Currently resolved but
-# NOT WIRED — Stage A is purely additive resolver plumbing. The UI
-# server in dashboard.mjs picks this up in Stage B; until then it
-# is harmless extra parsing.
+# UI port (TRDD-c30609ab three-port split). The UI server in
+# dashboard.mjs binds to this; the dashboard's HTML and the 18 UI-only
+# API endpoints (account-prefs, switch, refresh, logs/stream, etc.) are
+# served from here. The user opens http://localhost:$UI_PORT in their
+# browser; `vdm dashboard stop` closes only this port.
 #
 # Default 4444 was chosen to be visually distinct from 3333/3334 (so
 # users diagnosing a port-conflict can grep their netstat output for
@@ -535,8 +536,14 @@ _post_settings_to_dashboard() {
   command -v python3 >/dev/null 2>&1 || return 1
   # Quick reachability check. -m 2 keeps the fall-through fast for an
   # offline dashboard so the user never feels a "vdm config" hang.
+  # Probe UI_PORT (not DASHBOARD_PORT) because the actual POST target
+  # below is /api/settings which is UI-only. With UI stopped via
+  # `vdm dashboard stop`, the daemon /health would still pass but
+  # the POST would 308-redirect curl to a closed UI port — caller
+  # falls back to local-write but the operation has wasted a round
+  # trip. Probing the right port avoids the false-positive precheck.
   if ! curl -s --max-time 2 -o /dev/null \
-       "http://localhost:$DASHBOARD_PORT/health"; then
+       "http://localhost:$UI_PORT/health"; then
     return 1
   fi
   # L6 — the API now uses the same name as config.json
@@ -570,7 +577,7 @@ print(json.dumps({key: val}))
       -o /dev/null -w '%{http_code}' \
       -X POST -H 'Content-Type: application/json' \
       -d "$payload" \
-      "http://localhost:$DASHBOARD_PORT/api/settings" 2>/dev/null || echo '000')"
+      "http://localhost:$UI_PORT/api/settings" 2>/dev/null || echo '000')"
   [[ "$code" =~ ^2[0-9][0-9]$ ]]
 }
 
@@ -870,7 +877,7 @@ cmd_switch() {
     resp=$(curl -fsS --max-time 5 -X POST \
       -H 'Content-Type: application/json' \
       -d '{"auto":true}' \
-      "http://localhost:${CSW_PORT:-3333}/api/switch?auto=true" 2>/dev/null) || resp=""
+      "http://localhost:$UI_PORT/api/switch?auto=true" 2>/dev/null) || resp=""
     if [[ -n "$resp" ]]; then
       local picked
       picked=$(echo "$resp" | python3 -c '
@@ -1443,8 +1450,12 @@ cmd_dashboard() {
         resp="$(curl -s --max-time 5 -X POST \
                   "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/stop" 2>/dev/null || echo '')"
         if echo "$resp" | grep -q '"ok":true'; then
-          echo -e "${GREEN}✓${NC} Dashboard UI stopped (port $DASHBOARD_PORT closed)."
-          echo -e "  ${DIM}Proxy continues running on port $PROXY_PORT — token tracking, account rotation, hook ingestion all unaffected.${NC}"
+          echo -e "${GREEN}✓${NC} Dashboard UI stopped (port $UI_PORT closed)."
+          echo -e "  ${DIM}Daemon continues running on port $DASHBOARD_PORT (hooks) and $PROXY_PORT (proxy):${NC}"
+          echo -e "  ${DIM}    UNAFFECTED: token tracking via Claude Code hooks, proxy-driven auto-rotation${NC}"
+          echo -e "  ${DIM}                on 429/401, OAuth refresh, the git commit-msg trailer.${NC}"
+          echo -e "  ${DIM}    AFFECTED:   CLI commands that hit UI endpoints (vdm switch, vdm prefs,${NC}"
+          echo -e "  ${DIM}                vdm logs) — those return errors until 'vdm dashboard start'.${NC}"
           echo -e "  ${DIM}Re-open the UI: ${CYAN}vdm dashboard start${NC}${DIM}. Stop everything: ${CYAN}vdm disable${NC}${DIM}.${NC}"
           # Do NOT remove the pidfile — daemon is still alive and the
           # pidfile's PID is still meaningful for monitoring.
@@ -1529,8 +1540,8 @@ cmd_dashboard() {
                        "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/status" 2>/dev/null || echo '')"
         if echo "$ui_status" | grep -q '"listening":true'; then
           # State 1
-          echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
-          echo -e "${DIM}Use 'vdm dashboard stop' to close just the UI (proxy stays up).${NC}"
+          echo -e "${YELLOW}Dashboard already running at http://localhost:$UI_PORT${NC}"
+          echo -e "${DIM}Use 'vdm dashboard stop' to close just the UI (daemon + proxy stay up).${NC}"
           return 0
         fi
         # State 2 — soft-restart of the UI listener.
@@ -1538,32 +1549,62 @@ cmd_dashboard() {
         resp="$(curl -s --max-time 5 -X POST \
                   "http://localhost:$PROXY_PORT/api/dashboard/ui-listener/start" 2>/dev/null || echo '')"
         if echo "$resp" | grep -q '"listening":true'; then
-          echo -e "${GREEN}✓${NC} Dashboard UI re-opened at http://localhost:$DASHBOARD_PORT"
+          echo -e "${GREEN}✓${NC} Dashboard UI re-opened at http://localhost:$UI_PORT"
           echo -e "  ${DIM}Daemon was already running — no new process spawned.${NC}"
           return 0
         fi
-        echo -e "  ${YELLOW}!${NC} Soft-start failed (response: $resp). Falling back to spawn."
+        # Soft-start failed. The most common cause is UI_PORT
+        # collision — another process is bound to it (e.g. a previous
+        # vdm install on a custom port that didn't get cleaned up,
+        # an unrelated dev server). Surface the actual failure with
+        # a recovery hint pointing at port-conflict resolution
+        # instead of the generic "spawn" fallback that would just
+        # re-trigger the same EADDRINUSE.
+        echo -e "${RED}!${NC} Could not re-open the UI listener on http://localhost:$UI_PORT."
+        echo -e "  ${DIM}API response: ${resp:-<empty>}${NC}"
+        local _ui_port_pid
+        _ui_port_pid=$(lsof -iTCP:"$UI_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
+        if [[ -n "$_ui_port_pid" && "$_ui_port_pid" =~ ^[1-9][0-9]*$ ]]; then
+          local _ui_port_cmd
+          _ui_port_cmd="$(ps -o comm= -p "$_ui_port_pid" 2>/dev/null | head -1 || true)"
+          echo -e "  ${DIM}Likely cause: port $UI_PORT is held by PID $_ui_port_pid (${_ui_port_cmd:-unknown}).${NC}"
+          echo -e "  ${DIM}Fix: change CSW_UI_PORT or 'uiPort' in $SCRIPT_DIR/config.json to a free port, then 'vdm dashboard stop && vdm dashboard start'.${NC}"
+        else
+          echo -e "  ${DIM}Daemon (PID-tracked) is alive on $DASHBOARD_PORT but the UI listener refused to bind. Check $SCRIPT_DIR/startup.log for the underlying error.${NC}"
+        fi
+        return 1
       fi
       # State 3 — old behaviour: clean up stale pidfile / port checks
       # and spawn a new node process. Same code as before (kept verbatim
       # so existing operational habits keep working).
+      #
+      # The two pre-checks below confirm the dashboard.mjs PROCESS is
+      # alive (via pidfile or lsof on the always-on daemon port). They
+      # do NOT confirm the UI listener is bound — a daemon-only state
+      # (Phase 1.0 stop, future --no-ui flag) leaves the daemon alive
+      # but UI_PORT free. Phrase the message accordingly: don't claim
+      # the UI is reachable at $UI_PORT when we haven't probed it.
       local pid
       pid=$(read_pidfile "$DASHBOARD_PID_FILE")
       if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
-        echo -e "${DIM}Use 'vdm dashboard stop' to stop it.${NC}"
+        echo -e "${YELLOW}Dashboard process already running (PID $pid) on daemon port $DASHBOARD_PORT.${NC}"
+        echo -e "${DIM}If the UI is closed, re-open with 'vdm dashboard start' (soft-restart). Stop everything with 'vdm dashboard stop' (UI only) or 'vdm disable' (full).${NC}"
         return 0
       fi
       # Stale pidfile (or non-numeric content): clean it up.
       [[ -f "$DASHBOARD_PID_FILE" ]] && rm -f "$DASHBOARD_PID_FILE"
-      # Also check by port
+      # Also check by port — the DAEMON port (DASHBOARD_PORT) is the
+      # always-on listener that proves a live dashboard.mjs process.
+      # Do NOT check UI_PORT here: daemon-only state has UI_PORT free
+      # even though dashboard.mjs is running. The message must NOT
+      # claim UI_PORT is reachable since we haven't probed it.
       if lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
-        echo -e "${YELLOW}Dashboard already running at http://localhost:$DASHBOARD_PORT${NC}"
-        echo -e "${DIM}Use 'vdm dashboard stop' to stop it.${NC}"
+        echo -e "${YELLOW}Dashboard process already bound to daemon port $DASHBOARD_PORT.${NC}"
+        echo -e "${DIM}If the UI is closed, re-open with 'vdm dashboard start' (soft-restart). Stop everything with 'vdm dashboard stop' (UI only) or 'vdm disable' (full).${NC}"
         return 0
       fi
 
-      echo -e "${BLUE}Starting dashboard on http://localhost:$DASHBOARD_PORT${NC}"
+      echo -e "${BLUE}Starting dashboard on http://localhost:$UI_PORT${NC} (daemon $DASHBOARD_PORT, proxy $PROXY_PORT)"
       # Detach the dashboard from this shell so closing the terminal
       # (or pressing Ctrl-C during the readiness probe below) does NOT
       # kill it. nohup ignores SIGHUP, the stdio redirections detach it
@@ -1595,18 +1636,107 @@ cmd_dashboard() {
         return 130
       ' INT TERM HUP
 
-      # Wait briefly then probe — the dashboard has to bind two ports
+      # Wait briefly then probe — the dashboard has to bind three ports
       # AND read settings from disk, which takes a few hundred ms on
       # cold cache. 1.0s is conservative without being slow enough that
       # the user notices.
       sleep 1.0
       trap - INT TERM HUP
       if kill -0 "$new_pid" 2>/dev/null; then
-        echo -e "${GREEN}✓${NC} Dashboard running (PID $new_pid)"
-        echo -e "  Dashboard: ${CYAN}http://localhost:$DASHBOARD_PORT${NC}"
-        echo -e "  API Proxy: ${CYAN}http://localhost:$PROXY_PORT${NC}"
-        echo -e "  Logs:      ${DIM}$startup_log${NC}"
-        open "http://localhost:$DASHBOARD_PORT" 2>/dev/null || echo -e "  Open http://localhost:$DASHBOARD_PORT in your browser"
+        # Process is alive but that doesn't tell us which servers
+        # bound. Probe both /health endpoints to distinguish
+        # full-up from partial-up so the success message + browser-
+        # open don't mislead the user.
+        #
+        # Probes run in PARALLEL via background curls + wait — daemon
+        # and UI are independent, so serialising them would double
+        # the worst-case latency for no benefit (3s + 3s = 6s vs
+        # max(3s, 3s) = 3s). Each probe is bounded by the curl
+        # `--max-time 3` plus a small slack for fork/exec.
+        #
+        # In current dashboard.mjs, daemon EADDRINUSE causes the
+        # whole process to exit 0 immediately (the kill -0 above
+        # would already have failed). The daemon-probe here is
+        # defense-in-depth for any future change to that error
+        # handler.
+        local _daemon_out _ui_out
+        _daemon_out="$(mktemp -t vdm-daemon-probe.XXXXXX)"
+        _ui_out="$(mktemp -t vdm-ui-probe.XXXXXX)"
+        # Trap cleanup for the temp probe files. Without this, a SIGINT
+        # / SIGTERM during the 3s wait below leaks the tmp files until
+        # OS reclaim. EXIT covers the normal-completion path; INT/TERM/
+        # HUP cover Ctrl-C and other signal-driven exits. The trap is
+        # cleared right after the post-`wait` cleanup so it doesn't
+        # carry into later code in cmd_dashboard.
+        trap 'rm -f "$_daemon_out" "$_ui_out" 2>/dev/null || true' EXIT INT TERM HUP
+        (
+          for _i in 1 2 3 4 5 6; do
+            local _b
+            _b="$(curl -fsS --connect-timeout 1 --max-time 1 \
+                    "http://localhost:$DASHBOARD_PORT/health" 2>/dev/null || echo '')"
+            if [[ "$_b" == *'"server":"dashboard"'* || "$_b" == *'"server":"daemon"'* ]]; then
+              echo "ok" > "$_daemon_out"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "down" > "$_daemon_out"
+        ) &
+        local _daemon_pid=$!
+        (
+          for _i in 1 2 3 4 5 6; do
+            local _b
+            _b="$(curl -fsS --connect-timeout 1 --max-time 1 \
+                    "http://localhost:$UI_PORT/health" 2>/dev/null || echo '')"
+            if [[ "$_b" == *'"server":"ui"'* ]]; then
+              echo "ok" > "$_ui_out"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "down" > "$_ui_out"
+        ) &
+        local _ui_pid=$!
+        wait "$_daemon_pid" "$_ui_pid"
+        local _daemon_up=0 _ui_up=0
+        [[ "$(cat "$_daemon_out" 2>/dev/null)" == "ok" ]] && _daemon_up=1
+        [[ "$(cat "$_ui_out" 2>/dev/null)" == "ok" ]] && _ui_up=1
+        rm -f "$_daemon_out" "$_ui_out"
+        # Probe finished — the EXIT/INT/TERM/HUP trap is no longer
+        # needed (files removed above). Clearing it prevents the
+        # cleanup from running again on a later cmd_dashboard exit
+        # path with stale, possibly-reused mktemp paths.
+        trap - EXIT INT TERM HUP
+        if [[ $_daemon_up -eq 1 && $_ui_up -eq 1 ]]; then
+          echo -e "${GREEN}✓${NC} Dashboard running (PID $new_pid)"
+          echo -e "  UI:        ${CYAN}http://localhost:$UI_PORT${NC}"
+          echo -e "  Daemon:    ${CYAN}http://localhost:$DASHBOARD_PORT${NC} ${DIM}(hooks, always-on)${NC}"
+          echo -e "  API Proxy: ${CYAN}http://localhost:$PROXY_PORT${NC} ${DIM}(claude → anthropic, always-on)${NC}"
+          echo -e "  Logs:      ${DIM}$startup_log${NC}"
+          open "http://localhost:$UI_PORT" 2>/dev/null || echo -e "  Open http://localhost:$UI_PORT in your browser"
+        elif [[ $_daemon_up -eq 0 ]]; then
+          # Daemon didn't come up — hooks are silently broken even
+          # though the process is alive. This is the worst of the
+          # partial-up states because token tracking is dead. Return
+          # non-zero so scripts/CI/wrappers that chain `vdm dashboard
+          # start && do-other-thing` don't proceed assuming success.
+          echo -e "${RED}✗${NC} Dashboard process running (PID $new_pid) but DAEMON port $DASHBOARD_PORT did NOT respond."
+          echo -e "  ${DIM}Hooks → daemon /health is the canary for token-tracking. Without it, every Claude Code hook silently ECONNREFUSEs and token usage is lost.${NC}"
+          echo -e "  ${DIM}Most likely cause: another process is listening on $DASHBOARD_PORT (lsof -iTCP:$DASHBOARD_PORT). Change CSW_PORT or 'port' in $SCRIPT_DIR/config.json and restart.${NC}"
+          echo -e "  Logs: ${DIM}$startup_log${NC}"
+          return 1
+        else
+          # Daemon up, UI down. Token tracking works; only the HTML
+          # UI is unreachable. Skip `open`. Return non-zero — the
+          # user explicitly asked for `vdm dashboard start` (which
+          # implies UI bound) and we didn't deliver. Token-tracking
+          # being unaffected is the silver lining, not a success.
+          echo -e "${YELLOW}!${NC} Dashboard process running (PID $new_pid) — daemon up, but UI port $UI_PORT did NOT respond."
+          echo -e "  ${DIM}Most likely cause: another process is listening on $UI_PORT (lsof -iTCP:$UI_PORT). Daemon + proxy are up — token tracking and the proxy continue to work; only the HTML UI is unreachable.${NC}"
+          echo -e "  ${DIM}Fix: change CSW_UI_PORT or 'uiPort' in $SCRIPT_DIR/config.json to a free port, then 'vdm dashboard stop && vdm dashboard start'.${NC}"
+          echo -e "  Logs: ${DIM}$startup_log${NC}"
+          return 1
+        fi
       else
         echo -e "${RED}Dashboard failed to start. Last lines of $startup_log:${NC}"
         if [[ -f "$startup_log" ]]; then
@@ -2278,9 +2408,13 @@ print(f"  Entries: {len(usage)}")
 cmd_logs() {
   local filter="${1:-}"
 
-  # Check if dashboard is running
-  if ! curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
-    echo -e "${RED}Dashboard is not running. Start it with: vdm dashboard${NC}"
+  # Check if the UI server is running — `cmd_logs` streams from
+  # /api/logs/stream which is a UI-only endpoint. Probing the daemon
+  # /health would mask the case where the user ran `vdm dashboard
+  # stop` (UI down, daemon up): the precheck would pass but the SSE
+  # stream below would silently return empty.
+  if ! curl -s --max-time 2 "http://localhost:$UI_PORT/health" >/dev/null 2>&1; then
+    echo -e "${RED}Dashboard UI is not running. Start it with: vdm dashboard${NC}"
     return 1
   fi
 
@@ -2309,7 +2443,7 @@ cmd_logs() {
   # cursor is back to the default color regardless of how the function
   # exits (Ctrl-C, dashboard close, EOF on stream).
   trap 'printf "\033[0m"; trap - EXIT' EXIT
-  curl -s -N "http://localhost:$DASHBOARD_PORT/api/logs/stream" 2>/dev/null | while IFS= read -r line; do
+  curl -s -N "http://localhost:$UI_PORT/api/logs/stream" 2>/dev/null | while IFS= read -r line; do
     # SSE format: "data: {...}"
     if [[ "$line" == data:* ]]; then
       local json_payload="${line#data: }"
@@ -2359,18 +2493,20 @@ cmd_prefs() {
   local key="${2:-}"
   local val="${3:-}"
 
-  # Dashboard must be running — these endpoints don't have a CLI fallback
-  # because the prefs file is owned by the dashboard process to avoid
-  # write conflicts.
-  if ! curl -s --max-time 2 "http://localhost:$DASHBOARD_PORT/health" >/dev/null 2>&1; then
-    echo -e "${RED}Dashboard is not running. Start it with: vdm dashboard${NC}"
+  # Dashboard UI must be running — /api/account-prefs is a UI-only
+  # endpoint, so probe UI_PORT (not DASHBOARD_PORT). The prefs file is
+  # owned by the dashboard process to avoid write conflicts; no CLI
+  # fallback. Probing the daemon would mask the UI-stopped case
+  # ("Failed to fetch preferences" with no hint about why).
+  if ! curl -s --max-time 2 "http://localhost:$UI_PORT/health" >/dev/null 2>&1; then
+    echo -e "${RED}Dashboard UI is not running. Start it with: vdm dashboard${NC}"
     return 1
   fi
 
   if [[ -z "$subname" ]]; then
     # List mode
     local resp
-    resp=$(curl -s --max-time 5 "http://localhost:$DASHBOARD_PORT/api/account-prefs")
+    resp=$(curl -s --max-time 5 "http://localhost:$UI_PORT/api/account-prefs")
     if [[ -z "$resp" ]]; then
       echo -e "${RED}Failed to fetch preferences${NC}"
       return 1
@@ -2403,7 +2539,7 @@ except Exception as e:
   if [[ -z "$key" ]]; then
     # Single-account view
     local resp
-    resp=$(curl -s --max-time 5 "http://localhost:$DASHBOARD_PORT/api/account-prefs")
+    resp=$(curl -s --max-time 5 "http://localhost:$UI_PORT/api/account-prefs")
     echo "$resp" | python3 -c '
 import sys, json
 name = sys.argv[1]
@@ -2453,7 +2589,7 @@ except Exception as e:
     return 1
   fi
   local resp
-  resp=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -d "$payload" "http://localhost:$DASHBOARD_PORT/api/account-prefs")
+  resp=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -d "$payload" "http://localhost:$UI_PORT/api/account-prefs")
   echo "$resp" | python3 -c '
 import sys, json
 try:

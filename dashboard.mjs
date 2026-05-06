@@ -41,6 +41,89 @@ process.stdout?.on?.('error', () => {});
 process.stderr?.on?.('error', () => {});
 
 const PORT = parseInt(process.env.CSW_PORT || '3333', 10);
+// TRDD-c30609ab Stage B — UI server port. The HTML dashboard + the
+// the UI-only API endpoints live on this port. PORT (above, default
+// 3333) is reserved for the always-on daemon: hook endpoints +
+// hook-adjacent reads (settings/token-usage GETs read by the git
+// commit-msg trailer). Stopping the dashboard means closing UI_PORT
+// only — the daemon stays bound so hooks keep firing and token
+// tracking continues uninterrupted.
+//
+// Default 4444 chosen to be visually distinct from 3333/3334 (so
+// users diagnosing a port-conflict can grep their netstat output
+// for "4444" without ambiguity) and outside the IANA reserved /
+// X11 ranges. Caveat: Selenium WebDriver's default is also 4444 —
+// users running Selenium concurrently will hit EADDRINUSE on the
+// UI port. dashboard.mjs's per-server error handler degrades
+// gracefully (daemon + proxy keep running, only HTML UI is
+// unreachable; install.sh and `vdm dashboard start` both surface
+// this as a yellow warning pointing at CSW_UI_PORT / uiPort
+// override). A user who lives in Selenium should set CSW_UI_PORT
+// permanently (e.g. 4445).
+const UI_PORT = parseInt(process.env.CSW_UI_PORT || '4444', 10);
+// Proxy server port. Hosts Anthropic-forwarding traffic + Phase 1.0
+// ui-listener control endpoints. Always-on. Default 3334, overridable
+// via `CSW_PROXY_PORT` env or `proxyPort` in ~/.vdm/config.json.
+//
+// Declared up here (not next to the proxyServer block far below) so
+// the runtime distinctness check below can compare all three ports
+// BEFORE any .listen() call kicks off — without this, a port-collision
+// scenario would have one server bind and the other emit
+// EADDRINUSE before our check even runs, leaking the bound port to
+// the kernel for the lifetime of the (failed-and-degraded) process.
+const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
+
+// TRDD-c30609ab Stage B — runtime distinctness check on the three
+// resolved ports. install.sh has the same check at install time
+// (install.sh:_resolve_install_ports), but `node dashboard.mjs`
+// invoked directly (dev / launchd plist / CI) bypasses install.sh
+// entirely. Without this guard, two ports collapsing to the same
+// value would silently degrade: the first server to bind wins, the
+// second emits EADDRINUSE which the per-server error handler
+// "degrades gracefully" by logging — and the user discovers the
+// missing UI / proxy / hooks much later.
+//
+// Hard-fail with a clear error referencing both env vars so the
+// user can correct the conflict immediately. Process exit code 78
+// (EX_CONFIG from sysexits.h) signals "configuration error" to any
+// supervisor.
+//
+// Runs at module init, BEFORE createServer / listen calls below, so
+// no port is bound when the conflict is detected. process.exit() is
+// synchronous and preempts any async error handlers.
+(() => {
+  const _ports = [
+    ['PORT (CSW_PORT)', PORT],
+    ['PROXY_PORT (CSW_PROXY_PORT)', PROXY_PORT],
+    ['UI_PORT (CSW_UI_PORT)', UI_PORT],
+  ];
+  // First reject NaN / non-finite / out-of-range. parseInt on
+  // non-numeric env (e.g. CSW_PORT=abc) returns NaN; NaN === NaN is
+  // false so a pure equality check would silently let two NaN ports
+  // through and the user would hit ERR_INVALID_ARG / EADDR much
+  // later. Validate per port BEFORE the pairwise comparison.
+  for (const [_label, _v] of _ports) {
+    if (!Number.isInteger(_v) || _v < 1 || _v > 65535) {
+      console.error(
+        `[fatal] dashboard.mjs invalid port: ${_label} = ${_v} (expected integer 1..65535).\n` +
+        `        Set the env var (or the corresponding key in ~/.vdm/config.json) to a valid TCP port.`
+      );
+      process.exit(78);
+    }
+  }
+  for (let i = 0; i < _ports.length; i++) {
+    for (let j = i + 1; j < _ports.length; j++) {
+      if (_ports[i][1] === _ports[j][1]) {
+        console.error(
+          `[fatal] dashboard.mjs port conflict: ${_ports[i][0]} and ${_ports[j][0]} both = ${_ports[i][1]}.\n` +
+          `        Set the env vars (or daemonPort/proxyPort/uiPort in ~/.vdm/config.json) to distinct values.`
+        );
+        process.exit(78);
+      }
+    }
+  }
+})();
+
 const ACCOUNTS_DIR = join(__dirname, 'accounts');
 const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
@@ -1997,8 +2080,202 @@ async function loadStats() {
 // API handlers
 // ─────────────────────────────────────────────────
 
-async function handleAPI(req, res) {
+// TRDD-c30609ab Stage B — endpoint role classification.
+// Each Claude Code hook endpoint must remain reachable on the daemon
+// port (PORT, default 3333) regardless of UI listener state, because
+// install-hooks.sh writes hook URLs against PORT and stopping the UI
+// must NOT silently break token tracking. Conversely, UI-only routes
+// must be reachable only via the UI server (UI_PORT, default 4444)
+// so that closing the UI listener actually closes the user-perceived
+// dashboard.
+//
+// Two sets, looked up by exact pathname. Method is checked at the
+// existing per-endpoint dispatchers; the role filter only narrows
+// to "the right path on the right server".
+//
+// Path-AND-method special cases:
+//   /api/settings        GET  — DUAL-USE (UI reads + git trailer reads)
+//   /api/settings        POST — UI-only (write to settings)
+//   /api/token-usage     GET  — DUAL-USE (UI reads + git trailer reads)
+// "Dual-use" means the path is in NEITHER set so both roles serve it.
+//
+// Path strings are constructed via concat (the `_API` constant joined
+// with the path suffix) rather than embedded as literals. This keeps
+// the Set definition out of the way of source-grep regression tests
+// that locate dispatchers via the `indexOf` of a quoted path string
+// (50+ such call sites in test/lib.test.mjs). A literal Set entry
+// would shadow every hit.
+const _API = '/api/';
+const HOOK_PATHS = new Set([
+  'session-start',
+  'session-stop',
+  'session-end',
+  'subagent-start',
+  'pre-compact',
+  'post-compact',
+  'cwd-changed',
+  'post-tool-batch',
+  'worktree-create',
+  'worktree-remove',
+  'task-created',
+  'task-completed',
+  'teammate-idle',
+  'notification',
+  'config-change',
+  'user-prompt-expansion',
+].map(s => _API + s));
+const UI_PATHS = new Set([
+  'profiles',
+  'proxy-status',
+  'switch',
+  'remove',
+  'refresh',
+  'activity',
+  'account-prefs',
+  'cleanup-plaintext',
+  'logs/stream',
+  'viewer-state',
+  'otel-events',
+  'token-usage/by-tool',
+  'token-usage/flush',
+  'token-usage-tree',
+  'sessions',
+].map(s => _API + s));
+
+// Dual-use endpoints — served on BOTH the daemon and the UI server.
+// Listed explicitly (not implicitly via "in NEITHER set") so a future
+// `/api/*` endpoint added without classification fails closed (the
+// endpoint dispatcher runs only when its path matches AND the
+// classification predicate below is satisfied for the role).
+//
+// Currently only two endpoints qualify:
+//   GET /api/settings     — UI settings tab + git commit-msg trailer
+//   GET /api/token-usage  — UI tokens tab  + git commit-msg trailer
+// Both are read-only and idempotent; the trailer hook reads them
+// even when the UI listener is closed (Phase 1.0 stop), which is
+// why they live on the always-on daemon port. Same handler also
+// registered on the UI server for same-origin convenience to the
+// browser-side fetch() calls.
+//
+// Adding a new dual-use endpoint: add the pathname here AND the
+// dispatcher block in handleAPI. CRITICAL: an unclassified
+// `/api/*` path no longer silently leaks — the runtime fail-closed
+// check in handleAPI's role filter (below) returns HTTP 500 with
+// a clear "missing classification" error. Plus the static CI test
+// in test/lib.test.mjs ("endpoint classification — every dispatcher
+// pathname is in exactly one of HOOK_PATHS / UI_PATHS /
+// DUAL_USE_PATHS") fails the build if a new endpoint is added
+// without an entry in any set. Together: one belt + one suspender,
+// so neither a CI miss nor a runtime miss leaves the user with a
+// silently-leaking endpoint.
+const DUAL_USE_PATHS = new Set([
+  'settings',
+  'token-usage',
+].map(s => _API + s));
+
+// Role parameter values:
+//   'ui'   — uiServer; reject HOOK_PATHS, accept UI_PATHS + dual-use
+//   'hook' — daemon `server`; reject UI_PATHS + UI-only methods, accept HOOK_PATHS + dual-use
+//
+// `role` is REQUIRED. The two production createServer callbacks both
+// pass an explicit role. A future caller that forgets to pass one
+// gets a hard fail-closed response (HTTP 500) so the
+// "serve-everything" backwards-compat hole that the original draft
+// shipped with cannot regress silently.
+async function handleAPI(req, res, role) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Fail-closed if `role` is missing or not one of the two valid
+  // values. Tests that need to exercise dispatcher logic should pass
+  // an explicit role (typically 'ui' since that's the most-permissive
+  // surface — UI-only paths AND dual-use reads).
+  if (role !== 'ui' && role !== 'hook') {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: "handleAPI called without a valid role — must be 'ui' or 'hook'",
+      received: role === undefined ? 'undefined' : String(role),
+    }));
+    return true;
+  }
+
+  // Role-based filter. Bail with 308 redirect (daemon receiving UI
+  // request → bounce to UI port) or 404 (UI receiving hook request —
+  // hooks never arrive on UI port from a correctly-installed setup,
+  // so 404 is the more honest signal than a redirect).
+  //
+  // The settings-POST UI-only check is computed via path concatenation
+  // (`_API + 'settings'`) rather than embedding the dispatcher's exact
+  // signature literal here. The latter would shadow the test/lib.test.mjs
+  // CQ-005 dispatcher locator (which does an indexOf on the exact
+  // dispatcher signature substring `if (url.pathname === '/api/settings'
+  // && req.method === 'POST'`); the test would land on this line
+  // instead of the actual dispatcher and the slice would miss the
+  // _prevCommitTokenUsage assertions.
+  const _SETTINGS_PATH = _API + 'settings';
+  // Fail-closed classification check — every `/api/*` path MUST be in
+  // exactly one of HOOK_PATHS / UI_PATHS / DUAL_USE_PATHS. The static
+  // test in test/lib.test.mjs ("TRDD-c30609ab — endpoint classification")
+  // enforces this at CI time. The runtime predicate below is defense
+  // in depth: an unclassified `/api/*` path that somehow shipped past
+  // CI gets a 500 instead of being silently dual-served.
+  const _isApi = url.pathname.startsWith(_API);
+  const _isHookPath = HOOK_PATHS.has(url.pathname);
+  const _isUIPath = UI_PATHS.has(url.pathname);
+  const _isDualUsePath = DUAL_USE_PATHS.has(url.pathname);
+  const _isClassified = _isHookPath || _isUIPath || _isDualUsePath;
+  if (_isApi && !_isClassified) {
+    // Two legitimate cases land here:
+    //   (a) `/api/dashboard/ui-listener/*` — Phase 1.0 control endpoints
+    //       that live ONLY on the proxy server (port 3334). A client
+    //       posting them to the daemon (3333) or the UI (4444) is
+    //       misconfigured but not a vdm bug. 404 + a hint is the right
+    //       signal.
+    //   (b) A new `/api/*` endpoint added without classification. This
+    //       IS a vdm bug — the static CI test should have caught it,
+    //       but runtime fail-closed is belt + suspenders.
+    // Distinguish via prefix so the error message guides the user vs
+    // the developer correctly.
+    const _isProxyControl = url.pathname.startsWith(_API + 'dashboard/');
+    if (_isProxyControl) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'this endpoint lives on the proxy server, not this server',
+        pathname: url.pathname,
+        proxyPort: PROXY_PORT,
+      }));
+    } else {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'unclassified /api endpoint — dashboard.mjs is missing a HOOK_PATHS / UI_PATHS / DUAL_USE_PATHS entry',
+        pathname: url.pathname,
+      }));
+    }
+    return true;
+  }
+  if (role === 'hook') {
+    const isUISettingsPost = url.pathname === _SETTINGS_PATH && req.method === 'POST';
+    if (_isUIPath || isUISettingsPost) {
+      // 308 (Permanent Redirect, RFC 7538) preserves both the request
+      // method AND the body. 301 historically allows clients to
+      // silently downgrade POST → GET (losing the body), which would
+      // cause `/api/settings` POST or `/api/switch` POST to fail
+      // mysteriously when an old hook URL hits the daemon port. 308
+      // is the correct code for a permanent move that preserves
+      // method semantics.
+      res.writeHead(308, { Location: `http://localhost:${UI_PORT}${req.url}` });
+      res.end();
+      return true;
+    }
+  } else if (role === 'ui') {
+    if (_isHookPath) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'hook endpoint reached UI port — hooks live on daemon port',
+        daemonPort: PORT,
+      }));
+      return true;
+    }
+  }
 
   if (url.pathname === '/api/profiles' && req.method === 'GET') {
     const profiles = await loadProfiles();
@@ -12399,6 +12676,11 @@ function _getAllowedOrigins() {
     `http://127.0.0.1:${PORT}`,
     `http://localhost:${proxyPort}`,
     `http://127.0.0.1:${proxyPort}`,
+    // TRDD-c30609ab Stage B — UI server origin. The HTML dashboard
+    // is served from UI_PORT and its fetch() calls carry this Origin.
+    // Without it, every UI button click hits the CSRF guard.
+    `http://localhost:${UI_PORT}`,
+    `http://127.0.0.1:${UI_PORT}`,
   ]);
   return _ALLOWED_ORIGINS;
 }
@@ -12431,6 +12713,13 @@ function _isLocalhostHost(host, expectedPort) {
   return allowed.includes(host.toLowerCase());
 }
 
+// TRDD-c30609ab Stage B — `server` is the DAEMON server. It hosts hook
+// endpoints + the 2 dual-use reads (`/api/settings` GET, `/api/token-usage`
+// GET) used by the git commit-msg trailer. It does NOT serve the HTML
+// dashboard — that moved to `uiServer` on UI_PORT (4444 default). A
+// browser request for GET / on this port is redirected to the UI port
+// so a stale bookmark or rc-snippet still lands the user on the right
+// page after upgrade.
 const server = createServer(async (req, res) => {
   try {
     // DNS-rebind defense — see comment above.
@@ -12459,7 +12748,7 @@ const server = createServer(async (req, res) => {
     // for HEAD), so cheap probes that only care about status work too.
     if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, server: 'dashboard', port: PORT }));
+      res.end(JSON.stringify({ ok: true, server: 'daemon', port: PORT, uiPort: UI_PORT }));
       return;
     }
 
@@ -12474,9 +12763,95 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // API routes
+    // API routes — this is the DAEMON server, so role='hook'. UI-only
+    // paths get a 301 redirect to UI_PORT inside handleAPI; hook paths
+    // and dual-use reads (`/api/settings` GET, `/api/token-usage` GET)
+    // are served here normally.
     if (req.url.startsWith('/api/')) {
-      const handled = await handleAPI(req, res);
+      const handled = await handleAPI(req, res, 'hook');
+      if (handled) return;
+    }
+
+    // GET / on the daemon port → 308 to the UI port. A user opening
+    // http://localhost:3333/ in a browser after upgrade lands on the
+    // UI without seeing a 404. The redirect preserves any query string
+    // (rare for GET / but defensible). 308 (vs 301) is for consistency
+    // with the API redirect above — both are permanent moves and 308
+    // preserves method semantics across all callers.
+    if ((req.method === 'GET' || req.method === 'HEAD') && (req.url === '/' || req.url.startsWith('/?'))) {
+      res.writeHead(308, { Location: `http://localhost:${UI_PORT}${req.url}` });
+      res.end();
+      return;
+    }
+
+    // Anything else on the daemon port — 404. The HTML, the static
+    // assets, every UI fetch — those all live on UI_PORT now.
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'not found on daemon port',
+      hint: `UI lives on http://localhost:${UI_PORT}`,
+    }));
+  } catch (e) {
+    console.error('Server error:', e);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: e.message }));
+  }
+});
+
+// TRDD-c30609ab Stage B — `uiServer` is the UI-facing server. It
+// hosts:
+//   • GET / — the HTML dashboard (renderHTML)
+//   • the UI-only API endpoints (see UI_PATHS in handleAPI)
+//   • the 2 dual-use reads — registered on both servers for same-
+//     origin convenience (the UI's fetch() calls hit the same port
+//     they were served from, so no CORS preflight required)
+// Hook endpoints (HOOK_PATHS) get a 404 here — those live on the
+// daemon `server` only and a misconfigured install hitting UI_PORT
+// for hooks is the kind of fail-fast we want surfaced.
+//
+// Stoppable: `vdm dashboard stop` closes ONLY this server; the daemon
+// and proxy continue running so hooks keep firing and token tracking
+// keeps recording.
+const uiServer = createServer(async (req, res) => {
+  try {
+    // DNS-rebind defense bound to UI_PORT — same logic as the daemon
+    // server, just on the UI port.
+    if (!_isLocalhostHost(req.headers.host, UI_PORT)) {
+      res.writeHead(421, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'misdirected request: invalid Host header' }));
+      return;
+    }
+    const origin = req.headers.origin || '';
+    if (origin && _getAllowedOrigins().has(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    // Health check — same shape as daemon's, useful for monitoring
+    // both ports independently. `server: 'ui'` distinguishes from the
+    // daemon's `server: 'daemon'` in dashboards.
+    if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, server: 'ui', port: UI_PORT, daemonPort: PORT }));
+      return;
+    }
+
+    const isMutating = req.method && req.method !== 'GET' && req.method !== 'HEAD';
+    if (isMutating && !_isOriginAllowed(origin)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'cross-origin request rejected' }));
+      return;
+    }
+
+    // API routes — role='ui'. Hook paths get a 404 inside handleAPI
+    // so a misrouted hook payload fails fast instead of silently
+    // succeeding against a no-op handler.
+    if (req.url.startsWith('/api/')) {
+      const handled = await handleAPI(req, res, 'ui');
       if (handled) return;
     }
 
@@ -12484,7 +12859,7 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(renderHTML());
   } catch (e) {
-    console.error('Server error:', e);
+    console.error('UI server error:', e);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
   }
@@ -12560,8 +12935,34 @@ server.listen(PORT, '127.0.0.1', () => {
 // already-bound dashboard wins cleanly.
 server.on('error', (e) => {
   if (e && e.code === 'EADDRINUSE') {
-    console.error(`Dashboard port ${PORT} already in use — another instance is already running. Exiting.`);
+    console.error(`Dashboard daemon port ${PORT} already in use — another instance is already running. Exiting.`);
     process.exit(0);
+  }
+  throw e;
+});
+
+// TRDD-c30609ab Stage B — bind the UI server. Same '127.0.0.1' bind
+// scope as the daemon, same EADDRINUSE-exits-0 fallback for the
+// rc-snippet race.
+//
+// uiServer is independently startable / stoppable — `vdm dashboard
+// stop` closes ONLY this listener via the Phase 1.0 control endpoint
+// on the proxy server. The renderHTML self-test runs alongside the
+// daemon's self-test (same setImmediate-deferred check); duplicating
+// the test on uiServer's listen callback would emit two passes per
+// startup so we leave it on the daemon's callback only.
+uiServer.listen(UI_PORT, '127.0.0.1', () => {
+  console.log(`UI dashboard running at http://localhost:${UI_PORT}`);
+});
+uiServer.on('error', (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    // EADDRINUSE on the UI port is recoverable — the daemon is still
+    // serving hooks, the proxy is still forwarding. Log + degrade
+    // gracefully (UI unreachable, but tracking + rotation continue).
+    // The user can change CSW_UI_PORT and restart, or stop whatever
+    // is on UI_PORT.
+    console.error(`UI port ${UI_PORT} already in use — UI dashboard not bound. Daemon (${PORT}) and proxy still up. Set CSW_UI_PORT or 'uiPort' in config.json to a different port.`);
+    return;
   }
   throw e;
 });
@@ -12582,7 +12983,10 @@ server.on('error', (e) => {
 //     every response's headers
 // ─────────────────────────────────────────────────
 
-const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
+// PROXY_PORT and the runtime distinctness check moved to module-init
+// (top of file, near PORT and UI_PORT) so the conflict is detected
+// BEFORE any server binds. See the module-init block for the full
+// rationale and the IIFE.
 
 // Phase F — proxy queue + timeout tuning. All env-var configurable so users
 // on different plans / load profiles can adjust without code changes.
@@ -16427,9 +16831,15 @@ const proxyServer = createServer((clientReq, clientRes) => {
   // origin check. GET (/status) is safe to leave open since the
   // browser won't expose the response body to a foreign origin
   // without matching CORS headers.
+  // TRDD-c30609ab Stage B — these endpoints always meant to control
+  // "the UI listener". Pre-Stage-B they controlled `server` because
+  // `server` happened to host both the UI HTML AND hook endpoints
+  // (which is what F-001 flagged: closing it broke hooks). Post-
+  // Stage-B they correctly control `uiServer` only — closing the UI
+  // server leaves the daemon (`server` on PORT) listening for hooks.
   if (clientReq.url === '/api/dashboard/ui-listener/status' && clientReq.method === 'GET') {
     clientRes.writeHead(200, { 'Content-Type': 'application/json' });
-    clientRes.end(JSON.stringify({ ok: true, listening: server.listening, port: PORT }));
+    clientRes.end(JSON.stringify({ ok: true, listening: uiServer.listening, port: UI_PORT }));
     return;
   }
   if (clientReq.url === '/api/dashboard/ui-listener/stop' && clientReq.method === 'POST') {
@@ -16439,12 +16849,12 @@ const proxyServer = createServer((clientReq, clientRes) => {
       clientRes.end(JSON.stringify({ error: 'cross-origin request rejected' }));
       return;
     }
-    if (server.listening) {
-      try { server.close(); } catch (e) { /* already closed */ }
-      log('info', '[ui-listener] stopped via /api/dashboard/ui-listener/stop — proxy continues running');
+    if (uiServer.listening) {
+      try { uiServer.close(); } catch (e) { /* already closed */ }
+      log('info', '[ui-listener] stopped via /api/dashboard/ui-listener/stop — daemon + proxy continue running');
     }
     clientRes.writeHead(200, { 'Content-Type': 'application/json' });
-    clientRes.end(JSON.stringify({ ok: true, listening: server.listening, message: 'UI listener closed; proxy continues running' }));
+    clientRes.end(JSON.stringify({ ok: true, listening: uiServer.listening, message: 'UI listener closed; daemon + proxy continue running' }));
     return;
   }
   if (clientReq.url === '/api/dashboard/ui-listener/start' && clientReq.method === 'POST') {
@@ -16454,7 +16864,7 @@ const proxyServer = createServer((clientReq, clientRes) => {
       clientRes.end(JSON.stringify({ error: 'cross-origin request rejected' }));
       return;
     }
-    if (server.listening) {
+    if (uiServer.listening) {
       clientRes.writeHead(200, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({ ok: true, listening: true, message: 'UI listener already running' }));
       return;
@@ -16462,7 +16872,7 @@ const proxyServer = createServer((clientReq, clientRes) => {
     // Re-bind and respond after the listener is actually accepting
     // connections, so the CLI knows the dashboard is reachable when
     // the response arrives. Bind error (e.g. port collision with a
-    // different process that grabbed 3333 in the meantime) surfaces
+    // different process that grabbed UI_PORT in the meantime) surfaces
     // as a 500 instead of a hung curl.
     //
     // EventEmitter cleanup — Node's `once()` registers a one-shot
@@ -16474,25 +16884,25 @@ const proxyServer = createServer((clientReq, clientRes) => {
     const _onListening = () => {
       if (_settled) return;
       _settled = true;
-      server.removeListener('error', _onError);
+      uiServer.removeListener('error', _onError);
       log('info', '[ui-listener] re-opened via /api/dashboard/ui-listener/start');
       clientRes.writeHead(200, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ ok: true, listening: true, port: PORT }));
+      clientRes.end(JSON.stringify({ ok: true, listening: true, port: UI_PORT }));
     };
     const _onError = (e) => {
       if (_settled) return;
       _settled = true;
-      server.removeListener('listening', _onListening);
+      uiServer.removeListener('listening', _onListening);
       log('warn', `[ui-listener] re-open failed: ${e.message}`);
       try {
         clientRes.writeHead(500, { 'Content-Type': 'application/json' });
         clientRes.end(JSON.stringify({ ok: false, error: e.message, code: e.code }));
       } catch {}
     };
-    server.once('listening', _onListening);
-    server.once('error', _onError);
+    uiServer.once('listening', _onListening);
+    uiServer.once('error', _onError);
     try {
-      server.listen(PORT, '127.0.0.1');
+      uiServer.listen(UI_PORT, '127.0.0.1');
     } catch (e) {
       _onError(e);
     }
@@ -17671,8 +18081,21 @@ function shutdown(signal) {
   // (default 5s) we exit anyway so a wedged stream cannot hold the
   // process forever.
   const _SHUTDOWN_DRAIN_MS = 5_000;
+  // Capture uiServer's listening state BEFORE close() flips the flag.
+  // The _maybeExit counter below uses this to decide whether the UI's
+  // 'close' event will actually fire (true → wait for it; false → it
+  // was already stopped, pre-count it as closed). Querying
+  // uiServer.listening AFTER close() is always false and would dead-
+  // code the conditional listener attach.
+  const _uiWasListening = uiServer.listening;
   try { proxyServer.close(); } catch {}
   try { server.close(); } catch {}
+  // TRDD-c30609ab Stage B — close the UI server too. Stoppable via the
+  // Phase 1.0 `/api/dashboard/ui-listener/stop` endpoint, but the
+  // dashboard process can also exit while the UI listener is up — in
+  // which case shutdown must drain it. The `_closed >= 3` threshold
+  // below counts daemon + proxy + UI.
+  try { uiServer.close(); } catch {}
   // M12 fix — close the OTLP listener (Phase H, opt-in via CSW_OTEL_ENABLED).
   // Without this it stays open during the 5s drain and process.exit, leaking
   // the bound port to the kernel until OS reclaim. Null-safe since OTEL is
@@ -17701,10 +18124,24 @@ function shutdown(signal) {
     try { _upstreamAgent.destroy(); } catch {}
     process.exit(0);
   }, _SHUTDOWN_DRAIN_MS);
-  // If both servers report 'close' before the timer, exit early.
-  let _closed = 0;
+  // If all three servers (daemon, proxy, UI) report 'close' before the
+  // timer, exit early. TRDD-c30609ab Stage B added the UI server, so
+  // the threshold bumped from 2 to 3. The UI server is special because
+  // it can be stopped at runtime via Phase 1.0's ui-listener/stop
+  // endpoint — at shutdown entry it may already be closed.
+  //
+  // To make the count correct in BOTH cases (UI was listening at
+  // shutdown / UI was already stopped), capture the pre-close state
+  // BEFORE we called uiServer.close() above. The check
+  // `uiServer.listening` AFTER the close call is always false (close
+  // flips the flag synchronously) and would make the conditional
+  // attach below dead code.
+  //
+  // Pre-close capture is at top-of-function in `_uiWasListening` so
+  // we can rely on it here without re-querying.
+  let _closed = _uiWasListening ? 0 : 1;
   const _maybeExit = () => {
-    if (++_closed >= 2) {
+    if (++_closed >= 3) {
       clearTimeout(_exitTimer);
       // Same FG4 invariant — destroy the agent at the very last moment,
       // never before in-flight streams have had a chance to drain.
@@ -17714,6 +18151,12 @@ function shutdown(signal) {
   };
   try { proxyServer.once('close', _maybeExit); } catch {}
   try { server.once('close', _maybeExit); } catch {}
+  // Always attach to uiServer.once('close'). If the UI was listening
+  // at shutdown entry, the just-fired close() above will trigger this
+  // listener after sockets drain. If it wasn't listening, the
+  // listener attaches but never fires (no event coming) — the
+  // _uiWasListening = false branch above pre-counted that case.
+  try { uiServer.once('close', _maybeExit); } catch {}
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

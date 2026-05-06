@@ -4540,26 +4540,137 @@ describe('Phase I — dashboard.mjs /health endpoint', () => {
     'utf8',
   );
 
-  it('UI server defines a /health route', () => {
-    // The proxy server already had /health; this is the UI-server one
-    // added in Phase I so install.sh can poll the port that hooks point at.
+  it('dashboard.mjs defines a /health route', () => {
+    // The proxy server already had /health; this is the daemon-server
+    // (and post-TRDD-c30609ab also UI-server) /health so install.sh
+    // can poll the port that hooks point at.
     assert.match(_dashboardSrc_health, /req\.url === '\/health'/);
   });
 
-  it('UI /health returns the server identity for squatter-detection', () => {
-    // H3 fix: install.sh greps the response body for "server":"dashboard"
+  it('daemon /health returns the server identity for squatter-detection', () => {
+    // H3 fix: install.sh greps the response body for "server":"<marker>"
     // before trusting that we found our own dashboard. Removing this
     // field would break the squatter check silently.
-    assert.match(_dashboardSrc_health, /server: 'dashboard'/);
+    //
+    // Two accepted markers on the DAEMON server's /health, both
+    // recognised by install.sh's _dashboard_responds:
+    //   server: 'dashboard'  — pre-TRDD-c30609ab single-server build
+    //   server: 'daemon'     — TRDD-c30609ab Stage B+ three-server split
+    assert.match(_dashboardSrc_health, /server: '(?:dashboard|daemon)'/);
   });
 
-  it('UI /health accepts both GET and HEAD', () => {
+  it('UI /health emits the ui server identity (post-TRDD-c30609ab)', () => {
+    // TRDD-c30609ab Stage B added a separate uiServer with its own
+    // /health route. install.sh's _ui_responds greps the body for
+    // "server":"ui" so a daemon /health (squatter or otherwise) can
+    // never be misclassified as the UI server. The marker is on the
+    // UI server's /health JSON.body — DO NOT remove it without also
+    // updating install.sh and bumping the install-time UI-warning
+    // logic.
+    assert.match(_dashboardSrc_health, /server: 'ui'/);
+  });
+
+  it('/health accepts both GET and HEAD', () => {
     // L4 fix: HEAD requests should not fall through to render the dashboard
     // HTML — a cheap probe deserves a cheap response.
     assert.match(
       _dashboardSrc_health,
       /req\.method === 'GET' \|\| req\.method === 'HEAD'/,
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// TRDD-c30609ab Stage B — endpoint classification regression
+// ─────────────────────────────────────────────────────────
+//
+// Static check that every dispatcher's `if (url.pathname === '/api/...'`
+// path appears in exactly one of HOOK_PATHS / UI_PATHS / DUAL_USE_PATHS.
+// Without this, a new endpoint added to handleAPI without classification
+// would default to "served by both servers" via the role-filter's
+// fall-through behaviour — masking a security/architectural mismatch.
+//
+// CI fails the build when:
+//   • A dispatcher path is in TWO sets (over-classified — the role
+//     filter's redirect/reject decision becomes ambiguous).
+//   • A dispatcher path is in NO set AND not in the "skip-classify"
+//     allow-list below (under-classified — silently dual-served).
+describe('TRDD-c30609ab — endpoint classification', () => {
+  const _src_endpoints = _readFileSync_xss(
+    new URL('../dashboard.mjs', import.meta.url),
+    'utf8',
+  );
+
+  // Extract every Set's contents as a flat list of pathnames.
+  // Pattern: `const HOOK_PATHS = new Set([` ... `].map(s => _API + s));`
+  // The strings are the suffixes; we re-prepend `_API` (= '/api/').
+  function _extractSetSuffixes(src, setName) {
+    const re = new RegExp(`const\\s+${setName}\\s*=\\s*new\\s+Set\\(\\s*\\[([\\s\\S]*?)\\]\\s*\\.map`, 'm');
+    const m = src.match(re);
+    if (!m) return [];
+    return Array.from(m[1].matchAll(/'([^']+)'/g)).map(g => '/api/' + g[1]);
+  }
+  const _hooks = new Set(_extractSetSuffixes(_src_endpoints, 'HOOK_PATHS'));
+  const _ui = new Set(_extractSetSuffixes(_src_endpoints, 'UI_PATHS'));
+  const _dual = new Set(_extractSetSuffixes(_src_endpoints, 'DUAL_USE_PATHS'));
+
+  // Every dispatcher path mentioned in handleAPI as
+  // `if (url.pathname === '/api/...'` (or a `||` alternative).
+  const _dispatcherPaths = new Set();
+  const _dispatcherRe = /url\.pathname === '(\/api\/[^']+)'/g;
+  // Scope the search to the body of handleAPI so we only catch real
+  // dispatcher heads (not Set-construction or comments referencing
+  // example paths).
+  //
+  // Boundary detection: the START anchor is the unique signature
+  // `async function handleAPI(`. The END anchor is the next
+  // `async function ` OR `function ` declaration after handleAPI
+  // (whichever comes first); both are robust to insertions inside
+  // handleAPI's body, which is the failure mode a `\n}\n` heuristic
+  // would silently miss (a column-0 closing brace inside a template
+  // literal or a future inline function would truncate the slice).
+  const _handleAPIStart = _src_endpoints.indexOf('async function handleAPI(');
+  assert.notStrictEqual(_handleAPIStart, -1, 'handleAPI signature not found');
+  const _afterStart = _handleAPIStart + 'async function handleAPI('.length;
+  const _nextAsyncFn = _src_endpoints.indexOf('\nasync function ', _afterStart);
+  const _nextFn = _src_endpoints.indexOf('\nfunction ', _afterStart);
+  // Pick whichever next-function declaration comes first (whichever
+  // index is smaller and not -1). If neither is found, slice to
+  // end-of-file (handleAPI is the last function — unlikely but safe).
+  let _handleAPIEnd = _src_endpoints.length;
+  for (const _idx of [_nextAsyncFn, _nextFn]) {
+    if (_idx !== -1 && _idx < _handleAPIEnd) _handleAPIEnd = _idx;
+  }
+  const _handleBody = _src_endpoints.slice(_handleAPIStart, _handleAPIEnd);
+  for (const m of _handleBody.matchAll(_dispatcherRe)) {
+    _dispatcherPaths.add(m[1]);
+  }
+
+  it('every dispatcher pathname is in HOOK_PATHS, UI_PATHS, or DUAL_USE_PATHS — and only one', () => {
+    const errors = [];
+    for (const p of _dispatcherPaths) {
+      const inH = _hooks.has(p);
+      const inU = _ui.has(p);
+      const inD = _dual.has(p);
+      const count = Number(inH) + Number(inU) + Number(inD);
+      if (count === 0) errors.push(`unclassified: ${p}`);
+      if (count > 1) errors.push(`over-classified (in ${count} sets): ${p}`);
+    }
+    assert.strictEqual(errors.length, 0, errors.join('\n'));
+  });
+
+  it('Set construction extracted non-empty path sets', () => {
+    // Sanity guard against the regex above silently returning empty
+    // sets after a future Set declaration refactor. Only "non-empty"
+    // is asserted — exact counts would have to be hand-updated every
+    // time an endpoint is added or removed (drift hazard) and the
+    // per-path classification check above already enforces every
+    // dispatcher is in exactly one set, which subsumes any
+    // numeric-threshold check.
+    assert.ok(_hooks.size > 0, `HOOK_PATHS extraction returned empty — regex broke?`);
+    assert.ok(_ui.size > 0, `UI_PATHS extraction returned empty — regex broke?`);
+    assert.ok(_dual.size > 0, `DUAL_USE_PATHS extraction returned empty — regex broke?`);
+    assert.ok(_dispatcherPaths.size > 0, `dispatcher extraction returned empty — boundary detection broke?`);
   });
 });
 
@@ -11732,11 +11843,13 @@ describe('Code-quality audit fixes (CQ-001 .. CQ-013) — source-grep regression
       _src_cq.indexOf('function _prunePendingSessions') + 800,
     );
     assert.match(pruneSlice, /_safeAutoClaim\(id, s\)/);
-    // The inline prune in /api/session-start.
-    const inlineSlice = _src_cq.slice(
-      _src_cq.indexOf("'/api/session-start'"),
-      _src_cq.indexOf("'/api/session-start'") + 6500,
-    );
+    // The inline prune in /api/session-start. TRDD-c30609ab Stage B
+    // added HOOK_PATHS Set entries that include this same path string,
+    // so anchor on the dispatcher signature instead of the bare path.
+    const dispatcherSig = "if (url.pathname === '/api/session-start'";
+    const idx = _src_cq.indexOf(dispatcherSig);
+    assert.notStrictEqual(idx, -1, 'dispatcher signature for /api/session-start not found');
+    const inlineSlice = _src_cq.slice(idx, idx + 6500);
     assert.match(inlineSlice, /_safeAutoClaim\(id, s\)/);
   });
 
@@ -11794,29 +11907,37 @@ describe('Code-quality audit fixes (CQ-001 .. CQ-013) — source-grep regression
   });
 
   // ── CQ-011 — session-* endpoints return 400 for malformed JSON ──
+  // TRDD-c30609ab Stage B introduced a role-filter at the top of
+  // handleAPI plus comment text that referred to the path strings.
+  // The Set entries themselves are now built via concat (so they don't
+  // shadow indexOf locators), but the explanatory comment + the
+  // `_SETTINGS_PATH` const block could still drift toward containing
+  // the same literal as a dispatcher signature. Anchor on the
+  // dispatcher's `if (url.pathname === ...` signature explicitly so
+  // the locator is unambiguous regardless of upstream drift.
   it('CQ-011 — /api/session-stop returns 400 (not 500) for malformed JSON', () => {
-    const handlerSlice = _src_cq.slice(
-      _src_cq.indexOf("'/api/session-stop'"),
-      _src_cq.indexOf("'/api/session-stop'") + 1200,
-    );
+    const dispatcherSig = "if (url.pathname === '/api/session-stop'";
+    const idx = _src_cq.indexOf(dispatcherSig);
+    assert.notStrictEqual(idx, -1, 'dispatcher signature for /api/session-stop not found');
+    const handlerSlice = _src_cq.slice(idx, idx + 1200);
     assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
     assert.match(handlerSlice, /\? 400 : 500/);
   });
 
   it('CQ-011 — /api/session-end returns 400 (not 500) for malformed JSON', () => {
-    const handlerSlice = _src_cq.slice(
-      _src_cq.indexOf("'/api/session-end'"),
-      _src_cq.indexOf("'/api/session-end'") + 1200,
-    );
+    const dispatcherSig = "if (url.pathname === '/api/session-end'";
+    const idx = _src_cq.indexOf(dispatcherSig);
+    assert.notStrictEqual(idx, -1, 'dispatcher signature for /api/session-end not found');
+    const handlerSlice = _src_cq.slice(idx, idx + 1200);
     assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
     assert.match(handlerSlice, /\? 400 : 500/);
   });
 
   it('CQ-011 — /api/session-start returns 400 (not 500) for malformed JSON', () => {
-    const handlerSlice = _src_cq.slice(
-      _src_cq.indexOf("'/api/session-start'"),
-      _src_cq.indexOf("'/api/session-start'") + 7500,
-    );
+    const dispatcherSig = "if (url.pathname === '/api/session-start'";
+    const idx = _src_cq.indexOf(dispatcherSig);
+    assert.notStrictEqual(idx, -1, 'dispatcher signature for /api/session-start not found');
+    const handlerSlice = _src_cq.slice(idx, idx + 7500);
     assert.match(handlerSlice, /e\.name === 'SyntaxError'/);
     assert.match(handlerSlice, /\? 400 : 500/);
   });

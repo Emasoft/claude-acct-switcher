@@ -197,6 +197,7 @@ elif [[ -d "$LEGACY_INSTALL_DIR" ]] && [[ ! -d "$INSTALL_DIR" ]]; then
     # the 1..65535 contract. Fall back to defaults on rejection.
     _legacy_dash_port=3333
     _legacy_proxy_port=3334
+    _legacy_ui_port=4444
     if [[ -f "$LEGACY_INSTALL_DIR/config.json" ]] && declare -f _json_get_int >/dev/null 2>&1; then
       _v="$(_json_get_int "$LEGACY_INSTALL_DIR/config.json" port 2>/dev/null || true)"
       if [[ -n "$_v" ]] && declare -f _validate_port >/dev/null 2>&1 && _validate_port "$_v" 2>/dev/null; then
@@ -206,8 +207,12 @@ elif [[ -d "$LEGACY_INSTALL_DIR" ]] && [[ ! -d "$INSTALL_DIR" ]]; then
       if [[ -n "$_v" ]] && declare -f _validate_port >/dev/null 2>&1 && _validate_port "$_v" 2>/dev/null; then
         _legacy_proxy_port="$_v"
       fi
+      _v="$(_json_get_int "$LEGACY_INSTALL_DIR/config.json" uiPort 2>/dev/null || true)"
+      if [[ -n "$_v" ]] && declare -f _validate_port >/dev/null 2>&1 && _validate_port "$_v" 2>/dev/null; then
+        _legacy_ui_port="$_v"
+      fi
     fi
-    _kill_running_vdm "$_legacy_dash_port" "$_legacy_proxy_port" 2>/dev/null || true
+    _kill_running_vdm "$_legacy_dash_port" "$_legacy_proxy_port" "$_legacy_ui_port" 2>/dev/null || true
   fi
   # Atomic rename (single mv on same FS). On cross-FS this falls back
   # to copy+delete — non-atomic but acceptable for one-shot migration.
@@ -304,7 +309,7 @@ _resolve_install_ports() {
   fi
 }
 _resolve_install_ports
-if _kill_running_vdm "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"; then
+if _kill_running_vdm "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT" "$_UI_PORT_DEFAULT"; then
   echo -e "  ${YELLOW}!${NC} Stopped a previously-running vdm dashboard/proxy."
 fi
 
@@ -416,7 +421,7 @@ if [[ "$SKIP_DETECT" != "true" ]]; then
   detect_orphaned_settings_hooks
   detect_malformed_rc_blocks
   detect_dangling_symlinks
-  detect_port_holders "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"
+  detect_port_holders "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT" "$_UI_PORT_DEFAULT"
   detect_orphan_keychain_entries "$INSTALL_DIR"
   detect_truncated_config "$INSTALL_DIR/config.json"
   detect_disabling_env_vars
@@ -466,7 +471,7 @@ if [[ "$SKIP_DETECT" != "true" ]]; then
     detect_orphaned_settings_hooks
     detect_malformed_rc_blocks
     detect_dangling_symlinks
-    detect_port_holders "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT"
+    detect_port_holders "$_DASH_PORT_DEFAULT" "$_PROXY_PORT_DEFAULT" "$_UI_PORT_DEFAULT"
     detect_orphan_keychain_entries "$INSTALL_DIR"
     detect_truncated_config "$INSTALL_DIR/config.json"
     set +e
@@ -819,16 +824,16 @@ if [ ! -f "\$HOME/.vdm/dashboard.mjs" ] || [ -f "\$HOME/.vdm/.disabled" ]; then
       ;;
   esac
 else
-  # Resolve dashboard + proxy ports. Priority order:
-  #   1. Pre-existing env var (\$CSW_PORT / \$CSW_PROXY_PORT) wins — lets a user
-  #      run \`CSW_PORT=4444 CSW_PROXY_PORT=4445 …\` in the SAME shell (or via a
-  #      launchd plist that already exported the value) without this snippet
-  #      stomping it back to 3333/3334.
-  #   2. Else, parse ~/.vdm/config.json for "port" /
-  #      "proxyPort" — that's where the dashboard persists user-configured
-  #      ports via the settings UI, so a setting saved last week is still
-  #      honoured by every fresh shell this week.
-  #   3. Else, fall back to the project defaults 3333 / 3334.
+  # Resolve daemon + proxy + UI ports. Priority order:
+  #   1. Pre-existing env var (\$CSW_PORT / \$CSW_PROXY_PORT / \$CSW_UI_PORT)
+  #      wins — lets a user run \`CSW_PORT=4444 CSW_PROXY_PORT=4445 CSW_UI_PORT=5555 …\`
+  #      in the SAME shell (or via a launchd plist that already exported
+  #      the value) without this snippet stomping it back to defaults.
+  #   2. Else, parse ~/.vdm/config.json for "port" / "proxyPort" / "uiPort" —
+  #      that's where the dashboard persists user-configured ports via the
+  #      settings UI, so a setting saved last week is still honoured by
+  #      every fresh shell this week.
+  #   3. Else, fall back to the project defaults 3333 / 3334 / 4444.
   # All python3 calls short-circuit silently on ANY failure (missing python3,
   # missing config.json, malformed JSON, missing key) — the \`|| true\` swallows
   # parse errors and the \`command -v python3\` guard handles a missing
@@ -855,11 +860,28 @@ try:
 except Exception:
   pass' "\$HOME/.vdm/config.json" 2>/dev/null || true)"
   fi
+  # TRDD-c30609ab Stage B — uiPort resolution. Without this, a user's
+  # config.json uiPort=5555 silently drifts: vdm CLI (in their shell)
+  # resolves UI_PORT=5555 but the auto-spawned dashboard binds to the
+  # default 4444 since CSW_UI_PORT was never exported. Every
+  # vdm CLI call to \$UI_PORT then targets a port nothing is listening
+  # on. Mirror the daemon/proxy resolver block exactly so the
+  # contract stays uniform across all three ports.
+  if [ -z "\${CSW_UI_PORT:-}" ] && [ -r "\$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    CSW_UI_PORT="\$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  v=d.get("uiPort","")
+  print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
+except Exception:
+  pass' "\$HOME/.vdm/config.json" 2>/dev/null || true)"
+  fi
   # Numeric default fallback runs unconditionally — covers the case where
   # python3 ran but returned an empty string (key missing / non-int value).
   CSW_PORT="\${CSW_PORT:-3333}"
   CSW_PROXY_PORT="\${CSW_PROXY_PORT:-3334}"
-  export CSW_PORT CSW_PROXY_PORT
+  CSW_UI_PORT="\${CSW_UI_PORT:-4444}"
+  export CSW_PORT CSW_PROXY_PORT CSW_UI_PORT
   # Auto-start the dashboard at most once per machine. Two terminals opened
   # the same instant would both pass an \`lsof\` check before either had
   # bound the port, so we use a mkdir-based mutex (atomic on every POSIX
@@ -958,9 +980,16 @@ else
   echo '  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
   echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
   echo '      fi'
+  echo '      if [ -z "${CSW_UI_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then'
+  echo '        CSW_UI_PORT="$(python3 -c '"'"'import json,sys'
+  echo 'try:'
+  echo '  d=json.load(open(sys.argv[1])); v=d.get("uiPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
+  echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
+  echo '      fi'
   echo '      CSW_PORT="${CSW_PORT:-3333}"'
   echo '      CSW_PROXY_PORT="${CSW_PROXY_PORT:-3334}"'
-  echo '      export CSW_PORT CSW_PROXY_PORT'
+  echo '      CSW_UI_PORT="${CSW_UI_PORT:-4444}"'
+  echo '      export CSW_PORT CSW_PROXY_PORT CSW_UI_PORT'
   echo '      _vdm_lock="${TMPDIR:-/tmp}/vdm-autostart-$(id -u).lock.d"'
   echo '      if [ -d "$_vdm_lock" ] && find "$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then'
   echo '        rmdir "$_vdm_lock" 2>/dev/null'
@@ -1005,19 +1034,40 @@ fi
 #     install step that fails reaps the dashboard too, not just files.
 _DASH_HEALTH_PORT="$_DASH_PORT_DEFAULT"
 _PROXY_HEALTH_PORT="$_PROXY_PORT_DEFAULT"
+_UI_HEALTH_PORT="$_UI_PORT_DEFAULT"
 
 _dashboard_responds() {
-  # Body MUST contain `"server":"dashboard"` so a generic webserver
-  # squatting on the same port can't fool us into installing hooks
-  # pointing at it. JSON-string match (no quoting nuance) is fine.
+  # Body MUST contain a vdm-issued server marker so a generic
+  # webserver squatting on the same port can't fool us into installing
+  # hooks pointing at it. JSON-string match (no quoting nuance) is fine.
+  #
+  # Two accepted markers:
+  #   "server":"dashboard"  — pre-TRDD-c30609ab (single-server build)
+  #   "server":"daemon"     — TRDD-c30609ab Stage B+ (three-server split)
+  # Both are emitted by dashboard.mjs's daemon-port /health. Old/new
+  # builds both work; the matcher transitions automatically as the
+  # user's local install picks up the new code.
   local body
   body="$(curl -fsS --connect-timeout 1 --max-time 2 \
     "http://localhost:${_DASH_HEALTH_PORT}/health" 2>/dev/null)" || return 1
-  [[ "$body" == *'"server":"dashboard"'* ]]
+  [[ "$body" == *'"server":"dashboard"'* || "$body" == *'"server":"daemon"'* ]]
 }
 _proxy_responds() {
   curl -fsS --connect-timeout 1 --max-time 2 \
     "http://localhost:${_PROXY_HEALTH_PORT}/health" >/dev/null 2>&1
+}
+# TRDD-c30609ab Stage B — UI server liveness probe. Decoupled from the
+# atomic readiness gate (`_both_servers_responding`) because the UI is
+# best-effort: an EADDRINUSE on UI_PORT leaves the daemon + proxy up
+# (dashboard.mjs's error handler degrades), so failing the install on
+# UI port collision would needlessly block hooks + proxy from being
+# wired up. We probe UI separately and emit a WARNING (not error)
+# when it doesn't respond.
+_ui_responds() {
+  local body
+  body="$(curl -fsS --connect-timeout 1 --max-time 2 \
+    "http://localhost:${_UI_HEALTH_PORT}/health" 2>/dev/null)" || return 1
+  [[ "$body" == *'"server":"ui"'* ]]
 }
 _both_servers_responding() {
   _dashboard_responds && _proxy_responds
@@ -1065,7 +1115,7 @@ else
   env -i \
     HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
     LANG="${LANG:-}" TZ="${TZ:-}" \
-    CSW_PORT="$_DASH_HEALTH_PORT" CSW_PROXY_PORT="$_PROXY_HEALTH_PORT" \
+    CSW_PORT="$_DASH_HEALTH_PORT" CSW_PROXY_PORT="$_PROXY_HEALTH_PORT" CSW_UI_PORT="$_UI_HEALTH_PORT" \
     OAUTH_TOKEN_URL="${OAUTH_TOKEN_URL:-}" OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID:-}" \
     LM_API_TOKEN="${LM_API_TOKEN:-}" \
     nohup "$_NODE_BIN" "$INSTALL_DIR/dashboard.mjs" \
@@ -1098,6 +1148,27 @@ else
     echo -e "    Common causes: port ${_DASH_HEALTH_PORT} or ${_PROXY_HEALTH_PORT} already taken (lsof -iTCP:${_DASH_HEALTH_PORT} -iTCP:${_PROXY_HEALTH_PORT}), node version too old, dashboard crash on startup (check ${CYAN}$INSTALL_DIR/startup.log${NC}), or a non-vdm process serving 200 on /health."
     _kill_if_ours "$_NEW_DASH_PID"
     exit 1
+  fi
+  # TRDD-c30609ab Stage B — UI port liveness check (best-effort).
+  # The atomic gate above only requires daemon + proxy to be up; UI
+  # is a separate listener that may legitimately fail to bind (port
+  # collision, daemon-only mode in the future). Probe it with a small
+  # budget so we surface the EADDRINUSE-on-UI case to the user
+  # WITHOUT failing the install — hooks still work, proxy still
+  # forwards, only the HTML dashboard is unreachable.
+  _ui_ok=0
+  for _i in 1 2 3 4 5; do
+    if _ui_responds; then
+      _ui_ok=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ $_ui_ok -eq 1 ]]; then
+    echo -e "  ${GREEN}✓${NC} UI dashboard responding on port ${CYAN}${_UI_HEALTH_PORT}${NC}"
+  else
+    echo -e "  ${YELLOW}!${NC} UI dashboard on port ${CYAN}${_UI_HEALTH_PORT}${NC} did NOT respond — daemon + proxy are up, hooks will be wired, but the HTML UI is unreachable."
+    echo -e "    ${DIM}Most likely cause: another process is listening on $_UI_HEALTH_PORT (lsof -iTCP:${_UI_HEALTH_PORT}). Change CSW_UI_PORT or 'uiPort' in $INSTALL_DIR/config.json and restart with 'vdm dashboard stop && vdm dashboard start'.${NC}"
   fi
 fi
 
@@ -1171,7 +1242,12 @@ echo -e "  the keychain entry. Click ${BOLD}Always Allow${NC}${DIM} to skip the 
 echo -e "  ${DIM}reads. One prompt per saved account on first switch.${NC}"
 echo ""
 # Use the RESOLVED ports (config > env > default) so a custom-port
-# install does not advertise a dead 3333/3334 link in the closing message.
-echo -e "  Dashboard:  ${CYAN}http://localhost:${_DASH_PORT_DEFAULT}${NC}"
-echo -e "  API Proxy:  ${CYAN}http://localhost:${_PROXY_PORT_DEFAULT}${NC}"
+# install does not advertise a dead 3333/3334/4444 link.
+# TRDD-c30609ab Stage B — three-row layout matches `vdm dashboard
+# start`'s post-spawn output. UI is the user-facing URL; daemon and
+# proxy are operational diagnostics. Without this distinction the
+# user opening the daemon URL relies on a 308 redirect to land on UI.
+echo -e "  UI:         ${CYAN}http://localhost:${_UI_PORT_DEFAULT}${NC}"
+echo -e "  Daemon:     ${CYAN}http://localhost:${_DASH_PORT_DEFAULT}${NC} ${DIM}(hooks, always-on)${NC}"
+echo -e "  API Proxy:  ${CYAN}http://localhost:${_PROXY_PORT_DEFAULT}${NC} ${DIM}(claude → anthropic, always-on)${NC}"
 echo ""

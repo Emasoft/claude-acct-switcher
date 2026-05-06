@@ -324,39 +324,47 @@ _safe_kill_pid() {
   kill "-$sig" "$pid" 2>/dev/null
 }
 
-# _kill_running_vdm <dash_port> <proxy_port>
-# Idempotent best-effort kill of any vdm dashboard/proxy process. Used by
-# both install.sh (to clear the slate before laying down new files) and
-# uninstall.sh (to stop the dashboard before deleting its install dir).
+# _kill_running_vdm <dash_port> <proxy_port> [ui_port]
+# Idempotent best-effort kill of any vdm dashboard/proxy/UI process. Used
+# by both install.sh (to clear the slate before laying down new files)
+# and uninstall.sh (to stop the dashboard before deleting its install dir).
 #
 # Returns 0 if anything was stopped, 1 if nothing matched.
+#
+# TRDD-c30609ab Stage B — third arg is the UI port. Optional for
+# backward-compat: callers from older install.sh (or external scripts)
+# pre-Stage-B will pass two args; we default the third to 4444 and
+# treat the kill operation as covering all three ports. If a future
+# user binds UI to a custom port via config.json AND triggers
+# uninstall via an old uninstall.sh that hasn't picked up the third
+# arg yet, the cmdline-anchored pkill fallback below still kills any
+# `dashboard.mjs` process regardless of which port it's bound to —
+# defense in depth.
 #
 # Strategy:
 #   1. Graceful via `vdm dashboard stop` if the canonical CLI is on disk
 #      (uses the PID file when present, atomic-renames any in-flight state
 #      writes before exit).
-#   2. Cmdline-validated SIGTERM to anything bound to the dashboard or
-#      proxy port whose argv contains "dashboard.mjs". _safe_kill_pid
+#   2. Cmdline-validated SIGTERM to anything bound to the daemon, proxy,
+#      OR UI port whose argv contains "dashboard.mjs". _safe_kill_pid
 #      verifies the cmdline BEFORE signalling — guards against PID reuse
 #      on a busy host between the lsof query and the kill.
 #   3. Pattern-based fallback for vdm-shaped processes that are not
 #      currently bound to a port (starting up, retrying after EADDRINUSE,
-#      stuck during teardown). Two pkill patterns:
-#        - the canonical install path
-#        - `node -e ... dashboard.mjs ...` smoke-test invocations from
-#          a source-repo checkout (which lack the install-path string)
+#      stuck during teardown). Two pkill patterns.
 #   4. Drain ≤5s; SIGKILL anything still bound (cmdline-validated even
 #      at SIGKILL stage so a recycled PID can't be sniped).
 _kill_running_vdm() {
   local dash_port="${1:-3333}"
   local proxy_port="${2:-3334}"
+  local ui_port="${3:-4444}"
   local stopped=false port pid
 
   if [[ -x "$HOME/.vdm/vdm" ]]; then
     "$HOME/.vdm/vdm" dashboard stop 2>/dev/null && stopped=true || true
   fi
 
-  for port in "$dash_port" "$proxy_port"; do
+  for port in "$dash_port" "$proxy_port" "$ui_port"; do
     while IFS= read -r pid; do
       [[ -z "$pid" ]] && continue
       _safe_kill_pid "$pid" "dashboard.mjs" TERM && stopped=true || true
@@ -388,14 +396,14 @@ _kill_running_vdm() {
     local _i listeners pids
     for _i in 1 2 3 4 5 6 7 8 9 10; do
       listeners=""
-      for port in "$dash_port" "$proxy_port"; do
+      for port in "$dash_port" "$proxy_port" "$ui_port"; do
         pids="$(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)"
         [[ -n "$pids" ]] && listeners="$listeners $pids"
       done
       [[ -z "$listeners" ]] && break
       sleep 0.5
     done
-    for port in "$dash_port" "$proxy_port"; do
+    for port in "$dash_port" "$proxy_port" "$ui_port"; do
       while IFS= read -r pid; do
         [[ -z "$pid" ]] && continue
         _safe_kill_pid "$pid" "dashboard.mjs" KILL || true
@@ -624,7 +632,7 @@ detect_port_holders() {
       else
         _issue port-conflict error \
           "Port $port held by non-vdm process: PID $pid: $cmd" \
-          "Free the port or set CSW_PORT/CSW_PROXY_PORT to alternative values before installing."
+          "Free the port or set CSW_PORT/CSW_PROXY_PORT/CSW_UI_PORT to alternative values before installing."
       fi
     done < <(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
   done

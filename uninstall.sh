@@ -135,8 +135,27 @@ _resolve_dash_port_for_uninstall() {
   fi
   printf '%s' "3333"
 }
+# TRDD-c30609ab Stage B — UI port resolver. Same env→config.json→default
+# precedence as the daemon and proxy. Used by `_kill_running_vdm` so the
+# UI listener gets stopped alongside daemon + proxy during uninstall.
+_resolve_ui_port_for_uninstall() {
+  if _validate_port "${CSW_UI_PORT:-}"; then
+    printf '%s' "$CSW_UI_PORT"
+    return
+  fi
+  if [[ -f "$INSTALL_DIR/config.json" ]] && declare -f _json_get_int >/dev/null 2>&1; then
+    local _from_cfg
+    _from_cfg="$(_json_get_int "$INSTALL_DIR/config.json" "uiPort" 2>/dev/null || true)"
+    if _validate_port "$_from_cfg"; then
+      printf '%s' "$_from_cfg"
+      return
+    fi
+  fi
+  printf '%s' "4444"
+}
 _PROXY_PORT_RESOLVED="$(_resolve_proxy_port_for_uninstall)"
 _DASH_PORT_RESOLVED="$(_resolve_dash_port_for_uninstall)"
+_UI_PORT_RESOLVED="$(_resolve_ui_port_for_uninstall)"
 
 # ── Python-backed file/process scanners (replace bash grep regex builds) ──
 #
@@ -525,7 +544,7 @@ if [[ "$DETECT_ONLY" == "true" ]]; then
     detect_orphaned_settings_hooks
     detect_malformed_rc_blocks
     detect_dangling_symlinks
-    detect_port_holders "$_DASH_PORT_RESOLVED" "$_PROXY_PORT_RESOLVED"
+    detect_port_holders "$_DASH_PORT_RESOLVED" "$_PROXY_PORT_RESOLVED" "$_UI_PORT_RESOLVED"
     detect_orphan_keychain_entries "$INSTALL_DIR"
     detect_truncated_config "$INSTALL_DIR/config.json"
     set +e
@@ -686,11 +705,12 @@ echo ""
 # scan when CSW_*_PORT is set to a malformed value.
 _DASH_PORT="$_DASH_PORT_RESOLVED"
 _PROXY_PORT="$_PROXY_PORT_RESOLVED"
+_UI_PORT="$_UI_PORT_RESOLVED"
 
-if _kill_running_vdm "$_DASH_PORT" "$_PROXY_PORT"; then
-  echo -e "  ${GREEN}✓${NC} Stopped dashboard/proxy"
+if _kill_running_vdm "$_DASH_PORT" "$_PROXY_PORT" "$_UI_PORT"; then
+  echo -e "  ${GREEN}✓${NC} Stopped dashboard/proxy/UI"
 else
-  echo -e "  ${DIM}No running dashboard/proxy found${NC}"
+  echo -e "  ${DIM}No running dashboard/proxy/UI found${NC}"
 fi
 
 # ── 2. Remove shell config block ──
