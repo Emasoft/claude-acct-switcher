@@ -1329,18 +1329,38 @@ cmd_config() {
     # vdm is currently using (env > config.json > default), with the
     # source labelled so the user can see why a config.json change
     # may not be taking effect (env override).
+    #
+    # Label honesty: a non-empty `CSW_*_PORT` env var alone is NOT
+    # enough to claim "(from env)" — `_vdm_resolve_port` silently
+    # rejects malformed values (e.g. CSW_PORT=abc) and falls back
+    # to config.json or the default. To avoid the misleading
+    # "(from env)" label in that edge case, require BOTH that the
+    # env var is set AND that its (numeric, trimmed) value matches
+    # the resolved port that vdm is actually using.
     local _src_dash _src_proxy _src_ui
-    if [[ -n "${CSW_PORT:-}" ]]; then _src_dash="env"; else
-      local _v_dash="$(get_config_string "port")"
-      [[ -n "$_v_dash" ]] && _src_dash="config.json" || _src_dash="default"
+    local _v_dash="$(get_config_string "port")"
+    local _v_proxy="$(get_config_string "proxyPort")"
+    local _v_ui="$(get_config_string "uiPort")"
+    if [[ -n "${CSW_PORT:-}" && "${CSW_PORT}" == "$DASHBOARD_PORT" ]]; then
+      _src_dash="env"
+    elif [[ -n "$_v_dash" && "$_v_dash" == "$DASHBOARD_PORT" ]]; then
+      _src_dash="config.json"
+    else
+      _src_dash="default"
     fi
-    if [[ -n "${CSW_PROXY_PORT:-}" ]]; then _src_proxy="env"; else
-      local _v_proxy="$(get_config_string "proxyPort")"
-      [[ -n "$_v_proxy" ]] && _src_proxy="config.json" || _src_proxy="default"
+    if [[ -n "${CSW_PROXY_PORT:-}" && "${CSW_PROXY_PORT}" == "$PROXY_PORT" ]]; then
+      _src_proxy="env"
+    elif [[ -n "$_v_proxy" && "$_v_proxy" == "$PROXY_PORT" ]]; then
+      _src_proxy="config.json"
+    else
+      _src_proxy="default"
     fi
-    if [[ -n "${CSW_UI_PORT:-}" ]]; then _src_ui="env"; else
-      local _v_ui="$(get_config_string "uiPort")"
-      [[ -n "$_v_ui" ]] && _src_ui="config.json" || _src_ui="default"
+    if [[ -n "${CSW_UI_PORT:-}" && "${CSW_UI_PORT}" == "$UI_PORT" ]]; then
+      _src_ui="env"
+    elif [[ -n "$_v_ui" && "$_v_ui" == "$UI_PORT" ]]; then
+      _src_ui="config.json"
+    else
+      _src_ui="default"
     fi
     echo -e "  port (daemon):      ${CYAN}${DASHBOARD_PORT}${NC} ${DIM}(from ${_src_dash})${NC}"
     echo -e "  proxyPort:          ${CYAN}${PROXY_PORT}${NC} ${DIM}(from ${_src_proxy})${NC}"

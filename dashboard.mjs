@@ -2821,10 +2821,21 @@ async function handleAPI(req, res, role) {
       settings.activityMaxEntries = Math.floor(patch.activityMaxEntries);
     }
     saveSettings(settings);
-    logActivity('settings-changed', {
+    // TRDD-c30609ab Stage C — include port keys in the activity-log
+    // payload when they appear in the patch. A port-only POST would
+    // otherwise leave NO record of the change in the UI feed,
+    // making the "user reported the dashboard moved unexpectedly"
+    // case impossible to triage. Only emit ports that actually
+    // changed (via hasOwnProperty) so non-port toggles don't gain
+    // a redundant port=<unchanged> column.
+    const _activityPayload = {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
       rotationStrategy: settings.rotationStrategy, rotationIntervalMin: settings.rotationIntervalMin,
-    });
+    };
+    if (Object.prototype.hasOwnProperty.call(patch, 'port'))      _activityPayload.port = settings.port;
+    if (Object.prototype.hasOwnProperty.call(patch, 'proxyPort')) _activityPayload.proxyPort = settings.proxyPort;
+    if (Object.prototype.hasOwnProperty.call(patch, 'uiPort'))    _activityPayload.uiPort = settings.uiPort;
+    logActivity('settings-changed', _activityPayload);
     json(res, settings);
     return true;
   }
