@@ -1690,11 +1690,21 @@ cmd_dashboard() {
       # CSW_DISABLE_UI=1 in the spawn env (dashboard.mjs reads it at
       # module-init).
       local _no_ui=0
-      # Drop the "start" subcommand token if present. `vdm dashboard`
-      # (zero args) defaults action="start" via the case-statement
-      # default, so $1 is already a flag in that path — `shift`
-      # would still need protection. Use `[[ "${1:-}" == start ]]`
-      # to drop only when actually present (chk-review F-004).
+      # Drop the "start" subcommand token if present. Three reachable
+      # input shapes after the outer `case "$action" in start|"")`
+      # branch resolves:
+      #   • `vdm dashboard`            → action="" (set by default-empty
+      #     branch); $1 is unset.
+      #   • `vdm dashboard start`      → action="start"; $1 is "start".
+      #   • `vdm dashboard start FLAG` → action="start"; $1 is "start",
+      #     $2 is FLAG.
+      # In the first shape there is no token to consume; in the other
+      # two, "start" is the literal $1 and we shift it off so the
+      # while-loop below sees only flags. `[[ "${1:-}" == start ]] &&
+      # shift` correctly handles all three (chk-review F-004 + F-001).
+      # NOTE: a stray `vdm dashboard --no-ui` is impossible to reach
+      # here because the outer case treats unknown $1 as the catch-all
+      # `*)` Usage branch — never touches this start-handler.
       [[ "${1:-}" == "start" ]] && shift
       while [[ $# -gt 0 ]]; do
         case "$1" in

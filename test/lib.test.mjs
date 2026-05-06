@@ -9746,12 +9746,22 @@ describe('Time formatting batch — UX-X8 / UX-X9 source-grep regressions', () =
     assert.match(_src_tfmt_lib, /export function fmtDuration\(/);
   });
 
-  it('UX-X8/X9 — dashboard.mjs imports both helpers from lib.mjs', () => {
-    // The Node-side import block (line ~790) must surface both new
-    // helpers; without this the dashboard's CLI / hook handlers cannot
-    // emit the shared compact form on stderr / log strings.
-    assert.match(_src_tfmt_dash, /fmtTokenCount/);
-    assert.match(_src_tfmt_dash, /fmtDuration/);
+  it('UX-X8/X9 — dashboard.mjs ships browser-side mirrors of fmtTokenCount / fmtDuration', () => {
+    // Originally this asserted that dashboard.mjs imported the
+    // Node-side helpers from lib.mjs. After the cleanup commit
+    // d1f7eb7 removed the unused Node-side imports (TS6133), the old
+    // assertion still passed by accidentally matching unrelated
+    // string occurrences (codex P2). Replaced with the ACTUAL
+    // contract: dashboard.mjs ships browser-side mirrors named
+    // `fmtTokenCountShort` / `fmtDurationShort` (declared inside the
+    // renderHTML template literal — they CANNOT `import` from
+    // lib.mjs because the template ships as a string to the
+    // browser). The drift-regression tests below pin that the
+    // wrappers `formatNum` / `sessionDuration` delegate to those
+    // mirrors so a future refactor can't quietly fork the
+    // algorithm.
+    assert.match(_src_tfmt_dash, /function fmtTokenCountShort\(/);
+    assert.match(_src_tfmt_dash, /function fmtDurationShort\(/);
   });
 
   it('UX-X9 — at least 5 token-count display sites carry a title= with the exact form', () => {
