@@ -17111,7 +17111,15 @@ async function handleProxyRequest(clientReq, clientRes) {
   // Health check
   if (clientReq.method === 'GET' && clientReq.url === '/health') {
     clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+    // PIA-004 — `server: 'proxy'` is a vdm-issued identity marker so
+    // install.sh's atomic-readiness gate can body-check the proxy /health
+    // (mirrors the daemon's `server: 'daemon'` and UI's `server: 'ui'`).
+    // Without this a non-vdm squatter on the proxy port returning 200 on
+    // any path called /health would trick install into wiring hooks at a
+    // dead proxy.
     clientRes.end(JSON.stringify({
+      ok: true,
+      server: 'proxy',
       status: _circuitOpen ? 'passthrough' : 'ok',
       accounts: loadAllAccountTokens().length,
       activeToken: getActiveToken() ? 'present' : 'missing',

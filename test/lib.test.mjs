@@ -4618,6 +4618,29 @@ describe('Phase I — dashboard.mjs /health endpoint', () => {
     assert.match(_dashboardSrc_health, /server: 'ui'/);
   });
 
+  it('proxy /health emits the proxy server identity (PIA-004)', () => {
+    // PIA-004 — pre-fix the proxy /health body returned only
+    // {status, accounts, activeToken, circuitBreaker, consecutiveExhausted}.
+    // install.sh's _proxy_responds was a HTTP-status-only check, so a
+    // non-vdm squatter on the proxy port returning 200 on /health would
+    // pass the atomic-readiness gate. Adding `server: 'proxy'` mirrors
+    // the daemon ('daemon') and UI ('ui') markers and lets install.sh
+    // body-check the proxy too. Pin the marker so a future "let me
+    // simplify" refactor that drops the field also updates install.sh.
+    assert.match(_dashboardSrc_health, /server: 'proxy'/);
+  });
+
+  it('install.sh _proxy_responds body-checks "server":"proxy" (PIA-004)', () => {
+    const _installSrc = _readFileSync_xss(
+      new URL('../install.sh', import.meta.url),
+      'utf8',
+    );
+    // Pin the install.sh-side body match so install.sh and dashboard.mjs
+    // stay in lockstep. Either changing the marker on one side without
+    // the other reintroduces the squatter-acceptance regression.
+    assert.match(_installSrc, /"server":"proxy"/);
+  });
+
   it('/health accepts both GET and HEAD', () => {
     // L4 fix: HEAD requests should not fall through to render the dashboard
     // HTML — a cheap probe deserves a cheap response.

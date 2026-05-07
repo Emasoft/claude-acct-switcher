@@ -1053,8 +1053,18 @@ _dashboard_responds() {
   [[ "$body" == *'"server":"dashboard"'* || "$body" == *'"server":"daemon"'* ]]
 }
 _proxy_responds() {
-  curl -fsS --connect-timeout 1 --max-time 2 \
-    "http://localhost:${_PROXY_HEALTH_PORT}/health" >/dev/null 2>&1
+  # PIA-004 — body-check the proxy /health for `"server":"proxy"`,
+  # mirroring _dashboard_responds. Without this a non-vdm squatter
+  # returning 200 on /health would trick install into wiring hooks at a
+  # dead proxy. Single accepted marker (no legacy form to support — the
+  # proxy /health body shape was historically `{status, accounts, ...}`
+  # without an identity marker, so any pre-marker dashboard.mjs simply
+  # fails the body match and the install retries until the upgraded
+  # binary lands).
+  local body
+  body="$(curl -fsS --connect-timeout 1 --max-time 2 \
+    "http://localhost:${_PROXY_HEALTH_PORT}/health" 2>/dev/null)" || return 1
+  [[ "$body" == *'"server":"proxy"'* ]]
 }
 # TRDD-c30609ab Stage B — UI server liveness probe. Decoupled from the
 # atomic readiness gate (`_both_servers_responding`) because the UI is
