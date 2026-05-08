@@ -67,6 +67,7 @@ if [[ -n "$_LIB" ]]; then
 else
   echo -e "${YELLOW}Warning: lib-install.sh not found — running in degraded mode (no atomic helpers).${NC}" >&2
   # Provide minimal stubs so unconditional calls below don't crash.
+  # shellcheck disable=SC2034  # array is read by _register_cleanup / _run_cleanup defined below as stubs; this stub-mode init keeps the contract identical to lib-install.sh's real definition.
   VDM_CLEANUP_ACTIONS=()
   _trap_signals() { :; }
   _register_cleanup() { :; }

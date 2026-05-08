@@ -4,6 +4,17 @@
 # All running Claude Code sessions share the same Keychain entry,
 # so switching here affects every open tab.
 
+# shellcheck disable=SC2155
+# Rationale: vdm has 36 `local foo="$(cmd)"` patterns. SC2155 warns that
+# this masks the inner command's exit code from `$?`, but vdm uses
+# `set -euo pipefail` (so any inner non-zero abruptly aborts the function
+# anyway when the result feeds into `[[ ... ]]` or `case`) and never
+# reads `$?` between the assignment and the next statement. Splitting
+# every site into `local foo; foo="$(cmd)"` is mechanical churn with no
+# behavioral benefit. Disabling project-wide here keeps shellcheck
+# reports actionable (real issues stand out) without 36 separate
+# disable directives sprinkled through the file.
+
 set -euo pipefail
 
 # Resolve SCRIPT_DIR canonically, BSD-portable.
@@ -148,6 +159,7 @@ if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]] \
       _needs_hooks=true
     fi
     if [[ "$_needs_hooks" == "true" ]]; then
+      # shellcheck disable=SC1091  # install-hooks.sh is sourced at runtime; shellcheck -x not invoked from CI to avoid pulling lib-install.sh's stubs into static analysis.
       source "$SCRIPT_DIR/install-hooks.sh"
       install_hooks 2>/dev/null || true
     fi
@@ -660,6 +672,7 @@ set_config_number() {
     return 0
   fi
   # Atomic + surfaced errors — see set_config_value.
+  # shellcheck disable=SC2016  # python script body is intentionally single-quoted — shell expansion would mangle the json/sys references inside.
   python3 -c '
 import json, os, sys
 config_file = sys.argv[1]
@@ -2061,7 +2074,8 @@ cmd_upgrade() {
   fi
   local tmpdir
   tmpdir=$(mktemp -d)
-  # Ensure cleanup on any exit from this function
+  # Ensure cleanup on any exit from this function.
+  # shellcheck disable=SC2064  # double-quote-expansion-now is intentional — `$tmpdir` is `local` and would be out-of-scope at trap-fire time during function teardown.
   trap "rm -rf '$tmpdir'" RETURN
 
   echo ""
@@ -2228,6 +2242,7 @@ cmd_upgrade() {
 
   # Install hooks if not yet present
   if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+    # shellcheck disable=SC1091  # install-hooks.sh is sourced at runtime; static-analysis follow disabled to keep shellcheck portable across CI environments.
     source "$SCRIPT_DIR/install-hooks.sh"
     install_hooks && echo -e "  ${GREEN}✓${NC} Token tracking hooks installed" || true
   fi
@@ -2452,6 +2467,7 @@ cmd_tokens() {
     # `$repo` + `$active_branch` via argv. Single-quoted python source so
     # bash performs no expansion inside it — branch names from the JSON
     # entries cannot escape the python literal.
+    # shellcheck disable=SC2016
     printf '%s' "$usage" | python3 -c '
 import json, sys, subprocess
 

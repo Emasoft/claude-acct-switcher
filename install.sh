@@ -466,6 +466,7 @@ if [[ "$SKIP_DETECT" != "true" ]]; then
       fi
     done
     # Re-run detection so the user sees what's left.
+    # shellcheck disable=SC2034  # array is read by detector helpers + render_detected_issues, both in lib-install.sh; shellcheck doesn't follow cross-file flow.
     VDM_DETECTED_ISSUES=()
     detect_old_install_remnants "$INSTALL_DIR"
     detect_orphaned_settings_hooks
@@ -521,7 +522,8 @@ _install_atomic() {
   # disk-full failure leaves the existing install intact.
   if [[ $was_present -eq 1 ]]; then
     mkdir -p "$_ROLLBACK_DIR" 2>/dev/null || true
-    local _snap="$_ROLLBACK_DIR/$(basename "$dst")"
+    local _snap
+    _snap="$_ROLLBACK_DIR/$(basename "$dst")"
     if cp -p "$dst" "$_snap" 2>/dev/null; then
       _SNAPSHOTTED_FILES+=("$dst")
     else
@@ -555,7 +557,8 @@ _rollback_install_files() {
     local i
     for (( i=${#_SNAPSHOTTED_FILES[@]}-1; i>=0; i-- )); do
       local dst="${_SNAPSHOTTED_FILES[$i]}"
-      local snap="$_ROLLBACK_DIR/$(basename "$dst")"
+      local snap
+      snap="$_ROLLBACK_DIR/$(basename "$dst")"
       if [[ -f "$snap" ]]; then
         _atomic_replace "$snap" "$dst" 2>/dev/null || true
       fi
@@ -580,6 +583,7 @@ _rollback_install_files() {
   fi
   rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
 }
+# shellcheck disable=SC2016  # the body is captured as a literal trap string and evaluated at trap-fire time; expansion-now would freeze _INSTALL_OK to 0 forever.
 _register_cleanup '
 if [[ "${_INSTALL_OK:-0}" != "1" ]]; then
   _rollback_install_files
@@ -959,53 +963,71 @@ else
   echo -e "  ${YELLOW}Could not detect shell config file.${NC}"
   echo "  Add this to your shell profile manually:"
   echo ""
-  echo '    # BEGIN claude-account-switcher'
-  echo '    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone'
-  echo '    # OR if `vdm disable` has written the kill-switch marker file.'
-  echo '    # `-f` (file exists), NOT `-x` (executable): dashboard.mjs is mode 644.'
-  echo '    if [ ! -f "$HOME/.vdm/dashboard.mjs" ] || [ -f "$HOME/.vdm/.disabled" ]; then'
-  echo '      case "${ANTHROPIC_BASE_URL:-}" in'
-  echo '        http*://localhost:*|http*://127.0.0.1:*) unset ANTHROPIC_BASE_URL ;;'
-  echo '      esac'
-  echo '    else'
-  echo '      if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then'
-  echo '        CSW_PORT="$(python3 -c '"'"'import json,sys'
-  echo 'try:'
-  echo '  d=json.load(open(sys.argv[1])); v=d.get("port",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
-  echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
-  echo '      fi'
-  echo '      if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then'
-  echo '        CSW_PROXY_PORT="$(python3 -c '"'"'import json,sys'
-  echo 'try:'
-  echo '  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
-  echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
-  echo '      fi'
-  echo '      if [ -z "${CSW_UI_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then'
-  echo '        CSW_UI_PORT="$(python3 -c '"'"'import json,sys'
-  echo 'try:'
-  echo '  d=json.load(open(sys.argv[1])); v=d.get("uiPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")'
-  echo 'except Exception: pass'"'"' "$HOME/.vdm/config.json" 2>/dev/null || true)"'
-  echo '      fi'
-  echo '      CSW_PORT="${CSW_PORT:-3333}"'
-  echo '      CSW_PROXY_PORT="${CSW_PROXY_PORT:-3334}"'
-  echo '      CSW_UI_PORT="${CSW_UI_PORT:-4444}"'
-  echo '      export CSW_PORT CSW_PROXY_PORT CSW_UI_PORT'
-  echo '      _vdm_lock="${TMPDIR:-/tmp}/vdm-autostart-$(id -u).lock.d"'
-  echo '      if [ -d "$_vdm_lock" ] && find "$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then'
-  echo '        rmdir "$_vdm_lock" 2>/dev/null'
-  echo '      fi'
-  echo '      if mkdir "$_vdm_lock" 2>/dev/null; then'
-  echo '        if ! lsof -iTCP:"$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then'
-  echo "          nohup $(command -v node) ~/.vdm/dashboard.mjs \\"
-  echo '            >>~/.vdm/startup.log 2>&1 &'
-  echo '          disown'
-  echo '        fi'
-  echo '        rmdir "$_vdm_lock" 2>/dev/null'
-  echo '      fi'
-  echo '      unset _vdm_lock'
-  echo '      export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:$CSW_PROXY_PORT}"'
-  echo '    fi'
-  echo '    # END claude-account-switcher'
+  # Resolve node binary at install time so the manual snippet shows the
+  # absolute path the user would otherwise have to figure out themselves.
+  # Falls back to a literal `$(command -v node)` if node is missing —
+  # the user can resolve it later on the destination machine.
+  _MANUAL_NODE_BIN="$(command -v node 2>/dev/null || true)"
+  # Fallback emits the literal string `$(command -v node)` so the user's
+  # rc file resolves it at sourcing time on the destination machine. The
+  # single-quotes-around-`$(...)` is intentional — see SC2016 disable.
+  # shellcheck disable=SC2016
+  [[ -z "$_MANUAL_NODE_BIN" ]] && _MANUAL_NODE_BIN='$(command -v node)'
+  # Quoted heredoc — every `$VAR`, `\``, and `$(...)` reaches the user's
+  # screen verbatim (and from there their rc file) without install-time
+  # expansion. This block was previously 47 separate `echo '...'` lines
+  # carrying single-quote-escape gymnastics; the heredoc is one stream
+  # and shellcheck-clean. The single dynamic field (node binary path) is
+  # interpolated via a sentinel-replace below.
+  cat <<'MANUAL_RC_EOF' | sed "s|@@NODE_BIN@@|${_MANUAL_NODE_BIN}|g"
+    # BEGIN claude-account-switcher
+    # Uninstall-aware self-disable — strip stale env if dashboard.mjs is gone
+    # OR if `vdm disable` has written the kill-switch marker file.
+    # `-f` (file exists), NOT `-x` (executable): dashboard.mjs is mode 644.
+    if [ ! -f "$HOME/.vdm/dashboard.mjs" ] || [ -f "$HOME/.vdm/.disabled" ]; then
+      case "${ANTHROPIC_BASE_URL:-}" in
+        http*://localhost:*|http*://127.0.0.1:*) unset ANTHROPIC_BASE_URL ;;
+      esac
+    else
+      if [ -z "${CSW_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then
+        CSW_PORT="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1])); v=d.get("port",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
+except Exception: pass' "$HOME/.vdm/config.json" 2>/dev/null || true)"
+      fi
+      if [ -z "${CSW_PROXY_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then
+        CSW_PROXY_PORT="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1])); v=d.get("proxyPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
+except Exception: pass' "$HOME/.vdm/config.json" 2>/dev/null || true)"
+      fi
+      if [ -z "${CSW_UI_PORT:-}" ] && [ -r "$HOME/.vdm/config.json" ] && command -v python3 >/dev/null 2>&1; then
+        CSW_UI_PORT="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1])); v=d.get("uiPort",""); print(v if isinstance(v,int) and not isinstance(v,bool) and 0 < v <= 65535 else "")
+except Exception: pass' "$HOME/.vdm/config.json" 2>/dev/null || true)"
+      fi
+      CSW_PORT="${CSW_PORT:-3333}"
+      CSW_PROXY_PORT="${CSW_PROXY_PORT:-3334}"
+      CSW_UI_PORT="${CSW_UI_PORT:-4444}"
+      export CSW_PORT CSW_PROXY_PORT CSW_UI_PORT
+      _vdm_lock="${TMPDIR:-/tmp}/vdm-autostart-$(id -u).lock.d"
+      if [ -d "$_vdm_lock" ] && find "$_vdm_lock" -maxdepth 0 -mmin +1 2>/dev/null | grep -q .; then
+        rmdir "$_vdm_lock" 2>/dev/null
+      fi
+      if mkdir "$_vdm_lock" 2>/dev/null; then
+        if ! lsof -iTCP:"$CSW_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+          nohup @@NODE_BIN@@ ~/.vdm/dashboard.mjs \
+            >>~/.vdm/startup.log 2>&1 &
+          disown
+        fi
+        rmdir "$_vdm_lock" 2>/dev/null
+      fi
+      unset _vdm_lock
+      export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:$CSW_PROXY_PORT}"
+    fi
+    # END claude-account-switcher
+MANUAL_RC_EOF
 fi
 
 # ── Atomic install: BOTH servers MUST be reachable before hooks land ──

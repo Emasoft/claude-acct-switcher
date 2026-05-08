@@ -114,6 +114,7 @@ _VDM_PORT="$(_resolve_vdm_port)"
 # embedding, etc.) so abort hard rather than emit a bogus hook.
 if ! [[ "$_VDM_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || ! (( _VDM_PORT >= 1 && _VDM_PORT <= 65535 )); then
   echo "  install-hooks.sh: resolved port '$_VDM_PORT' is invalid; refusing to proceed" >&2
+  # shellcheck disable=SC2317  # `exit 1` is reachable when this file is invoked directly (not sourced); `return 1` only works in a sourced context. Belt + suspenders.
   return 1 2>/dev/null || exit 1
 fi
 _VDM_HOOKS_MARKER="# vdm-token-usage"
@@ -202,6 +203,7 @@ _install_claude_code_hooks() {
   # the trap fires — which happens during function teardown when the
   # `local` scope is being collapsed, and `set -u` in the caller turns
   # the missing reference into an error.
+  # shellcheck disable=SC2064  # double quotes intentional — see comment above; expansion-now is the correct semantics here.
   trap "rmdir \"$lock_dir\" 2>/dev/null || true" RETURN
 
   # Gate flag for the high-frequency PostToolBatch subscription. The
@@ -504,6 +506,7 @@ _uninstall_claude_code_hooks() {
   # the trap fires — which happens during function teardown when the
   # `local` scope is being collapsed, and `set -u` in the caller turns
   # the missing reference into an error.
+  # shellcheck disable=SC2064  # double quotes intentional — see comment above; expansion-now is the correct semantics here.
   trap "rmdir \"$lock_dir\" 2>/dev/null || true" RETURN
 
   if ! python3 - "$settings_file" "$_VDM_PORT" "$_VDM_HOOK_SENTINEL" <<'PYEOF'
