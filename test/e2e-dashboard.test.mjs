@@ -93,15 +93,19 @@ function httpPostJson(port, path, body, timeoutMs = 2000) {
   });
 }
 
-// Poll until /health on both ports returns 200, or timeout. Returns when ready.
-async function waitForBoot(dashPort, proxyPort, timeoutMs = 15_000) {
+// Poll until /health on all three ports returns 200, or timeout. Returns when ready.
+// TRDD-c30609ab: the dashboard binds three listeners (daemon, proxy, ui). All
+// three must be up before the test issues UI-port requests, otherwise the test
+// races the bind.
+async function waitForBoot(dashPort, proxyPort, uiPort, timeoutMs = 15_000) {
   const t0 = Date.now();
   let lastErr = null;
   while (Date.now() - t0 < timeoutMs) {
     try {
       const a = await httpGet(dashPort, '/health', 800);
       const b = await httpGet(proxyPort, '/health', 800);
-      if (a.status === 200 && b.status === 200) return { ms: Date.now() - t0 };
+      const c = await httpGet(uiPort, '/health', 800);
+      if (a.status === 200 && b.status === 200 && c.status === 200) return { ms: Date.now() - t0 };
     } catch (e) { lastErr = e; }
     await new Promise(r => setTimeout(r, 100));
   }
@@ -191,10 +195,17 @@ process.exit(2);
   return { root, home, fakebin, keychainFile, securityPath };
 }
 
-// Spawn dashboard.mjs in the isolated env. Returns {child, dashPort, proxyPort, root}.
+// Spawn dashboard.mjs in the isolated env. Returns {child, dashPort, proxyPort, uiPort, root}.
+// TRDD-c30609ab: the dashboard binds three listeners (daemon, proxy, ui). The
+// test must allocate a free port for each and pass it via the CSW_*_PORT env
+// vars so the dashboard's three-way distinctness check passes AND so the test
+// knows where each role lives. Default port 4444 must NOT be used here — a
+// parallel test run (or an already-running real dashboard on the developer's
+// laptop) would collide.
 async function spawnDashboard(env, opts = {}) {
   const dashPort = opts.dashPort || await freePort();
   const proxyPort = opts.proxyPort || await freePort();
+  const uiPort = opts.uiPort || await freePort();
   const child = spawn(process.execPath, [join(env.root, 'dashboard.mjs')], {
     cwd: env.root,
     env: {
@@ -203,6 +214,7 @@ async function spawnDashboard(env, opts = {}) {
       PATH: `${env.fakebin}:${process.env.PATH}`,
       CSW_PORT: String(dashPort),
       CSW_PROXY_PORT: String(proxyPort),
+      CSW_UI_PORT: String(uiPort),
       // Disable OTLP receiver to keep the test deterministic.
       CSW_OTEL_ENABLED: '0',
       // Force a high inflight cap so per-account semaphore doesn't block tests.
@@ -232,7 +244,7 @@ async function spawnDashboard(env, opts = {}) {
   };
   child.stdout.on('data', (d) => append('_stdoutBuf', d));
   child.stderr.on('data', (d) => append('_stderrBuf', d));
-  return { child, dashPort, proxyPort, root: env.root };
+  return { child, dashPort, proxyPort, uiPort, root: env.root };
 }
 
 // Hard cap on captured child stdout/stderr to prevent unbounded growth (F-004).
@@ -280,9 +292,9 @@ describe('e2e — dashboard subprocess boot + lifecycle', () => {
     if (env?.root) try { rmSync(env.root, { recursive: true, force: true }); } catch {}
   });
 
-  test('boots and binds both ports within 15s', async () => {
+  test('boots and binds all three ports within 15s', async () => {
     try {
-      const { ms } = await waitForBoot(ctx.dashPort, ctx.proxyPort, 15_000);
+      const { ms } = await waitForBoot(ctx.dashPort, ctx.proxyPort, ctx.uiPort, 15_000);
       assert.ok(ms < 15_000, `boot took ${ms}ms`);
     } catch (e) {
       throw new Error(`boot failed: ${e.message}${dumpChildOutput(ctx.child)}`);
@@ -308,7 +320,11 @@ describe('e2e — dashboard subprocess boot + lifecycle', () => {
     // handler then logs ERR_HTTP_HEADERS_SENT). Symptom in a real browser:
     // "loads forever, black screen". This test fetches the page like a
     // browser would and asserts a real HTML document came back.
-    const r = await httpGet(ctx.dashPort, '/', 8000);
+    //
+    // TRDD-c30609ab: the HTML lives on the UI port (4444), NOT the daemon
+    // port (3333). GET / on the daemon redirects 308 → UI port; this test
+    // hits the UI port directly to verify renderHTML output.
+    const r = await httpGet(ctx.uiPort, '/', 8000);
     assert.equal(r.status, 200,
                  `GET / should return 200 OK; got ${r.status}: ${r.body.slice(0, 300)}`);
     assert.ok(r.body.length > 1000,
@@ -347,14 +363,17 @@ describe('e2e — dashboard subprocess boot + lifecycle', () => {
   });
 
   test('GET /api/proxy-status returns parseable JSON', async () => {
-    const r = await httpGet(ctx.dashPort, '/api/proxy-status', 5000);
+    // TRDD-c30609ab: /api/proxy-status is a UI-only endpoint (UI_PATHS); the
+    // daemon (3333) returns 308 → UI port. Hit the UI port directly.
+    const r = await httpGet(ctx.uiPort, '/api/proxy-status', 5000);
     assert.equal(r.status, 200, `expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
     const data = JSON.parse(r.body);
     assert.ok(data && typeof data === 'object', 'expected an object');
   });
 
   test('GET /api/profiles returns the documented wrapped shape', async () => {
-    const r = await httpGet(ctx.dashPort, '/api/profiles', 5000);
+    // TRDD-c30609ab: /api/profiles is a UI-only endpoint (UI_PATHS).
+    const r = await httpGet(ctx.uiPort, '/api/profiles', 5000);
     assert.equal(r.status, 200);
     const data = JSON.parse(r.body);
     // F-002 fix: assert the ACTUAL contract — /api/profiles returns
@@ -391,11 +410,15 @@ describe('e2e — dashboard subprocess boot + lifecycle', () => {
   });
 
   test('POST /api/settings round-trips through config.json', async () => {
+    // TRDD-c30609ab: POST /api/settings is UI-only (writes); the daemon
+    // returns 308 → UI port. GET /api/settings is dual-use (works on either
+    // listener for the git commit-msg trailer use case) but we hit the UI
+    // port consistently within this test to keep the round-trip symmetric.
     const newSettings = {
       autoSwitch: false,
       rotationStrategy: 'spread',
     };
-    const r = await httpPostJson(ctx.dashPort, '/api/settings', newSettings, 5000);
+    const r = await httpPostJson(ctx.uiPort, '/api/settings', newSettings, 5000);
     assert.ok(r.status === 200 || r.status === 204, `expected 2xx, got ${r.status}: ${r.body.slice(0, 200)}`);
     // Verify config.json on disk
     const configPath = join(ctx.root, 'config.json');
@@ -404,7 +427,7 @@ describe('e2e — dashboard subprocess boot + lifecycle', () => {
     assert.equal(onDisk.autoSwitch, false, 'autoSwitch should be persisted to config.json');
     assert.equal(onDisk.rotationStrategy, 'spread', 'rotationStrategy should be persisted to config.json');
     // Round-trip via GET
-    const r2 = await httpGet(ctx.dashPort, '/api/settings', 5000);
+    const r2 = await httpGet(ctx.uiPort, '/api/settings', 5000);
     const settings = JSON.parse(r2.body);
     assert.equal(settings.autoSwitch, false, 'GET should reflect autoSwitch change');
     assert.equal(settings.rotationStrategy, 'spread', 'GET should reflect rotationStrategy change');
@@ -423,7 +446,7 @@ describe('e2e — singleton lock prevents two dashboards from starting on same d
     kc[JSON.stringify({ a: process.env.USER || 'test', s: 'Claude Code-credentials' })] = fakeBlob;
     writeFileSync(env.keychainFile, JSON.stringify(kc, null, 2), { mode: 0o600 });
     first = await spawnDashboard(env);
-    await waitForBoot(first.dashPort, first.proxyPort, 15_000).catch(e => {
+    await waitForBoot(first.dashPort, first.proxyPort, first.uiPort, 15_000).catch(e => {
       throw new Error(`first dashboard failed to boot: ${e.message}${dumpChildOutput(first.child)}`);
     });
   });
@@ -476,7 +499,7 @@ describe('e2e — hook ingest writes token-usage.json', () => {
     kc[JSON.stringify({ a: process.env.USER || 'test', s: 'Claude Code-credentials' })] = fakeBlob;
     writeFileSync(env.keychainFile, JSON.stringify(kc, null, 2), { mode: 0o600 });
     ctx = await spawnDashboard(env);
-    await waitForBoot(ctx.dashPort, ctx.proxyPort, 15_000).catch(e => {
+    await waitForBoot(ctx.dashPort, ctx.proxyPort, ctx.uiPort, 15_000).catch(e => {
       throw new Error(`boot failed: ${e.message}${dumpChildOutput(ctx.child)}`);
     });
   });
@@ -571,7 +594,7 @@ describe('e2e — POST body size cap (READ_BODY_MAX = 1 MiB)', () => {
     kc[JSON.stringify({ a: process.env.USER || 'test', s: 'Claude Code-credentials' })] = fakeBlob;
     writeFileSync(env.keychainFile, JSON.stringify(kc, null, 2), { mode: 0o600 });
     ctx = await spawnDashboard(env);
-    await waitForBoot(ctx.dashPort, ctx.proxyPort, 15_000);
+    await waitForBoot(ctx.dashPort, ctx.proxyPort, ctx.uiPort, 15_000);
   });
 
   after(async () => {
@@ -583,8 +606,14 @@ describe('e2e — POST body size cap (READ_BODY_MAX = 1 MiB)', () => {
     // Build a 2 MiB JSON payload — the body cap is at 1 MiB, this MUST be
     // refused. Critically, the dashboard must NOT crash; subsequent /health
     // calls must still succeed.
+    //
+    // TRDD-c30609ab: POST /api/settings is UI-only — the daemon's role
+    // filter would emit 308 BEFORE readBody runs, accidentally satisfying
+    // the `status !== 200` assertion below WITHOUT exercising the body cap.
+    // Hit the UI port directly so the cap actually trips (413/400/socket
+    // destroy) and the assertion verifies real behavior.
     const huge = 'x'.repeat(2 * 1024 * 1024);
-    const r = await httpPostJson(ctx.dashPort, '/api/settings', { autoSwitch: false, _huge: huge }, 5000)
+    const r = await httpPostJson(ctx.uiPort, '/api/settings', { autoSwitch: false, _huge: huge }, 5000)
               .catch(e => ({ status: 'error', body: e.message }));
     // Accept anything that's NOT a successful 200. The body cap may surface
     // as 413 (Payload Too Large), 400, or a connection error from the
