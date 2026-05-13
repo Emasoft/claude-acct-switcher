@@ -3,8 +3,9 @@
 // the macOS Keychain is not touched. Verifies the production-disaster failure
 // modes that unit tests cannot catch:
 //
-//  - dashboard boots and binds both ports
-//  - /health responds on both dashboard and proxy ports
+//  - dashboard boots and binds all three ports (daemon, proxy, ui — see
+//    TRDD-c30609ab in CLAUDE.md for the three-port split)
+//  - /health responds on the daemon, proxy, and ui ports
 //  - hook ingest writes token-usage.json correctly
 //  - singleton lock prevents two dashboards from clobbering shared state
 //  - graceful shutdown releases the lock + leaves files in a clean state
